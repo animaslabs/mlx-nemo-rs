@@ -79,6 +79,10 @@ pub enum Error {
     #[error("Archive error: {0}")]
     Archive(String),
 
+    /// Pickle parsing error.
+    #[error("Pickle error: {0}")]
+    Pickle(String),
+
     /// Feature not implemented.
     #[error("Not implemented: {0}")]
     NotImplemented(String),
@@ -143,6 +147,11 @@ impl Error {
     /// Create an archive error.
     pub fn archive(message: impl Into<String>) -> Self {
         Self::Archive(message.into())
+    }
+
+    /// Create a pickle parsing error.
+    pub fn pickle(message: impl Into<String>) -> Self {
+        Self::Pickle(message.into())
     }
 
     /// Create a not-implemented error.

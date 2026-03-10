@@ -186,14 +186,11 @@ impl NemoCheckpoint {
                 Ok(tensors)
             }
             "ckpt" => {
-                // PyTorch checkpoint format - needs conversion
-                // For now, return an error suggesting to use safetensors
-                Err(Error::not_implemented(
-                    "PyTorch .ckpt format not yet supported. Please convert to safetensors format.",
-                ))
+                // Load using PyTorch checkpoint loader
+                crate::core::pytorch::load(weights_path)
             }
             _ => Err(Error::checkpoint(format!(
-                "Unknown weights format: {}",
+                "Unknown weights format: '{}'. Supported: .safetensors, .ckpt",
                 extension
             ))),
         }

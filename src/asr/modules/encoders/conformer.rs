@@ -11,6 +11,7 @@ use mlx_rs::nn;
 use mlx_rs::ops::indexing::IndexOp;
 use mlx_rs::Array;
 
+use super::attention::{RelPositionMultiHeadAttention, RelPositionalEncoding};
 use crate::asr::config::EncoderConfig;
 use crate::core::error::Result;
 
@@ -35,9 +36,16 @@ fn load_linear(layer: &mut nn::Linear, weights: &HashMap<String, Array>, prefix:
 }
 
 /// Helper to load Conv1d weights
+///
+/// PyTorch Conv1d weight shape: (out_channels, in_channels/groups, kernel_size)
+/// MLX Conv1d weight shape: (out_channels, kernel_size, in_channels/groups)
+/// So we need to transpose axes 1 and 2.
 fn load_conv1d(layer: &mut nn::Conv1d, weights: &HashMap<String, Array>, prefix: &str) {
     if let Some(weight) = weights.get(&format!("{}.weight", prefix)) {
-        layer.weight.value = weight.clone();
+        // Transpose from PyTorch (O, I, K) to MLX (O, K, I)
+        if let Ok(transposed) = weight.transpose_axes(&[0, 2, 1]) {
+            layer.weight.value = transposed;
+        }
     }
     if let Some(bias) = weights.get(&format!("{}.bias", prefix)) {
         layer.bias.value = Some(bias.clone());
@@ -70,6 +78,9 @@ pub struct ConformerEncoder {
     /// Input projection / subsampling layers
     subsampling: Subsampling,
 
+    /// Relative positional encoding generator
+    pos_enc: RelPositionalEncoding,
+
     /// Conformer blocks
     layers: Vec<ConformerBlock>,
 
@@ -82,9 +93,14 @@ impl ConformerEncoder {
     pub fn new(config: EncoderConfig) -> Result<Self> {
         let d_model = config.d_model;
         let n_layers = config.n_layers;
+        let pos_emb_max_len = config.pos_emb_max_len;
+        let xscaling = config.xscaling.unwrap_or(true);
 
         // Create subsampling layer
         let subsampling = Subsampling::new(&config)?;
+
+        // Create relative positional encoding
+        let pos_enc = RelPositionalEncoding::new(d_model, pos_emb_max_len, xscaling)?;
 
         // Create conformer blocks
         let mut layers = Vec::with_capacity(n_layers);
@@ -98,6 +114,7 @@ impl ConformerEncoder {
         Ok(Self {
             config,
             subsampling,
+            pos_enc,
             layers,
             final_norm,
         })
@@ -119,9 +136,19 @@ impl ConformerEncoder {
         // Subsampling
         let (mut x, lengths) = self.subsampling.forward(&x, lengths)?;
 
-        // Process through conformer blocks
+        // Scale input by sqrt(d_model) if xscaling is enabled
+        let xscale = self.pos_enc.xscale();
+        if xscale != 1.0 {
+            x = &x * Array::from_f32(xscale);
+        }
+
+        // Generate positional encoding for this sequence length
+        let seq_len = x.dim(1) as usize;
+        let pos_emb = self.pos_enc.get_encoding(seq_len)?;
+
+        // Process through conformer blocks with positional info
         for layer in &mut self.layers {
-            x = layer.forward(&x, &lengths)?;
+            x = layer.forward(&x, &pos_emb)?;
         }
 
         // Final normalization
@@ -145,28 +172,60 @@ impl ConformerEncoder {
 
     /// Load weights from a state dict.
     pub fn load_weights(&mut self, weights: &HashMap<String, Array>) -> Result<()> {
-        // Load subsampling weights
-        self.subsampling.load_weights(weights, "pre_encode")?;
+        // Load subsampling weights (NeMo uses encoder.pre_encode prefix)
+        self.subsampling
+            .load_weights(weights, "encoder.pre_encode")?;
 
-        // Load conformer block weights
+        // Load conformer block weights (NeMo uses encoder.layers.N prefix)
+        // Position biases are per-layer (not shared), loaded in ConformerBlock
         for (i, layer) in self.layers.iter_mut().enumerate() {
-            layer.load_weights(weights, &format!("layers.{}", i))?;
+            layer.load_weights(weights, &format!("encoder.layers.{}", i))?;
         }
 
         // Load final norm weights
-        load_layer_norm(&mut self.final_norm, weights, "final_norm");
+        load_layer_norm(&mut self.final_norm, weights, "encoder.final_norm");
 
         Ok(())
     }
 }
 
-/// Subsampling layer for reducing sequence length.
+/// Helper to load Conv2d weights
+///
+/// PyTorch Conv2d weight shape: (out_channels, in_channels/groups, kernel_h, kernel_w)
+/// MLX Conv2d weight shape: (out_channels, kernel_h, kernel_w, in_channels/groups)
+/// So we need to transpose axes 1,2,3 -> 2,3,1
+fn load_conv2d(layer: &mut nn::Conv2d, weights: &HashMap<String, Array>, prefix: &str) {
+    if let Some(weight) = weights.get(&format!("{}.weight", prefix)) {
+        // Transpose from PyTorch (O, I, H, W) to MLX (O, H, W, I)
+        if let Ok(transposed) = weight.transpose_axes(&[0, 2, 3, 1]) {
+            layer.weight.value = transposed;
+        }
+    }
+    if let Some(bias) = weights.get(&format!("{}.bias", prefix)) {
+        layer.bias.value = Some(bias.clone());
+    }
+}
+
+/// Subsampling layer for reducing sequence length using depthwise striding.
+///
+/// This implements the `dw_striding` subsampling method used in NeMo's Conformer encoder.
+/// It uses 2D convolutions to downsample the mel spectrogram in both time and frequency.
 struct Subsampling {
-    #[allow(dead_code)]
     subsampling_factor: usize,
-    /// Convolutional layers for subsampling
-    conv_layers: Vec<nn::Conv1d>,
-    /// Output projection
+    conv_channels: usize,
+
+    /// First conv: regular Conv2d(1, conv_channels, 3x3, stride=2)
+    first_conv: nn::Conv2d,
+
+    /// Depthwise convolutions (one for each additional striding level)
+    /// Conv2d(conv_channels, conv_channels, 3x3, stride=2, groups=conv_channels)
+    depthwise_convs: Vec<nn::Conv2d>,
+
+    /// Pointwise convolutions after each depthwise conv
+    /// Conv2d(conv_channels, conv_channels, 1x1)
+    pointwise_convs: Vec<nn::Conv2d>,
+
+    /// Output projection: Linear(conv_channels * reduced_feat, d_model)
     out_proj: nn::Linear,
 }
 
@@ -175,83 +234,118 @@ impl Subsampling {
         let feat_in = config.feat_in;
         let d_model = config.d_model;
         let subsampling_factor = config.subsampling_factor;
+        let conv_channels = config.subsampling_conv_channels.unwrap_or(256);
 
-        // For dw_striding (depthwise striding) subsampling
-        // Typical configuration: 2 conv layers with stride 2 each for 4x subsampling
-        // or 3 conv layers for 8x subsampling
-        let n_conv_layers = match subsampling_factor {
+        // Number of striding operations: log2(subsampling_factor)
+        let n_strides = match subsampling_factor {
             2 => 1,
             4 => 2,
             8 => 3,
             _ => 2,
         };
 
-        let conv_channels = config.subsampling_conv_channels.unwrap_or(256);
+        let kernel_size = 3;
+        let padding = 1; // (kernel_size - 1) / 2
 
-        let mut conv_layers = Vec::new();
-        let mut in_channels = feat_in;
+        // First conv: 1 input channel (mono spectrogram) -> conv_channels
+        let first_conv = nn::Conv2dBuilder::new(1, conv_channels as i32, kernel_size)
+            .stride(2)
+            .padding(padding)
+            .build()?;
 
-        for i in 0..n_conv_layers {
-            let out_channels = if i == n_conv_layers - 1 {
-                conv_channels
-            } else {
-                conv_channels
-            };
+        // Depthwise + pointwise pairs for remaining strides
+        let mut depthwise_convs = Vec::new();
+        let mut pointwise_convs = Vec::new();
 
-            let conv = nn::Conv1dBuilder::new(in_channels as i32, out_channels as i32, 3)
-                .stride(2)
-                .padding(1)
-                .build()?;
+        for _ in 0..(n_strides - 1) {
+            // Depthwise conv: groups = channels for depthwise convolution
+            let dw_conv =
+                nn::Conv2dBuilder::new(conv_channels as i32, conv_channels as i32, kernel_size)
+                    .stride(2)
+                    .padding(padding)
+                    .groups(conv_channels as i32)
+                    .build()?;
+            depthwise_convs.push(dw_conv);
 
-            conv_layers.push(conv);
-            in_channels = out_channels;
+            // Pointwise conv: 1x1 convolution to mix channels
+            let pw_conv =
+                nn::Conv2dBuilder::new(conv_channels as i32, conv_channels as i32, 1).build()?;
+            pointwise_convs.push(pw_conv);
         }
 
-        // Output projection to d_model
-        let out_proj = nn::Linear::new(conv_channels as i32, d_model as i32)?;
+        // Calculate output feature dimension after all striding
+        // Each stride halves the dimension: feat_out = feat_in / subsampling_factor
+        let feat_out = feat_in / subsampling_factor;
+        let linear_in = conv_channels * feat_out;
+
+        let out_proj = nn::Linear::new(linear_in as i32, d_model as i32)?;
 
         Ok(Self {
             subsampling_factor,
-            conv_layers,
+            conv_channels,
+            first_conv,
+            depthwise_convs,
+            pointwise_convs,
             out_proj,
         })
     }
 
     fn forward(&mut self, x: &Array, lengths: &Array) -> Result<(Array, Array)> {
-        // x: [B, T, F] - MLX Conv1d expects (N, L, C_in) format
-        let mut x = x.clone();
+        // x: [B, T, F] where F is number of mel features (e.g., 80)
+        // Add channel dimension: [B, T, F] -> [B, T, F, 1] for MLX Conv2d
+        // MLX Conv2d expects (N, H, W, C) format
+        let x = x.reshape(&[-1, x.dim(1) as i32, x.dim(2) as i32, 1])?;
 
-        // Apply conv layers with ReLU
-        for conv in &mut self.conv_layers {
-            x = conv.forward(&x)?;
+        // First conv layer with ReLU
+        let mut x = self.first_conv.forward(&x)?;
+        x = mlx_rs::nn::relu(&x)?;
+
+        // Apply depthwise + pointwise pairs with ReLU
+        for (dw_conv, pw_conv) in self
+            .depthwise_convs
+            .iter_mut()
+            .zip(self.pointwise_convs.iter_mut())
+        {
+            x = dw_conv.forward(&x)?;
+            x = pw_conv.forward(&x)?;
             x = mlx_rs::nn::relu(&x)?;
         }
 
-        // x is now [B, T', C_conv]
-        // Project to d_model
+        // x is now [B, T', F', C] where T' = T/subsampling_factor, F' = F/subsampling_factor
+        // Flatten frequency and channel dimensions: [B, T', F' * C]
+        let batch = x.dim(0);
+        let time = x.dim(1);
+        let x = x.reshape(&[batch as i32, time as i32, -1])?;
+
+        // Project to d_model: [B, T', d_model]
         let x = self.out_proj.forward(&x)?;
 
-        // Update lengths
+        // Update lengths: each stride halves the length
         let mut new_lengths = lengths.clone();
-        for _ in &self.conv_layers {
-            // Each conv with stride 2: new_len = (len + 1) / 2
-            let len_plus_one = &new_lengths + &Array::from_int(1);
-            new_lengths = mlx_rs::ops::floor_divide(&len_plus_one, &Array::from_int(2))?;
+        for _ in 0..self.depthwise_convs.len() + 1 {
+            new_lengths = mlx_rs::ops::floor_divide(&new_lengths, &Array::from_int(2))?;
         }
 
         Ok((x, new_lengths))
     }
 
     fn load_weights(&mut self, weights: &HashMap<String, Array>, prefix: &str) -> Result<()> {
-        // Load subsampling conv layers
-        for (i, conv) in self.conv_layers.iter_mut().enumerate() {
-            let conv_prefix = format!("{}.conv.{}", prefix, i);
-            if let Some(weight) = weights.get(&format!("{}.weight", conv_prefix)) {
-                conv.weight.value = weight.clone();
-            }
-            if let Some(bias) = weights.get(&format!("{}.bias", conv_prefix)) {
-                conv.bias.value = Some(bias.clone());
-            }
+        // Load first conv: encoder.pre_encode.conv.0
+        load_conv2d(&mut self.first_conv, weights, &format!("{}.conv.0", prefix));
+
+        // Load depthwise and pointwise conv pairs
+        // NeMo layout: conv.0 (first), activation, conv.2 (dw), conv.3 (pw), activation, ...
+        // Layer indices: 0=first, 1=activation, 2=dw1, 3=pw1, 4=activation, 5=dw2, 6=pw2, ...
+        for (i, (dw_conv, pw_conv)) in self
+            .depthwise_convs
+            .iter_mut()
+            .zip(self.pointwise_convs.iter_mut())
+            .enumerate()
+        {
+            let dw_idx = 2 + i * 3; // 2, 5, 8, ...
+            let pw_idx = 3 + i * 3; // 3, 6, 9, ...
+            load_conv2d(dw_conv, weights, &format!("{}.conv.{}", prefix, dw_idx));
+            load_conv2d(pw_conv, weights, &format!("{}.conv.{}", prefix, pw_idx));
         }
 
         // Load output projection
@@ -276,8 +370,8 @@ struct ConformerBlock {
     ff1: FeedForward,
     ff1_norm: nn::LayerNorm,
 
-    /// Multi-head self-attention
-    self_attn: MultiHeadAttention,
+    /// Multi-head self-attention with relative positional encoding
+    self_attn: RelPositionMultiHeadAttention,
     self_attn_norm: nn::LayerNorm,
 
     /// Convolution module
@@ -304,7 +398,7 @@ impl ConformerBlock {
             d_model,
             ff1: FeedForward::new(d_model, ff_dim, dropout)?,
             ff1_norm: nn::LayerNorm::new(d_model as i32)?,
-            self_attn: MultiHeadAttention::new(d_model, n_heads, dropout)?,
+            self_attn: RelPositionMultiHeadAttention::new(d_model, n_heads)?,
             self_attn_norm: nn::LayerNorm::new(d_model as i32)?,
             conv: ConvolutionModule::new(d_model, conv_kernel, dropout)?,
             conv_norm: nn::LayerNorm::new(d_model as i32)?,
@@ -314,7 +408,7 @@ impl ConformerBlock {
         })
     }
 
-    fn forward(&mut self, x: &Array, _lengths: &Array) -> Result<Array> {
+    fn forward(&mut self, x: &Array, pos_emb: &Array) -> Result<Array> {
         // x: [B, T, D]
 
         // Feed-forward 1 (half-step residual)
@@ -325,10 +419,10 @@ impl ConformerBlock {
         let scaled_ff1 = &half * &ff1_out;
         let x = &residual + &scaled_ff1;
 
-        // Self-attention (full residual)
+        // Self-attention with relative positional encoding (full residual)
         let residual = x.clone();
         let attn_out = self.self_attn_norm.forward(&x)?;
-        let attn_out = self.self_attn.forward(&attn_out)?;
+        let attn_out = self.self_attn.forward(&attn_out, pos_emb)?;
         let x = &residual + &attn_out;
 
         // Convolution (full residual)
@@ -351,9 +445,14 @@ impl ConformerBlock {
     }
 
     fn load_weights(&mut self, weights: &HashMap<String, Array>, prefix: &str) -> Result<()> {
-        // Load feed-forward 1
-        self.ff1.load_weights(weights, &format!("{}.ff1", prefix))?;
-        load_layer_norm(&mut self.ff1_norm, weights, &format!("{}.ff1_norm", prefix));
+        // Load feed-forward 1 (NeMo uses "feed_forward1" not "ff1")
+        self.ff1
+            .load_weights(weights, &format!("{}.feed_forward1", prefix))?;
+        load_layer_norm(
+            &mut self.ff1_norm,
+            weights,
+            &format!("{}.norm_feed_forward1", prefix),
+        );
 
         // Load self-attention
         self.self_attn
@@ -361,7 +460,7 @@ impl ConformerBlock {
         load_layer_norm(
             &mut self.self_attn_norm,
             weights,
-            &format!("{}.self_attn_norm", prefix),
+            &format!("{}.norm_self_att", prefix),
         );
 
         // Load convolution module
@@ -370,18 +469,23 @@ impl ConformerBlock {
         load_layer_norm(
             &mut self.conv_norm,
             weights,
-            &format!("{}.conv_norm", prefix),
+            &format!("{}.norm_conv", prefix),
         );
 
-        // Load feed-forward 2
-        self.ff2.load_weights(weights, &format!("{}.ff2", prefix))?;
-        load_layer_norm(&mut self.ff2_norm, weights, &format!("{}.ff2_norm", prefix));
+        // Load feed-forward 2 (NeMo uses "feed_forward2" not "ff2")
+        self.ff2
+            .load_weights(weights, &format!("{}.feed_forward2", prefix))?;
+        load_layer_norm(
+            &mut self.ff2_norm,
+            weights,
+            &format!("{}.norm_feed_forward2", prefix),
+        );
 
-        // Load final norm
+        // Load final norm (NeMo uses "norm_out")
         load_layer_norm(
             &mut self.final_norm,
             weights,
-            &format!("{}.final_norm", prefix),
+            &format!("{}.norm_out", prefix),
         );
 
         Ok(())
@@ -420,82 +524,6 @@ impl FeedForward {
     }
 }
 
-/// Multi-head self-attention module.
-struct MultiHeadAttention {
-    d_model: usize,
-    n_heads: usize,
-    head_dim: usize,
-    q_proj: nn::Linear,
-    k_proj: nn::Linear,
-    v_proj: nn::Linear,
-    out_proj: nn::Linear,
-}
-
-impl MultiHeadAttention {
-    fn new(d_model: usize, n_heads: usize, _dropout: f32) -> Result<Self> {
-        let head_dim = d_model / n_heads;
-
-        Ok(Self {
-            d_model,
-            n_heads,
-            head_dim,
-            q_proj: nn::Linear::new(d_model as i32, d_model as i32)?,
-            k_proj: nn::Linear::new(d_model as i32, d_model as i32)?,
-            v_proj: nn::Linear::new(d_model as i32, d_model as i32)?,
-            out_proj: nn::Linear::new(d_model as i32, d_model as i32)?,
-        })
-    }
-
-    fn forward(&mut self, x: &Array) -> Result<Array> {
-        let batch_size = x.shape()[0];
-        let seq_len = x.shape()[1];
-        let n_heads = self.n_heads as i32;
-        let head_dim = self.head_dim as i32;
-
-        // Project to Q, K, V
-        let q = self.q_proj.forward(x)?;
-        let k = self.k_proj.forward(x)?;
-        let v = self.v_proj.forward(x)?;
-
-        // Reshape for multi-head attention: [B, T, D] -> [B, H, T, D/H]
-        let q = q.reshape(&[batch_size, seq_len, n_heads, head_dim])?;
-        let q = mlx_rs::ops::transpose_axes(&q, &[0, 2, 1, 3])?;
-
-        let k = k.reshape(&[batch_size, seq_len, n_heads, head_dim])?;
-        let k = mlx_rs::ops::transpose_axes(&k, &[0, 2, 1, 3])?;
-
-        let v = v.reshape(&[batch_size, seq_len, n_heads, head_dim])?;
-        let v = mlx_rs::ops::transpose_axes(&v, &[0, 2, 1, 3])?;
-
-        // Scaled dot-product attention
-        let scale = Array::from_f32(1.0 / (head_dim as f32).sqrt());
-        let k_transposed = mlx_rs::ops::transpose_axes(&k, &[0, 1, 3, 2])?;
-        let attn_weights = mlx_rs::ops::matmul(&q, &k_transposed)?;
-        let attn_weights = &attn_weights * &scale;
-        let attn_weights = mlx_rs::ops::softmax_axis(&attn_weights, -1, None)?;
-
-        // Apply attention to values
-        let attn_output = mlx_rs::ops::matmul(&attn_weights, &v)?;
-
-        // Reshape back: [B, H, T, D/H] -> [B, T, D]
-        let attn_output = mlx_rs::ops::transpose_axes(&attn_output, &[0, 2, 1, 3])?;
-        let attn_output = attn_output.reshape(&[batch_size, seq_len, self.d_model as i32])?;
-
-        // Output projection
-        let output = self.out_proj.forward(&attn_output)?;
-
-        Ok(output)
-    }
-
-    fn load_weights(&mut self, weights: &HashMap<String, Array>, prefix: &str) -> Result<()> {
-        load_linear(&mut self.q_proj, weights, &format!("{}.q_proj", prefix));
-        load_linear(&mut self.k_proj, weights, &format!("{}.k_proj", prefix));
-        load_linear(&mut self.v_proj, weights, &format!("{}.v_proj", prefix));
-        load_linear(&mut self.out_proj, weights, &format!("{}.out_proj", prefix));
-        Ok(())
-    }
-}
-
 /// Convolution module for Conformer.
 struct ConvolutionModule {
     d_model: usize,
@@ -508,6 +536,10 @@ struct ConvolutionModule {
 impl ConvolutionModule {
     fn new(d_model: usize, kernel_size: usize, _dropout: f32) -> Result<Self> {
         let padding = (kernel_size - 1) / 2;
+
+        // Create batch norm - keep in training mode for now
+        // TODO: Investigate why eval mode produces empty output
+        let batch_norm = nn::BatchNorm::new(d_model as i32)?;
 
         Ok(Self {
             d_model,
@@ -525,7 +557,7 @@ impl ConvolutionModule {
             .build()?,
             // Pointwise compression (d_model -> d_model)
             pointwise_conv2: nn::Conv1dBuilder::new(d_model as i32, d_model as i32, 1).build()?,
-            batch_norm: nn::BatchNorm::new(d_model as i32)?,
+            batch_norm,
         })
     }
 

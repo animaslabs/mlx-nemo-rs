@@ -6,5 +6,6 @@
 pub mod checkpoint;
 pub mod config;
 pub mod error;
+pub mod pytorch;
 
 pub use error::{Error, Result};

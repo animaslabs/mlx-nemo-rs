@@ -65,26 +65,26 @@ impl CTCDecoder {
 
     /// Load weights from a state dict.
     pub fn load_weights(&mut self, weights: &HashMap<String, Array>, prefix: &str) -> Result<()> {
-        // NeMo uses "decoder_layers.0" for the linear projection
+        // NeMo uses "decoder_layers.0" for the CTC projection
+        // It's a Conv1d layer with kernel_size=1, shape [vocab_size, d_model, 1]
         let weight_key = format!("{}.decoder_layers.0.weight", prefix);
         let bias_key = format!("{}.decoder_layers.0.bias", prefix);
 
-        // Alternative key format
-        let alt_weight_key = format!("{}.weight", prefix);
-        let alt_bias_key = format!("{}.bias", prefix);
-
-        // Try to find weights with either naming convention
-        if let Some(weight) = weights
-            .get(&weight_key)
-            .or_else(|| weights.get(&alt_weight_key))
-        {
-            self.decoder.weight.value = weight.clone();
+        // Try to find weights
+        if let Some(weight) = weights.get(&weight_key) {
+            // NeMo Conv1d weight shape is [O, I, K] = [vocab_size, d_model, 1]
+            // We need to squeeze the last dimension for Linear: [vocab_size, d_model]
+            if weight.ndim() == 3 {
+                // Squeeze kernel dimension: [O, I, 1] -> [O, I]
+                if let Ok(squeezed) = weight.squeeze_axes(&[-1]) {
+                    self.decoder.weight.value = squeezed;
+                }
+            } else {
+                self.decoder.weight.value = weight.clone();
+            }
         }
 
-        if let Some(bias) = weights
-            .get(&bias_key)
-            .or_else(|| weights.get(&alt_bias_key))
-        {
+        if let Some(bias) = weights.get(&bias_key) {
             self.decoder.bias.value = Some(bias.clone());
         }
 

@@ -37,6 +37,11 @@ thiserror = "2.0"
 # Archive handling (.nemo files are TAR archives)
 tar = "0.4"
 flate2 = "1.0"
+zip = "2.1"
+
+# Byte manipulation
+bytemuck = { version = "1.21", features = ["derive"] }
+half = "2.4"
 
 # Audio processing (for ASR feature)
 hound = { version = "3.5", optional = true }

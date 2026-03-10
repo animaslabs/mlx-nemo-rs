@@ -33,11 +33,15 @@ pub fn greedy_decode(
     let predictions = argmax_axis(log_probs, 2, false)?;
     predictions.eval()?;
 
-    // Get lengths as a vector
-    let lengths_data: Vec<i32> = lengths.as_slice::<i32>().to_vec();
+    // Get lengths as a vector - convert to i32 if needed
+    let lengths_i32 = lengths.as_type::<i32>()?;
+    lengths_i32.eval()?;
+    let lengths_data: Vec<i32> = lengths_i32.as_slice::<i32>().to_vec();
 
     // Get predictions as a flat vector
-    let pred_data: Vec<i32> = predictions.as_slice::<i32>().to_vec();
+    let predictions_u32 = predictions.as_type::<u32>()?;
+    predictions_u32.eval()?;
+    let pred_data: Vec<u32> = predictions_u32.as_slice::<u32>().to_vec();
 
     let mut results = Vec::with_capacity(batch_size);
 

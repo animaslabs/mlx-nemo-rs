@@ -1,2 +1,5 @@
 /target
 /models
+.DS_Store
+__pycache__/
+scripts/.venv
