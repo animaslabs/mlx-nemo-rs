@@ -1,11 +1,6 @@
 # AGENTS.md - AI Agent Guidelines for mlx-nemo-rs
 
-This document provides guidelines for AI coding agents working in this repository.
-
-## Project Overview
-
-mlx-nemo-rs is a Rust implementation of NVIDIA NeMo for Apple Silicon, built on MLX.
-It provides speech AI capabilities including ASR (Automatic Speech Recognition).
+Guidelines for AI coding agents working in this Rust implementation of NVIDIA NeMo for Apple Silicon (MLX).
 
 ## Build Commands
 
@@ -13,29 +8,29 @@ It provides speech AI capabilities including ASR (Automatic Speech Recognition).
 cargo build                    # Build the library
 cargo build --all-features     # Build with all features (default includes 'asr')
 cargo build --release          # Build in release mode
-cargo check                    # Check for compilation errors without building
+cargo check                    # Quick compilation check without building
 ```
 
 ## Test Commands
 
+**IMPORTANT:** Tests must run single-threaded due to MLX runtime constraints.
+
 ```bash
-cargo test                     # Run all tests
-cargo test test_name           # Run a single test by name
-cargo test --exact test_add    # Run a single test with exact match
-cargo test math::tests         # Run tests in a specific module
-cargo test core::config::tests # Run tests in a specific file (by module path)
-cargo test -- --nocapture      # Run tests with output visible
-cargo test --doc               # Run doc tests only
+cargo test -- --test-threads=1                     # Run all tests (single-threaded)
+cargo test test_name -- --test-threads=1           # Run tests matching "test_name"
+cargo test --exact test_name -- --test-threads=1   # Run a single test with exact name match
+cargo test module::tests -- --test-threads=1       # Run tests in a specific module (e.g., math::tests)
+cargo test -- --test-threads=1 --nocapture         # Run tests with stdout/stderr visible
+cargo test --doc                                   # Run documentation tests only
 ```
 
 ## Lint and Format Commands
 
 ```bash
-cargo fmt                      # Format code (uses default rustfmt settings)
-cargo fmt --check              # Check formatting without changing files
+cargo fmt                      # Format code
+cargo fmt --check              # Check formatting without changes
 cargo clippy                   # Run clippy lints
-cargo clippy --all-features    # Run clippy with all features
-cargo clippy -- -D warnings    # Run clippy and fail on warnings
+cargo clippy -- -D warnings    # Fail on any warnings
 ```
 
 ## Development Tasks (xtask)
@@ -55,11 +50,7 @@ cargo run --example transcribe -- --model path/to/model.nemo audio.wav
 ## Code Style Guidelines
 
 ### Import Organization
-
-Organize imports in three groups, separated by blank lines:
-1. Standard library (`std::*`)
-2. External crates
-3. Internal crate modules (`crate::*`)
+Organize imports in three groups separated by blank lines: (1) std, (2) external crates, (3) crate modules.
 
 ```rust
 use std::path::Path;
@@ -68,19 +59,15 @@ use mlx_rs::Array;
 use serde::{Deserialize, Serialize};
 
 use crate::core::error::{Error, Result};
-use crate::asr::config::AsrModelConfig;
 ```
 
 ### Naming Conventions
-
-- **Structs/Enums**: `PascalCase` - `EncDecCTCModel`, `AsrModelConfig`
-- **Enum variants**: `PascalCase` - `Error::ShapeMismatch`, `WindowType::Hann`
+- **Structs/Enums**: `PascalCase` - `EncDecCTCModel`, `WindowType`
 - **Functions/methods**: `snake_case` - `greedy_decode`, `load_audio_batch`
 - **Constants**: `SCREAMING_SNAKE_CASE` - `PI`, `GOLDEN_RATIO`
-- **Modules**: `snake_case` - `mel_spectrogram.rs`, `enc_dec_ctc.rs`
+- **Modules/files**: `snake_case` - `mel_spectrogram.rs`, `enc_dec_ctc.rs`
 
 ### Error Handling
-
 Use the crate's `Error` type and `Result<T>` alias from `crate::core::error`:
 
 ```rust
@@ -92,29 +79,47 @@ fn load_model(path: &Path) -> Result<Model> {
     Ok(Model::new(config)?)
 }
 
-// Use map_err for context
+// Use map_err for context; use ok_or_else for Option -> Result
 let file = std::fs::read(path)
     .map_err(|e| Error::audio(format!("Failed to read {}: {}", path.display(), e)))?;
 
-// Use ok_or_else for Option -> Result
-let value = optional_value
-    .ok_or_else(|| Error::config("Value is required"))?;
-
-// Use helper constructors on Error
+// Error helper constructors (prefer these over direct enum construction)
 Error::config("Invalid configuration")
 Error::checkpoint_at("Failed to load", path)
 Error::model("Unsupported architecture")
 Error::tokenizer("Missing vocabulary")
 Error::audio("Invalid sample rate")
+Error::not_implemented("Feature X")
 ```
 
-### Other Patterns
+### Feature Flags
 
-- **Documentation**: Use `//!` for module docs, `///` for items with `# Arguments`, `# Returns`, `# Errors`, `# Example` sections
-- **Type flexibility**: Use `impl Into<T>` and `impl AsRef<Path>` for flexible parameters
-- **Module organization**: Use `mod.rs` for aggregation, re-export types, use feature flags `#[cfg(feature = "...")]`
-- **Logging**: Use `tracing` macros (`info!`, `debug!`, `warn!`, `error!`)
-- **Serde**: Use `#[serde(default)]`, `#[serde(rename = "...")]`, `#[serde(flatten)]` as needed
+```rust
+#[cfg(feature = "asr")]
+pub fn load_wav(path: impl AsRef<Path>) -> Result<(Vec<f32>, u32)> { ... }
+
+#[cfg(not(feature = "asr"))]
+pub fn load_wav(_path: impl AsRef<Path>) -> Result<(Vec<f32>, u32)> {
+    Err(Error::not_implemented("Audio loading requires the 'asr' feature"))
+}
+```
+
+### Type Flexibility
+Use `impl Into<T>` and `impl AsRef<Path>` for flexible function parameters.
+
+### Serde Patterns
+
+```rust
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct Config {
+    #[serde(default)]
+    pub optional_field: Option<String>,
+    #[serde(rename = "sample_rate")]
+    pub sr: u32,
+    #[serde(flatten)]
+    pub extra: HashMap<String, Value>,
+}
+```
 
 ### Testing Patterns
 
@@ -125,10 +130,24 @@ mod tests {
 
     #[test]
     fn test_descriptive_name() {
+        let result = function_under_test();
         assert_eq!(result, expected);
-        assert!(condition);
+        assert!(condition, "helpful error message");
     }
+
+    #[test]
+    #[ignore]  // For tests requiring external resources (models, etc.)
+    fn test_requires_model() { ... }
 }
+```
+
+### Logging
+Use `tracing` macros: `info!`, `debug!`, `warn!`, `error!` with structured fields.
+
+```rust
+info!("Loading model from {}", path.display());
+debug!(sample_rate = %sr, "Audio loaded");
+error!(?err, "Failed to process");
 ```
 
 ## Project Structure
@@ -136,30 +155,30 @@ mod tests {
 ```
 mlx-nemo-rs/
 ├── src/
-│   ├── lib.rs              # Library entry point
-│   ├── audio.rs            # Audio processing utilities
+│   ├── lib.rs              # Library entry point, re-exports
+│   ├── audio.rs            # Audio loading, resampling, preprocessing
 │   ├── math.rs             # Mathematical utilities
 │   ├── mlx.rs              # MLX integration layer
 │   ├── core/               # Core utilities
-│   │   ├── error.rs        # Error types (Error, Result)
-│   │   ├── config.rs       # Configuration traits
+│   │   ├── error.rs        # Error types (Error enum, Result alias)
+│   │   ├── config.rs       # Configuration traits (FromConfig)
 │   │   └── checkpoint.rs   # NeMo checkpoint handling
-│   └── asr/                # ASR module (feature-gated)
+│   └── asr/                # ASR module (feature-gated with "asr")
 │       ├── config.rs       # ASR configuration types
 │       ├── models/         # High-level model implementations
-│       ├── modules/        # Neural network modules
-│       └── decoding/       # Decoding strategies
-├── examples/               # Example applications
-├── xtask/                  # Development task runner
+│       ├── modules/        # Neural network modules (encoders, decoders, etc.)
+│       └── decoding/       # Decoding strategies (greedy, beam search)
+├── examples/               # Example applications (transcribe.rs)
+├── xtask/                  # Development task runner (model downloads)
 ├── models/                 # Downloaded models (gitignored)
-└── samples/                # Sample audio files
+└── samples/                # Sample audio files for testing
 ```
 
 ## Key Dependencies
 
 - `mlx-rs` (0.25) - MLX bindings for Apple Silicon
-- `thiserror` (2.0) - Error handling derive macros
+- `thiserror` (2.0) - Error derive macros
 - `serde` / `serde_yaml` / `serde_json` - Serialization
-- `hound` / `rubato` - Audio processing (optional, asr feature)
+- `hound` / `rubato` - Audio I/O and resampling (optional, "asr" feature)
 - `sentencepiece` - Tokenization
-- `tracing` - Logging
+- `tracing` - Structured logging

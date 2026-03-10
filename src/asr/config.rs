@@ -5,10 +5,10 @@
 
 use serde::{Deserialize, Serialize};
 
-/// Top-level configuration for ASR CTC models.
+/// Top-level configuration for ASR models (CTC and RNNT).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AsrModelConfig {
-    /// Target class (e.g., "nemo.collections.asr.models.EncDecCTCModelBPE")
+    /// Target class (e.g., "nemo.collections.asr.models.EncDecCTCModelBPE" or "...EncDecRNNTBPEModel")
     #[serde(default)]
     pub target: Option<String>,
 
@@ -22,8 +22,12 @@ pub struct AsrModelConfig {
     /// Encoder configuration
     pub encoder: EncoderConfig,
 
-    /// Decoder configuration
+    /// Decoder configuration (CTC decoder or RNNT prediction network)
     pub decoder: DecoderConfig,
+
+    /// Joint network configuration (RNNT models only)
+    #[serde(default)]
+    pub joint: Option<JointConfig>,
 
     /// Tokenizer configuration
     #[serde(default)]
@@ -40,6 +44,23 @@ pub struct AsrModelConfig {
     /// Additional fields we don't need to parse
     #[serde(flatten)]
     pub extra: std::collections::HashMap<String, serde_yaml::Value>,
+}
+
+impl AsrModelConfig {
+    /// Check if this is an RNNT model based on the target class or presence of joint config.
+    pub fn is_rnnt(&self) -> bool {
+        if let Some(ref target) = self.target {
+            target.contains("RNNT") || target.contains("Transducer")
+        } else {
+            // Fall back to checking if joint config is present
+            self.joint.is_some()
+        }
+    }
+
+    /// Check if this is a CTC model.
+    pub fn is_ctc(&self) -> bool {
+        !self.is_rnnt()
+    }
 }
 
 fn default_sample_rate() -> u32 {
@@ -273,6 +294,117 @@ pub struct DecoderConfig {
     /// Vocabulary (list of tokens)
     #[serde(default)]
     pub vocabulary: Vec<String>,
+
+    // --- RNNT-specific fields (for StatelessTransducerDecoder) ---
+    /// Prediction network hidden dimension
+    #[serde(default)]
+    pub prednet: Option<PredNetConfig>,
+
+    /// Context size for stateless decoder (number of previous tokens to consider)
+    #[serde(default)]
+    pub context_size: Option<usize>,
+
+    /// Normalization mode for prediction network
+    #[serde(default)]
+    pub normalization_mode: Option<String>,
+
+    /// Whether blank token is used as padding
+    #[serde(default)]
+    pub blank_as_pad: Option<bool>,
+}
+
+/// Prediction network configuration (for RNNT models).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PredNetConfig {
+    /// Hidden dimension of the prediction network
+    #[serde(default = "default_pred_hidden")]
+    pub pred_hidden: usize,
+
+    /// Dropout rate
+    #[serde(default)]
+    pub dropout: Option<f32>,
+}
+
+fn default_pred_hidden() -> usize {
+    640
+}
+
+impl Default for PredNetConfig {
+    fn default() -> Self {
+        Self {
+            pred_hidden: 640,
+            dropout: None,
+        }
+    }
+}
+
+/// Joint network configuration (for RNNT models).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JointConfig {
+    /// Target class
+    #[serde(rename = "_target_", default)]
+    pub target: Option<String>,
+
+    /// Joint network hidden dimension
+    #[serde(default = "default_joint_hidden")]
+    pub joint_hidden: usize,
+
+    /// Encoder hidden dimension (input from encoder)
+    #[serde(default)]
+    pub encoder_hidden: Option<usize>,
+
+    /// Prediction network hidden dimension (input from prediction network)
+    #[serde(default)]
+    pub pred_hidden: Option<usize>,
+
+    /// Number of output classes (vocabulary size including blank)
+    #[serde(default)]
+    pub num_classes: Option<usize>,
+
+    /// Vocabulary (list of tokens)
+    #[serde(default)]
+    pub vocabulary: Option<Vec<String>>,
+
+    /// Activation function (relu, tanh, sigmoid)
+    #[serde(default = "default_joint_activation")]
+    pub activation: String,
+
+    /// Whether to use fused batch computation in joint
+    #[serde(default)]
+    pub fuse_loss_wer: Option<bool>,
+
+    /// Whether to use fused log softmax
+    #[serde(default)]
+    pub fused_batch_size: Option<usize>,
+
+    /// Experimental: log softmax on CPU
+    #[serde(default)]
+    pub experimental_fuse_loss_wer: Option<bool>,
+}
+
+fn default_joint_hidden() -> usize {
+    640
+}
+
+fn default_joint_activation() -> String {
+    "relu".to_string()
+}
+
+impl Default for JointConfig {
+    fn default() -> Self {
+        Self {
+            target: None,
+            joint_hidden: 640,
+            encoder_hidden: None,
+            pred_hidden: None,
+            num_classes: None,
+            vocabulary: None,
+            activation: "relu".to_string(),
+            fuse_loss_wer: None,
+            fused_batch_size: None,
+            experimental_fuse_loss_wer: None,
+        }
+    }
 }
 
 /// Tokenizer configuration.
@@ -370,6 +502,10 @@ impl Default for DecoderConfig {
             feat_in: None,
             num_classes: -1,
             vocabulary: Vec::new(),
+            prednet: None,
+            context_size: None,
+            normalization_mode: None,
+            blank_as_pad: None,
         }
     }
 }
