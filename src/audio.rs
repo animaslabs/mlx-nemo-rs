@@ -173,7 +173,6 @@ pub mod resample {
 
 /// Audio preprocessing utilities.
 pub mod preprocess {
-    use super::*;
 
     /// Normalize audio to [-1, 1] range.
     pub fn normalize(samples: &mut [f32]) {
@@ -230,9 +229,9 @@ pub mod preprocess {
             WindowType::Blackman => (0..length)
                 .map(|i| {
                     let n = i as f32;
-                    let N = length as f32;
-                    0.42 - 0.5 * (2.0 * std::f32::consts::PI * n / (N - 1.0)).cos()
-                        + 0.08 * (4.0 * std::f32::consts::PI * n / (N - 1.0)).cos()
+                    let len = length as f32;
+                    0.42 - 0.5 * (2.0 * std::f32::consts::PI * n / (len - 1.0)).cos()
+                        + 0.08 * (4.0 * std::f32::consts::PI * n / (len - 1.0)).cos()
                 })
                 .collect(),
             WindowType::Rectangular => vec![1.0; length],
@@ -256,12 +255,12 @@ pub mod features {
     /// Extract mel spectrogram features from audio.
     pub fn mel_spectrogram(
         audio: &[f32],
-        sample_rate: u32,
+        _sample_rate: u32,
         n_fft: usize,
         hop_length: usize,
         n_mels: usize,
-        f_min: f32,
-        f_max: f32,
+        _f_min: f32,
+        _f_max: f32,
     ) -> Result<Array> {
         // This is a simplified implementation
         // In practice, you'd use a more sophisticated mel filter bank
@@ -348,9 +347,6 @@ pub mod features {
         )?;
 
         // Apply log compression
-        use crate::mlx::nn;
-        use crate::mlx::tensor;
-
         let log_mel = &mel_spec; // Placeholder for log operation
 
         // Apply DCT to get MFCCs (simplified)
@@ -495,7 +491,8 @@ mod tests {
         assert_eq!(batched.shape(), &[3, 4]);
         assert_eq!(lengths.shape(), &[3]);
 
-        let lengths_data = lengths.to_vec::<i32>().unwrap();
-        assert_eq!(lengths_data, vec![3, 2, 4]);
+        lengths.eval().unwrap();
+        let lengths_data: &[i32] = lengths.as_slice();
+        assert_eq!(lengths_data, &[3, 2, 4]);
     }
 }

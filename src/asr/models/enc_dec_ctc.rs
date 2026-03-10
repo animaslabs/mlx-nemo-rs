@@ -8,7 +8,7 @@ use std::path::Path;
 use mlx_rs::Array;
 use sentencepiece::SentencePieceProcessor;
 
-use crate::asr::config::{AsrModelConfig, DecoderConfig, EncoderConfig, PreprocessorConfig};
+use crate::asr::config::AsrModelConfig;
 use crate::asr::decoding::greedy_decode;
 use crate::asr::modules::{CTCDecoder, ConformerEncoder, MelSpectrogram};
 use crate::core::checkpoint::NemoCheckpoint;

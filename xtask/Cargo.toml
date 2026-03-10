@@ -1,0 +1,9 @@
+[package]
+name = "xtask"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+hf-hub = { workspace = true }
+anyhow = { workspace = true }
+clap = { version = "4.5", features = ["derive"] }

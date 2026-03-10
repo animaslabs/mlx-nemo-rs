@@ -3,7 +3,6 @@
 //! Usage:
 //!   cargo run --example transcribe -- --model path/to/model.nemo audio1.wav audio2.wav
 
-use std::path::PathBuf;
 use std::time::Instant;
 
 use mlx_nemo::asr::EncDecCTCModel;
@@ -26,7 +25,7 @@ fn main() -> mlx_nemo::Result<()> {
     println!("Loading model from: {}", model_path);
     let start = Instant::now();
 
-    let model = EncDecCTCModel::restore(model_path)?;
+    let mut model = EncDecCTCModel::restore(model_path)?;
 
     println!("Model loaded in {:.2}s", start.elapsed().as_secs_f32());
     println!("Sample rate: {} Hz", model.sample_rate());

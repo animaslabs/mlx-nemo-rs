@@ -5,7 +5,7 @@
 
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::{Read, Write};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use mlx_rs::Array;

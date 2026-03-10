@@ -14,6 +14,52 @@ use mlx_rs::Array;
 use crate::asr::config::EncoderConfig;
 use crate::core::error::Result;
 
+/// Helper to load LayerNorm weights
+fn load_layer_norm(layer: &mut nn::LayerNorm, weights: &HashMap<String, Array>, prefix: &str) {
+    if let Some(weight) = weights.get(&format!("{}.weight", prefix)) {
+        layer.weight.value = Some(weight.clone());
+    }
+    if let Some(bias) = weights.get(&format!("{}.bias", prefix)) {
+        layer.bias.value = Some(bias.clone());
+    }
+}
+
+/// Helper to load Linear weights
+fn load_linear(layer: &mut nn::Linear, weights: &HashMap<String, Array>, prefix: &str) {
+    if let Some(weight) = weights.get(&format!("{}.weight", prefix)) {
+        layer.weight.value = weight.clone();
+    }
+    if let Some(bias) = weights.get(&format!("{}.bias", prefix)) {
+        layer.bias.value = Some(bias.clone());
+    }
+}
+
+/// Helper to load Conv1d weights
+fn load_conv1d(layer: &mut nn::Conv1d, weights: &HashMap<String, Array>, prefix: &str) {
+    if let Some(weight) = weights.get(&format!("{}.weight", prefix)) {
+        layer.weight.value = weight.clone();
+    }
+    if let Some(bias) = weights.get(&format!("{}.bias", prefix)) {
+        layer.bias.value = Some(bias.clone());
+    }
+}
+
+/// Helper to load BatchNorm weights
+fn load_batch_norm(layer: &mut nn::BatchNorm, weights: &HashMap<String, Array>, prefix: &str) {
+    if let Some(weight) = weights.get(&format!("{}.weight", prefix)) {
+        layer.weight.value = Some(weight.clone());
+    }
+    if let Some(bias) = weights.get(&format!("{}.bias", prefix)) {
+        layer.bias.value = Some(bias.clone());
+    }
+    if let Some(running_mean) = weights.get(&format!("{}.running_mean", prefix)) {
+        layer.running_mean.value = Some(running_mean.clone());
+    }
+    if let Some(running_var) = weights.get(&format!("{}.running_var", prefix)) {
+        layer.running_var.value = Some(running_var.clone());
+    }
+}
+
 /// Conformer encoder for ASR.
 ///
 /// This implements the Conformer architecture as used in NeMo's ASR models,
@@ -108,12 +154,7 @@ impl ConformerEncoder {
         }
 
         // Load final norm weights
-        if let Some(_weight) = weights.get("final_norm.weight") {
-            // TODO: Set the layer norm weight
-        }
-        if let Some(_bias) = weights.get("final_norm.bias") {
-            // TODO: Set the layer norm bias
-        }
+        load_layer_norm(&mut self.final_norm, weights, "final_norm");
 
         Ok(())
     }
@@ -177,9 +218,8 @@ impl Subsampling {
     }
 
     fn forward(&mut self, x: &Array, lengths: &Array) -> Result<(Array, Array)> {
-        // x: [B, T, F]
-        // Transpose to [B, F, T] for conv1d
-        let mut x = mlx_rs::ops::transpose_axes(x, &[0, 2, 1])?;
+        // x: [B, T, F] - MLX Conv1d expects (N, L, C_in) format
+        let mut x = x.clone();
 
         // Apply conv layers with ReLU
         for conv in &mut self.conv_layers {
@@ -187,9 +227,7 @@ impl Subsampling {
             x = mlx_rs::nn::relu(&x)?;
         }
 
-        // Transpose back to [B, T', F]
-        let x = mlx_rs::ops::transpose_axes(&x, &[0, 2, 1])?;
-
+        // x is now [B, T', C_conv]
         // Project to d_model
         let x = self.out_proj.forward(&x)?;
 
@@ -204,8 +242,27 @@ impl Subsampling {
         Ok((x, new_lengths))
     }
 
-    fn load_weights(&mut self, _weights: &HashMap<String, Array>, _prefix: &str) -> Result<()> {
-        // TODO: Implement weight loading for subsampling layers
+    fn load_weights(&mut self, weights: &HashMap<String, Array>, prefix: &str) -> Result<()> {
+        // Load subsampling conv layers
+        for (i, conv) in self.conv_layers.iter_mut().enumerate() {
+            let conv_prefix = format!("{}.conv.{}", prefix, i);
+            if let Some(weight) = weights.get(&format!("{}.weight", conv_prefix)) {
+                conv.weight.value = weight.clone();
+            }
+            if let Some(bias) = weights.get(&format!("{}.bias", conv_prefix)) {
+                conv.bias.value = Some(bias.clone());
+            }
+        }
+
+        // Load output projection
+        let proj_prefix = format!("{}.out", prefix);
+        if let Some(weight) = weights.get(&format!("{}.weight", proj_prefix)) {
+            self.out_proj.weight.value = weight.clone();
+        }
+        if let Some(bias) = weights.get(&format!("{}.bias", proj_prefix)) {
+            self.out_proj.bias.value = Some(bias.clone());
+        }
+
         Ok(())
     }
 }
@@ -293,8 +350,40 @@ impl ConformerBlock {
         Ok(x)
     }
 
-    fn load_weights(&mut self, _weights: &HashMap<String, Array>, _prefix: &str) -> Result<()> {
-        // TODO: Implement weight loading for conformer blocks
+    fn load_weights(&mut self, weights: &HashMap<String, Array>, prefix: &str) -> Result<()> {
+        // Load feed-forward 1
+        self.ff1.load_weights(weights, &format!("{}.ff1", prefix))?;
+        load_layer_norm(&mut self.ff1_norm, weights, &format!("{}.ff1_norm", prefix));
+
+        // Load self-attention
+        self.self_attn
+            .load_weights(weights, &format!("{}.self_attn", prefix))?;
+        load_layer_norm(
+            &mut self.self_attn_norm,
+            weights,
+            &format!("{}.self_attn_norm", prefix),
+        );
+
+        // Load convolution module
+        self.conv
+            .load_weights(weights, &format!("{}.conv", prefix))?;
+        load_layer_norm(
+            &mut self.conv_norm,
+            weights,
+            &format!("{}.conv_norm", prefix),
+        );
+
+        // Load feed-forward 2
+        self.ff2.load_weights(weights, &format!("{}.ff2", prefix))?;
+        load_layer_norm(&mut self.ff2_norm, weights, &format!("{}.ff2_norm", prefix));
+
+        // Load final norm
+        load_layer_norm(
+            &mut self.final_norm,
+            weights,
+            &format!("{}.final_norm", prefix),
+        );
+
         Ok(())
     }
 }
@@ -322,6 +411,12 @@ impl FeedForward {
                                        // Skip dropout during inference
         let x = self.linear2.forward(&x)?;
         Ok(x)
+    }
+
+    fn load_weights(&mut self, weights: &HashMap<String, Array>, prefix: &str) -> Result<()> {
+        load_linear(&mut self.linear1, weights, &format!("{}.linear1", prefix));
+        load_linear(&mut self.linear2, weights, &format!("{}.linear2", prefix));
+        Ok(())
     }
 }
 
@@ -391,6 +486,14 @@ impl MultiHeadAttention {
 
         Ok(output)
     }
+
+    fn load_weights(&mut self, weights: &HashMap<String, Array>, prefix: &str) -> Result<()> {
+        load_linear(&mut self.q_proj, weights, &format!("{}.q_proj", prefix));
+        load_linear(&mut self.k_proj, weights, &format!("{}.k_proj", prefix));
+        load_linear(&mut self.v_proj, weights, &format!("{}.v_proj", prefix));
+        load_linear(&mut self.out_proj, weights, &format!("{}.out_proj", prefix));
+        Ok(())
+    }
 }
 
 /// Convolution module for Conformer.
@@ -427,25 +530,22 @@ impl ConvolutionModule {
     }
 
     fn forward(&mut self, x: &Array) -> Result<Array> {
-        // x: [B, T, D]
-        // Transpose to [B, D, T] for conv1d
-        let x = mlx_rs::ops::transpose_axes(x, &[0, 2, 1])?;
+        // x: [B, T, D] - MLX Conv1d expects (N, L, C_in) format, no transpose needed
 
         // Pointwise conv 1 with GLU activation
-        let x = self.pointwise_conv1.forward(&x)?;
+        // Output: [B, T, 2*D]
+        let x = self.pointwise_conv1.forward(x)?;
 
-        // GLU: split in half along channel dim, apply sigmoid to second half, multiply
+        // GLU: split in half along channel dim (axis 2), apply sigmoid to second half, multiply
         let d_model = self.d_model as i32;
-        let batch = x.shape()[0];
-        let time = x.shape()[2];
-        // Slice first half: x[:, :d_model, :]
-        let x1 = x.index((.., ..d_model, ..));
-        // Slice second half: x[:, d_model:, :]
-        let x2 = x.index((.., d_model.., ..));
+        // Slice first half: x[:, :, :d_model]
+        let x1 = x.index((.., .., ..d_model));
+        // Slice second half: x[:, :, d_model:]
+        let x2 = x.index((.., .., d_model..));
         let sigmoid_x2 = mlx_rs::ops::sigmoid(&x2)?;
         let x = &x1 * &sigmoid_x2;
 
-        // Depthwise conv
+        // Depthwise conv - x is [B, T, D]
         let x = self.depthwise_conv.forward(&x)?;
         let x = self.batch_norm.forward(&x)?;
         let x = mlx_rs::nn::silu(&x)?; // silu is the same as swish
@@ -453,9 +553,30 @@ impl ConvolutionModule {
         // Pointwise conv 2
         let x = self.pointwise_conv2.forward(&x)?;
 
-        // Transpose back to [B, T, D]
-        let x = mlx_rs::ops::transpose_axes(&x, &[0, 2, 1])?;
-
         Ok(x)
+    }
+
+    fn load_weights(&mut self, weights: &HashMap<String, Array>, prefix: &str) -> Result<()> {
+        load_conv1d(
+            &mut self.pointwise_conv1,
+            weights,
+            &format!("{}.pointwise_conv1", prefix),
+        );
+        load_conv1d(
+            &mut self.depthwise_conv,
+            weights,
+            &format!("{}.depthwise_conv", prefix),
+        );
+        load_conv1d(
+            &mut self.pointwise_conv2,
+            weights,
+            &format!("{}.pointwise_conv2", prefix),
+        );
+        load_batch_norm(
+            &mut self.batch_norm,
+            weights,
+            &format!("{}.batch_norm", prefix),
+        );
+        Ok(())
     }
 }

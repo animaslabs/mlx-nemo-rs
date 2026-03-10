@@ -13,6 +13,7 @@ use crate::core::error::Result;
 
 /// CTC decoder that projects encoder output to vocabulary logits.
 pub struct CTCDecoder {
+    #[allow(dead_code)]
     config: DecoderConfig,
     /// Linear projection to vocabulary size
     decoder: nn::Linear,
@@ -73,18 +74,18 @@ impl CTCDecoder {
         let alt_bias_key = format!("{}.bias", prefix);
 
         // Try to find weights with either naming convention
-        if let Some(_weight) = weights
+        if let Some(weight) = weights
             .get(&weight_key)
             .or_else(|| weights.get(&alt_weight_key))
         {
-            // TODO: Set the linear layer weight
+            self.decoder.weight.value = weight.clone();
         }
 
-        if let Some(_bias) = weights
+        if let Some(bias) = weights
             .get(&bias_key)
             .or_else(|| weights.get(&alt_bias_key))
         {
-            // TODO: Set the linear layer bias
+            self.decoder.bias.value = Some(bias.clone());
         }
 
         Ok(())
