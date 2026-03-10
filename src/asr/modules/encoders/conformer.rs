@@ -151,8 +151,9 @@ impl ConformerEncoder {
             x = layer.forward(&x, &pos_emb)?;
         }
 
-        // Final normalization
-        x = self.final_norm.forward(&x)?;
+        // NOTE: NeMo's ConformerEncoder does NOT have a final_norm at the encoder level.
+        // The norm_out is inside each ConformerBlock, applied at the end of the block.
+        // So we skip the final_norm here.
 
         // Transpose back to [B, D, T]
         let x = mlx_rs::ops::transpose_axes(&x, &[0, 2, 1])?;
@@ -312,9 +313,16 @@ impl Subsampling {
         }
 
         // x is now [B, T', F', C] where T' = T/subsampling_factor, F' = F/subsampling_factor
-        // Flatten frequency and channel dimensions: [B, T', F' * C]
+        // In MLX (N, H, W, C), H=T', W=F', C=conv_channels
+        // NeMo does: [B, C, T, F] -> permute to [B, T, C, F] -> flatten to [B, T, C*F]
+        // We have: [B, T', F', C] -> transpose to [B, T', C, F'] -> flatten to [B, T', C*F']
         let batch = x.dim(0);
         let time = x.dim(1);
+
+        // Transpose to [B, T', C, F'] to match NeMo's C*F flattening order
+        let x = mlx_rs::ops::transpose_axes(&x, &[0, 1, 3, 2])?;
+
+        // Flatten to [B, T', C*F']
         let x = x.reshape(&[batch as i32, time as i32, -1])?;
 
         // Project to d_model: [B, T', d_model]

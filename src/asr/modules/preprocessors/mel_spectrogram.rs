@@ -102,8 +102,9 @@ impl MelSpectrogram {
             &[self.mel_filterbank.clone(), power_spectrum],
         )?;
 
-        // Apply log with floor for numerical stability
-        let mel_spec = mlx_rs::ops::maximum(&mel_spec, &Array::from_f32(1e-10))?;
+        // Apply log with guard for numerical stability
+        // NeMo uses log_zero_guard_type="add": log(x + guard) rather than log(max(x, guard))
+        let mel_spec = &mel_spec + &Array::from_f32(5.960464477539063e-08);
         let log_mel_spec = mlx_rs::ops::log(&mel_spec)?;
 
         // Normalize if requested
@@ -116,9 +117,12 @@ impl MelSpectrogram {
         let output_lengths = if let Some(lens) = lengths {
             self.compute_output_lengths(lens)?
         } else {
-            // Compute based on total audio length
+            // Compute based on total audio length with center padding
+            // PyTorch formula: n_frames = floor((padded_len - n_fft) / hop_length) + 1
             let audio_len_usize = audio_len as usize;
-            let n_frames = (audio_len_usize - self.win_length) / self.hop_length + 1;
+            let n_fft = self.config.n_fft;
+            let padded_len = audio_len_usize + n_fft; // center padding adds n_fft/2 on each side
+            let n_frames = (padded_len - n_fft) / self.hop_length + 1;
             mlx_rs::ops::full::<i32>(&[batch_size], &Array::from_int(n_frames as i32))?
         };
 
@@ -128,6 +132,78 @@ impl MelSpectrogram {
     /// Get the output feature dimension.
     pub fn output_dim(&self) -> usize {
         self.config.features
+    }
+
+    /// Get reference to the mel filterbank for debugging.
+    pub fn filterbank(&self) -> &Array {
+        &self.mel_filterbank
+    }
+
+    /// Process audio and return BOTH pre-normalized and post-normalized mel spectrograms.
+    /// Used for debugging to compare with reference implementations.
+    pub fn forward_debug(
+        &self,
+        audio: &Array,
+        lengths: Option<&Array>,
+    ) -> Result<(Array, Array, Array)> {
+        // Ensure audio is 2D [batch, time]
+        let audio = if audio.ndim() == 1 {
+            audio.reshape(&[1, -1])?
+        } else {
+            audio.clone()
+        };
+
+        let batch_size = audio.shape()[0];
+        let audio_len = audio.shape()[1];
+
+        // Apply optional preemphasis
+        let audio = if let Some(coef) = self.config.preemph {
+            self.preemphasis(&audio, coef)?
+        } else {
+            audio
+        };
+
+        // Note: In NeMo, dither is only applied in training mode
+        // For inference (eval mode), dither is skipped. So we skip it here.
+
+        // Compute STFT
+        let stft_result = self.stft(&audio)?;
+
+        // Compute power spectrum
+        let power_spectrum = self.complex_abs_squared(&stft_result)?;
+
+        // Apply Mel filterbank
+        let mel_spec = mlx_rs::ops::einsum(
+            "mf,bft->bmt",
+            &[self.mel_filterbank.clone(), power_spectrum],
+        )?;
+
+        // Apply log with guard for numerical stability
+        // NeMo uses log_zero_guard_type="add": log(x + guard) rather than log(max(x, guard))
+        let mel_spec = &mel_spec + &Array::from_f32(5.960464477539063e-08);
+        let log_mel_spec = mlx_rs::ops::log(&mel_spec)?;
+
+        // Save pre-normalized
+        let pre_norm_mel = log_mel_spec.clone();
+
+        // Normalize if requested
+        let log_mel_spec = match self.config.normalize.as_str() {
+            "per_feature" => self.normalize_per_feature(&log_mel_spec)?,
+            _ => log_mel_spec,
+        };
+
+        // Compute output lengths
+        let output_lengths = if let Some(lens) = lengths {
+            self.compute_output_lengths(lens)?
+        } else {
+            let audio_len_usize = audio_len as usize;
+            let n_fft = self.config.n_fft;
+            let padded_len = audio_len_usize + n_fft;
+            let n_frames = (padded_len - n_fft) / self.hop_length + 1;
+            mlx_rs::ops::full::<i32>(&[batch_size], &Array::from_int(n_frames as i32))?
+        };
+
+        Ok((pre_norm_mel, log_mel_spec, output_lengths))
     }
 
     // Private helper methods
@@ -173,14 +249,34 @@ impl MelSpectrogram {
     ) -> Result<Array> {
         let n_freqs = n_fft / 2 + 1;
 
-        // Convert Hz to Mel scale
-        let hz_to_mel = |hz: f32| 2595.0 * (1.0 + hz / 700.0).log10();
-        let mel_to_hz = |mel: f32| 700.0 * (10.0_f32.powf(mel / 2595.0) - 1.0);
+        // Slaney mel scale (used by librosa and NeMo)
+        // This is NOT the HTK mel scale!
+        let f_sp = 200.0 / 3.0;
+        let min_log_hz = 1000.0;
+        let min_log_mel = (min_log_hz - 0.0) / f_sp;
+        let logstep = (6.4_f32).ln() / 27.0;
+
+        let hz_to_mel = |hz: f32| -> f32 {
+            if hz >= min_log_hz {
+                min_log_mel + (hz / min_log_hz).ln() / logstep
+            } else {
+                hz / f_sp
+            }
+        };
+
+        let mel_to_hz = |mel: f32| -> f32 {
+            if mel >= min_log_mel {
+                min_log_hz * (logstep * (mel - min_log_mel)).exp()
+            } else {
+                mel * f_sp
+            }
+        };
 
         let mel_low = hz_to_mel(lowfreq);
         let mel_high = hz_to_mel(highfreq);
 
-        // Create mel points
+        // Create mel points (n_mels + 2 points for triangular filters)
+        // Linearly spaced in mel scale
         let mel_points: Vec<f32> = (0..=n_mels + 1)
             .map(|i| mel_low + (mel_high - mel_low) * (i as f32) / ((n_mels + 1) as f32))
             .collect();
@@ -188,33 +284,46 @@ impl MelSpectrogram {
         // Convert back to Hz
         let hz_points: Vec<f32> = mel_points.iter().map(|&m| mel_to_hz(m)).collect();
 
-        // Convert to FFT bin indices
-        let bin_points: Vec<usize> = hz_points
-            .iter()
-            .map(|&hz| ((n_fft as f32 + 1.0) * hz / sample_rate).floor() as usize)
+        // FFT frequencies
+        let fft_freqs: Vec<f32> = (0..n_freqs)
+            .map(|i| i as f32 * sample_rate / n_fft as f32)
             .collect();
 
-        // Create filterbank matrix
+        // Compute frequency differences (n_mels + 1 differences)
+        let fdiff: Vec<f32> = hz_points.windows(2).map(|w| w[1] - w[0]).collect();
+
+        // Create filterbank matrix using librosa's method:
+        // lower = (f - f_left) / (f_center - f_left)
+        // upper = (f_right - f) / (f_right - f_center)
+        // value = max(0, min(lower, upper))
         let mut filterbank = vec![0.0f32; n_mels * n_freqs];
 
         for m in 0..n_mels {
-            let start = bin_points[m];
-            let center = bin_points[m + 1];
-            let end = bin_points[m + 2];
+            let f_left = hz_points[m];
+            let f_center = hz_points[m + 1];
+            let f_right = hz_points[m + 2];
 
-            // Rising edge
-            for k in start..center {
-                if k < n_freqs {
-                    filterbank[m * n_freqs + k] =
-                        (k - start) as f32 / (center - start).max(1) as f32;
-                }
+            for (k, &freq) in fft_freqs.iter().enumerate() {
+                // lower slope: (f - f_left) / (f_center - f_left) = -(f_left - f) / fdiff[m]
+                // which is (freq - f_left) / fdiff[m]
+                let lower = (freq - f_left) / fdiff[m];
+                // upper slope: (f_right - f) / (f_right - f_center) = (f_right - freq) / fdiff[m+1]
+                let upper = (f_right - freq) / fdiff[m + 1];
+
+                // Take minimum of lower and upper, clipped to >= 0
+                let value = lower.min(upper).max(0.0);
+                filterbank[m * n_freqs + k] = value;
             }
+        }
 
-            // Falling edge
-            for k in center..end {
-                if k < n_freqs {
-                    filterbank[m * n_freqs + k] = (end - k) as f32 / (end - center).max(1) as f32;
-                }
+        // Apply Slaney normalization: multiply each filter by 2 / (f_right - f_left)
+        for m in 0..n_mels {
+            let f_left = hz_points[m];
+            let f_right = hz_points[m + 2];
+            let enorm = 2.0 / (f_right - f_left);
+
+            for k in 0..n_freqs {
+                filterbank[m * n_freqs + k] *= enorm;
             }
         }
 
@@ -245,37 +354,55 @@ impl MelSpectrogram {
         let audio_len = audio.shape()[1];
         let n_fft = self.config.n_fft;
 
-        // Calculate number of frames
-        let win_length = self.win_length as i32;
-        let hop_length = self.hop_length as i32;
-        let n_frames = (audio_len - win_length) / hop_length + 1;
+        // Apply center padding (pad by n_fft//2 on each side with ZEROS)
+        // This matches NeMo's torch.stft with center=True, pad_mode='constant'
+        let pad_size = n_fft / 2;
 
-        // Pad audio if necessary
-        let pad_amount = (n_frames - 1) * hop_length + win_length - audio_len;
-        let audio = if pad_amount > 0 {
-            let padding = Array::zeros::<f32>(&[batch_size as i32, pad_amount as i32])?;
-            {
-                let refs: Vec<&Array> = vec![&audio, &padding];
-                mlx_rs::ops::concatenate_axis(&refs, 1)?
+        // Zero padding on both sides
+        audio.eval()?;
+        let audio_data: &[f32] = audio.as_slice();
+
+        let mut padded_data =
+            Vec::with_capacity(batch_size as usize * (audio_len as usize + 2 * pad_size));
+
+        for b in 0..batch_size as usize {
+            let batch_offset = b * audio_len as usize;
+
+            // Left padding: zeros
+            for _ in 0..pad_size {
+                padded_data.push(0.0);
             }
-        } else {
-            audio.clone()
-        };
 
-        // Create frames using strided view
-        // This is a simplified version - in production you'd want more efficient framing
-        let mut frames_data = Vec::with_capacity((batch_size * n_frames * win_length) as usize);
+            // Original audio
+            for i in 0..audio_len as usize {
+                padded_data.push(audio_data[batch_offset + i]);
+            }
 
-        // For now, we'll compute this more explicitly
-        // TODO: Optimize with proper strided operations
+            // Right padding: zeros
+            for _ in 0..pad_size {
+                padded_data.push(0.0);
+            }
+        }
+
+        let padded_len = audio_len as usize + 2 * pad_size;
+        let audio = Array::from_slice(&padded_data, &[batch_size as i32, padded_len as i32]);
+
+        // Calculate number of frames with the padded audio
+        // PyTorch formula: n_frames = floor((padded_len - n_fft) / hop_length) + 1
+        let hop_length = self.hop_length as i32;
+        let n_frames = (padded_len as i32 - n_fft as i32) / hop_length + 1;
+
+        // Create frames of length n_fft (not win_length!) - PyTorch extracts n_fft samples per frame
+        let mut frames_data = Vec::with_capacity((batch_size * n_frames * n_fft as i32) as usize);
+
         audio.eval()?;
         let audio_data: &[f32] = audio.as_slice();
 
         for b in 0..batch_size {
-            let batch_offset = b * audio.shape()[1];
+            let batch_offset = b * padded_len as i32;
             for frame_idx in 0..n_frames {
                 let start = frame_idx * hop_length;
-                for i in 0..self.win_length {
+                for i in 0..n_fft {
                     let idx = (batch_offset as usize) + (start as usize) + i;
                     frames_data.push(audio_data[idx]);
                 }
@@ -284,21 +411,23 @@ impl MelSpectrogram {
 
         let frames = Array::from_slice(
             &frames_data,
-            &[batch_size as i32, n_frames as i32, self.win_length as i32],
+            &[batch_size as i32, n_frames as i32, n_fft as i32],
         );
 
-        // Apply window
-        let windowed = &frames * &self.window;
-
-        // Pad to n_fft if necessary
-        let windowed = if self.win_length < n_fft {
-            let pad_size = n_fft - self.win_length;
-            let padding =
-                Array::zeros::<f32>(&[batch_size as i32, n_frames as i32, pad_size as i32])?;
-            mlx_rs::ops::concatenate_axis(&[&windowed, &padding], 2)?
+        // Create centered window: [zeros, window, zeros]
+        // PyTorch centers the window within n_fft when win_length < n_fft
+        let centered_window = if self.win_length < n_fft {
+            let left_pad = (n_fft - self.win_length) / 2;
+            let right_pad = n_fft - self.win_length - left_pad;
+            let left_zeros = Array::zeros::<f32>(&[left_pad as i32])?;
+            let right_zeros = Array::zeros::<f32>(&[right_pad as i32])?;
+            mlx_rs::ops::concatenate_axis(&[&left_zeros, &self.window, &right_zeros], 0)?
         } else {
-            windowed
+            self.window.clone()
         };
+
+        // Apply centered window
+        let windowed = &frames * &centered_window;
 
         // Compute FFT
         // windowed shape: [batch, frames, n_fft]
@@ -334,12 +463,12 @@ impl MelSpectrogram {
     }
 
     fn compute_output_lengths(&self, input_lengths: &Array) -> Result<Array> {
-        // output_length = (input_length - win_length) / hop_length + 1
-        let win_len = Array::from_int(self.win_length as i32);
-        let hop_len = Array::from_int(self.hop_length as i32);
+        // With center padding: padded_length = input_length + n_fft
+        // PyTorch formula: n_frames = floor((padded_length - n_fft) / hop_length) + 1
+        //                          = floor(input_length / hop_length) + 1
+        let hop_len = self.hop_length as i32;
 
-        let numerator = input_lengths - &win_len;
-        let divided = mlx_rs::ops::floor_divide(&numerator, &hop_len)?;
+        let divided = mlx_rs::ops::floor_divide(input_lengths, &Array::from_int(hop_len))?;
         let output_lengths = &divided + &Array::from_int(1);
         Ok(output_lengths)
     }

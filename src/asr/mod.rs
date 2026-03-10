@@ -24,7 +24,8 @@ pub mod modules;
 
 // Re-exports
 pub use config::*;
-pub use models::EncDecCTCModel;
+pub use models::{DebugOutput, EncDecCTCModel};
+pub use modules::MelSpectrogram;
 
 /// Prelude for convenient imports.
 pub mod prelude {

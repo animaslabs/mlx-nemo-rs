@@ -93,8 +93,8 @@ pub struct PreprocessorConfig {
     #[serde(default)]
     pub pad_to: usize,
 
-    /// Pre-emphasis coefficient
-    #[serde(default)]
+    /// Pre-emphasis coefficient (default 0.97 to match NeMo)
+    #[serde(default = "default_preemph")]
     pub preemph: Option<f32>,
 
     /// Mel frequency floor
@@ -129,6 +129,9 @@ fn default_normalize() -> String {
 }
 fn default_dither() -> f32 {
     1e-5
+}
+fn default_preemph() -> Option<f32> {
+    Some(0.97)
 }
 
 /// Encoder configuration.
@@ -326,7 +329,7 @@ impl Default for PreprocessorConfig {
             normalize: "per_feature".to_string(),
             dither: 1e-5,
             pad_to: 0,
-            preemph: None,
+            preemph: Some(0.97), // NeMo default
             lowfreq: None,
             highfreq: None,
         }

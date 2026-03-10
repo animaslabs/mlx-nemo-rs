@@ -15,6 +15,22 @@ use crate::core::checkpoint::NemoCheckpoint;
 use crate::core::config::from_yaml_str;
 use crate::core::error::{Error, Result};
 
+/// Debug output containing all intermediate tensors from forward pass.
+pub struct DebugOutput {
+    /// Mel spectrogram features BEFORE normalization [batch, n_mels, frames]
+    pub mel_pre_norm: Array,
+    /// Mel spectrogram features AFTER normalization [batch, n_mels, frames]
+    pub mel_spectrogram: Array,
+    /// Mel spectrogram lengths [batch]
+    pub mel_lengths: Array,
+    /// Encoder output [batch, d_model, time']
+    pub encoder_output: Array,
+    /// Encoder output lengths [batch]
+    pub encoder_lengths: Array,
+    /// Log probabilities [batch, time', vocab_size]
+    pub log_probs: Array,
+}
+
 /// Encoder-Decoder CTC ASR Model.
 ///
 /// This model consists of:
@@ -188,6 +204,36 @@ impl EncDecCTCModel {
         Ok((log_probs, encoded_lengths))
     }
 
+    /// Run forward pass with debug output of intermediate values.
+    ///
+    /// Returns all intermediate tensors for debugging/verification.
+    pub fn forward_debug(&mut self, audio: &Array, lengths: Option<&Array>) -> Result<DebugOutput> {
+        // Preprocess audio to mel spectrogram (with pre-norm values)
+        let (pre_norm, features, feature_lengths) =
+            self.preprocessor.forward_debug(audio, lengths)?;
+        pre_norm.eval()?;
+        features.eval()?;
+        feature_lengths.eval()?;
+
+        // Encode
+        let (encoded, encoded_lengths) = self.encoder.forward(&features, &feature_lengths)?;
+        encoded.eval()?;
+        encoded_lengths.eval()?;
+
+        // Decode to log probabilities
+        let log_probs = self.decoder.forward(&encoded)?;
+        log_probs.eval()?;
+
+        Ok(DebugOutput {
+            mel_pre_norm: pre_norm,
+            mel_spectrogram: features,
+            mel_lengths: feature_lengths,
+            encoder_output: encoded,
+            encoder_lengths: encoded_lengths,
+            log_probs,
+        })
+    }
+
     /// Load audio files and return batched tensors.
     fn load_audio_batch(&self, paths: &[impl AsRef<Path>]) -> Result<(Array, Array)> {
         let sample_rate = self.config.sample_rate;
@@ -256,6 +302,11 @@ impl EncDecCTCModel {
     /// Get the sample rate expected by the model.
     pub fn sample_rate(&self) -> u32 {
         self.config.sample_rate
+    }
+
+    /// Get a reference to the preprocessor (for debugging).
+    pub fn preprocessor(&self) -> &MelSpectrogram {
+        &self.preprocessor
     }
 }
 
