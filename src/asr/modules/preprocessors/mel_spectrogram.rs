@@ -109,9 +109,12 @@ impl MelSpectrogram {
         let log_mel_spec = mlx_rs::ops::log(&mel_spec)?;
 
         // Normalize if requested
+        // "per_feature" - normalize each mel bin to zero mean and unit variance
+        // "NA" or other values - no normalization (Nemotron uses "NA")
         let log_mel_spec = match self.config.normalize.as_str() {
             "per_feature" => self.normalize_per_feature(&log_mel_spec)?,
-            _ => log_mel_spec,
+            "NA" | "" => log_mel_spec, // No normalization
+            _ => log_mel_spec,         // Unknown values default to no normalization
         };
 
         // Compute output lengths
@@ -189,9 +192,12 @@ impl MelSpectrogram {
         let pre_norm_mel = log_mel_spec.clone();
 
         // Normalize if requested
+        // "per_feature" - normalize each mel bin to zero mean and unit variance
+        // "NA" or other values - no normalization (Nemotron uses "NA")
         let log_mel_spec = match self.config.normalize.as_str() {
             "per_feature" => self.normalize_per_feature(&log_mel_spec)?,
-            _ => log_mel_spec,
+            "NA" | "" => log_mel_spec, // No normalization
+            _ => log_mel_spec,         // Unknown values default to no normalization
         };
 
         // Compute output lengths

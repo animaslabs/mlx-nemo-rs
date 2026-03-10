@@ -68,6 +68,23 @@ fn load_batch_norm(layer: &mut nn::BatchNorm, weights: &HashMap<String, Array>, 
     }
 }
 
+/// Apply causal padding to a 4D tensor [B, T, F, C].
+/// Pads the time dimension (axis 1) with (kernel_size - 1) zeros on the left.
+fn causal_pad_2d(x: &Array, kernel_size: usize) -> Result<Array> {
+    let batch = x.dim(0);
+    let freq = x.dim(2);
+    let channels = x.dim(3);
+
+    let pad_size = kernel_size - 1;
+
+    // Create zero padding: [B, pad_size, F, C]
+    let zeros =
+        mlx_rs::ops::zeros::<f32>(&[batch as i32, pad_size as i32, freq as i32, channels as i32])?;
+
+    // Concatenate along time axis
+    Ok(mlx_rs::ops::concatenate_axis(&[&zeros, x], 1)?)
+}
+
 /// Conformer encoder for ASR.
 ///
 /// This implements the Conformer architecture as used in NeMo's ASR models,
@@ -212,7 +229,9 @@ fn load_conv2d(layer: &mut nn::Conv2d, weights: &HashMap<String, Array>, prefix:
 /// This implements the `dw_striding` subsampling method used in NeMo's Conformer encoder.
 /// It uses 2D convolutions to downsample the mel spectrogram in both time and frequency.
 struct Subsampling {
+    #[allow(dead_code)]
     subsampling_factor: usize,
+    #[allow(dead_code)]
     conv_channels: usize,
 
     /// First conv: regular Conv2d(1, conv_channels, 3x3, stride=2)
@@ -228,6 +247,15 @@ struct Subsampling {
 
     /// Output projection: Linear(conv_channels * reduced_feat, d_model)
     out_proj: nn::Linear,
+
+    /// Whether to use causal (left-only) padding for streaming
+    is_causal: bool,
+
+    /// Kernel size for manual causal padding
+    kernel_size: usize,
+
+    /// Stride for length calculation
+    stride: usize,
 }
 
 impl Subsampling {
@@ -236,6 +264,7 @@ impl Subsampling {
         let d_model = config.d_model;
         let subsampling_factor = config.subsampling_factor;
         let conv_channels = config.subsampling_conv_channels.unwrap_or(256);
+        let is_causal = config.is_causal_downsampling();
 
         // Number of striding operations: log2(subsampling_factor)
         let n_strides = match subsampling_factor {
@@ -245,12 +274,16 @@ impl Subsampling {
             _ => 2,
         };
 
-        let kernel_size = 3;
-        let padding = 1; // (kernel_size - 1) / 2
+        let kernel_size: usize = 3;
+        let stride: usize = 2;
+
+        // For causal: no padding in conv (we'll pad manually)
+        // For non-causal: symmetric padding
+        let padding = if is_causal { 0 } else { 1 }; // (kernel_size - 1) / 2
 
         // First conv: 1 input channel (mono spectrogram) -> conv_channels
-        let first_conv = nn::Conv2dBuilder::new(1, conv_channels as i32, kernel_size)
-            .stride(2)
+        let first_conv = nn::Conv2dBuilder::new(1, conv_channels as i32, kernel_size as i32)
+            .stride(stride as i32)
             .padding(padding)
             .build()?;
 
@@ -260,12 +293,15 @@ impl Subsampling {
 
         for _ in 0..(n_strides - 1) {
             // Depthwise conv: groups = channels for depthwise convolution
-            let dw_conv =
-                nn::Conv2dBuilder::new(conv_channels as i32, conv_channels as i32, kernel_size)
-                    .stride(2)
-                    .padding(padding)
-                    .groups(conv_channels as i32)
-                    .build()?;
+            let dw_conv = nn::Conv2dBuilder::new(
+                conv_channels as i32,
+                conv_channels as i32,
+                kernel_size as i32,
+            )
+            .stride(stride as i32)
+            .padding(padding)
+            .groups(conv_channels as i32)
+            .build()?;
             depthwise_convs.push(dw_conv);
 
             // Pointwise conv: 1x1 convolution to mix channels
@@ -288,18 +324,30 @@ impl Subsampling {
             depthwise_convs,
             pointwise_convs,
             out_proj,
+            is_causal,
+            kernel_size,
+            stride,
         })
     }
 
     fn forward(&mut self, x: &Array, lengths: &Array) -> Result<(Array, Array)> {
-        // x: [B, T, F] where F is number of mel features (e.g., 80)
+        // x: [B, T, F] where F is number of mel features (e.g., 80 or 128)
         // Add channel dimension: [B, T, F] -> [B, T, F, 1] for MLX Conv2d
         // MLX Conv2d expects (N, H, W, C) format
-        let x = x.reshape(&[-1, x.dim(1) as i32, x.dim(2) as i32, 1])?;
+        let mut x = x.reshape(&[-1, x.dim(1) as i32, x.dim(2) as i32, 1])?;
+
+        // Apply causal padding if needed before first conv
+        if self.is_causal {
+            x = causal_pad_2d(&x, self.kernel_size)?;
+        }
 
         // First conv layer with ReLU
-        let mut x = self.first_conv.forward(&x)?;
+        x = self.first_conv.forward(&x)?;
         x = mlx_rs::nn::relu(&x)?;
+
+        // Get parameters for loop since we need to avoid borrow issues
+        let is_causal = self.is_causal;
+        let kernel_size = self.kernel_size;
 
         // Apply depthwise + pointwise pairs with ReLU
         for (dw_conv, pw_conv) in self
@@ -307,6 +355,10 @@ impl Subsampling {
             .iter_mut()
             .zip(self.pointwise_convs.iter_mut())
         {
+            // Apply causal padding before each depthwise conv
+            if is_causal {
+                x = causal_pad_2d(&x, kernel_size)?;
+            }
             x = dw_conv.forward(&x)?;
             x = pw_conv.forward(&x)?;
             x = mlx_rs::nn::relu(&x)?;
@@ -329,6 +381,7 @@ impl Subsampling {
         let x = self.out_proj.forward(&x)?;
 
         // Update lengths: each stride halves the length
+        // For causal, the formula is slightly different but floor_divide still works
         let mut new_lengths = lengths.clone();
         for _ in 0..self.depthwise_convs.len() + 1 {
             new_lengths = mlx_rs::ops::floor_divide(&new_lengths, &Array::from_int(2))?;
@@ -402,13 +455,22 @@ impl ConformerBlock {
         let conv_kernel = config.conv_kernel_size;
         let dropout = config.dropout;
 
+        // Check if causal convolution is requested
+        let is_causal = config.is_causal_conv();
+
         Ok(Self {
             d_model,
             ff1: FeedForward::new(d_model, ff_dim, dropout)?,
             ff1_norm: nn::LayerNorm::new(d_model as i32)?,
             self_attn: RelPositionMultiHeadAttention::new(d_model, n_heads)?,
             self_attn_norm: nn::LayerNorm::new(d_model as i32)?,
-            conv: ConvolutionModule::new(d_model, conv_kernel, dropout)?,
+            conv: ConvolutionModule::new(
+                d_model,
+                conv_kernel,
+                dropout,
+                &config.conv_norm_type,
+                is_causal,
+            )?,
             conv_norm: nn::LayerNorm::new(d_model as i32)?,
             ff2: FeedForward::new(d_model, ff_dim, dropout)?,
             ff2_norm: nn::LayerNorm::new(d_model as i32)?,
@@ -532,22 +594,56 @@ impl FeedForward {
     }
 }
 
+/// Normalization type for convolution module.
+enum ConvNorm {
+    BatchNorm(nn::BatchNorm),
+    LayerNorm(nn::LayerNorm),
+}
+
+impl ConvNorm {
+    fn forward(&mut self, x: &Array) -> mlx_rs::error::Result<Array> {
+        match self {
+            ConvNorm::BatchNorm(bn) => bn.forward(x),
+            ConvNorm::LayerNorm(ln) => ln.forward(x),
+        }
+    }
+}
+
 /// Convolution module for Conformer.
 struct ConvolutionModule {
     d_model: usize,
     pointwise_conv1: nn::Conv1d,
     depthwise_conv: nn::Conv1d,
     pointwise_conv2: nn::Conv1d,
-    batch_norm: nn::BatchNorm,
+    norm: ConvNorm,
+    /// Whether this is a causal convolution (for streaming)
+    is_causal: bool,
+    /// Kernel size for causal padding calculation
+    kernel_size: usize,
 }
 
 impl ConvolutionModule {
-    fn new(d_model: usize, kernel_size: usize, _dropout: f32) -> Result<Self> {
-        let padding = (kernel_size - 1) / 2;
+    fn new(
+        d_model: usize,
+        kernel_size: usize,
+        _dropout: f32,
+        norm_type: &str,
+        is_causal: bool,
+    ) -> Result<Self> {
+        // For non-causal: symmetric padding (kernel_size - 1) / 2 on each side
+        // For causal: all padding on the left (kernel_size - 1), none on right
+        // With causal, we'll handle padding manually in forward()
+        let padding = if is_causal {
+            0 // We'll pad manually in forward
+        } else {
+            (kernel_size - 1) / 2
+        };
 
-        // Create batch norm - keep in training mode for now
-        // TODO: Investigate why eval mode produces empty output
-        let batch_norm = nn::BatchNorm::new(d_model as i32)?;
+        // Create normalization layer based on type
+        let norm = match norm_type {
+            "layer_norm" => ConvNorm::LayerNorm(nn::LayerNorm::new(d_model as i32)?),
+            _ => ConvNorm::BatchNorm(nn::BatchNorm::new(d_model as i32)?),
+        };
 
         Ok(Self {
             d_model,
@@ -565,7 +661,9 @@ impl ConvolutionModule {
             .build()?,
             // Pointwise compression (d_model -> d_model)
             pointwise_conv2: nn::Conv1dBuilder::new(d_model as i32, d_model as i32, 1).build()?,
-            batch_norm,
+            norm,
+            is_causal,
+            kernel_size,
         })
     }
 
@@ -585,9 +683,24 @@ impl ConvolutionModule {
         let sigmoid_x2 = mlx_rs::ops::sigmoid(&x2)?;
         let x = &x1 * &sigmoid_x2;
 
-        // Depthwise conv - x is [B, T, D]
+        // Apply causal padding if needed (pad left only)
+        let x = if self.is_causal {
+            // Pad on the left (time dimension) with zeros
+            // x is [B, T, D], we need to pad T by (kernel_size - 1) on the left
+            let pad_size = self.kernel_size - 1;
+            let batch = x.dim(0);
+            let d = x.dim(2);
+
+            // Create zero padding: [B, pad_size, D]
+            let zeros = mlx_rs::ops::zeros::<f32>(&[batch as i32, pad_size as i32, d as i32])?;
+            mlx_rs::ops::concatenate_axis(&[&zeros, &x], 1)?
+        } else {
+            x
+        };
+
+        // Depthwise conv - x is [B, T, D] (or [B, T+pad, D] if causal)
         let x = self.depthwise_conv.forward(&x)?;
-        let x = self.batch_norm.forward(&x)?;
+        let x = self.norm.forward(&x)?;
         let x = mlx_rs::nn::silu(&x)?; // silu is the same as swish
 
         // Pointwise conv 2
@@ -612,11 +725,16 @@ impl ConvolutionModule {
             weights,
             &format!("{}.pointwise_conv2", prefix),
         );
-        load_batch_norm(
-            &mut self.batch_norm,
-            weights,
-            &format!("{}.batch_norm", prefix),
-        );
+
+        // Load normalization weights based on type
+        match &mut self.norm {
+            ConvNorm::BatchNorm(bn) => {
+                load_batch_norm(bn, weights, &format!("{}.batch_norm", prefix));
+            }
+            ConvNorm::LayerNorm(ln) => {
+                load_layer_norm(ln, weights, &format!("{}.batch_norm", prefix));
+            }
+        }
         Ok(())
     }
 }

@@ -5,6 +5,68 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Attention context size configuration.
+///
+/// NeMo supports two formats:
+/// - Single: `[left, right]` - fixed context window (Parakeet style)
+/// - Multiple: `[[70,13], [70,6], [70,1], [70,0]]` - multiple streaming modes (Nemotron style)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum AttContextSize {
+    /// Single context window: [left_context, right_context]
+    Single(Vec<i32>),
+    /// Multiple streaming modes, each with [left_context, right_context]
+    Multiple(Vec<Vec<i32>>),
+}
+
+impl AttContextSize {
+    /// Get the default (first) context size as (left, right).
+    ///
+    /// For Single, returns the values directly.
+    /// For Multiple, returns the first mode (typically the largest context / lowest latency).
+    pub fn get_default(&self) -> Option<(i32, i32)> {
+        match self {
+            AttContextSize::Single(v) if v.len() >= 2 => Some((v[0], v[1])),
+            AttContextSize::Multiple(modes) if !modes.is_empty() => {
+                let first = &modes[0];
+                if first.len() >= 2 {
+                    Some((first[0], first[1]))
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// Get context size for a specific streaming mode index.
+    ///
+    /// For Single, always returns the same context regardless of index.
+    /// For Multiple, returns the context for the given mode index.
+    pub fn get_mode(&self, mode_idx: usize) -> Option<(i32, i32)> {
+        match self {
+            AttContextSize::Single(v) if v.len() >= 2 => Some((v[0], v[1])),
+            AttContextSize::Multiple(modes) if mode_idx < modes.len() => {
+                let mode = &modes[mode_idx];
+                if mode.len() >= 2 {
+                    Some((mode[0], mode[1]))
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// Get number of available streaming modes.
+    pub fn num_modes(&self) -> usize {
+        match self {
+            AttContextSize::Single(_) => 1,
+            AttContextSize::Multiple(modes) => modes.len(),
+        }
+    }
+}
+
 /// Top-level configuration for ASR models (CTC and RNNT).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AsrModelConfig {
@@ -207,12 +269,21 @@ pub struct EncoderConfig {
     pub self_attention_model: String,
 
     /// Attention context size [left, right] (-1 for unlimited)
+    /// Can be a single [left, right] or multiple modes [[left1, right1], [left2, right2], ...]
     #[serde(default)]
-    pub att_context_size: Option<Vec<i32>>,
+    pub att_context_size: Option<AttContextSize>,
+
+    /// Attention context style: "regular" (default) or "chunked_limited" (streaming)
+    #[serde(default)]
+    pub att_context_style: Option<String>,
 
     /// Whether to use x-scaling for attention
     #[serde(default)]
     pub xscaling: Option<bool>,
+
+    /// Whether to untie position biases across layers (each layer has its own bias)
+    #[serde(default)]
+    pub untie_biases: Option<bool>,
 
     /// Positional embedding max length
     #[serde(default = "default_pos_emb_max_len")]
@@ -230,9 +301,21 @@ pub struct EncoderConfig {
     #[serde(default)]
     pub dropout_pre_encoder: Option<f32>,
 
-    /// Convolution normalization type
+    /// Convolution normalization type: "batch_norm" (default) or "layer_norm"
     #[serde(default = "default_conv_norm")]
     pub conv_norm_type: String,
+
+    /// Convolution context size: null (symmetric, default) or "causal" (left-only padding)
+    #[serde(default)]
+    pub conv_context_size: Option<String>,
+
+    /// Whether to use causal (left-only) padding in subsampling convolutions
+    #[serde(default)]
+    pub causal_downsampling: Option<bool>,
+
+    /// Whether to use bias in linear layers (default true for Parakeet, false for Nemotron)
+    #[serde(default)]
+    pub use_bias: Option<bool>,
 
     /// Additional fields
     #[serde(flatten)]
@@ -581,14 +664,47 @@ impl Default for EncoderConfig {
             subsampling_conv_channels: None,
             self_attention_model: "rel_pos".to_string(),
             att_context_size: None,
+            att_context_style: None,
             xscaling: None,
+            untie_biases: None,
             pos_emb_max_len: 5000,
             dropout: 0.1,
             dropout_att: None,
             dropout_pre_encoder: None,
             conv_norm_type: "batch_norm".to_string(),
+            conv_context_size: None,
+            causal_downsampling: None,
+            use_bias: None,
             extra: std::collections::HashMap::new(),
         }
+    }
+}
+
+impl EncoderConfig {
+    /// Check if causal convolution is enabled.
+    pub fn is_causal_conv(&self) -> bool {
+        self.conv_context_size
+            .as_ref()
+            .map(|s| s == "causal")
+            .unwrap_or(false)
+    }
+
+    /// Check if causal downsampling is enabled.
+    pub fn is_causal_downsampling(&self) -> bool {
+        self.causal_downsampling.unwrap_or(false)
+    }
+
+    /// Check if this is a streaming-capable encoder (chunked_limited style).
+    pub fn is_streaming(&self) -> bool {
+        self.att_context_style
+            .as_ref()
+            .map(|s| s == "chunked_limited")
+            .unwrap_or(false)
+    }
+
+    /// Get effective use_bias setting (default true for backward compatibility).
+    pub fn effective_use_bias(&self) -> bool {
+        self.use_bias.unwrap_or(true)
     }
 }
 

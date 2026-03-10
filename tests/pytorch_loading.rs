@@ -98,3 +98,136 @@ fn test_storage_type_parsing() {
     );
     assert_eq!(StorageType::from_class_name("UnknownStorage"), None);
 }
+
+#[test]
+#[ignore] // Requires Nemotron model file to be present
+fn test_load_nemotron_checkpoint() {
+    use mlx_nemo::core::checkpoint::NemoCheckpoint;
+
+    let path = Path::new(
+        "models/nvidia/nemotron-speech-streaming-en-0.6b/nemotron-speech-streaming-en-0.6b.nemo",
+    );
+
+    if !path.exists() {
+        eprintln!("Skipping test: model file not found at {}", path.display());
+        return;
+    }
+
+    let checkpoint = NemoCheckpoint::open(path).expect("Failed to open checkpoint");
+    let weights = checkpoint.load_weights().expect("Failed to load weights");
+
+    // Nemotron has more layers (24 vs 17) and larger model
+    assert!(
+        weights.len() > 600,
+        "Expected >600 tensors, got {}",
+        weights.len()
+    );
+    println!("Loaded {} tensors from Nemotron checkpoint", weights.len());
+
+    // Verify key weight tensors exist
+    assert!(
+        weights.contains_key("encoder.pre_encode.out.weight"),
+        "Missing encoder.pre_encode.out.weight"
+    );
+    assert!(
+        weights.contains_key("encoder.layers.0.self_attn.linear_q.weight"),
+        "Missing encoder.layers.0.self_attn.linear_q.weight"
+    );
+
+    // Find joint network key pattern
+    let joint_keys: Vec<_> = weights.keys().filter(|k| k.contains("joint")).collect();
+    assert!(
+        !joint_keys.is_empty(),
+        "Expected joint network weights to be present"
+    );
+    println!("Found {} joint-related tensors", joint_keys.len());
+
+    // Verify Nemotron-specific tensor shapes
+    // d_model = 1024 (vs 512 in Parakeet)
+    let linear_q = weights
+        .get("encoder.layers.0.self_attn.linear_q.weight")
+        .unwrap();
+    assert_eq!(
+        linear_q.shape(),
+        &[1024, 1024],
+        "Unexpected shape for linear_q.weight - expected [1024, 1024] for Nemotron"
+    );
+}
+
+#[test]
+#[ignore] // Requires Nemotron model file to be present
+fn test_parse_nemotron_config() {
+    use mlx_nemo::asr::config::AsrModelConfig;
+    use mlx_nemo::core::checkpoint::NemoCheckpoint;
+
+    let path = Path::new(
+        "models/nvidia/nemotron-speech-streaming-en-0.6b/nemotron-speech-streaming-en-0.6b.nemo",
+    );
+
+    if !path.exists() {
+        eprintln!("Skipping test: model file not found at {}", path.display());
+        return;
+    }
+
+    let checkpoint = NemoCheckpoint::open(path).expect("Failed to open checkpoint");
+    let config: AsrModelConfig = checkpoint.load_config().expect("Failed to load config");
+
+    // Verify Nemotron-specific config values
+    assert_eq!(
+        config.encoder.feat_in, 128,
+        "Nemotron uses 128 mel features"
+    );
+    assert_eq!(
+        config.encoder.d_model, 1024,
+        "Nemotron d_model should be 1024"
+    );
+    assert_eq!(
+        config.encoder.n_layers, 24,
+        "Nemotron has 24 encoder layers"
+    );
+    assert_eq!(
+        config.encoder.conv_kernel_size, 9,
+        "Nemotron conv kernel is 9"
+    );
+    assert_eq!(
+        config.encoder.conv_norm_type, "layer_norm",
+        "Nemotron uses layer_norm in convolution"
+    );
+
+    // Verify streaming config
+    assert!(
+        config.encoder.is_causal_conv(),
+        "Nemotron should have causal convolution"
+    );
+    assert!(
+        config.encoder.is_causal_downsampling(),
+        "Nemotron should have causal downsampling"
+    );
+    assert!(
+        config.encoder.is_streaming(),
+        "Nemotron should be streaming-capable"
+    );
+
+    // Verify att_context_size is nested (multiple streaming modes)
+    let att_ctx = config
+        .encoder
+        .att_context_size
+        .as_ref()
+        .expect("Should have att_context_size");
+    assert!(
+        att_ctx.num_modes() >= 4,
+        "Nemotron should have at least 4 streaming modes, got {}",
+        att_ctx.num_modes()
+    );
+
+    // First mode should be [70, 13] (1.12s latency)
+    let (left, right) = att_ctx.get_default().expect("Should have default context");
+    assert_eq!(left, 70, "Default left context should be 70");
+    assert_eq!(right, 13, "Default right context should be 13");
+
+    println!("Nemotron config parsed successfully:");
+    println!("  feat_in: {}", config.encoder.feat_in);
+    println!("  d_model: {}", config.encoder.d_model);
+    println!("  n_layers: {}", config.encoder.n_layers);
+    println!("  streaming modes: {}", att_ctx.num_modes());
+}

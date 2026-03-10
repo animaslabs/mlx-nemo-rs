@@ -165,6 +165,14 @@ impl NemoCheckpoint {
         None
     }
 
+    /// Load the model configuration from the checkpoint.
+    ///
+    /// This parses the config_yaml into the specified type.
+    pub fn load_config<T: serde::de::DeserializeOwned>(&self) -> Result<T> {
+        serde_yaml::from_str(&self.config_yaml)
+            .map_err(|e| Error::config(format!("Failed to parse model config: {}", e)))
+    }
+
     /// Load weights from the checkpoint.
     ///
     /// This loads the weights from either a safetensors or PyTorch checkpoint file.
