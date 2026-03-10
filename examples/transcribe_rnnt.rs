@@ -5,12 +5,20 @@
 //!
 //! Options:
 //!   --beam <size>   Use beam search decoding with given beam size (default: greedy)
+//!
+//! Environment:
+//!   RUST_LOG=mlx_nemo=debug   Enable debug logging
 
 use std::time::Instant;
 
 use mlx_nemo::asr::{EncDecRNNTModel, RnntDecodingStrategy};
+use tracing_subscriber::EnvFilter;
 
 fn main() -> mlx_nemo::Result<()> {
+    // Initialize tracing subscriber for debug output
+    tracing_subscriber::fmt()
+        .with_env_filter(EnvFilter::from_default_env())
+        .init();
     // Parse command line arguments
     let args: Vec<String> = std::env::args().collect();
 

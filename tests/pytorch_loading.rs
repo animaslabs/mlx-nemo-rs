@@ -156,6 +156,46 @@ fn test_load_nemotron_checkpoint() {
 
 #[test]
 #[ignore] // Requires Nemotron model file to be present
+fn test_nemotron_weight_shapes() {
+    use mlx_nemo::core::checkpoint::NemoCheckpoint;
+
+    let path = Path::new(
+        "models/nvidia/nemotron-speech-streaming-en-0.6b/nemotron-speech-streaming-en-0.6b.nemo",
+    );
+
+    if !path.exists() {
+        eprintln!("Skipping test: model file not found at {}", path.display());
+        return;
+    }
+
+    let checkpoint = NemoCheckpoint::open(path).expect("Failed to open checkpoint");
+    let weights = checkpoint.load_weights().expect("Failed to load weights");
+
+    // Check pre_encode (subsampling) output projection
+    let out_weight = weights
+        .get("encoder.pre_encode.out.weight")
+        .expect("Missing encoder.pre_encode.out.weight");
+    println!("encoder.pre_encode.out.weight: {:?}", out_weight.shape());
+
+    // This should tell us what the expected input dimension is
+    // Shape should be [d_model, linear_in] = [1024, conv_channels * feat_out]
+    assert_eq!(out_weight.shape()[0], 1024, "d_model should be 1024");
+
+    let linear_in = out_weight.shape()[1];
+    println!("Expected linear_in from weights: {}", linear_in);
+
+    // With 256 channels: linear_in / 256 = feat_out
+    let feat_out = linear_in / 256;
+    println!("Implied feat_out: {} (= {} / 256)", feat_out, linear_in);
+
+    // Check first conv weight
+    if let Some(w) = weights.get("encoder.pre_encode.conv.0.weight") {
+        println!("encoder.pre_encode.conv.0.weight: {:?}", w.shape());
+    }
+}
+
+#[test]
+#[ignore] // Requires Nemotron model file to be present
 fn test_parse_nemotron_config() {
     use mlx_nemo::asr::config::AsrModelConfig;
     use mlx_nemo::core::checkpoint::NemoCheckpoint;

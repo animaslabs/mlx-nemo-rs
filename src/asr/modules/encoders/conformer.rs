@@ -69,20 +69,38 @@ fn load_batch_norm(layer: &mut nn::BatchNorm, weights: &HashMap<String, Array>, 
 }
 
 /// Apply causal padding to a 4D tensor [B, T, F, C].
-/// Pads the time dimension (axis 1) with (kernel_size - 1) zeros on the left.
-fn causal_pad_2d(x: &Array, kernel_size: usize) -> Result<Array> {
-    let batch = x.dim(0);
-    let freq = x.dim(2);
-    let channels = x.dim(3);
+///
+/// This matches NeMo's CausalConv2D padding behavior, which pads BOTH time and
+/// frequency dimensions the same way:
+/// - left_pad = kernel_size - 1 (for causal behavior on time, and extra preservation on frequency)
+/// - right_pad = (kernel_size - 1) // 2 (additional padding for output size preservation)
+///
+/// This asymmetric padding ensures the output size is: ceil((input + left_pad + right_pad - kernel) / stride) + 1
+/// which gives us the same output dimensions as NeMo's CausalConv2D.
+fn causal_pad_2d(x: &Array, kernel_size: usize, _stride: usize) -> Result<Array> {
+    let batch = x.dim(0) as i32;
+    let time = x.dim(1) as i32;
+    let freq = x.dim(2) as i32;
+    let channels = x.dim(3) as i32;
 
-    let pad_size = kernel_size - 1;
+    // NeMo's CausalConv2D uses the same padding for both time and frequency:
+    // left_pad = kernel_size - 1
+    // right_pad = (kernel_size - 1) // 2
+    let left_pad = (kernel_size - 1) as i32;
+    let right_pad = ((kernel_size - 1) / 2) as i32;
 
-    // Create zero padding: [B, pad_size, F, C]
-    let zeros =
-        mlx_rs::ops::zeros::<f32>(&[batch as i32, pad_size as i32, freq as i32, channels as i32])?;
+    // Step 1: Pad time dimension (axis 1): [B, T, F, C] -> [B, T+left_pad+right_pad, F, C]
+    let time_zeros_left = mlx_rs::ops::zeros::<f32>(&[batch, left_pad, freq, channels])?;
+    let time_zeros_right = mlx_rs::ops::zeros::<f32>(&[batch, right_pad, freq, channels])?;
+    let x = mlx_rs::ops::concatenate_axis(&[&time_zeros_left, x, &time_zeros_right], 1)?;
 
-    // Concatenate along time axis
-    Ok(mlx_rs::ops::concatenate_axis(&[&zeros, x], 1)?)
+    // Step 2: Pad frequency dimension (axis 2)
+    let new_time = time + left_pad + right_pad;
+    let freq_zeros_left = mlx_rs::ops::zeros::<f32>(&[batch, new_time, left_pad, channels])?;
+    let freq_zeros_right = mlx_rs::ops::zeros::<f32>(&[batch, new_time, right_pad, channels])?;
+    let x = mlx_rs::ops::concatenate_axis(&[&freq_zeros_left, &x, &freq_zeros_right], 2)?;
+
+    Ok(x)
 }
 
 /// Conformer encoder for ASR.
@@ -277,7 +295,7 @@ impl Subsampling {
         let kernel_size: usize = 3;
         let stride: usize = 2;
 
-        // For causal: no padding in conv (we'll pad manually)
+        // For causal: no padding in conv (we'll pad manually with asymmetric padding)
         // For non-causal: symmetric padding
         let padding = if is_causal { 0 } else { 1 }; // (kernel_size - 1) / 2
 
@@ -311,8 +329,20 @@ impl Subsampling {
         }
 
         // Calculate output feature dimension after all striding
-        // Each stride halves the dimension: feat_out = feat_in / subsampling_factor
-        let feat_out = feat_in / subsampling_factor;
+        // We need to compute the actual conv output size, not just feat_in / subsampling_factor
+        // Conv output: floor((input + 2*padding - kernel) / stride) + 1
+        // For causal mode with our padding: we add (kernel-1) left and (kernel-1)/2 symmetric on freq
+        // so freq padding is effectively (kernel-1)/2 = 1 for kernel=3
+        // NeMo's causal subsampling uses ceil-mode-like rounding to preserve dimensions
+        let freq_padding = (kernel_size - 1) / 2; // Always symmetric for frequency dimension
+        let feat_out = Self::compute_freq_output_size(
+            feat_in,
+            n_strides,
+            kernel_size,
+            stride,
+            freq_padding,
+            is_causal,
+        );
         let linear_in = conv_channels * feat_out;
 
         let out_proj = nn::Linear::new(linear_in as i32, d_model as i32)?;
@@ -330,6 +360,40 @@ impl Subsampling {
         })
     }
 
+    /// Compute the frequency dimension output size after subsampling convolutions.
+    ///
+    /// For NeMo's CausalConv2D with kernel=3, stride=2, the padding is:
+    /// - left_pad = kernel - 1 = 2
+    /// - right_pad = (kernel - 1) / 2 = 1
+    ///
+    /// Output size = floor((input + left_pad + right_pad - kernel) / stride) + 1
+    ///             = floor((input + 2 + 1 - 3) / 2) + 1
+    ///             = floor(input / 2) + 1
+    fn compute_freq_output_size(
+        feat_in: usize,
+        n_strides: usize,
+        kernel_size: usize,
+        stride: usize,
+        _freq_padding: usize,
+        is_causal: bool,
+    ) -> usize {
+        let mut f = feat_in;
+        for _ in 0..n_strides {
+            if is_causal {
+                // CausalConv2D: output = floor(input / stride) + 1
+                // This comes from: floor((input + (k-1) + (k-1)/2 - k) / stride) + 1
+                //                = floor((input + k - 1 + floor((k-1)/2) - k) / stride) + 1
+                // For k=3: floor((input + 2 + 1 - 3) / 2) + 1 = floor(input / 2) + 1
+                f = f / stride + 1;
+            } else {
+                // Standard conv with symmetric padding: floor((input + 2*pad - kernel) / stride) + 1
+                let pad = (kernel_size - 1) / 2;
+                f = (f + 2 * pad - kernel_size) / stride + 1;
+            }
+        }
+        f
+    }
+
     fn forward(&mut self, x: &Array, lengths: &Array) -> Result<(Array, Array)> {
         // x: [B, T, F] where F is number of mel features (e.g., 80 or 128)
         // Add channel dimension: [B, T, F] -> [B, T, F, 1] for MLX Conv2d
@@ -338,7 +402,7 @@ impl Subsampling {
 
         // Apply causal padding if needed before first conv
         if self.is_causal {
-            x = causal_pad_2d(&x, self.kernel_size)?;
+            x = causal_pad_2d(&x, self.kernel_size, self.stride)?;
         }
 
         // First conv layer with ReLU
@@ -348,6 +412,7 @@ impl Subsampling {
         // Get parameters for loop since we need to avoid borrow issues
         let is_causal = self.is_causal;
         let kernel_size = self.kernel_size;
+        let stride = self.stride;
 
         // Apply depthwise + pointwise pairs with ReLU
         for (dw_conv, pw_conv) in self
@@ -357,7 +422,7 @@ impl Subsampling {
         {
             // Apply causal padding before each depthwise conv
             if is_causal {
-                x = causal_pad_2d(&x, kernel_size)?;
+                x = causal_pad_2d(&x, kernel_size, stride)?;
             }
             x = dw_conv.forward(&x)?;
             x = pw_conv.forward(&x)?;
@@ -380,11 +445,24 @@ impl Subsampling {
         // Project to d_model: [B, T', d_model]
         let x = self.out_proj.forward(&x)?;
 
-        // Update lengths: each stride halves the length
-        // For causal, the formula is slightly different but floor_divide still works
+        // Update lengths based on padding mode
         let mut new_lengths = lengths.clone();
-        for _ in 0..self.depthwise_convs.len() + 1 {
-            new_lengths = mlx_rs::ops::floor_divide(&new_lengths, &Array::from_int(2))?;
+        let n_convs = self.depthwise_convs.len() + 1;
+
+        if is_causal {
+            // For CausalConv2D: output = floor(input / stride) + 1
+            // This is equivalent to: (input + stride - 1) / stride when we want ceiling behavior
+            // Actually, it's just floor(input / stride) + 1
+            // So we compute: input // 2 + 1 for each conv
+            for _ in 0..n_convs {
+                new_lengths = &mlx_rs::ops::floor_divide(&new_lengths, &Array::from_int(2))?
+                    + &Array::from_int(1);
+            }
+        } else {
+            // Standard: each stride just halves the length (with symmetric padding preserving dims)
+            for _ in 0..n_convs {
+                new_lengths = mlx_rs::ops::floor_divide(&new_lengths, &Array::from_int(2))?;
+            }
         }
 
         Ok((x, new_lengths))

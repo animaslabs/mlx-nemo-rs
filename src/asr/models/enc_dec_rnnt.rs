@@ -480,8 +480,50 @@ impl EncDecRNNTModel {
         // Preprocess audio to mel spectrogram
         let (features, feature_lengths) = self.preprocessor.forward(audio, lengths)?;
 
+        // Debug: print mel spectrogram stats
+        features.eval()?;
+        feature_lengths.eval()?;
+        tracing::debug!(
+            "Mel spectrogram shape: {:?}, length: {:?}",
+            features.shape(),
+            feature_lengths.as_slice::<i32>()
+        );
+        let features_flat = features.reshape(&[-1])?;
+        features_flat.eval()?;
+        let f_slice: &[f32] = features_flat.as_slice();
+        let f_min = f_slice.iter().cloned().fold(f32::INFINITY, f32::min);
+        let f_max = f_slice.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        let f_mean: f32 = f_slice.iter().sum::<f32>() / f_slice.len() as f32;
+        tracing::debug!(
+            "Mel min: {:.4}, max: {:.4}, mean: {:.4}",
+            f_min,
+            f_max,
+            f_mean
+        );
+
         // Encode
         let (encoded, encoded_lengths) = self.encoder.forward(&features, &feature_lengths)?;
+
+        // Debug: print encoder output stats
+        encoded.eval()?;
+        encoded_lengths.eval()?;
+        tracing::debug!(
+            "Encoder output shape: {:?}, length: {:?}",
+            encoded.shape(),
+            encoded_lengths.as_slice::<i32>()
+        );
+        let encoded_flat = encoded.reshape(&[-1])?;
+        encoded_flat.eval()?;
+        let e_slice: &[f32] = encoded_flat.as_slice();
+        let e_min = e_slice.iter().cloned().fold(f32::INFINITY, f32::min);
+        let e_max = e_slice.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        let e_mean: f32 = e_slice.iter().sum::<f32>() / e_slice.len() as f32;
+        tracing::debug!(
+            "Encoder min: {:.4}, max: {:.4}, mean: {:.4}",
+            e_min,
+            e_max,
+            e_mean
+        );
 
         // For RNNT, we return encoder output directly (decoding happens separately)
         // Transpose from [B, D, T] to [B, T, D]
