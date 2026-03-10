@@ -1,0 +1,48 @@
+{
+  "config": {
+    "sample_rate": 16000,
+    "window_size": 0.025,
+    "window_stride": 0.01,
+    "n_fft": 512,
+    "win_length": 400,
+    "hop_length": 160
+  },
+  "cases": [
+    {
+      "input_length": 1600,
+      "output_length": 11
+    },
+    {
+      "input_length": 8000,
+      "output_length": 51
+    },
+    {
+      "input_length": 16000,
+      "output_length": 101
+    },
+    {
+      "input_length": 24000,
+      "output_length": 151
+    },
+    {
+      "input_length": 32000,
+      "output_length": 201
+    },
+    {
+      "input_length": 48000,
+      "output_length": 301
+    },
+    {
+      "input_length": 160,
+      "output_length": 2
+    },
+    {
+      "input_length": 320,
+      "output_length": 3
+    },
+    {
+      "input_length": 480,
+      "output_length": 4
+    }
+  ]
+}
