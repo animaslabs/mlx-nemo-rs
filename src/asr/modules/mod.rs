@@ -10,6 +10,6 @@ pub mod encoders;
 pub mod preprocessors;
 
 pub use decoders::CTCDecoder;
-pub use decoders::{RNNTJoint, StatelessTransducerDecoder};
+pub use decoders::{LstmState, RNNTDecoder, RNNTJoint, StatelessTransducerDecoder};
 pub use encoders::ConformerEncoder;
 pub use preprocessors::MelSpectrogram;

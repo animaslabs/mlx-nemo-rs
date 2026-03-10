@@ -263,15 +263,17 @@ impl StatelessTransducerDecoder {
     /// Get embeddings for token indices.
     fn embed(&self, indices: &Array) -> Result<Array> {
         // indices: [batch, seq_len] -> [batch, seq_len, pred_hidden]
-        // Flatten indices, do embedding lookup, then reshape
         let batch = indices.shape()[0];
         let seq_len = indices.shape()[1];
 
         // Flatten indices to [batch * seq_len]
         let flat_indices = ops::reshape(indices, &[-1])?;
 
-        // Do embedding lookup: [batch * seq_len, pred_hidden]
-        let flat_emb = indexing::take(&self.embedding_weight, &flat_indices)?;
+        // Do embedding lookup using take_axis on axis 0
+        // embedding_weight: [vocab_size, pred_hidden]
+        // flat_indices: [batch * seq_len]
+        // result: [batch * seq_len, pred_hidden]
+        let flat_emb = indexing::take_axis(&self.embedding_weight, &flat_indices, 0)?;
 
         // Reshape back to [batch, seq_len, pred_hidden]
         let emb = ops::reshape(&flat_emb, &[batch, seq_len, self.pred_hidden as i32])?;
@@ -299,6 +301,331 @@ impl StatelessTransducerDecoder {
                     embed_key,
                     alt_key
                 );
+            }
+        }
+
+        Ok(())
+    }
+}
+
+/// LSTM-based RNN-T Decoder (Prediction Network).
+///
+/// A prediction network that uses an LSTM to model the label sequence.
+/// This is used by models like parakeet-rnnt-0.6b.
+///
+/// The architecture is:
+/// - Embedding layer: vocab_size + 1 -> pred_hidden
+/// - LSTM layers (typically 2 layers)
+///
+/// State consists of (hidden, cell) tensors for each LSTM layer.
+pub struct RNNTDecoder {
+    /// Embedding layer: vocab_size + 1 (blank) -> pred_hidden
+    embedding_weight: Array,
+    /// LSTM layers - list of (weight_ih, weight_hh, bias_ih, bias_hh)
+    lstm_layers: Vec<LstmLayer>,
+    /// Hidden dimension of prediction network
+    pred_hidden: usize,
+    /// Number of LSTM layers
+    num_layers: usize,
+    /// Vocabulary size (excluding blank)
+    vocab_size: usize,
+    /// Blank token index (typically vocab_size)
+    blank_idx: usize,
+}
+
+/// Weights for a single LSTM layer.
+struct LstmLayer {
+    /// Input-hidden weight: [4 * hidden_size, input_size]
+    weight_ih: Array,
+    /// Hidden-hidden weight: [4 * hidden_size, hidden_size]
+    weight_hh: Array,
+    /// Input-hidden bias: [4 * hidden_size]
+    bias_ih: Array,
+    /// Hidden-hidden bias: [4 * hidden_size]
+    bias_hh: Array,
+}
+
+/// LSTM decoder state for a single batch item.
+/// Contains hidden and cell states for each layer.
+#[derive(Clone)]
+pub struct LstmState {
+    /// Hidden states per layer: [num_layers, batch, hidden_size]
+    pub hidden: Array,
+    /// Cell states per layer: [num_layers, batch, hidden_size]
+    pub cell: Array,
+}
+
+impl RNNTDecoder {
+    /// Create a new LSTM-based transducer decoder.
+    ///
+    /// # Arguments
+    /// * `config` - Decoder configuration
+    /// * `vocab_size` - Vocabulary size (excluding blank token)
+    pub fn new(config: &DecoderConfig, vocab_size: usize) -> Result<Self> {
+        let pred_hidden = config
+            .prednet
+            .as_ref()
+            .map(|p| p.pred_hidden)
+            .unwrap_or(640);
+
+        let num_layers = config
+            .prednet
+            .as_ref()
+            .and_then(|p| p.pred_rnn_layers)
+            .unwrap_or(2);
+
+        let blank_idx = vocab_size;
+
+        // Initialize embedding with zeros (will be loaded from weights)
+        // Shape: [vocab_size + 1, pred_hidden] (includes blank token)
+        let embedding_weight = Array::zeros::<f32>(&[(vocab_size + 1) as i32, pred_hidden as i32])?;
+
+        // Initialize LSTM layers
+        let mut lstm_layers = Vec::with_capacity(num_layers);
+        for _ in 0..num_layers {
+            // All layers have the same input/hidden size for NeMo models
+            let gate_size = 4 * pred_hidden;
+            lstm_layers.push(LstmLayer {
+                weight_ih: Array::zeros::<f32>(&[gate_size as i32, pred_hidden as i32])?,
+                weight_hh: Array::zeros::<f32>(&[gate_size as i32, pred_hidden as i32])?,
+                bias_ih: Array::zeros::<f32>(&[gate_size as i32])?,
+                bias_hh: Array::zeros::<f32>(&[gate_size as i32])?,
+            });
+        }
+
+        Ok(Self {
+            embedding_weight,
+            lstm_layers,
+            pred_hidden,
+            num_layers,
+            vocab_size,
+            blank_idx,
+        })
+    }
+
+    /// Get the prediction network hidden dimension.
+    pub fn pred_hidden(&self) -> usize {
+        self.pred_hidden
+    }
+
+    /// Get the blank token index.
+    pub fn blank_idx(&self) -> usize {
+        self.blank_idx
+    }
+
+    /// Get the vocabulary size (excluding blank).
+    pub fn vocab_size(&self) -> usize {
+        self.vocab_size
+    }
+
+    /// Get the number of LSTM layers.
+    pub fn num_layers(&self) -> usize {
+        self.num_layers
+    }
+
+    /// Initialize decoder state for a batch.
+    ///
+    /// # Arguments
+    /// * `batch_size` - Number of sequences in the batch
+    ///
+    /// # Returns
+    /// * LstmState with zero-initialized hidden and cell states
+    pub fn initialize_state(&self, batch_size: usize) -> Result<LstmState> {
+        // Hidden and cell states: [num_layers, batch, hidden_size]
+        let hidden = Array::zeros::<f32>(&[
+            self.num_layers as i32,
+            batch_size as i32,
+            self.pred_hidden as i32,
+        ])?;
+        let cell = Array::zeros::<f32>(&[
+            self.num_layers as i32,
+            batch_size as i32,
+            self.pred_hidden as i32,
+        ])?;
+        Ok(LstmState { hidden, cell })
+    }
+
+    /// Run a single-step prediction for decoding.
+    ///
+    /// # Arguments
+    /// * `y` - Single token index [batch, 1] or None for blank/SOS
+    /// * `state` - Previous LSTM state
+    ///
+    /// # Returns
+    /// * `(output, new_state)` where:
+    ///   - output: [batch, 1, pred_hidden]
+    ///   - new_state: Updated LstmState
+    pub fn predict_one(&self, y: Option<&Array>, state: &LstmState) -> Result<(Array, LstmState)> {
+        let batch_size = state.hidden.shape()[1] as usize;
+
+        // Get embedding for input token
+        let embedding = if let Some(y) = y {
+            // y: [batch, 1] -> embedding: [batch, 1, pred_hidden]
+            self.embed(y)?
+        } else {
+            // Use blank token embedding
+            let fill_value = Array::from_int(self.blank_idx as i32);
+            let blank_idx = Array::full::<i32>(&[batch_size as i32, 1], &fill_value)?;
+            self.embed(&blank_idx)?
+        };
+
+        // Run through LSTM layers
+        // embedding: [batch, 1, pred_hidden]
+        let mut x = embedding;
+        let mut new_hiddens = Vec::with_capacity(self.num_layers);
+        let mut new_cells = Vec::with_capacity(self.num_layers);
+
+        for layer_idx in 0..self.num_layers {
+            // Get layer state: [batch, hidden_size]
+            let h = state.hidden.index((layer_idx as i32, .., ..));
+            let c = state.cell.index((layer_idx as i32, .., ..));
+
+            // Run LSTM cell for this layer
+            let (new_h, new_c) = self.lstm_cell(layer_idx, &x.squeeze_axes(&[1])?, &h, &c)?;
+
+            // Store new states
+            new_hiddens.push(new_h.clone());
+            new_cells.push(new_c.clone());
+
+            // Output becomes input to next layer (add sequence dim back)
+            x = ops::expand_dims(&new_h, 1)?;
+        }
+
+        // Stack states: [num_layers, batch, hidden_size]
+        let new_hidden = ops::stack_axis(&new_hiddens.iter().collect::<Vec<_>>(), 0)?;
+        let new_cell = ops::stack_axis(&new_cells.iter().collect::<Vec<_>>(), 0)?;
+
+        let new_state = LstmState {
+            hidden: new_hidden,
+            cell: new_cell,
+        };
+
+        Ok((x, new_state))
+    }
+
+    /// Run LSTM cell for a single layer.
+    ///
+    /// # Arguments
+    /// * `layer_idx` - Index of the LSTM layer
+    /// * `x` - Input tensor [batch, hidden_size]
+    /// * `h` - Previous hidden state [batch, hidden_size]
+    /// * `c` - Previous cell state [batch, hidden_size]
+    ///
+    /// # Returns
+    /// * `(new_h, new_c)` - New hidden and cell states
+    fn lstm_cell(
+        &self,
+        layer_idx: usize,
+        x: &Array,
+        h: &Array,
+        c: &Array,
+    ) -> Result<(Array, Array)> {
+        let layer = &self.lstm_layers[layer_idx];
+
+        // Compute gates: i, f, g, o
+        // gates = x @ weight_ih^T + bias_ih + h @ weight_hh^T + bias_hh
+        let weight_ih_t = layer.weight_ih.transpose()?;
+        let weight_hh_t = layer.weight_hh.transpose()?;
+
+        let gates_ih = ops::add(&ops::matmul(x, &weight_ih_t)?, &layer.bias_ih)?;
+        let gates_hh = ops::add(&ops::matmul(h, &weight_hh_t)?, &layer.bias_hh)?;
+        let gates = ops::add(&gates_ih, &gates_hh)?;
+
+        // Split into 4 gates: [batch, hidden_size] each
+        let hidden_size = self.pred_hidden as i32;
+        let i = ops::sigmoid(&gates.index((.., 0..hidden_size)))?;
+        let f = ops::sigmoid(&gates.index((.., hidden_size..(2 * hidden_size))))?;
+        let g = ops::tanh(&gates.index((.., (2 * hidden_size)..(3 * hidden_size))))?;
+        let o = ops::sigmoid(&gates.index((.., (3 * hidden_size)..)))?;
+
+        // New cell state: c_new = f * c + i * g
+        let new_c = ops::add(&ops::multiply(&f, c)?, &ops::multiply(&i, &g)?)?;
+
+        // New hidden state: h_new = o * tanh(c_new)
+        let new_h = ops::multiply(&o, &ops::tanh(&new_c)?)?;
+
+        Ok((new_h, new_c))
+    }
+
+    /// Get embeddings for token indices.
+    fn embed(&self, indices: &Array) -> Result<Array> {
+        // indices: [batch, seq_len] -> [batch, seq_len, pred_hidden]
+        let batch = indices.shape()[0];
+        let seq_len = indices.shape()[1];
+
+        // Flatten indices to [batch * seq_len]
+        let flat_indices = ops::reshape(indices, &[-1])?;
+
+        // Do embedding lookup using take_axis on axis 0
+        // embedding_weight: [vocab_size, pred_hidden]
+        // flat_indices: [batch * seq_len]
+        // result: [batch * seq_len, pred_hidden]
+        let flat_emb = indexing::take_axis(&self.embedding_weight, &flat_indices, 0)?;
+
+        // Reshape back to [batch, seq_len, pred_hidden]
+        let emb = ops::reshape(&flat_emb, &[batch, seq_len, self.pred_hidden as i32])?;
+
+        Ok(emb)
+    }
+
+    /// Load weights from a checkpoint.
+    pub fn load_weights(&mut self, weights: &HashMap<String, Array>, prefix: &str) -> Result<()> {
+        // NeMo keys:
+        // decoder.prediction.embed.weight: [vocab_size + 1, pred_hidden]
+        // decoder.prediction.dec_rnn.lstm.weight_ih_l0: [4 * hidden, input_size]
+        // decoder.prediction.dec_rnn.lstm.weight_hh_l0: [4 * hidden, hidden_size]
+        // decoder.prediction.dec_rnn.lstm.bias_ih_l0: [4 * hidden]
+        // decoder.prediction.dec_rnn.lstm.bias_hh_l0: [4 * hidden]
+        // (and l1 for second layer, etc.)
+
+        // Load embedding
+        let embed_key = format!("{}.prediction.embed.weight", prefix);
+        if let Some(weight) = weights.get(&embed_key) {
+            self.embedding_weight = weight.clone();
+            tracing::debug!("Loaded prediction embedding: {:?}", weight.shape());
+        } else {
+            tracing::warn!("Prediction embedding not found at {}", embed_key);
+        }
+
+        // Load LSTM layers
+        for layer_idx in 0..self.num_layers {
+            let weight_ih_key = format!(
+                "{}.prediction.dec_rnn.lstm.weight_ih_l{}",
+                prefix, layer_idx
+            );
+            let weight_hh_key = format!(
+                "{}.prediction.dec_rnn.lstm.weight_hh_l{}",
+                prefix, layer_idx
+            );
+            let bias_ih_key = format!("{}.prediction.dec_rnn.lstm.bias_ih_l{}", prefix, layer_idx);
+            let bias_hh_key = format!("{}.prediction.dec_rnn.lstm.bias_hh_l{}", prefix, layer_idx);
+
+            if let Some(w) = weights.get(&weight_ih_key) {
+                self.lstm_layers[layer_idx].weight_ih = w.clone();
+                tracing::debug!("Loaded LSTM layer {} weight_ih: {:?}", layer_idx, w.shape());
+            } else {
+                tracing::warn!("LSTM weight_ih not found at {}", weight_ih_key);
+            }
+
+            if let Some(w) = weights.get(&weight_hh_key) {
+                self.lstm_layers[layer_idx].weight_hh = w.clone();
+                tracing::debug!("Loaded LSTM layer {} weight_hh: {:?}", layer_idx, w.shape());
+            } else {
+                tracing::warn!("LSTM weight_hh not found at {}", weight_hh_key);
+            }
+
+            if let Some(b) = weights.get(&bias_ih_key) {
+                self.lstm_layers[layer_idx].bias_ih = b.clone();
+                tracing::debug!("Loaded LSTM layer {} bias_ih: {:?}", layer_idx, b.shape());
+            } else {
+                tracing::warn!("LSTM bias_ih not found at {}", bias_ih_key);
+            }
+
+            if let Some(b) = weights.get(&bias_hh_key) {
+                self.lstm_layers[layer_idx].bias_hh = b.clone();
+                tracing::debug!("Loaded LSTM layer {} bias_hh: {:?}", layer_idx, b.shape());
+            } else {
+                tracing::warn!("LSTM bias_hh not found at {}", bias_hh_key);
             }
         }
 
@@ -651,6 +978,8 @@ mod tests {
         let config = DecoderConfig {
             prednet: Some(PredNetConfig {
                 pred_hidden: 256,
+                pred_rnn_layers: None,
+                t_max: None,
                 dropout: None,
             }),
             context_size: Some(2),
@@ -669,6 +998,8 @@ mod tests {
         let config = DecoderConfig {
             prednet: Some(PredNetConfig {
                 pred_hidden: 256,
+                pred_rnn_layers: None,
+                t_max: None,
                 dropout: None,
             }),
             context_size: Some(2),

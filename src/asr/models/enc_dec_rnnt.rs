@@ -3,15 +3,15 @@
 //! This model implements the RNN-T (Transducer) ASR architecture used by
 //! NeMo's EncDecRNNTModel and EncDecRNNTBPEModel (Parakeet RNNT models).
 
+use std::collections::HashMap;
 use std::path::Path;
 
 use mlx_rs::Array;
 use sentencepiece::SentencePieceProcessor;
 
 use crate::asr::config::{AsrModelConfig, JointConfig};
-use crate::asr::decoding::{rnnt_beam_decode, rnnt_greedy_decode};
 use crate::asr::modules::{
-    ConformerEncoder, MelSpectrogram, RNNTJoint, StatelessTransducerDecoder,
+    ConformerEncoder, LstmState, MelSpectrogram, RNNTDecoder, RNNTJoint, StatelessTransducerDecoder,
 };
 use crate::core::checkpoint::NemoCheckpoint;
 use crate::core::config::from_yaml_str;
@@ -32,12 +32,101 @@ impl Default for RnntDecodingStrategy {
     }
 }
 
+/// Prediction network type (stateless or LSTM-based).
+pub enum PredictionNetwork {
+    /// Stateless decoder (embedding-based)
+    Stateless(StatelessTransducerDecoder),
+    /// LSTM-based decoder
+    Lstm(RNNTDecoder),
+}
+
+/// Decoder state type.
+pub enum DecoderState {
+    /// Stateless decoder state (context buffer)
+    Stateless(Array),
+    /// LSTM decoder state (hidden + cell)
+    Lstm(LstmState),
+}
+
+impl PredictionNetwork {
+    /// Get the prediction network hidden dimension.
+    pub fn pred_hidden(&self) -> usize {
+        match self {
+            Self::Stateless(d) => d.pred_hidden(),
+            Self::Lstm(d) => d.pred_hidden(),
+        }
+    }
+
+    /// Get the blank token index.
+    pub fn blank_idx(&self) -> usize {
+        match self {
+            Self::Stateless(d) => d.blank_idx(),
+            Self::Lstm(d) => d.blank_idx(),
+        }
+    }
+
+    /// Get the vocabulary size (excluding blank).
+    pub fn vocab_size(&self) -> usize {
+        match self {
+            Self::Stateless(d) => d.vocab_size(),
+            Self::Lstm(d) => d.vocab_size(),
+        }
+    }
+
+    /// Initialize decoder state for a batch.
+    pub fn initialize_state(&self, batch_size: usize) -> Result<DecoderState> {
+        match self {
+            Self::Stateless(d) => Ok(DecoderState::Stateless(d.initialize_state(batch_size)?)),
+            Self::Lstm(d) => Ok(DecoderState::Lstm(d.initialize_state(batch_size)?)),
+        }
+    }
+
+    /// Run a single-step prediction for decoding.
+    ///
+    /// # Arguments
+    /// * `y` - Single token index [batch, 1] or None for blank/SOS
+    /// * `state` - Previous decoder state
+    ///
+    /// # Returns
+    /// * `(output, new_state)` where output is [batch, 1, pred_hidden]
+    pub fn predict_one(
+        &self,
+        y: Option<&Array>,
+        state: &DecoderState,
+    ) -> Result<(Array, DecoderState)> {
+        match (self, state) {
+            (Self::Stateless(decoder), DecoderState::Stateless(s)) => {
+                let (output, new_state) = decoder.predict_one(y, s)?;
+                Ok((output, DecoderState::Stateless(new_state)))
+            }
+            (Self::Lstm(decoder), DecoderState::Lstm(s)) => {
+                let (output, new_state) = decoder.predict_one(y, s)?;
+                Ok((output, DecoderState::Lstm(new_state)))
+            }
+            _ => Err(Error::model("Decoder and state type mismatch".to_string())),
+        }
+    }
+
+    /// Load weights from a checkpoint.
+    pub fn load_weights(&mut self, weights: &HashMap<String, Array>, prefix: &str) -> Result<()> {
+        match self {
+            Self::Stateless(d) => d.load_weights(weights, prefix),
+            Self::Lstm(d) => d.load_weights(weights, prefix),
+        }
+    }
+
+    /// Check if this is an LSTM-based decoder.
+    pub fn is_lstm(&self) -> bool {
+        matches!(self, Self::Lstm(_))
+    }
+}
+
 /// Encoder-Decoder RNN-T ASR Model.
 ///
 /// This model consists of:
 /// 1. Audio preprocessor (Mel spectrogram)
 /// 2. Conformer/FastConformer encoder
-/// 3. Stateless prediction network (decoder)
+/// 3. Prediction network (stateless or LSTM-based decoder)
 /// 4. Joint network
 ///
 /// # Example
@@ -55,7 +144,7 @@ pub struct EncDecRNNTModel {
     config: AsrModelConfig,
     preprocessor: MelSpectrogram,
     encoder: ConformerEncoder,
-    decoder: StatelessTransducerDecoder,
+    decoder: PredictionNetwork,
     joint: RNNTJoint,
     tokenizer: Option<SentencePieceProcessor>,
     /// Blank token ID (typically vocab_size, last token)
@@ -78,19 +167,48 @@ impl EncDecRNNTModel {
             1024 // Default placeholder
         };
 
-        // Create prediction network (decoder)
-        let decoder = StatelessTransducerDecoder::new(&config.decoder, vocab_size)?;
+        // Detect decoder type from config
+        let is_lstm_decoder = config
+            .decoder
+            .prednet
+            .as_ref()
+            .map(|p| p.is_lstm_based())
+            .unwrap_or(false);
 
-        // Create joint network
-        let joint_config = config.joint.clone().unwrap_or_else(|| JointConfig {
-            joint_hidden: 640,
-            activation: "relu".to_string(),
-            ..Default::default()
-        });
+        // Create prediction network (decoder) based on config
+        let decoder = if is_lstm_decoder {
+            tracing::info!("Using LSTM-based prediction network");
+            PredictionNetwork::Lstm(RNNTDecoder::new(&config.decoder, vocab_size)?)
+        } else {
+            tracing::info!("Using stateless prediction network");
+            PredictionNetwork::Stateless(StatelessTransducerDecoder::new(
+                &config.decoder,
+                vocab_size,
+            )?)
+        };
+
+        // Create joint network using effective config values
+        let joint_config = config.joint.clone().unwrap_or_default();
 
         let encoder_hidden = encoder.output_dim();
         let pred_hidden = decoder.pred_hidden();
-        let joint = RNNTJoint::new(&joint_config, encoder_hidden, pred_hidden, vocab_size + 1)?;
+
+        // Use effective values from jointnet if present
+        let joint_hidden = joint_config.effective_joint_hidden();
+        let activation = joint_config.effective_activation().to_string();
+
+        let effective_joint_config = JointConfig {
+            joint_hidden,
+            activation,
+            ..joint_config
+        };
+
+        let joint = RNNTJoint::new(
+            &effective_joint_config,
+            encoder_hidden,
+            pred_hidden,
+            vocab_size + 1,
+        )?;
 
         // Blank is typically the last token (vocab_size)
         let blank_id = vocab_size;
@@ -181,27 +299,43 @@ impl EncDecRNNTModel {
         let vocab_size = tokenizer.len();
         self.blank_id = vocab_size; // Blank is typically vocab_size (last index)
 
-        // Recreate decoder and joint with correct vocab size
-        self.decoder = StatelessTransducerDecoder::new(&self.config.decoder, vocab_size)?;
+        // Recreate decoder with correct vocab size
+        let is_lstm_decoder = self.decoder.is_lstm();
+        self.decoder = if is_lstm_decoder {
+            PredictionNetwork::Lstm(RNNTDecoder::new(&self.config.decoder, vocab_size)?)
+        } else {
+            PredictionNetwork::Stateless(StatelessTransducerDecoder::new(
+                &self.config.decoder,
+                vocab_size,
+            )?)
+        };
 
-        let joint_config = self.config.joint.clone().unwrap_or_else(|| JointConfig {
-            joint_hidden: 640,
-            activation: "relu".to_string(),
-            ..Default::default()
-        });
+        // Recreate joint network with correct vocab size
+        let joint_config = self.config.joint.clone().unwrap_or_default();
         let encoder_hidden = self.encoder.output_dim();
         let pred_hidden = self.decoder.pred_hidden();
-        self.joint = RNNTJoint::new(&joint_config, encoder_hidden, pred_hidden, vocab_size + 1)?;
+        let joint_hidden = joint_config.effective_joint_hidden();
+        let activation = joint_config.effective_activation().to_string();
+
+        let effective_joint_config = JointConfig {
+            joint_hidden,
+            activation,
+            ..joint_config
+        };
+
+        self.joint = RNNTJoint::new(
+            &effective_joint_config,
+            encoder_hidden,
+            pred_hidden,
+            vocab_size + 1,
+        )?;
 
         self.tokenizer = Some(tokenizer);
         Ok(())
     }
 
     /// Load weights from a HashMap.
-    pub fn load_weights(
-        &mut self,
-        weights: &std::collections::HashMap<String, Array>,
-    ) -> Result<()> {
+    pub fn load_weights(&mut self, weights: &HashMap<String, Array>) -> Result<()> {
         // Load encoder weights
         self.encoder.load_weights(weights)?;
 
@@ -239,31 +373,98 @@ impl EncDecRNNTModel {
         let (encoder_output, encoder_lengths) =
             self.forward(&audio_batch.0, Some(&audio_batch.1))?;
 
-        // Decode based on strategy
-        let token_sequences = match self.decoding_strategy {
-            RnntDecodingStrategy::Greedy => rnnt_greedy_decode(
-                &encoder_output,
-                &encoder_lengths,
-                &self.decoder,
-                &self.joint,
-                self.blank_id,
-                None,
-            )?,
-            RnntDecodingStrategy::BeamSearch { beam_size } => rnnt_beam_decode(
-                &encoder_output,
-                &encoder_lengths,
-                &self.decoder,
-                &self.joint,
-                self.blank_id,
-                beam_size,
-                None,
-            )?,
-        };
+        // Decode using greedy decoding (now supports both decoder types)
+        let token_sequences = self.greedy_decode(&encoder_output, &encoder_lengths)?;
 
         // Convert tokens to text
         let texts = self.decode_tokens(&token_sequences)?;
 
         Ok(texts)
+    }
+
+    /// Perform greedy decoding using the model's decoder.
+    fn greedy_decode(
+        &self,
+        encoder_output: &Array,
+        encoder_lengths: &Array,
+    ) -> Result<Vec<Vec<usize>>> {
+        use mlx_rs::ops::indexing::{argmax_axis, IndexOp};
+
+        const MAX_SYMBOLS_PER_STEP: usize = 10;
+
+        encoder_output.eval()?;
+        encoder_lengths.eval()?;
+
+        let batch_size = encoder_output.shape()[0] as usize;
+
+        // Get encoder lengths as a vector
+        let lengths_i32 = encoder_lengths.as_type::<i32>()?;
+        lengths_i32.eval()?;
+        let lengths_data: Vec<i32> = lengths_i32.as_slice::<i32>().to_vec();
+
+        let mut results = Vec::with_capacity(batch_size);
+
+        // Process each sequence in the batch independently
+        for b in 0..batch_size {
+            let seq_len = lengths_data[b] as usize;
+            let mut tokens = Vec::new();
+
+            // Initialize decoder state for this sequence
+            let mut state = self.decoder.initialize_state(1)?;
+
+            // Process each encoder frame
+            let mut t = 0;
+            while t < seq_len {
+                // Get encoder output for current frame: [1, 1, encoder_hidden]
+                let enc_frame =
+                    encoder_output.index((b as i32..b as i32 + 1, t as i32..t as i32 + 1, ..));
+
+                let mut symbols_emitted = 0;
+
+                // Emit symbols until blank or max symbols reached
+                loop {
+                    // Get prediction network output
+                    let last_token = if tokens.is_empty() {
+                        None
+                    } else {
+                        let last = *tokens.last().unwrap() as i32;
+                        Some(Array::from_slice(&[last], &[1, 1]))
+                    };
+                    let (pred_output, new_state) =
+                        self.decoder.predict_one(last_token.as_ref(), &state)?;
+
+                    // Compute joint output: [1, vocab_size]
+                    let log_probs = self.joint.forward_one(&enc_frame, &pred_output)?;
+                    log_probs.eval()?;
+
+                    // Get argmax
+                    let prediction = argmax_axis(&log_probs, -1, false)?;
+                    prediction.eval()?;
+                    let pred_token = prediction.as_slice::<u32>()[0] as usize;
+
+                    if pred_token == self.blank_id {
+                        // Blank: advance to next encoder frame
+                        break;
+                    }
+
+                    // Non-blank: emit token and update state
+                    tokens.push(pred_token);
+                    state = new_state;
+                    symbols_emitted += 1;
+
+                    if symbols_emitted >= MAX_SYMBOLS_PER_STEP {
+                        // Safety limit reached, advance frame
+                        break;
+                    }
+                }
+
+                t += 1;
+            }
+
+            results.push(tokens);
+        }
+
+        Ok(results)
     }
 
     /// Run forward pass on preprocessed audio.
@@ -374,14 +575,19 @@ impl EncDecRNNTModel {
         &self.encoder
     }
 
-    /// Get a reference to the decoder (prediction network).
-    pub fn decoder(&self) -> &StatelessTransducerDecoder {
+    /// Get a reference to the prediction network.
+    pub fn prediction_network(&self) -> &PredictionNetwork {
         &self.decoder
     }
 
     /// Get a reference to the joint network.
     pub fn joint(&self) -> &RNNTJoint {
         &self.joint
+    }
+
+    /// Check if this model uses an LSTM-based decoder.
+    pub fn is_lstm_decoder(&self) -> bool {
+        self.decoder.is_lstm()
     }
 }
 

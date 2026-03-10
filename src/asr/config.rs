@@ -320,6 +320,14 @@ pub struct PredNetConfig {
     #[serde(default = "default_pred_hidden")]
     pub pred_hidden: usize,
 
+    /// Number of RNN layers (for LSTM-based decoder, 0 for stateless)
+    #[serde(default)]
+    pub pred_rnn_layers: Option<usize>,
+
+    /// Maximum time for chrono initialization
+    #[serde(default)]
+    pub t_max: Option<usize>,
+
     /// Dropout rate
     #[serde(default)]
     pub dropout: Option<f32>,
@@ -333,8 +341,22 @@ impl Default for PredNetConfig {
     fn default() -> Self {
         Self {
             pred_hidden: 640,
+            pred_rnn_layers: None,
+            t_max: None,
             dropout: None,
         }
+    }
+}
+
+impl PredNetConfig {
+    /// Check if this is an LSTM-based decoder (has pred_rnn_layers > 0).
+    pub fn is_lstm_based(&self) -> bool {
+        self.pred_rnn_layers.map(|n| n > 0).unwrap_or(false)
+    }
+
+    /// Check if this is a stateless decoder.
+    pub fn is_stateless(&self) -> bool {
+        !self.is_lstm_based()
     }
 }
 
@@ -345,7 +367,7 @@ pub struct JointConfig {
     #[serde(rename = "_target_", default)]
     pub target: Option<String>,
 
-    /// Joint network hidden dimension
+    /// Joint network hidden dimension (direct or from jointnet)
     #[serde(default = "default_joint_hidden")]
     pub joint_hidden: usize,
 
@@ -380,6 +402,80 @@ pub struct JointConfig {
     /// Experimental: log softmax on CPU
     #[serde(default)]
     pub experimental_fuse_loss_wer: Option<bool>,
+
+    /// Nested jointnet config (NeMo style)
+    #[serde(default)]
+    pub jointnet: Option<JointNetConfig>,
+}
+
+/// Nested joint network config (inside joint.jointnet in NeMo config).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JointNetConfig {
+    /// Joint network hidden dimension
+    #[serde(default = "default_joint_hidden")]
+    pub joint_hidden: usize,
+
+    /// Activation function
+    #[serde(default = "default_joint_activation")]
+    pub activation: String,
+
+    /// Dropout rate
+    #[serde(default)]
+    pub dropout: Option<f32>,
+
+    /// Encoder hidden dimension
+    #[serde(default)]
+    pub encoder_hidden: Option<usize>,
+
+    /// Prediction network hidden dimension
+    #[serde(default)]
+    pub pred_hidden: Option<usize>,
+}
+
+impl Default for JointNetConfig {
+    fn default() -> Self {
+        Self {
+            joint_hidden: 640,
+            activation: "relu".to_string(),
+            dropout: None,
+            encoder_hidden: None,
+            pred_hidden: None,
+        }
+    }
+}
+
+impl JointConfig {
+    /// Get the effective joint hidden dimension (from jointnet if present).
+    pub fn effective_joint_hidden(&self) -> usize {
+        self.jointnet
+            .as_ref()
+            .map(|jn| jn.joint_hidden)
+            .unwrap_or(self.joint_hidden)
+    }
+
+    /// Get the effective activation function.
+    pub fn effective_activation(&self) -> &str {
+        self.jointnet
+            .as_ref()
+            .map(|jn| jn.activation.as_str())
+            .unwrap_or(&self.activation)
+    }
+
+    /// Get the effective encoder hidden dimension.
+    pub fn effective_encoder_hidden(&self) -> Option<usize> {
+        self.jointnet
+            .as_ref()
+            .and_then(|jn| jn.encoder_hidden)
+            .or(self.encoder_hidden)
+    }
+
+    /// Get the effective pred hidden dimension.
+    pub fn effective_pred_hidden(&self) -> Option<usize> {
+        self.jointnet
+            .as_ref()
+            .and_then(|jn| jn.pred_hidden)
+            .or(self.pred_hidden)
+    }
 }
 
 fn default_joint_hidden() -> usize {
@@ -403,6 +499,7 @@ impl Default for JointConfig {
             fuse_loss_wer: None,
             fused_batch_size: None,
             experimental_fuse_loss_wer: None,
+            jointnet: None,
         }
     }
 }
