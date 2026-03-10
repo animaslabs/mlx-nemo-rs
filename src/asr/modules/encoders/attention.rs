@@ -157,6 +157,9 @@ pub struct RelPositionMultiHeadAttention {
     pos_bias_u: Array,
     /// Position bias for position attention [n_heads, head_dim]
     pos_bias_v: Array,
+
+    /// Cache drop size for streaming (frames to drop from cache per step)
+    pub cache_drop_size: usize,
 }
 
 impl RelPositionMultiHeadAttention {
@@ -190,7 +193,18 @@ impl RelPositionMultiHeadAttention {
             linear_pos,
             pos_bias_u,
             pos_bias_v,
+            cache_drop_size: 0,
         })
+    }
+
+    /// Get head dimension.
+    pub fn head_dim(&self) -> usize {
+        self.head_dim
+    }
+
+    /// Get number of heads.
+    pub fn n_heads(&self) -> usize {
+        self.n_heads
     }
 
     /// Forward pass with relative positional attention.
@@ -277,37 +291,188 @@ impl RelPositionMultiHeadAttention {
         Ok(output)
     }
 
+    /// Forward pass with cache support for streaming inference.
+    ///
+    /// # Arguments
+    /// * `x` - Input tensor [batch, seq_len, d_model]
+    /// * `pos_emb` - Positional embeddings [1, 2*total_len-1, d_model] where total_len = cache_len + seq_len
+    /// * `cache` - Optional cache tensor [batch, cache_len, d_model] containing previous key/value states
+    /// * `att_mask` - Optional attention mask [batch, seq_len, total_len]
+    ///
+    /// # Returns
+    /// * Output tensor [batch, seq_len, d_model]
+    /// * Updated cache tensor [batch, new_cache_len, d_model] (if cache was provided)
+    pub fn forward_with_cache(
+        &mut self,
+        x: &Array,
+        pos_emb: &Array,
+        cache: Option<&Array>,
+        att_mask: Option<&Array>,
+    ) -> Result<(Array, Option<Array>)> {
+        let batch_size = x.dim(0) as i32;
+        let seq_len = x.dim(1) as i32;
+        let n_heads = self.n_heads as i32;
+        let head_dim = self.head_dim as i32;
+
+        // Project Q, K, V from current input
+        let q = self.linear_q.forward(x)?;
+        let mut k = self.linear_k.forward(x)?;
+        let mut v = self.linear_v.forward(x)?;
+
+        // Handle cache: concatenate with current K, V
+        let (total_len, new_cache) = if let Some(cache_tensor) = cache {
+            let cache_len = cache_tensor.dim(1) as i32;
+
+            if cache_len > 0 {
+                // Project cache through K, V (cache contains raw hidden states)
+                let cache_k = self.linear_k.forward(cache_tensor)?;
+                let cache_v = self.linear_v.forward(cache_tensor)?;
+
+                // Concatenate: [batch, cache_len + seq_len, d_model]
+                k = ops::concatenate_axis(&[&cache_k, &k], 1)?;
+                v = ops::concatenate_axis(&[&cache_v, &v], 1)?;
+
+                let total = cache_len + seq_len;
+
+                // Update cache: keep cache_len frames, drop cache_drop_size, add query states
+                // new_cache = concat(cache[cache_drop_size:], x[:, :keep_size, :])
+                let keep_size = (seq_len - self.cache_drop_size as i32).max(0);
+                let new_cache = if self.cache_drop_size > 0 {
+                    let cache_keep = cache_tensor.index((.., self.cache_drop_size as i32.., ..));
+                    if keep_size > 0 {
+                        let x_keep = x.index((.., ..keep_size, ..));
+                        ops::concatenate_axis(&[&cache_keep, &x_keep], 1)?
+                    } else {
+                        cache_keep
+                    }
+                } else {
+                    // No drop, just append
+                    ops::concatenate_axis(&[cache_tensor, x], 1)?
+                };
+
+                (total, Some(new_cache))
+            } else {
+                // Cache tensor exists but is empty - start fresh
+                let keep_size = (seq_len - self.cache_drop_size as i32).max(0);
+                let new_cache = if keep_size > 0 {
+                    x.index((.., ..keep_size, ..))
+                } else {
+                    ops::zeros::<f32>(&[batch_size, 0, x.dim(2) as i32])?
+                };
+                (seq_len, Some(new_cache))
+            }
+        } else {
+            // No cache at all - first chunk, start building cache
+            let keep_size = (seq_len - self.cache_drop_size as i32).max(0);
+            let new_cache = if keep_size > 0 {
+                x.index((.., ..keep_size, ..))
+            } else {
+                ops::zeros::<f32>(&[batch_size, 0, x.dim(2) as i32])?
+            };
+            (seq_len, Some(new_cache))
+        };
+
+        // Reshape Q to multi-head: [batch, seq_len, n_heads, head_dim]
+        let q = q.reshape(&[batch_size, seq_len, n_heads, head_dim])?;
+        // Reshape K, V to multi-head: [batch, total_len, n_heads, head_dim]
+        let k = k.reshape(&[batch_size, total_len, n_heads, head_dim])?;
+        let v = v.reshape(&[batch_size, total_len, n_heads, head_dim])?;
+
+        // Transpose to [batch, n_heads, len, head_dim]
+        let q = ops::transpose_axes(&q, &[0, 2, 1, 3])?;
+        let k = ops::transpose_axes(&k, &[0, 2, 1, 3])?;
+        let v = ops::transpose_axes(&v, &[0, 2, 1, 3])?;
+
+        // Project positional embeddings
+        let p = self.linear_pos.forward(pos_emb)?;
+        let pos_len = pos_emb.dim(1) as i32;
+        let p = p.reshape(&[1, pos_len, n_heads, head_dim])?;
+        let p = ops::transpose_axes(&p, &[0, 2, 1, 3])?;
+
+        // Add position biases to query
+        let bias_u = self.pos_bias_u.reshape(&[1, n_heads, 1, head_dim])?;
+        let bias_v = self.pos_bias_v.reshape(&[1, n_heads, 1, head_dim])?;
+        let q_with_bias_u = &q + &bias_u;
+        let q_with_bias_v = &q + &bias_v;
+
+        // Content attention: (Q + u) @ K^T -> [batch, n_heads, seq_len, total_len]
+        let k_t = ops::transpose_axes(&k, &[0, 1, 3, 2])?;
+        let matrix_ac = ops::matmul(&q_with_bias_u, &k_t)?;
+
+        // Position attention: (Q + v) @ P^T
+        let p_t = ops::transpose_axes(&p, &[0, 1, 3, 2])?;
+        let matrix_bd = ops::matmul(&q_with_bias_v, &p_t)?;
+
+        // Apply rel_shift and truncate to total_len
+        let matrix_bd = Self::rel_shift(&matrix_bd)?;
+        let matrix_bd = matrix_bd.index((.., .., .., ..total_len));
+
+        // Combine and scale
+        let scale = (head_dim as f32).sqrt();
+        let mut scores = (&matrix_ac + &matrix_bd) / Array::from_f32(scale);
+
+        // Apply attention mask if provided
+        if let Some(mask) = att_mask {
+            // mask: [batch, seq_len, total_len] -> [batch, 1, seq_len, total_len]
+            let mask = mask.reshape(&[batch_size, 1, seq_len, total_len])?;
+            // Where mask is True (padding), set score to -inf
+            let neg_inf = Array::from_f32(f32::NEG_INFINITY);
+            scores = ops::r#where(&mask, &neg_inf, &scores)?;
+        }
+
+        // Softmax
+        let attn_weights = ops::softmax_axis(&scores, -1, None)?;
+
+        // Apply attention to values: [batch, n_heads, seq_len, head_dim]
+        let context = ops::matmul(&attn_weights, &v)?;
+
+        // Transpose back: [batch, seq_len, n_heads, head_dim]
+        let context = ops::transpose_axes(&context, &[0, 2, 1, 3])?;
+
+        // Reshape: [batch, seq_len, d_model]
+        let context = context.reshape(&[batch_size, seq_len, self.d_model as i32])?;
+
+        // Output projection
+        let output = self.linear_out.forward(&context)?;
+
+        Ok((output, new_cache))
+    }
+
     /// Relative shift operation to align position attention scores.
     ///
     /// Transforms position attention from shape where each row has positions
     /// [L-1, L-2, ..., 0, ..., -(L-1)] to a skewed matrix where row i has
     /// the correct relative positions to keys 0..L.
     ///
+    /// This follows NeMo's implementation which handles variable position lengths
+    /// (important for streaming where pos_len = 2*total_len-1 != 2*seq_len-1).
+    ///
     /// # Arguments
-    /// * `x` - Position attention scores [batch, n_heads, seq_len, 2*seq_len-1]
+    /// * `x` - Position attention scores [batch, n_heads, seq_len, pos_len]
     ///
     /// # Returns
-    /// Shifted scores [batch, n_heads, seq_len, 2*seq_len-1]
+    /// Shifted scores [batch, n_heads, seq_len, pos_len]
     fn rel_shift(x: &Array) -> Result<Array> {
         let shape = x.shape();
         let batch = shape[0] as i32;
         let n_heads = shape[1] as i32;
         let seq_len = shape[2] as i32;
-        let pos_len = shape[3] as i32; // 2*seq_len - 1
+        let pos_len = shape[3] as i32;
 
         // Step 1: Pad with zeros on the left of last dimension
-        // [batch, n_heads, seq_len, 2*seq_len-1] -> [batch, n_heads, seq_len, 2*seq_len]
+        // [batch, n_heads, seq_len, pos_len] -> [batch, n_heads, seq_len, pos_len+1]
         let zeros = ops::zeros::<f32>(&[batch, n_heads, seq_len, 1])?;
         let x_padded = ops::concatenate_axis(&[&zeros, x], -1)?;
 
-        // Step 2: Reshape to [batch, n_heads, 2*seq_len, seq_len]
-        let x_reshaped = x_padded.reshape(&[batch, n_heads, 2 * seq_len, seq_len])?;
+        // Step 2: Reshape to [batch, n_heads, pos_len+1, seq_len]
+        // This is a transposition-via-reshape that shifts positions
+        let x_reshaped = x_padded.reshape(&[batch, n_heads, pos_len + 1, seq_len])?;
 
         // Step 3: Slice from index 1 in dimension 2 (skip first row)
-        // [batch, n_heads, 2*seq_len, seq_len] -> [batch, n_heads, 2*seq_len-1, seq_len]
+        // [batch, n_heads, pos_len+1, seq_len] -> [batch, n_heads, pos_len, seq_len]
         let x_sliced = x_reshaped.index((.., .., 1.., ..));
 
-        // Step 4: Reshape back to [batch, n_heads, seq_len, 2*seq_len-1]
+        // Step 4: Reshape back to [batch, n_heads, seq_len, pos_len]
         let x_shifted = x_sliced.reshape(&[batch, n_heads, seq_len, pos_len])?;
 
         Ok(x_shifted)

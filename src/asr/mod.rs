@@ -31,11 +31,16 @@ pub mod config;
 pub mod decoding;
 pub mod models;
 pub mod modules;
+pub mod streaming;
 
 // Re-exports
 pub use config::*;
-pub use models::{DebugOutput, EncDecCTCModel, EncDecRNNTModel, RnntDecodingStrategy};
+pub use models::{
+    CtcStreamingSession, DebugOutput, EncDecCTCModel, EncDecRNNTModel, RnntDecodingStrategy,
+    RnntStreamingSession,
+};
 pub use modules::MelSpectrogram;
+pub use streaming::{EncoderCache, MelBuffer, StreamingConfig, StreamingModeInfo, StreamingOutput};
 
 /// Prelude for convenient imports.
 pub mod prelude {

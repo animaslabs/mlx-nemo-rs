@@ -7,5 +7,7 @@
 mod enc_dec_ctc;
 mod enc_dec_rnnt;
 
-pub use enc_dec_ctc::{DebugOutput, EncDecCTCModel};
-pub use enc_dec_rnnt::{DecoderState, EncDecRNNTModel, PredictionNetwork, RnntDecodingStrategy};
+pub use enc_dec_ctc::{CtcStreamingSession, DebugOutput, EncDecCTCModel};
+pub use enc_dec_rnnt::{
+    DecoderState, EncDecRNNTModel, PredictionNetwork, RnntDecodingStrategy, RnntStreamingSession,
+};

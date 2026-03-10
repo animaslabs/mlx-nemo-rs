@@ -223,6 +223,194 @@ impl ConformerEncoder {
 
         Ok(())
     }
+
+    // ==================== Streaming Support ====================
+
+    /// Check if this encoder supports streaming inference.
+    pub fn supports_streaming(&self) -> bool {
+        self.config.is_streaming()
+    }
+
+    /// Get the encoder configuration.
+    pub fn config(&self) -> &EncoderConfig {
+        &self.config
+    }
+
+    /// Get the number of layers.
+    pub fn num_layers(&self) -> usize {
+        self.layers.len()
+    }
+
+    /// Get the model dimension.
+    pub fn d_model(&self) -> usize {
+        self.config.d_model
+    }
+
+    /// Get convolution cache size (kernel_size - 1).
+    pub fn conv_cache_size(&self) -> usize {
+        if !self.layers.is_empty() {
+            self.layers[0].conv_cache_size()
+        } else {
+            0
+        }
+    }
+
+    /// Setup streaming parameters and update layer cache drop sizes.
+    ///
+    /// This should be called before streaming inference to configure
+    /// the cache drop behavior for attention and convolution layers.
+    pub fn setup_streaming(&mut self, cache_drop_size: usize) {
+        for layer in &mut self.layers {
+            layer.self_attn.cache_drop_size = cache_drop_size;
+            layer.conv.cache_drop_size = cache_drop_size;
+        }
+    }
+
+    /// Forward pass with streaming cache support.
+    ///
+    /// # Arguments
+    /// * `features` - Input features [batch, features, time]
+    /// * `lengths` - Sequence lengths [batch]
+    /// * `cache_last_channel` - MHA cache [num_layers, batch, cache_len, d_model]
+    /// * `cache_last_time` - Conv cache [num_layers, batch, d_model, time_cache]
+    /// * `cache_last_channel_len` - Cache fill level [batch]
+    ///
+    /// # Returns
+    /// * Encoded features [batch, d_model, time']
+    /// * Output lengths [batch]
+    /// * Updated MHA cache
+    /// * Updated conv cache
+    /// * Updated cache fill level
+    pub fn forward_streaming(
+        &mut self,
+        features: &Array,
+        lengths: &Array,
+        cache_last_channel: &Array,
+        cache_last_time: &Array,
+        cache_last_channel_len: &Array,
+    ) -> Result<(Array, Array, Array, Array, Array)> {
+        // Transpose from [B, F, T] to [B, T, F] for processing
+        let x = mlx_rs::ops::transpose_axes(features, &[0, 2, 1])?;
+
+        // Subsampling
+        let (mut x, lengths) = self.subsampling.forward(&x, lengths)?;
+
+        // Scale input by sqrt(d_model) if xscaling is enabled
+        let xscale = self.pos_enc.xscale();
+        if xscale != 1.0 {
+            x = &x * Array::from_f32(xscale);
+        }
+
+        let seq_len = x.dim(1);
+        let cache_size = cache_last_channel.dim(2); // Allocated cache size
+
+        // Get the actual filled cache length (use first batch element, assume all same)
+        cache_last_channel_len.eval()?;
+        let filled_cache_len = cache_last_channel_len.as_slice::<i64>()[0].max(0) as i32;
+
+        // Total length is filled cache + new sequence
+        let total_len = filled_cache_len + seq_len;
+
+        // Generate positional encoding for the total length (filled cache + current)
+        let pos_emb = self.pos_enc.get_encoding(total_len as usize)?;
+
+        // Initialize output caches
+        let mut cache_channel_next = Vec::with_capacity(self.layers.len());
+        let mut cache_time_next = Vec::with_capacity(self.layers.len());
+
+        // Process through conformer blocks with cache
+        for (layer_idx, layer) in self.layers.iter_mut().enumerate() {
+            // Extract per-layer cache: [batch, cache_size, d_model] and [batch, d_model, time_cache]
+            let layer_cache_channel_full = cache_last_channel.index((layer_idx as i32, .., .., ..));
+            let layer_cache_time = cache_last_time.index((layer_idx as i32, .., .., ..));
+
+            // Only use the filled portion of the channel cache
+            // Cache is stored with newest at the end, so we take the last `filled_cache_len` frames
+            let cache_start = (cache_size - filled_cache_len).max(0);
+            let layer_cache_channel = if filled_cache_len > 0 {
+                layer_cache_channel_full.index((.., cache_start.., ..))
+            } else {
+                // Empty cache - create empty tensor with right shape
+                mlx_rs::ops::zeros::<f32>(&[x.dim(0) as i32, 0, x.dim(2) as i32])?
+            };
+
+            let (x_out, new_channel, new_time) = layer.forward_with_cache(
+                &x,
+                &pos_emb,
+                if filled_cache_len > 0 {
+                    Some(&layer_cache_channel)
+                } else {
+                    None
+                },
+                // Only pass time cache if we have some context (not the first chunk)
+                // On first chunk, the conv module should apply its own causal padding
+                if filled_cache_len > 0 {
+                    Some(&layer_cache_time)
+                } else {
+                    None
+                },
+                None, // att_mask
+            )?;
+
+            x = x_out;
+
+            // For the output cache, we need to maintain the full cache size
+            // The layer returns cache of size [batch, filled_len + seq_len - drop_size, d_model]
+            // We need to pad or truncate to cache_size
+            if let Some(nc) = new_channel {
+                let nc_len = nc.dim(1);
+                let padded_cache = if nc_len < cache_size {
+                    // Pad with zeros on the left
+                    let pad_size = cache_size - nc_len;
+                    let zeros =
+                        mlx_rs::ops::zeros::<f32>(&[nc.dim(0) as i32, pad_size, nc.dim(2) as i32])?;
+                    mlx_rs::ops::concatenate_axis(&[&zeros, &nc], 1)?
+                } else if nc_len > cache_size {
+                    // Truncate from the left (keep newest)
+                    let start = nc_len - cache_size;
+                    nc.index((.., start.., ..))
+                } else {
+                    nc
+                };
+                cache_channel_next.push(padded_cache);
+            }
+            if let Some(nt) = new_time {
+                cache_time_next.push(nt);
+            }
+        }
+
+        // Transpose back to [B, D, T]
+        let x = mlx_rs::ops::transpose_axes(&x, &[0, 2, 1])?;
+
+        // Stack caches: [num_layers, batch, ...]
+        let cache_channel_next = if !cache_channel_next.is_empty() {
+            let refs: Vec<&Array> = cache_channel_next.iter().collect();
+            mlx_rs::ops::stack_axis(&refs, 0)?
+        } else {
+            cache_last_channel.clone()
+        };
+
+        let cache_time_next = if !cache_time_next.is_empty() {
+            let refs: Vec<&Array> = cache_time_next.iter().collect();
+            mlx_rs::ops::stack_axis(&refs, 0)?
+        } else {
+            cache_last_time.clone()
+        };
+
+        // Update cache length: clamp(old_len + seq_len, max=cache_size)
+        let cache_channel_len_next = mlx_rs::ops::clip(
+            &(cache_last_channel_len + &Array::from_int(seq_len as i32)),
+            ((), &Array::from_int(cache_size)),
+        )?;
+
+        Ok((
+            x,
+            lengths,
+            cache_channel_next,
+            cache_time_next,
+            cache_channel_len_next,
+        ))
+    }
 }
 
 /// Helper to load Conv2d weights
@@ -592,6 +780,68 @@ impl ConformerBlock {
         Ok(x)
     }
 
+    /// Forward pass with cache support for streaming inference.
+    ///
+    /// # Arguments
+    /// * `x` - Input tensor [batch, seq_len, d_model]
+    /// * `pos_emb` - Positional embeddings
+    /// * `cache_last_channel` - Optional MHA cache [batch, cache_len, d_model]
+    /// * `cache_last_time` - Optional conv cache [batch, d_model, time_cache]
+    /// * `att_mask` - Optional attention mask
+    ///
+    /// # Returns
+    /// * Output tensor [batch, seq_len, d_model]
+    /// * Updated MHA cache
+    /// * Updated conv cache
+    fn forward_with_cache(
+        &mut self,
+        x: &Array,
+        pos_emb: &Array,
+        cache_last_channel: Option<&Array>,
+        cache_last_time: Option<&Array>,
+        att_mask: Option<&Array>,
+    ) -> Result<(Array, Option<Array>, Option<Array>)> {
+        // Feed-forward 1 (half-step residual)
+        let residual = x.clone();
+        let ff1_out = self.ff1_norm.forward(x)?;
+        let ff1_out = self.ff1.forward(&ff1_out)?;
+        let half = Array::from_f32(0.5);
+        let scaled_ff1 = &half * &ff1_out;
+        let x = &residual + &scaled_ff1;
+
+        // Self-attention with cache
+        let residual = x.clone();
+        let attn_out = self.self_attn_norm.forward(&x)?;
+        let (attn_out, new_cache_channel) =
+            self.self_attn
+                .forward_with_cache(&attn_out, pos_emb, cache_last_channel, att_mask)?;
+        let x = &residual + &attn_out;
+
+        // Convolution with cache
+        let residual = x.clone();
+        let conv_out = self.conv_norm.forward(&x)?;
+        let (conv_out, new_cache_time) =
+            self.conv.forward_with_cache(&conv_out, cache_last_time)?;
+        let x = &residual + &conv_out;
+
+        // Feed-forward 2 (half-step residual)
+        let residual = x.clone();
+        let ff2_out = self.ff2_norm.forward(&x)?;
+        let ff2_out = self.ff2.forward(&ff2_out)?;
+        let scaled_ff2 = &half * &ff2_out;
+        let x = &residual + &scaled_ff2;
+
+        // Final layer norm
+        let x = self.final_norm.forward(&x)?;
+
+        Ok((x, new_cache_channel, new_cache_time))
+    }
+
+    /// Get the convolution cache size for this block.
+    fn conv_cache_size(&self) -> usize {
+        self.conv.cache_size()
+    }
+
     fn load_weights(&mut self, weights: &HashMap<String, Array>, prefix: &str) -> Result<()> {
         // Load feed-forward 1 (NeMo uses "feed_forward1" not "ff1")
         self.ff1
@@ -698,6 +948,8 @@ struct ConvolutionModule {
     is_causal: bool,
     /// Kernel size for causal padding calculation
     kernel_size: usize,
+    /// Cache drop size for streaming
+    pub cache_drop_size: usize,
 }
 
 impl ConvolutionModule {
@@ -742,6 +994,7 @@ impl ConvolutionModule {
             norm,
             is_causal,
             kernel_size,
+            cache_drop_size: 0,
         })
     }
 
@@ -785,6 +1038,78 @@ impl ConvolutionModule {
         let x = self.pointwise_conv2.forward(&x)?;
 
         Ok(x)
+    }
+
+    /// Forward pass with cache support for streaming inference.
+    ///
+    /// # Arguments
+    /// * `x` - Input tensor [batch, seq_len, d_model]
+    /// * `cache` - Optional cache tensor [batch, d_model, cache_len] for left context
+    ///
+    /// # Returns
+    /// * Output tensor [batch, seq_len, d_model]
+    /// * Updated cache tensor [batch, d_model, new_cache_len] (if cache was provided)
+    fn forward_with_cache(
+        &mut self,
+        x: &Array,
+        cache: Option<&Array>,
+    ) -> Result<(Array, Option<Array>)> {
+        // Pointwise conv 1 with GLU activation
+        let x = self.pointwise_conv1.forward(x)?;
+
+        // GLU: split in half along channel dim
+        let d_model = self.d_model as i32;
+        let x1 = x.index((.., .., ..d_model));
+        let x2 = x.index((.., .., d_model..));
+        let sigmoid_x2 = mlx_rs::ops::sigmoid(&x2)?;
+        let x = &x1 * &sigmoid_x2;
+
+        // For streaming: use cache instead of padding
+        let (x, new_cache) = if let Some(cache_tensor) = cache {
+            // cache: [batch, d_model, cache_len]
+            // x after GLU: [batch, seq_len, d_model]
+            // Need to transpose x to [batch, d_model, seq_len] for concatenation
+            let x_transposed = mlx_rs::ops::transpose_axes(&x, &[0, 2, 1])?;
+
+            // Concatenate: [batch, d_model, cache_len + seq_len]
+            let x_with_cache = mlx_rs::ops::concatenate_axis(&[cache_tensor, &x_transposed], 2)?;
+
+            // Update cache: keep the last (kernel_size - 1) frames
+            let cache_size = self.kernel_size - 1;
+            let total_len = x_with_cache.dim(2) as usize;
+            let cache_start = total_len.saturating_sub(cache_size);
+            let new_cache = x_with_cache.index((.., .., cache_start as i32..));
+
+            // Transpose back to [batch, total_len, d_model] for conv
+            let x_for_conv = mlx_rs::ops::transpose_axes(&x_with_cache, &[0, 2, 1])?;
+
+            (x_for_conv, Some(new_cache))
+        } else if self.is_causal {
+            // No cache but causal: pad on the left
+            let pad_size = self.kernel_size - 1;
+            let batch = x.dim(0);
+            let d = x.dim(2);
+            let zeros = mlx_rs::ops::zeros::<f32>(&[batch as i32, pad_size as i32, d as i32])?;
+            let x_padded = mlx_rs::ops::concatenate_axis(&[&zeros, &x], 1)?;
+            (x_padded, None)
+        } else {
+            (x, None)
+        };
+
+        // Depthwise conv (no additional padding needed when using cache)
+        let x = self.depthwise_conv.forward(&x)?;
+        let x = self.norm.forward(&x)?;
+        let x = mlx_rs::nn::silu(&x)?;
+
+        // Pointwise conv 2
+        let x = self.pointwise_conv2.forward(&x)?;
+
+        Ok((x, new_cache))
+    }
+
+    /// Get the cache size needed for this convolution module.
+    fn cache_size(&self) -> usize {
+        self.kernel_size - 1
     }
 
     fn load_weights(&mut self, weights: &HashMap<String, Array>, prefix: &str) -> Result<()> {

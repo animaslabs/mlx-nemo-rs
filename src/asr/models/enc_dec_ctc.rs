@@ -2,6 +2,35 @@
 //!
 //! This model implements the CTC-based ASR architecture used by
 //! NeMo's EncDecCTCModel and EncDecCTCModelBPE.
+//!
+//! # Streaming Support
+//!
+//! For streaming-capable models (e.g., Nemotron), this module provides
+//! cache-aware streaming inference:
+//!
+//! ```rust,ignore
+//! let mut model = EncDecCTCModel::restore("model.nemo")?;
+//!
+//! // Check streaming support and modes
+//! if model.supports_streaming() {
+//!     for mode in model.streaming_modes() {
+//!         println!("Mode {}: {}ms latency", mode.mode_idx, mode.latency_ms);
+//!     }
+//!
+//!     // Initialize streaming session
+//!     let mut session = model.init_streaming(0, 1)?;
+//!
+//!     // Process audio chunks
+//!     while let Some(chunk) = audio_source.next_chunk() {
+//!         let output = model.process_chunk(&mut session, &chunk)?;
+//!         print!("{}", output.text[0]);
+//!     }
+//!
+//!     // Finalize
+//!     let final_output = model.finalize_streaming(session)?;
+//!     println!("{}", final_output.text[0]);
+//! }
+//! ```
 
 use std::path::Path;
 
@@ -9,8 +38,12 @@ use mlx_rs::Array;
 use sentencepiece::SentencePieceProcessor;
 
 use crate::asr::config::AsrModelConfig;
-use crate::asr::decoding::greedy_decode;
+use crate::asr::decoding::{greedy_ctc_merge, greedy_decode, lcs_merge_buffer};
 use crate::asr::modules::{CTCDecoder, ConformerEncoder, MelSpectrogram};
+use crate::asr::streaming::{
+    compute_streaming_config, get_streaming_modes, EncoderCache, MelBuffer, StreamingConfig,
+    StreamingModeInfo, StreamingOutput,
+};
 use crate::core::checkpoint::NemoCheckpoint;
 use crate::core::config::from_yaml_str;
 use crate::core::error::{Error, Result};
@@ -308,6 +341,269 @@ impl EncDecCTCModel {
     pub fn preprocessor(&self) -> &MelSpectrogram {
         &self.preprocessor
     }
+
+    // ==================== Streaming API ====================
+
+    /// Check if this model supports streaming inference.
+    ///
+    /// Returns true if the encoder has streaming configuration
+    /// (chunked_limited attention style).
+    pub fn supports_streaming(&self) -> bool {
+        self.encoder.supports_streaming()
+    }
+
+    /// Get available streaming modes with latency information.
+    ///
+    /// Each mode represents a different latency/accuracy tradeoff.
+    /// Lower mode indices typically have higher latency but better accuracy.
+    pub fn streaming_modes(&self) -> Vec<StreamingModeInfo> {
+        // Frame duration in ms (after subsampling)
+        let frame_duration_ms = self.config.preprocessor.window_stride
+            * 1000.0
+            * self.encoder.subsampling_factor() as f32;
+
+        get_streaming_modes(self.encoder.config(), frame_duration_ms)
+    }
+
+    /// Initialize a streaming session for the given mode.
+    ///
+    /// # Arguments
+    /// * `mode_idx` - Streaming mode index (0 = default, typically lowest latency)
+    /// * `batch_size` - Number of independent audio streams to process
+    ///
+    /// # Returns
+    /// A `CtcStreamingSession` containing the initial cache state
+    pub fn init_streaming(
+        &mut self,
+        mode_idx: usize,
+        batch_size: usize,
+    ) -> Result<CtcStreamingSession> {
+        if !self.supports_streaming() {
+            return Err(Error::config(
+                "Model does not support streaming. Use a streaming-capable model like Nemotron.",
+            ));
+        }
+
+        // Compute streaming configuration
+        let config = compute_streaming_config(self.encoder.config(), mode_idx, 10000)?;
+
+        // Setup encoder with cache drop size
+        self.encoder.setup_streaming(config.cache_drop_size);
+
+        // Create initial encoder cache
+        let encoder_cache = EncoderCache::new(
+            self.encoder.num_layers(),
+            batch_size,
+            config.last_channel_cache_size,
+            config.last_time_cache_size,
+            self.encoder.d_model(),
+        )?;
+
+        // Create mel buffer
+        let preprocessor_config = self.preprocessor.config();
+        let mel_buffer = MelBuffer::new(
+            preprocessor_config.sample_rate,
+            preprocessor_config.window_size,
+            preprocessor_config.window_stride,
+            preprocessor_config.features,
+        );
+
+        Ok(CtcStreamingSession {
+            config,
+            encoder_cache,
+            mel_buffer,
+            prev_tokens: vec![Vec::new(); batch_size],
+            is_first_chunk: true,
+            blank_id: self.blank_id,
+        })
+    }
+
+    /// Process an audio chunk and return partial transcription.
+    ///
+    /// # Arguments
+    /// * `session` - Mutable reference to the streaming session
+    /// * `audio_chunk` - Audio samples [batch, samples] or [samples] for single stream
+    ///
+    /// # Returns
+    /// Streaming output with partial tokens and text
+    pub fn process_chunk(
+        &mut self,
+        session: &mut CtcStreamingSession,
+        audio_chunk: &[f32],
+    ) -> Result<StreamingOutput> {
+        let batch_size = session.encoder_cache.batch_size();
+
+        // Add audio to buffer
+        session.mel_buffer.add_audio(audio_chunk);
+
+        // Check if we have enough audio for a chunk
+        let chunk_samples = session.config.chunk_size_for_step(session.is_first_chunk)
+            * self.preprocessor.hop_length();
+
+        if session.mel_buffer.audio_buffer.len() < chunk_samples {
+            // Not enough audio yet
+            return Ok(StreamingOutput::default());
+        }
+
+        // Extract audio for this chunk
+        let audio_data = session
+            .mel_buffer
+            .consume_frames(session.config.chunk_size_for_step(session.is_first_chunk));
+
+        // Convert to Array
+        let audio = Array::from_slice(&audio_data, &[1, audio_data.len() as i32]);
+
+        // Compute mel features (without normalization for streaming)
+        let features = self.preprocessor.forward_unnormalized(&audio)?;
+
+        // For streaming, we use buffer-based normalization
+        // Get running stats and normalize
+        let (mean, std) = session.mel_buffer.get_norm_stats();
+        let mean_arr = Array::from_slice(&mean, &[session.mel_buffer.n_mels as i32]);
+        let std_arr = Array::from_slice(&std, &[session.mel_buffer.n_mels as i32]);
+
+        // Update running stats with new features
+        features.eval()?;
+        let features_flat: Vec<f32> = features.as_slice().to_vec();
+        session.mel_buffer.update_stats(&features_flat);
+
+        // Normalize with running stats (or skip if not enough data)
+        let features = if session.mel_buffer.frames_processed > 10 {
+            self.preprocessor
+                .normalize_with_stats(&features, &mean_arr, &std_arr)?
+        } else {
+            features
+        };
+
+        // Get lengths
+        let seq_len = features.dim(2);
+        let lengths = Array::from_slice(&[seq_len as i32], &[1]);
+
+        // Run encoder with cache
+        let (encoded, encoded_lengths, cache_channel_next, cache_time_next, cache_len_next) =
+            self.encoder.forward_streaming(
+                &features,
+                &lengths,
+                &session.encoder_cache.last_channel,
+                &session.encoder_cache.last_time,
+                &session.encoder_cache.last_channel_len,
+            )?;
+
+        // Update cache
+        session.encoder_cache.last_channel = cache_channel_next;
+        session.encoder_cache.last_time = cache_time_next;
+        session.encoder_cache.last_channel_len = cache_len_next;
+
+        // Decode to log probabilities
+        let log_probs = self.decoder.forward(&encoded)?;
+
+        // Greedy decode
+        let token_sequences = greedy_decode(&log_probs, &encoded_lengths, self.blank_id)?;
+
+        // Merge with previous tokens using LCS
+        let delay = session.config.lookahead_frames;
+        let mut merged_tokens = Vec::with_capacity(batch_size);
+        let mut texts = Vec::with_capacity(batch_size);
+
+        for (i, new_tokens) in token_sequences.into_iter().enumerate() {
+            let merged = lcs_merge_buffer(&session.prev_tokens[i], &new_tokens, delay, 5, 1);
+
+            // Collapse CTC output
+            let collapsed = greedy_ctc_merge(&merged, session.blank_id);
+
+            // Decode to text
+            let text = if let Some(tokenizer) = &self.tokenizer {
+                let token_ids: Vec<u32> = collapsed.iter().map(|&t| t as u32).collect();
+                tokenizer.decode_piece_ids(&token_ids).unwrap_or_default()
+            } else {
+                String::new()
+            };
+
+            session.prev_tokens[i] = merged;
+            merged_tokens.push(collapsed);
+            texts.push(text);
+        }
+
+        session.is_first_chunk = false;
+
+        Ok(StreamingOutput {
+            log_probs: Some(log_probs),
+            tokens: merged_tokens,
+            text: texts,
+            is_final: false,
+        })
+    }
+
+    /// Finalize streaming and get final transcription.
+    ///
+    /// Processes any remaining audio in the buffer and returns
+    /// the complete transcription.
+    pub fn finalize_streaming(
+        &mut self,
+        mut session: CtcStreamingSession,
+    ) -> Result<StreamingOutput> {
+        // Process any remaining audio in the buffer
+        if !session.mel_buffer.audio_buffer.is_empty() {
+            // Pad to minimum chunk size if needed
+            let min_samples = self.preprocessor.window_length();
+            if session.mel_buffer.audio_buffer.len() < min_samples {
+                session.mel_buffer.audio_buffer.resize(min_samples, 0.0);
+            }
+
+            // Process final chunk
+            let remaining: Vec<f32> = session.mel_buffer.audio_buffer.drain(..).collect();
+            let _ = self.process_chunk(&mut session, &remaining)?;
+        }
+
+        // Final decode of accumulated tokens
+        let batch_size = session.prev_tokens.len();
+        let mut final_tokens = Vec::with_capacity(batch_size);
+        let mut final_texts = Vec::with_capacity(batch_size);
+
+        for tokens in &session.prev_tokens {
+            let collapsed = greedy_ctc_merge(tokens, session.blank_id);
+
+            let text = if let Some(tokenizer) = &self.tokenizer {
+                let token_ids: Vec<u32> = collapsed.iter().map(|&t| t as u32).collect();
+                tokenizer.decode_piece_ids(&token_ids).unwrap_or_default()
+            } else {
+                String::new()
+            };
+
+            final_tokens.push(collapsed);
+            final_texts.push(text);
+        }
+
+        Ok(StreamingOutput {
+            log_probs: None,
+            tokens: final_tokens,
+            text: final_texts,
+            is_final: true,
+        })
+    }
+}
+
+/// Streaming session state for CTC models.
+///
+/// Contains all state needed for incremental streaming inference.
+pub struct CtcStreamingSession {
+    /// Streaming configuration (chunk sizes, cache sizes, etc.)
+    pub config: StreamingConfig,
+
+    /// Encoder cache state (attention + convolution)
+    pub encoder_cache: EncoderCache,
+
+    /// Audio/feature buffer for mel spectrogram computation
+    pub mel_buffer: MelBuffer,
+
+    /// Previous tokens for each batch sample (for LCS merge)
+    pub prev_tokens: Vec<Vec<usize>>,
+
+    /// Whether this is the first chunk (affects chunk size)
+    pub is_first_chunk: bool,
+
+    /// Blank token ID for CTC decoding
+    blank_id: usize,
 }
 
 /// Load a WAV file and return samples and sample rate.

@@ -143,6 +143,102 @@ impl MelSpectrogram {
         &self.mel_filterbank
     }
 
+    /// Get the configuration.
+    pub fn config(&self) -> &PreprocessorConfig {
+        &self.config
+    }
+
+    /// Get window length in samples.
+    pub fn window_length(&self) -> usize {
+        self.win_length
+    }
+
+    /// Get hop length in samples.
+    pub fn hop_length(&self) -> usize {
+        self.hop_length
+    }
+
+    /// Process audio without normalization (for streaming).
+    ///
+    /// Returns raw log-mel features without per-feature normalization.
+    /// The caller is responsible for applying normalization using running
+    /// statistics.
+    ///
+    /// # Arguments
+    /// * `audio` - Audio waveform tensor [batch, time]
+    ///
+    /// # Returns
+    /// * Raw log-mel features [batch, n_mels, frames]
+    pub fn forward_unnormalized(&self, audio: &Array) -> Result<Array> {
+        // Ensure audio is 2D [batch, time]
+        let audio = if audio.ndim() == 1 {
+            audio.reshape(&[1, -1])?
+        } else {
+            audio.clone()
+        };
+
+        // Apply optional preemphasis
+        let audio = if let Some(coef) = self.config.preemph {
+            self.preemphasis(&audio, coef)?
+        } else {
+            audio
+        };
+
+        // Skip dither for streaming (it's typically only used in training anyway)
+
+        // Compute STFT
+        let stft_result = self.stft(&audio)?;
+
+        // Compute power spectrum
+        let power_spectrum = self.complex_abs_squared(&stft_result)?;
+
+        // Apply Mel filterbank
+        let mel_spec = mlx_rs::ops::einsum(
+            "mf,bft->bmt",
+            &[self.mel_filterbank.clone(), power_spectrum],
+        )?;
+
+        // Apply log with guard for numerical stability
+        let mel_spec = &mel_spec + &Array::from_f32(2.0_f32.powi(-24));
+        let log_mel_spec = mlx_rs::ops::log(&mel_spec)?;
+
+        Ok(log_mel_spec)
+    }
+
+    /// Apply normalization using provided mean and std statistics.
+    ///
+    /// # Arguments
+    /// * `features` - Log-mel features [batch, n_mels, frames]
+    /// * `mean` - Per-feature mean [n_mels] or [1, n_mels, 1]
+    /// * `std` - Per-feature std [n_mels] or [1, n_mels, 1]
+    ///
+    /// # Returns
+    /// * Normalized features [batch, n_mels, frames]
+    pub fn normalize_with_stats(
+        &self,
+        features: &Array,
+        mean: &Array,
+        std: &Array,
+    ) -> Result<Array> {
+        // Ensure mean and std are broadcastable: [1, n_mels, 1]
+        let mean = if mean.ndim() == 1 {
+            mean.reshape(&[1, mean.dim(0) as i32, 1])?
+        } else {
+            mean.clone()
+        };
+        let std = if std.ndim() == 1 {
+            std.reshape(&[1, std.dim(0) as i32, 1])?
+        } else {
+            std.clone()
+        };
+
+        let centered = features - &mean;
+        let std_eps = &std + &Array::from_f32(1e-5);
+        let normalized = &centered / &std_eps;
+
+        Ok(normalized)
+    }
+
     /// Process audio and return BOTH pre-normalized and post-normalized mel spectrograms.
     /// Used for debugging to compare with reference implementations.
     pub fn forward_debug(

@@ -2,16 +2,41 @@
 //!
 //! This model implements the RNN-T (Transducer) ASR architecture used by
 //! NeMo's EncDecRNNTModel and EncDecRNNTBPEModel (Parakeet RNNT models).
+//!
+//! # Streaming Support
+//!
+//! For streaming-capable models, this module provides cache-aware streaming:
+//!
+//! ```rust,ignore
+//! let mut model = EncDecRNNTModel::restore("model.nemo")?;
+//!
+//! // Initialize streaming
+//! let mut session = model.init_streaming(0, 1)?;
+//!
+//! // Process audio chunks
+//! while let Some(chunk) = audio_source.next_chunk() {
+//!     let output = model.process_chunk(&mut session, &chunk)?;
+//!     print!("{}", output.text[0]);
+//! }
+//!
+//! // Finalize
+//! let final_output = model.finalize_streaming(session)?;
+//! ```
 
 use std::collections::HashMap;
 use std::path::Path;
 
+use mlx_rs::ops::indexing::{argmax_axis, IndexOp};
 use mlx_rs::Array;
 use sentencepiece::SentencePieceProcessor;
 
 use crate::asr::config::{AsrModelConfig, JointConfig};
 use crate::asr::modules::{
     ConformerEncoder, LstmState, MelSpectrogram, RNNTDecoder, RNNTJoint, StatelessTransducerDecoder,
+};
+use crate::asr::streaming::{
+    compute_streaming_config, get_streaming_modes, EncoderCache, MelBuffer, StreamingConfig,
+    StreamingModeInfo, StreamingOutput,
 };
 use crate::core::checkpoint::NemoCheckpoint;
 use crate::core::config::from_yaml_str;
@@ -631,6 +656,294 @@ impl EncDecRNNTModel {
     pub fn is_lstm_decoder(&self) -> bool {
         self.decoder.is_lstm()
     }
+
+    // ==================== Streaming API ====================
+
+    /// Check if this model supports streaming inference.
+    pub fn supports_streaming(&self) -> bool {
+        self.encoder.supports_streaming()
+    }
+
+    /// Get available streaming modes with latency information.
+    pub fn streaming_modes(&self) -> Vec<StreamingModeInfo> {
+        let frame_duration_ms = self.config.preprocessor.window_stride
+            * 1000.0
+            * self.encoder.subsampling_factor() as f32;
+        get_streaming_modes(self.encoder.config(), frame_duration_ms)
+    }
+
+    /// Initialize a streaming session.
+    ///
+    /// # Arguments
+    /// * `mode_idx` - Streaming mode index
+    /// * `batch_size` - Number of independent audio streams
+    pub fn init_streaming(
+        &mut self,
+        mode_idx: usize,
+        batch_size: usize,
+    ) -> Result<RnntStreamingSession> {
+        if !self.supports_streaming() {
+            return Err(Error::config(
+                "Model does not support streaming. Use a streaming-capable model.",
+            ));
+        }
+
+        // Compute streaming configuration
+        let config = compute_streaming_config(self.encoder.config(), mode_idx, 10000)?;
+
+        // Setup encoder
+        self.encoder.setup_streaming(config.cache_drop_size);
+
+        // Create encoder cache
+        let encoder_cache = EncoderCache::new(
+            self.encoder.num_layers(),
+            batch_size,
+            config.last_channel_cache_size,
+            config.last_time_cache_size,
+            self.encoder.d_model(),
+        )?;
+
+        // Create mel buffer
+        let preprocessor_config = self.preprocessor.config();
+        let mel_buffer = MelBuffer::new(
+            preprocessor_config.sample_rate,
+            preprocessor_config.window_size,
+            preprocessor_config.window_stride,
+            preprocessor_config.features,
+        );
+
+        // Initialize decoder state for each batch sample
+        let mut decoder_states = Vec::with_capacity(batch_size);
+        for _ in 0..batch_size {
+            decoder_states.push(self.decoder.initialize_state(1)?);
+        }
+
+        Ok(RnntStreamingSession {
+            config,
+            encoder_cache,
+            mel_buffer,
+            decoder_states,
+            last_tokens: vec![None; batch_size],
+            accumulated_tokens: vec![Vec::new(); batch_size],
+            is_first_chunk: true,
+            blank_id: self.blank_id,
+        })
+    }
+
+    /// Process an audio chunk and return partial transcription.
+    pub fn process_chunk(
+        &mut self,
+        session: &mut RnntStreamingSession,
+        audio_chunk: &[f32],
+    ) -> Result<StreamingOutput> {
+        let batch_size = session.encoder_cache.batch_size();
+
+        // Add audio to buffer
+        session.mel_buffer.add_audio(audio_chunk);
+
+        // Process all complete chunks in the buffer
+        let mut all_new_tokens: Vec<Vec<usize>> = vec![Vec::new(); batch_size];
+
+        loop {
+            // Check if we have enough audio for the next chunk
+            let chunk_samples = session.config.chunk_size_for_step(session.is_first_chunk)
+                * self.preprocessor.hop_length();
+
+            if session.mel_buffer.audio_buffer.len() < chunk_samples {
+                break;
+            }
+
+            // Extract audio for this chunk
+            let audio_data = session
+                .mel_buffer
+                .consume_frames(session.config.chunk_size_for_step(session.is_first_chunk));
+
+            // Convert to Array
+            let audio = Array::from_slice(&audio_data, &[1, audio_data.len() as i32]);
+
+            // Compute mel features with standard normalization
+            let (features, _) = self.preprocessor.forward(&audio, None)?;
+
+            // Get lengths
+            let seq_len = features.dim(2);
+            let lengths = Array::from_slice(&[seq_len as i32], &[1]);
+
+            // Run encoder with cache
+            let (encoded, encoded_lengths, cache_channel_next, cache_time_next, cache_len_next) =
+                self.encoder.forward_streaming(
+                    &features,
+                    &lengths,
+                    &session.encoder_cache.last_channel,
+                    &session.encoder_cache.last_time,
+                    &session.encoder_cache.last_channel_len,
+                )?;
+
+            // Update cache
+            session.encoder_cache.last_channel = cache_channel_next;
+            session.encoder_cache.last_time = cache_time_next;
+            session.encoder_cache.last_channel_len = cache_len_next;
+
+            // Transpose encoder output from [B, D, T] to [B, T, D]
+            let encoded = mlx_rs::ops::transpose_axes(&encoded, &[0, 2, 1])?;
+            encoded.eval()?;
+            encoded_lengths.eval()?;
+
+            // RNNT greedy decoding for this chunk
+            let enc_seq_len = encoded_lengths.as_slice::<i32>()[0] as usize;
+
+            const MAX_SYMBOLS_PER_STEP: usize = 10;
+
+            for b in 0..batch_size {
+                // Process each encoder frame
+                for t in 0..enc_seq_len {
+                    let enc_frame =
+                        encoded.index((b as i32..b as i32 + 1, t as i32..t as i32 + 1, ..));
+
+                    let mut symbols_emitted = 0;
+
+                    loop {
+                        // Get prediction output
+                        let last_token = session.last_tokens[b]
+                            .map(|tok| Array::from_slice(&[tok as i32], &[1, 1]));
+                        let (pred_output, new_state) = self
+                            .decoder
+                            .predict_one(last_token.as_ref(), &session.decoder_states[b])?;
+
+                        // Compute joint output
+                        let log_probs = self.joint.forward_one(&enc_frame, &pred_output)?;
+                        log_probs.eval()?;
+
+                        // Get argmax
+                        let prediction = argmax_axis(&log_probs, -1, false)?;
+                        prediction.eval()?;
+                        let pred_token = prediction.as_slice::<u32>()[0] as usize;
+
+                        if pred_token == session.blank_id {
+                            break;
+                        }
+
+                        // Emit token
+                        all_new_tokens[b].push(pred_token);
+                        session.accumulated_tokens[b].push(pred_token);
+                        session.last_tokens[b] = Some(pred_token);
+                        session.decoder_states[b] = new_state;
+                        symbols_emitted += 1;
+
+                        if symbols_emitted >= MAX_SYMBOLS_PER_STEP {
+                            break;
+                        }
+                    }
+                }
+            }
+
+            session.is_first_chunk = false;
+        }
+
+        // If we didn't process any chunks, return empty output
+        if session.is_first_chunk {
+            return Ok(StreamingOutput::default());
+        }
+
+        // Build output texts from accumulated tokens
+        let mut texts = Vec::with_capacity(batch_size);
+        for b in 0..batch_size {
+            let text = if let Some(tokenizer) = &self.tokenizer {
+                let token_ids: Vec<u32> = session.accumulated_tokens[b]
+                    .iter()
+                    .map(|&t| t as u32)
+                    .collect();
+                tokenizer.decode_piece_ids(&token_ids).unwrap_or_default()
+            } else {
+                String::new()
+            };
+            texts.push(text);
+        }
+
+        Ok(StreamingOutput {
+            log_probs: None,
+            tokens: all_new_tokens,
+            text: texts,
+            is_final: false,
+        })
+    }
+
+    /// Finalize streaming and get final transcription.
+    pub fn finalize_streaming(
+        &mut self,
+        mut session: RnntStreamingSession,
+    ) -> Result<StreamingOutput> {
+        // Process any remaining audio - may need multiple chunks
+        while !session.mel_buffer.audio_buffer.is_empty() {
+            let min_samples = self.preprocessor.window_length();
+            let buffer_len = session.mel_buffer.audio_buffer.len();
+
+            // If we have less than minimum samples, pad and do final processing
+            if buffer_len < min_samples {
+                session.mel_buffer.audio_buffer.resize(min_samples, 0.0);
+            }
+
+            let remaining: Vec<f32> = session.mel_buffer.audio_buffer.drain(..).collect();
+            let output = self.process_chunk(&mut session, &remaining)?;
+
+            // If process_chunk didn't consume anything, break to avoid infinite loop
+            if output.tokens.iter().all(|t| t.is_empty())
+                && !session.mel_buffer.audio_buffer.is_empty()
+            {
+                break;
+            }
+        }
+
+        // Final output
+        let batch_size = session.accumulated_tokens.len();
+        let mut final_tokens = Vec::with_capacity(batch_size);
+        let mut final_texts = Vec::with_capacity(batch_size);
+
+        for tokens in &session.accumulated_tokens {
+            let text = if let Some(tokenizer) = &self.tokenizer {
+                let token_ids: Vec<u32> = tokens.iter().map(|&t| t as u32).collect();
+                tokenizer.decode_piece_ids(&token_ids).unwrap_or_default()
+            } else {
+                String::new()
+            };
+
+            final_tokens.push(tokens.clone());
+            final_texts.push(text);
+        }
+
+        Ok(StreamingOutput {
+            log_probs: None,
+            tokens: final_tokens,
+            text: final_texts,
+            is_final: true,
+        })
+    }
+}
+
+/// Streaming session state for RNNT models.
+pub struct RnntStreamingSession {
+    /// Streaming configuration
+    pub config: StreamingConfig,
+
+    /// Encoder cache state
+    pub encoder_cache: EncoderCache,
+
+    /// Audio/feature buffer
+    pub mel_buffer: MelBuffer,
+
+    /// Decoder states for each batch sample
+    pub decoder_states: Vec<DecoderState>,
+
+    /// Last emitted token for each batch sample
+    pub last_tokens: Vec<Option<usize>>,
+
+    /// All accumulated tokens for each batch sample
+    pub accumulated_tokens: Vec<Vec<usize>>,
+
+    /// Whether this is the first chunk
+    pub is_first_chunk: bool,
+
+    /// Blank token ID
+    blank_id: usize,
 }
 
 /// Load a WAV file and return samples and sample rate.
