@@ -21,7 +21,6 @@
 //! ```
 
 pub mod core;
-pub mod mlx;
 
 #[cfg(feature = "asr")]
 pub mod asr;
