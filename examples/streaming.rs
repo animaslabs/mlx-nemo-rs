@@ -140,10 +140,7 @@ fn main() -> mlx_nemo::Result<()> {
     let mut last_text = String::new();
     let mut chunks_processed = 0;
 
-    let mut empty_outputs = 0;
-    let mut total_samples_fed = 0usize;
     for chunk in samples.chunks(chunk_samples) {
-        total_samples_fed += chunk.len();
         let output = model.process_chunk(&mut session, chunk)?;
         chunks_processed += 1;
 
@@ -154,18 +151,8 @@ fn main() -> mlx_nemo::Result<()> {
             print!("{}", output.text[0]);
             io::stdout().flush().unwrap();
             last_text = output.text[0].clone();
-        } else if output.text.is_empty() {
-            empty_outputs += 1;
         }
     }
-
-    eprintln!(
-        "\nDebug: {} empty outputs, {} total chunks, {} samples fed (expected {})",
-        empty_outputs,
-        chunks_processed,
-        total_samples_fed,
-        samples.len()
-    );
 
     // Finalize
     let final_output = model.finalize_streaming(session)?;

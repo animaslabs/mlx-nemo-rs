@@ -58,3 +58,8 @@ tempfile = "3.24.0"
 # For examples and tests
 tokio = { version = "1.0", features = ["full"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# For live microphone example
+cpal = "0.17"       # Cross-platform audio I/O (microphone capture)
+ringbuf = "0.4"     # Lock-free SPSC ring buffer for audio thread communication
+ctrlc = "3.5"       # Graceful Ctrl+C handling
