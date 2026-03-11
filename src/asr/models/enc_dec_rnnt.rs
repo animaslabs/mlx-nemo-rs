@@ -845,11 +845,10 @@ impl EncDecRNNTModel {
             let pre_encode_cache = session
                 .config
                 .pre_encode_cache_for_step(session.is_first_chunk);
-            let drop_extra = if session.is_first_chunk {
-                0
-            } else {
-                session.config.drop_extra_pre_encoded
-            };
+            // NeMo always applies drop_extra_pre_encoded when cache is provided,
+            // even on the first chunk (when cache is empty but not None).
+            // The streaming mode means cache is always passed, so always drop.
+            let drop_extra = session.config.drop_extra_pre_encoded;
 
             // Check if we have enough mel frames
             let remaining = session.mel_buffer.remaining_frames();
@@ -945,6 +944,9 @@ impl EncDecRNNTModel {
                     "[DEBUG]   encoder output stats: min={:.3}, max={:.3}, mean={:.3}",
                     enc_min, enc_max, enc_mean
                 );
+                // Print first 10 values of first frame (for comparison with NeMo)
+                let first_10: Vec<f32> = enc_slice.iter().take(10).cloned().collect();
+                eprintln!("[DEBUG]   first frame[:10]: {:?}", first_10);
             }
 
             // Truncate to valid_out_len

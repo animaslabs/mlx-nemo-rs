@@ -481,12 +481,10 @@ impl EncDecCTCModel {
         let seq_len = features.dim(2);
         let lengths = Array::from_slice(&[seq_len as i32], &[1]);
 
-        // Determine drop_extra for this chunk
-        let drop_extra = if session.is_first_chunk {
-            0
-        } else {
-            session.config.drop_extra_pre_encoded
-        };
+        // NeMo always applies drop_extra_pre_encoded when cache is provided,
+        // even on the first chunk (when cache is empty but not None).
+        // The streaming mode means cache is always passed, so always drop.
+        let drop_extra = session.config.drop_extra_pre_encoded;
 
         // Run encoder with cache
         let (encoded, encoded_lengths, cache_channel_next, cache_time_next, cache_len_next) =
