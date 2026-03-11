@@ -307,9 +307,9 @@ impl ConformerEncoder {
         // Drop extra pre-encoded frames for streaming
         // This is needed because the subsampling convolutions produce extra frames
         // at chunk boundaries that should be discarded to match offline behavior.
-        // NeMo applies this whenever cache is provided (even on first chunk when cache is empty).
-        // The cache tensor being passed indicates we're in streaming mode.
-        if drop_extra_pre_encoded > 0 {
+        // Only apply on subsequent chunks (when cache is filled, not on first chunk).
+        let filled_cache_len_check = cache_last_channel_len.as_slice::<i64>()[0];
+        if drop_extra_pre_encoded > 0 && filled_cache_len_check > 0 {
             let drop = drop_extra_pre_encoded as i32;
             x = x.index((.., drop.., ..));
             lengths = mlx_rs::ops::clip(
@@ -345,20 +345,19 @@ impl ConformerEncoder {
         cache_last_channel_len.eval()?;
         let filled_cache_len = cache_last_channel_len.as_slice::<i64>()[0].max(0) as i32;
 
-        // NeMo uses the ALLOCATED cache size (not filled) for positional encoding.
-        // This is because the relative positional encoding needs to cover the maximum
-        // possible attention span, regardless of how much cache is currently filled.
-        let pos_len = cache_size + seq_len;
+        // Total length is filled cache + new sequence (for attention K/V)
+        let total_len = filled_cache_len + seq_len;
 
         if debug {
             eprintln!(
-                "[DEBUG]   encoder: seq_len={}, cache_size={}, filled_cache={}, pos_len={}",
-                seq_len, cache_size, filled_cache_len, pos_len
+                "[DEBUG]   encoder: seq_len={}, cache_size={}, filled_cache={}, total_len={}",
+                seq_len, cache_size, filled_cache_len, total_len
             );
         }
 
-        // Generate positional encoding for cache_size + seq_len (matching NeMo)
-        let pos_emb = self.pos_enc.get_encoding(pos_len as usize)?;
+        // Generate positional encoding for total length (filled cache + current)
+        // This should cover positions for all K/V that attention will see
+        let pos_emb = self.pos_enc.get_encoding(total_len as usize)?;
 
         // Initialize output caches
         let mut cache_channel_next = Vec::with_capacity(self.layers.len());

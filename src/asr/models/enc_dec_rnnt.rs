@@ -845,10 +845,13 @@ impl EncDecRNNTModel {
             let pre_encode_cache = session
                 .config
                 .pre_encode_cache_for_step(session.is_first_chunk);
-            // NeMo always applies drop_extra_pre_encoded when cache is provided,
-            // even on the first chunk (when cache is empty but not None).
-            // The streaming mode means cache is always passed, so always drop.
-            let drop_extra = session.config.drop_extra_pre_encoded;
+            // Only apply drop_extra on subsequent chunks, not the first one.
+            // On the first chunk, we need all the frames.
+            let drop_extra = if session.is_first_chunk {
+                0
+            } else {
+                session.config.drop_extra_pre_encoded
+            };
 
             // Check if we have enough mel frames
             let remaining = session.mel_buffer.remaining_frames();
