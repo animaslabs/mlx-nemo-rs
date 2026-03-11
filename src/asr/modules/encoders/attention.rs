@@ -416,6 +416,19 @@ impl RelPositionMultiHeadAttention {
 
         // Apply rel_shift and truncate to total_len
         let matrix_bd = Self::rel_shift(&matrix_bd)?;
+
+        // Debug: check matrix_bd before truncation
+        let debug = std::env::var("ATTN_DEBUG")
+            .map(|v| v == "1")
+            .unwrap_or(false);
+        if debug {
+            eprintln!(
+                "[ATTN_DEBUG] matrix_bd after rel_shift: {:?}, truncating to {}",
+                matrix_bd.shape(),
+                total_len
+            );
+        }
+
         let matrix_bd = matrix_bd.index((.., .., .., ..total_len));
 
         // Combine and scale

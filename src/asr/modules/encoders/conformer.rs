@@ -304,12 +304,35 @@ impl ConformerEncoder {
 
         let subsampled_frames = x.dim(1);
 
+        // Debug: check subsampling output (before xscale)
+        if debug {
+            x.eval()?;
+            let x_slice: &[f32] = x.as_slice();
+            let d_model = x.dim(2) as usize;
+            eprintln!(
+                "[DEBUG]   after subsampling (before xscale): shape {:?}",
+                x.shape(),
+            );
+            // Print first 3 values of frames 0, 1, 2
+            for frame in 0..3.min(x.dim(1) as usize) {
+                let start = frame * d_model;
+                eprintln!(
+                    "[DEBUG]     frame {}: [{:.4}, {:.4}, {:.4}, ...]",
+                    frame,
+                    x_slice.get(start).unwrap_or(&0.0),
+                    x_slice.get(start + 1).unwrap_or(&0.0),
+                    x_slice.get(start + 2).unwrap_or(&0.0),
+                );
+            }
+        }
+
         // Drop extra pre-encoded frames for streaming
         // This is needed because the subsampling convolutions produce extra frames
         // at chunk boundaries that should be discarded to match offline behavior.
-        // Only apply on subsequent chunks (when cache is filled, not on first chunk).
+        // NeMo applies this on ALL chunks (whenever cache_last_channel is not None),
+        // which in streaming mode is always.
         let filled_cache_len_check = cache_last_channel_len.as_slice::<i64>()[0];
-        if drop_extra_pre_encoded > 0 && filled_cache_len_check > 0 {
+        if drop_extra_pre_encoded > 0 {
             let drop = drop_extra_pre_encoded as i32;
             x = x.index((.., drop.., ..));
             lengths = mlx_rs::ops::clip(
@@ -317,10 +340,15 @@ impl ConformerEncoder {
                 (&Array::from_int(0), ()),
             )?;
             if debug {
+                x.eval()?;
+                let x_slice: &[f32] = x.as_slice();
                 eprintln!(
-                    "[DEBUG]   encoder: dropped {} extra pre-encoded frames, now {} frames",
+                    "[DEBUG]   encoder: dropped {} extra pre-encoded frames, now {} frames, first values [{:.4}, {:.4}, {:.4}]",
                     drop_extra_pre_encoded,
-                    x.dim(1)
+                    x.dim(1),
+                    x_slice.get(0).unwrap_or(&0.0),
+                    x_slice.get(1).unwrap_or(&0.0),
+                    x_slice.get(2).unwrap_or(&0.0),
                 );
             }
         }
@@ -336,6 +364,18 @@ impl ConformerEncoder {
         let xscale = self.pos_enc.xscale();
         if xscale != 1.0 {
             x = &x * Array::from_f32(xscale);
+            if debug {
+                x.eval()?;
+                let x_slice: &[f32] = x.as_slice();
+                eprintln!(
+                    "[DEBUG]   after xscale ({}): shape {:?}, first values [{:.4}, {:.4}, {:.4}]",
+                    xscale,
+                    x.shape(),
+                    x_slice.get(0).unwrap_or(&0.0),
+                    x_slice.get(1).unwrap_or(&0.0),
+                    x_slice.get(2).unwrap_or(&0.0),
+                );
+            }
         }
 
         let seq_len = x.dim(1);
@@ -379,6 +419,51 @@ impl ConformerEncoder {
                 mlx_rs::ops::zeros::<f32>(&[x.dim(0) as i32, 0, x.dim(2) as i32])?
             };
 
+            // Debug: show cache and input stats for first layer on chunk 2
+            if debug && layer_idx == 0 && filled_cache_len > 0 {
+                layer_cache_channel.eval()?;
+                x.eval()?;
+                let cache_slice: &[f32] = layer_cache_channel.as_slice();
+                let x_slice: &[f32] = x.as_slice();
+
+                // Show cache stats
+                let cache_len_actual = layer_cache_channel.dim(1);
+                let cache_min: f32 = cache_slice.iter().cloned().fold(f32::INFINITY, f32::min);
+                let cache_max: f32 = cache_slice
+                    .iter()
+                    .cloned()
+                    .fold(f32::NEG_INFINITY, f32::max);
+                eprintln!(
+                    "[DEBUG]   layer 0: cache shape {:?}, cache_len={}, min={:.4}, max={:.4}",
+                    layer_cache_channel.shape(),
+                    cache_len_actual,
+                    cache_min,
+                    cache_max,
+                );
+                eprintln!(
+                    "[DEBUG]     cache first values [{:.4}, {:.4}, {:.4}]",
+                    cache_slice.get(0).unwrap_or(&0.0),
+                    cache_slice.get(1).unwrap_or(&0.0),
+                    cache_slice.get(2).unwrap_or(&0.0),
+                );
+
+                // Show input stats
+                let x_min: f32 = x_slice.iter().cloned().fold(f32::INFINITY, f32::min);
+                let x_max: f32 = x_slice.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                eprintln!(
+                    "[DEBUG]   layer 0: input shape {:?}, min={:.4}, max={:.4}",
+                    x.shape(),
+                    x_min,
+                    x_max,
+                );
+                eprintln!(
+                    "[DEBUG]     input first values [{:.4}, {:.4}, {:.4}]",
+                    x_slice.get(0).unwrap_or(&0.0),
+                    x_slice.get(1).unwrap_or(&0.0),
+                    x_slice.get(2).unwrap_or(&0.0),
+                );
+            }
+
             let (x_out, new_channel, new_time) = layer.forward_with_cache(
                 &x,
                 &pos_emb,
@@ -399,17 +484,25 @@ impl ConformerEncoder {
 
             x = x_out;
 
-            // For the output cache, we need to maintain the full cache size
-            // The layer returns cache of size [batch, filled_len + seq_len - drop_size, d_model]
-            // We need to pad or truncate to cache_size
+            // For the output cache, we need to maintain the full cache size.
+            // The attention layer returns a new cache containing the new input frames (sliding window).
+            // We need to properly slide the old cache content and append the new cache.
+            //
+            // NeMo's approach: Always pass full cache (with zeros) and use attention mask.
+            // Our approach: Extract only filled portion, so we need to reconstruct the full cache.
+            //
+            // The attention returns: new_cache = concat(old_cache[q_keep_size:], x[:q_keep_size])
+            // When we pass only filled frames, new_cache will be smaller than cache_size.
+            // We reconstruct by: full_cache = concat(old_full_cache[new_cache_len:], new_cache)
             if let Some(nc) = new_channel {
                 let nc_len = nc.dim(1);
-                let padded_cache = if nc_len < cache_size {
-                    // Pad with zeros on the left
-                    let pad_size = cache_size - nc_len;
-                    let zeros =
-                        mlx_rs::ops::zeros::<f32>(&[nc.dim(0) as i32, pad_size, nc.dim(2) as i32])?;
-                    mlx_rs::ops::concatenate_axis(&[&zeros, &nc], 1)?
+                let updated_cache = if nc_len < cache_size {
+                    // Slide the old cache content and append new cache
+                    // Keep the portion of old cache that wasn't covered by new cache
+                    let old_keep_start = nc_len as i32; // Drop first nc_len frames from old cache
+                    let old_keep = layer_cache_channel_full.index((.., old_keep_start.., ..));
+                    // Concatenate: [old_keep | new_cache]
+                    mlx_rs::ops::concatenate_axis(&[&old_keep, &nc], 1)?
                 } else if nc_len > cache_size {
                     // Truncate from the left (keep newest)
                     let start = nc_len - cache_size;
@@ -417,7 +510,7 @@ impl ConformerEncoder {
                 } else {
                     nc
                 };
-                cache_channel_next.push(padded_cache);
+                cache_channel_next.push(updated_cache);
             }
             if let Some(nt) = new_time {
                 cache_time_next.push(nt);

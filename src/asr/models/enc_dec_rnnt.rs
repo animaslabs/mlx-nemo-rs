@@ -845,13 +845,11 @@ impl EncDecRNNTModel {
             let pre_encode_cache = session
                 .config
                 .pre_encode_cache_for_step(session.is_first_chunk);
-            // Only apply drop_extra on subsequent chunks, not the first one.
-            // On the first chunk, we need all the frames.
-            let drop_extra = if session.is_first_chunk {
-                0
-            } else {
-                session.config.drop_extra_pre_encoded
-            };
+            // NeMo applies drop_extra_pre_encoded on ALL chunks in streaming mode
+            // (whenever cache_last_channel is not None, which is always in streaming).
+            // This is needed because the pre_encode_cache overlap causes extra frames
+            // at chunk boundaries after subsampling.
+            let drop_extra = session.config.drop_extra_pre_encoded;
 
             // Check if we have enough mel frames
             let remaining = session.mel_buffer.remaining_frames();
@@ -896,6 +894,22 @@ impl EncDecRNNTModel {
                     "[DEBUG]   mel_chunk stats: min={:.3}, max={:.3}, mean={:.3}",
                     mel_min, mel_max, mel_mean
                 );
+                // Show first few mel frames
+                // mel_chunk is [n_mels, time] format, so frame t, freq f = mel_chunk[f * chunk_len + t]
+                let n_mels = session.n_mels;
+                eprintln!(
+                    "[DEBUG]   First 5 mel frames (first 3 freq bins each), format=[n_mels, time]:"
+                );
+                for t in 0..5.min(chunk_len) {
+                    // Get freq bins 0, 1, 2 for frame t
+                    let f0 = mel_chunk.get(0 * chunk_len + t).unwrap_or(&0.0);
+                    let f1 = mel_chunk.get(1 * chunk_len + t).unwrap_or(&0.0);
+                    let f2 = mel_chunk.get(2 * chunk_len + t).unwrap_or(&0.0);
+                    eprintln!(
+                        "[DEBUG]     frame {}: [{:.4}, {:.4}, {:.4}, ...]",
+                        t, f0, f1, f2,
+                    );
+                }
             }
 
             // Convert mel chunk to Array [1, n_mels, chunk_len]
