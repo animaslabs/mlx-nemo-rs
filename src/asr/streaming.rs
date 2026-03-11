@@ -338,17 +338,28 @@ impl MelBuffer {
     }
 
     /// Consume audio for a given number of frames.
-    /// Returns the audio slice and updates the buffer.
+    /// Returns the audio slice and updates the buffer, keeping proper overlap.
+    ///
+    /// The STFT requires `window_samples` of audio for each frame, but frames
+    /// advance by `hop_samples`. So for `num_frames` frames we need:
+    ///   `window_samples + (num_frames - 1) * hop_samples` samples
+    ///
+    /// After processing, we keep `window_samples - hop_samples` samples of overlap
+    /// for the next chunk, which corresponds to advancing by `num_frames * hop_samples`.
     pub fn consume_frames(&mut self, num_frames: usize) -> Vec<f32> {
+        // Total samples needed to produce num_frames
         let samples_needed =
             self.window_samples + (num_frames.saturating_sub(1)) * self.hop_samples;
         let samples_to_take = samples_needed.min(self.audio_buffer.len());
 
-        let audio: Vec<f32> = self.audio_buffer.drain(..samples_to_take).collect();
+        // Copy out the audio for processing (don't drain yet)
+        let audio: Vec<f32> = self.audio_buffer[..samples_to_take].to_vec();
 
-        // Keep overlap for next chunk (window_samples - hop_samples)
-        // Actually we need to keep the tail that wasn't fully processed
-        // This is handled by not draining all samples
+        // Advance the buffer by the number of samples that correspond to num_frames
+        // This keeps the overlap (window_samples - hop_samples) for the next chunk
+        let samples_to_advance = num_frames * self.hop_samples;
+        let samples_to_drain = samples_to_advance.min(self.audio_buffer.len());
+        self.audio_buffer.drain(..samples_to_drain);
 
         audio
     }
@@ -434,17 +445,21 @@ pub fn compute_streaming_config(
         ((conv_kernel - 1) / 2, (conv_kernel - 1) / 2)
     };
 
-    // Compute lookahead and cache drop size based on attention style
-    let (lookahead_frames, cache_drop_size) = if att_context_style == "chunked_limited" {
+    // Compute lookahead_steps and cache_drop_size based on attention style
+    // This follows NeMo's setup_streaming_params() logic exactly
+    let (lookahead_steps, cache_drop_size) = if att_context_style == "chunked_limited" {
         // Chunked limited: lookahead is just right context, no cache drop
+        // lookahead_steps = att_context_size[1] (right context)
         (right_context.max(0) as usize, 0)
     } else {
         // Regular style: lookahead accumulates through layers
+        // lookahead_steps = att_context_size[1] * n_layers + conv_context[1] * n_layers
         let lookahead = if right_context >= 0 {
             (right_context as usize) * n_layers + conv_context.1 * n_layers
         } else {
             0
         };
+        // cache_drop_size = lookahead_steps for regular style
         (lookahead, lookahead)
     };
 
@@ -460,7 +475,7 @@ pub fn compute_streaming_config(
 
     // Compute sampling frames from subsampling
     // For dw_striding with factor 8: sampling_frames = [7, 8] (first, subsequent)
-    // This is a simplification - NeMo's ConvSubsampling.get_sampling_frames() is more complex
+    // This matches NeMo's ConvSubsampling.get_sampling_frames()
     let sampling_frames = match subsampling_factor {
         2 => (1, 2),
         4 => (3, 4),
@@ -469,18 +484,29 @@ pub fn compute_streaming_config(
     };
 
     // Chunk size in pre-subsampled frames
+    // NeMo: chunk_size = [sampling_frames[0] + subsampling_factor * lookahead_steps,
+    //                     sampling_frames[1] + subsampling_factor * lookahead_steps]
     let chunk_size = (
-        sampling_frames.0 + subsampling_factor * lookahead_frames,
-        sampling_frames.1 + subsampling_factor * lookahead_frames,
+        sampling_frames.0 + subsampling_factor * lookahead_steps,
+        sampling_frames.1 + subsampling_factor * lookahead_steps,
     );
 
-    // Shift size
+    // Shift size - how many pre-subsampled frames to advance each step
+    // NeMo: shift_size = [sampling_frames[0] + sampling_frames[1] * (lookahead_steps - cache_drop_size),
+    //                     sampling_frames[1] + sampling_frames[1] * (lookahead_steps - cache_drop_size)]
     let shift_size = (
-        sampling_frames.0 + sampling_frames.1 * lookahead_frames.saturating_sub(cache_drop_size),
-        sampling_frames.1 + sampling_frames.1 * lookahead_frames.saturating_sub(cache_drop_size),
+        sampling_frames.0 + sampling_frames.1 * lookahead_steps.saturating_sub(cache_drop_size),
+        sampling_frames.1 + sampling_frames.1 * lookahead_steps.saturating_sub(cache_drop_size),
     );
 
-    // Valid output length
+    // Valid output length - how many OUTPUT frames are valid per chunk
+    // NeMo: valid_out_len = (shift_size[1] - sampling_frames[1]) // subsampling_factor + 1
+    // For chunked_limited with lookahead_steps = right_context and cache_drop_size = 0:
+    //   shift_size[1] = sampling_frames[1] + sampling_frames[1] * lookahead_steps
+    //                 = sampling_frames[1] * (1 + lookahead_steps)
+    //   valid_out_len = (sampling_frames[1] * (1 + lookahead_steps) - sampling_frames[1]) / subsampling_factor + 1
+    //                 = (sampling_frames[1] * lookahead_steps) / subsampling_factor + 1
+    //                 = lookahead_steps + 1 (when sampling_frames[1] == subsampling_factor)
     let valid_out_len = if sampling_frames.1 > 0 {
         (shift_size.1 - sampling_frames.1) / subsampling_factor + 1
     } else {
@@ -489,7 +515,6 @@ pub fn compute_streaming_config(
 
     // Pre-encode cache size (for subsampling overlap)
     // For dw_striding: cache = kernel_size - 1 for each conv layer
-    // Simplified calculation
     let pre_encode_cache = match subsampling_factor {
         8 => (6, 7), // 3 conv layers with kernel 3
         4 => (4, 5),
@@ -497,12 +522,26 @@ pub fn compute_streaming_config(
         _ => (0, 0),
     };
 
-    // Drop extra pre-encoded frames
+    // Drop extra pre-encoded frames after subsampling
+    // NeMo: drop_extra_pre_encoded = 1 + (pre_encode_cache_size[1] - 1) // subsampling_factor
     let drop_extra = if pre_encode_cache.1 >= 1 {
         1 + (pre_encode_cache.1 - 1) / subsampling_factor
     } else {
         0
     };
+
+    tracing::debug!(
+        "Streaming config: mode={}, style={}, lookahead_steps={}, cache_drop={}, \
+         chunk_size={:?}, shift_size={:?}, valid_out_len={}, drop_extra={}",
+        mode_idx,
+        att_context_style,
+        lookahead_steps,
+        cache_drop_size,
+        chunk_size,
+        shift_size,
+        valid_out_len,
+        drop_extra
+    );
 
     Ok(StreamingConfig {
         chunk_size,
@@ -513,7 +552,7 @@ pub fn compute_streaming_config(
         valid_out_len,
         pre_encode_cache_size: pre_encode_cache,
         drop_extra_pre_encoded: drop_extra,
-        lookahead_frames,
+        lookahead_frames: lookahead_steps,
         mode_idx,
         left_context,
         right_context,

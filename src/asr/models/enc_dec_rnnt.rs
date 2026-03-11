@@ -691,6 +691,32 @@ impl EncDecRNNTModel {
         // Compute streaming configuration
         let config = compute_streaming_config(self.encoder.config(), mode_idx, 10000)?;
 
+        let debug = Self::debug_enabled();
+        if debug {
+            eprintln!("[DEBUG] init_streaming: mode_idx={}", mode_idx);
+            eprintln!(
+                "[DEBUG]   chunk_size: first={}, subsequent={}",
+                config.chunk_size.0, config.chunk_size.1
+            );
+            eprintln!(
+                "[DEBUG]   shift_size: first={}, subsequent={}",
+                config.shift_size.0, config.shift_size.1
+            );
+            eprintln!(
+                "[DEBUG]   valid_out_len={}, lookahead_frames={}",
+                config.valid_out_len, config.lookahead_frames
+            );
+            eprintln!("[DEBUG]   cache_drop_size={}", config.cache_drop_size);
+            eprintln!(
+                "[DEBUG]   last_channel_cache_size={}, last_time_cache_size={}",
+                config.last_channel_cache_size, config.last_time_cache_size
+            );
+            eprintln!(
+                "[DEBUG]   left_context={}, right_context={}",
+                config.left_context, config.right_context
+            );
+        }
+
         // Setup encoder
         self.encoder.setup_streaming(config.cache_drop_size);
 
@@ -712,6 +738,17 @@ impl EncDecRNNTModel {
             preprocessor_config.features,
         );
 
+        if debug {
+            eprintln!(
+                "[DEBUG]   mel_buffer: window_samples={}, hop_samples={}",
+                mel_buffer.window_samples, mel_buffer.hop_samples
+            );
+            eprintln!(
+                "[DEBUG]   subsampling_factor={}",
+                self.encoder.subsampling_factor()
+            );
+        }
+
         // Initialize decoder state for each batch sample
         let mut decoder_states = Vec::with_capacity(batch_size);
         for _ in 0..batch_size {
@@ -731,25 +768,61 @@ impl EncDecRNNTModel {
     }
 
     /// Process an audio chunk and return partial transcription.
+    /// Enable debug output for streaming inference.
+    /// Set via environment variable: NEMO_DEBUG=1
+    fn debug_enabled() -> bool {
+        std::env::var("NEMO_DEBUG")
+            .map(|v| v == "1")
+            .unwrap_or(false)
+    }
+
+    /// Process an audio chunk and return partial transcription.
     pub fn process_chunk(
         &mut self,
         session: &mut RnntStreamingSession,
         audio_chunk: &[f32],
     ) -> Result<StreamingOutput> {
+        let debug = Self::debug_enabled();
         let batch_size = session.encoder_cache.batch_size();
 
         // Add audio to buffer
         session.mel_buffer.add_audio(audio_chunk);
 
+        if debug {
+            eprintln!(
+                "[DEBUG] process_chunk: received {} samples, buffer now has {} samples",
+                audio_chunk.len(),
+                session.mel_buffer.audio_buffer.len()
+            );
+        }
+
         // Process all complete chunks in the buffer
         let mut all_new_tokens: Vec<Vec<usize>> = vec![Vec::new(); batch_size];
+        let mut chunks_processed_this_call = 0;
 
         loop {
             // Check if we have enough audio for the next chunk
-            let chunk_samples = session.config.chunk_size_for_step(session.is_first_chunk)
-                * self.preprocessor.hop_length();
+            // To get N mel frames, we need: window_length + (N - 1) * hop_length samples
+            let target_frames = session.config.chunk_size_for_step(session.is_first_chunk);
+            let hop_length = self.preprocessor.hop_length();
+            let window_length = self.preprocessor.window_length();
+            let chunk_samples = window_length + target_frames.saturating_sub(1) * hop_length;
+
+            if debug {
+                eprintln!(
+                    "[DEBUG]   checking: need {} samples (window={} + {}*{} hop), have {}",
+                    chunk_samples,
+                    window_length,
+                    target_frames.saturating_sub(1),
+                    hop_length,
+                    session.mel_buffer.audio_buffer.len()
+                );
+            }
 
             if session.mel_buffer.audio_buffer.len() < chunk_samples {
+                if debug {
+                    eprintln!("[DEBUG]   not enough audio, breaking loop");
+                }
                 break;
             }
 
@@ -757,6 +830,14 @@ impl EncDecRNNTModel {
             let audio_data = session
                 .mel_buffer
                 .consume_frames(session.config.chunk_size_for_step(session.is_first_chunk));
+
+            if debug {
+                eprintln!(
+                    "[DEBUG]   consumed {} audio samples, buffer now has {}",
+                    audio_data.len(),
+                    session.mel_buffer.audio_buffer.len()
+                );
+            }
 
             // Convert to Array
             let audio = Array::from_slice(&audio_data, &[1, audio_data.len() as i32]);
@@ -768,7 +849,18 @@ impl EncDecRNNTModel {
             let seq_len = features.dim(2);
             let lengths = Array::from_slice(&[seq_len as i32], &[1]);
 
+            if debug {
+                eprintln!(
+                    "[DEBUG]   mel features shape: [{}, {}, {}]",
+                    features.dim(0),
+                    features.dim(1),
+                    features.dim(2)
+                );
+            }
+
             // Run encoder with cache
+            let cache_len_before = session.encoder_cache.last_channel_len.as_slice::<i64>()[0];
+
             let (encoded, encoded_lengths, cache_channel_next, cache_time_next, cache_len_next) =
                 self.encoder.forward_streaming(
                     &features,
@@ -788,10 +880,32 @@ impl EncDecRNNTModel {
             encoded.eval()?;
             encoded_lengths.eval()?;
 
-            // RNNT greedy decoding for this chunk
-            let enc_seq_len = encoded_lengths.as_slice::<i32>()[0] as usize;
+            let raw_enc_len = encoded_lengths.as_slice::<i32>()[0] as usize;
+            let cache_len_after = session.encoder_cache.last_channel_len.as_slice::<i64>()[0];
+
+            if debug {
+                eprintln!(
+                    "[DEBUG]   encoder output: {} frames (raw), cache: {} -> {}",
+                    raw_enc_len, cache_len_before, cache_len_after
+                );
+            }
+
+            // CRITICAL: Truncate encoder output to valid_out_len
+            // This is essential for streaming - we only decode frames that have
+            // complete context. The lookahead frames will be re-processed in
+            // the next chunk with more context.
+            let valid_out_len = session.config.valid_out_len;
+            let enc_seq_len = raw_enc_len.min(valid_out_len);
+
+            if debug {
+                eprintln!(
+                    "[DEBUG]   valid_out_len={}, decoding {} frames (is_first={})",
+                    valid_out_len, enc_seq_len, session.is_first_chunk
+                );
+            }
 
             const MAX_SYMBOLS_PER_STEP: usize = 10;
+            let mut tokens_this_chunk = Vec::new();
 
             for b in 0..batch_size {
                 // Process each encoder frame
@@ -828,6 +942,7 @@ impl EncDecRNNTModel {
                         session.last_tokens[b] = Some(pred_token);
                         session.decoder_states[b] = new_state;
                         symbols_emitted += 1;
+                        tokens_this_chunk.push(pred_token);
 
                         if symbols_emitted >= MAX_SYMBOLS_PER_STEP {
                             break;
@@ -836,7 +951,36 @@ impl EncDecRNNTModel {
                 }
             }
 
+            if debug {
+                // Decode tokens to show what we got
+                let token_text = if let Some(tokenizer) = &self.tokenizer {
+                    let ids: Vec<u32> = tokens_this_chunk.iter().map(|&t| t as u32).collect();
+                    tokenizer.decode_piece_ids(&ids).unwrap_or_default()
+                } else {
+                    format!("{:?}", tokens_this_chunk)
+                };
+                eprintln!(
+                    "[DEBUG]   decoded {} tokens this chunk: {:?} -> \"{}\"",
+                    tokens_this_chunk.len(),
+                    tokens_this_chunk,
+                    token_text
+                );
+            }
+
             session.is_first_chunk = false;
+            chunks_processed_this_call += 1;
+        }
+
+        if debug && chunks_processed_this_call > 0 {
+            eprintln!(
+                "[DEBUG] processed {} internal chunks, total accumulated tokens: {}",
+                chunks_processed_this_call,
+                session
+                    .accumulated_tokens
+                    .get(0)
+                    .map(|t| t.len())
+                    .unwrap_or(0)
+            );
         }
 
         // If we didn't process any chunks, return empty output

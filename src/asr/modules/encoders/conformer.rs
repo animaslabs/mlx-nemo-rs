@@ -289,11 +289,26 @@ impl ConformerEncoder {
         cache_last_time: &Array,
         cache_last_channel_len: &Array,
     ) -> Result<(Array, Array, Array, Array, Array)> {
+        let debug = std::env::var("NEMO_DEBUG")
+            .map(|v| v == "1")
+            .unwrap_or(false);
+
         // Transpose from [B, F, T] to [B, T, F] for processing
         let x = mlx_rs::ops::transpose_axes(features, &[0, 2, 1])?;
 
+        let input_frames = x.dim(1);
+
         // Subsampling
         let (mut x, lengths) = self.subsampling.forward(&x, lengths)?;
+
+        let subsampled_frames = x.dim(1);
+
+        if debug {
+            eprintln!(
+                "[DEBUG]   encoder: input {} frames -> subsampled {} frames (factor {})",
+                input_frames, subsampled_frames, self.config.subsampling_factor
+            );
+        }
 
         // Scale input by sqrt(d_model) if xscaling is enabled
         let xscale = self.pos_enc.xscale();
@@ -310,6 +325,13 @@ impl ConformerEncoder {
 
         // Total length is filled cache + new sequence
         let total_len = filled_cache_len + seq_len;
+
+        if debug {
+            eprintln!(
+                "[DEBUG]   encoder: seq_len={}, cache_size={}, filled_cache={}, total_len={}",
+                seq_len, cache_size, filled_cache_len, total_len
+            );
+        }
 
         // Generate positional encoding for the total length (filled cache + current)
         let pos_emb = self.pos_enc.get_encoding(total_len as usize)?;

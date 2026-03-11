@@ -122,10 +122,23 @@ fn main() -> mlx_nemo::Result<()> {
     println!("\nInitializing streaming (mode {})", mode_idx);
     let mut session = model.init_streaming(mode_idx, 1)?;
     println!(
-        "Chunk size: {} frames",
-        session.config.chunk_size_for_step(true)
+        "Chunk size: {} frames (first), {} frames (subsequent)",
+        session.config.chunk_size_for_step(true),
+        session.config.chunk_size_for_step(false)
     );
-    println!("Lookahead: {} frames", session.config.lookahead_frames);
+    println!(
+        "Shift size: {} frames (first), {} frames (subsequent)",
+        session.config.shift_size_for_step(true),
+        session.config.shift_size_for_step(false)
+    );
+    println!(
+        "Valid output length: {} frames, Lookahead: {} frames",
+        session.config.valid_out_len, session.config.lookahead_frames
+    );
+    println!(
+        "Cache sizes: channel={}, time={}",
+        session.config.last_channel_cache_size, session.config.last_time_cache_size
+    );
 
     // Calculate chunk size in samples
     let chunk_samples = (target_rate as f32 * chunk_ms as f32 / 1000.0) as usize;

@@ -181,9 +181,22 @@ fn main() -> mlx_nemo::Result<()> {
     println!("\nInitializing streaming (mode {})", mode_idx);
     let mut session = model.init_streaming(mode_idx, 1)?;
     println!(
-        "Chunk size: {} frames, Lookahead: {} frames",
+        "Chunk size: {} frames (first), {} frames (subsequent)",
         session.config.chunk_size_for_step(true),
-        session.config.lookahead_frames
+        session.config.chunk_size_for_step(false)
+    );
+    println!(
+        "Shift size: {} frames (first), {} frames (subsequent)",
+        session.config.shift_size_for_step(true),
+        session.config.shift_size_for_step(false)
+    );
+    println!(
+        "Valid output length: {} frames, Lookahead: {} frames",
+        session.config.valid_out_len, session.config.lookahead_frames
+    );
+    println!(
+        "Cache sizes: channel={}, time={}",
+        session.config.last_channel_cache_size, session.config.last_time_cache_size
     );
 
     // Create ring buffer (2 seconds of audio at source rate)
@@ -266,6 +279,7 @@ fn main() -> mlx_nemo::Result<()> {
 
         if audio_buffer.len() >= required_samples {
             let chunk: Vec<f32> = audio_buffer.drain(..required_samples).collect();
+            let input_len = chunk.len();
 
             // Resample if needed
             let chunk = if let Some(ref mut rs) = resampler {
@@ -274,12 +288,28 @@ fn main() -> mlx_nemo::Result<()> {
                 chunk
             };
 
+            // Debug: show what we're feeding to the model
+            let debug = std::env::var("NEMO_DEBUG")
+                .map(|v| v == "1")
+                .unwrap_or(false);
+            if debug {
+                eprintln!(
+                    "[LIVE DEBUG] chunk {}: input {} samples -> resampled {} samples",
+                    chunks_processed,
+                    input_len,
+                    chunk.len()
+                );
+            }
+
             // Process through model
             let output = model.process_chunk(&mut session, &chunk)?;
             chunks_processed += 1;
 
             // Display partial result if text changed
             if !output.text.is_empty() && output.text[0] != last_text {
+                if debug {
+                    eprintln!("[LIVE DEBUG] text changed: \"{}\"", output.text[0]);
+                }
                 print!("\r\x1b[K{}", output.text[0]);
                 io::stdout().flush().unwrap();
                 last_text = output.text[0].clone();
