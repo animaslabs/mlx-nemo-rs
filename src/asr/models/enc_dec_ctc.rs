@@ -449,7 +449,6 @@ impl EncDecCTCModel {
         }
 
         // Extract audio for this chunk
-        // CRITICAL: Feed chunk_frames to encoder but only advance by shift_frames
         let audio_data = session
             .mel_buffer
             .consume_frames(chunk_frames, shift_frames);
@@ -461,7 +460,6 @@ impl EncDecCTCModel {
         let features = self.preprocessor.forward_unnormalized(&audio)?;
 
         // For streaming, we use buffer-based normalization
-        // Get running stats and normalize
         let (mean, std) = session.mel_buffer.get_norm_stats();
         let mean_arr = Array::from_slice(&mean, &[session.mel_buffer.n_mels as i32]);
         let std_arr = Array::from_slice(&std, &[session.mel_buffer.n_mels as i32]);
@@ -483,6 +481,13 @@ impl EncDecCTCModel {
         let seq_len = features.dim(2);
         let lengths = Array::from_slice(&[seq_len as i32], &[1]);
 
+        // Determine drop_extra for this chunk
+        let drop_extra = if session.is_first_chunk {
+            0
+        } else {
+            session.config.drop_extra_pre_encoded
+        };
+
         // Run encoder with cache
         let (encoded, encoded_lengths, cache_channel_next, cache_time_next, cache_len_next) =
             self.encoder.forward_streaming(
@@ -491,7 +496,7 @@ impl EncDecCTCModel {
                 &session.encoder_cache.last_channel,
                 &session.encoder_cache.last_time,
                 &session.encoder_cache.last_channel_len,
-                session.config.drop_extra_pre_encoded,
+                drop_extra,
             )?;
 
         // Update cache

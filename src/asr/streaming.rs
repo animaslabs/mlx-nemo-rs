@@ -277,22 +277,204 @@ impl Default for StreamingOutput {
     }
 }
 
-/// Buffer for incremental mel spectrogram computation.
+/// Streaming audio buffer that mirrors NeMo's CacheAwareStreamingAudioBuffer.
 ///
-/// This buffer accumulates mel frames and provides pre_encode_cache context
-/// for proper chunk boundary handling in streaming ASR.
+/// This buffer pre-computes mel spectrograms from audio and provides chunks
+/// with proper overlap (pre_encode_cache) for streaming inference.
 ///
-/// NeMo's approach (CacheAwareStreamingAudioBuffer):
-/// 1. Pre-computes mel spectrogram for entire audio upfront
-/// 2. For each chunk, extracts `chunk_size` mel frames
-/// 3. Prepends `pre_encode_cache_size` mel frames from before the current position
-/// 4. Passes combined mel frames (cache + chunk) to encoder
+/// # NeMo Streaming Flow
 ///
-/// Our approach (incremental):
-/// 1. Receives audio chunks incrementally
-/// 2. Computes mel spectrogram for each chunk
-/// 3. Accumulates mel frames in `mel_cache`
-/// 4. When extracting a chunk, prepends `pre_encode_cache_size` frames from accumulated mel
+/// NeMo's streaming works as follows:
+/// 1. Audio is converted to mel spectrogram upfront (or incrementally)
+/// 2. Mel frames are stored in a buffer
+/// 3. Chunks are extracted with overlap: `[pre_encode_cache frames | chunk_size frames]`
+/// 4. Buffer index advances by `shift_size` frames
+///
+/// For example with mode 0:
+/// - First chunk: 105 mel frames (pre_encode_cache=0)
+/// - Subsequent: 112 + 9 = 121 mel frames (pre_encode_cache=9)
+/// - Shift: 112 frames per step (after first)
+#[derive(Debug, Clone)]
+pub struct StreamingMelBuffer {
+    /// Pre-computed mel frames stored as [n_mels, total_frames]
+    /// This matches NeMo's buffer format which is [batch, features, time]
+    pub mel_buffer: Vec<f32>,
+
+    /// Number of mel features (e.g., 128)
+    pub n_mels: usize,
+
+    /// Total mel frames in buffer
+    pub total_frames: usize,
+
+    /// Current position in mel buffer (analogous to NeMo's buffer_idx)
+    pub buffer_idx: usize,
+
+    /// Audio samples waiting to be converted to mel
+    pub audio_buffer: Vec<f32>,
+
+    /// Sample rate
+    pub sample_rate: u32,
+
+    /// Window size in samples
+    pub window_samples: usize,
+
+    /// Hop size in samples
+    pub hop_samples: usize,
+}
+
+impl StreamingMelBuffer {
+    /// Create a new streaming mel buffer.
+    pub fn new(sample_rate: u32, window_size: f32, window_stride: f32, n_mels: usize) -> Self {
+        let window_samples = (window_size * sample_rate as f32) as usize;
+        let hop_samples = (window_stride * sample_rate as f32) as usize;
+
+        Self {
+            mel_buffer: Vec::new(),
+            n_mels,
+            total_frames: 0,
+            buffer_idx: 0,
+            audio_buffer: Vec::new(),
+            sample_rate,
+            window_samples,
+            hop_samples,
+        }
+    }
+
+    /// Add audio samples to be converted to mel frames.
+    pub fn add_audio(&mut self, samples: &[f32]) {
+        self.audio_buffer.extend_from_slice(samples);
+    }
+
+    /// Append pre-computed mel frames to the buffer.
+    ///
+    /// # Arguments
+    /// * `mel` - Mel spectrogram data in [batch=1, n_mels, time] format (flattened row-major)
+    /// * `num_frames` - Number of time frames
+    ///
+    /// The input is in row-major [batch, n_mels, time] format from the preprocessor.
+    /// We store internally as [time, n_mels] for efficient frame-by-frame access.
+    pub fn append_mel(&mut self, mel: &[f32], num_frames: usize) {
+        // Input mel is [1, n_mels, time] flattened row-major, so:
+        // mel[mel_idx * time + frame_idx] = feature mel_idx at frame frame_idx
+        //
+        // We want to store as [time, n_mels] for easier frame extraction:
+        // buffer[frame_idx * n_mels + mel_idx] = feature mel_idx at frame frame_idx
+        let n_mels = self.n_mels;
+        for frame_idx in 0..num_frames {
+            for mel_idx in 0..n_mels {
+                // Input index: [batch=0, mel_idx, frame_idx] = mel_idx * num_frames + frame_idx
+                let input_idx = mel_idx * num_frames + frame_idx;
+                if input_idx < mel.len() {
+                    self.mel_buffer.push(mel[input_idx]);
+                }
+            }
+        }
+        self.total_frames += num_frames;
+    }
+
+    /// Get the number of audio samples available.
+    pub fn audio_samples_available(&self) -> usize {
+        self.audio_buffer.len()
+    }
+
+    /// Get the number of mel frames we can compute from buffered audio.
+    pub fn computable_frames(&self) -> usize {
+        if self.audio_buffer.len() < self.window_samples {
+            0
+        } else {
+            (self.audio_buffer.len() - self.window_samples) / self.hop_samples + 1
+        }
+    }
+
+    /// Get audio samples and clear the audio buffer.
+    /// Returns (samples, can_compute_more) where can_compute_more indicates
+    /// if there are enough samples for at least one frame.
+    pub fn take_audio(&mut self) -> Vec<f32> {
+        std::mem::take(&mut self.audio_buffer)
+    }
+
+    /// Get the number of remaining mel frames to process.
+    pub fn remaining_frames(&self) -> usize {
+        self.total_frames.saturating_sub(self.buffer_idx)
+    }
+
+    /// Check if the buffer is empty (no more frames to process).
+    pub fn is_empty(&self) -> bool {
+        self.buffer_idx >= self.total_frames
+    }
+
+    /// Extract a chunk of mel frames for processing.
+    ///
+    /// This mirrors NeMo's CacheAwareStreamingAudioBuffer iteration:
+    /// - Extracts `pre_encode_cache + chunk_size` frames starting from `buffer_idx - pre_encode_cache`
+    /// - Advances `buffer_idx` by `shift_size`
+    ///
+    /// # Arguments
+    /// * `chunk_size` - Number of new mel frames in the chunk
+    /// * `shift_size` - Number of frames to advance
+    /// * `pre_encode_cache` - Number of frames to prepend from previous context
+    ///
+    /// # Returns
+    /// * `Some((mel_data, actual_length))` - Mel chunk in [n_mels, time] format for encoder input
+    /// * `None` if not enough frames available
+    pub fn extract_chunk(
+        &mut self,
+        chunk_size: usize,
+        shift_size: usize,
+        pre_encode_cache: usize,
+    ) -> Option<(Vec<f32>, usize)> {
+        // Check if we have enough frames for this chunk
+        if self.buffer_idx + chunk_size > self.total_frames {
+            // Not enough frames - check if we have any remaining for final chunk
+            if self.buffer_idx >= self.total_frames {
+                return None;
+            }
+            // Handle partial final chunk
+            let remaining = self.total_frames - self.buffer_idx;
+            return self.extract_chunk(remaining, remaining, pre_encode_cache);
+        }
+
+        // Calculate start position accounting for pre_encode_cache
+        let cache_start = self.buffer_idx.saturating_sub(pre_encode_cache);
+        let cache_frames_available = self.buffer_idx - cache_start;
+
+        // Total frames to extract: cache + chunk
+        let total_extract = cache_frames_available + chunk_size;
+
+        // Internal buffer is [time, n_mels]: buffer[frame * n_mels + mel_idx]
+        // Output needs to be [n_mels, time] for encoder: output[mel_idx * time + frame_idx]
+        let mut mel_chunk = vec![0.0f32; self.n_mels * total_extract];
+
+        for frame_offset in 0..total_extract {
+            let frame = cache_start + frame_offset;
+            for mel_idx in 0..self.n_mels {
+                // Source: buffer[frame * n_mels + mel_idx]
+                let src_idx = frame * self.n_mels + mel_idx;
+                // Destination: output[mel_idx * total_extract + frame_offset]
+                let dst_idx = mel_idx * total_extract + frame_offset;
+                if src_idx < self.mel_buffer.len() {
+                    mel_chunk[dst_idx] = self.mel_buffer[src_idx];
+                }
+            }
+        }
+
+        // Advance buffer index
+        self.buffer_idx += shift_size;
+
+        Some((mel_chunk, total_extract))
+    }
+
+    /// Reset the buffer for a new audio stream.
+    pub fn reset(&mut self) {
+        self.mel_buffer.clear();
+        self.total_frames = 0;
+        self.buffer_idx = 0;
+        self.audio_buffer.clear();
+    }
+}
+
+/// Legacy MelBuffer for backward compatibility with CTC streaming.
+/// Wraps audio buffering with running normalization stats.
 #[derive(Debug, Clone)]
 pub struct MelBuffer {
     /// Accumulated audio samples.
@@ -318,17 +500,6 @@ pub struct MelBuffer {
 
     /// Number of mel features.
     pub n_mels: usize,
-
-    /// Accumulated mel frames for pre_encode_cache.
-    /// Shape: [n_frames, n_mels] stored as row-major Vec.
-    /// We keep enough frames to provide pre_encode_cache context.
-    pub mel_cache: Vec<f32>,
-
-    /// Number of mel frames in mel_cache.
-    pub mel_cache_frames: usize,
-
-    /// Total mel frames processed so far (for tracking position).
-    pub total_mel_frames: usize,
 }
 
 impl MelBuffer {
@@ -346,9 +517,6 @@ impl MelBuffer {
             window_samples,
             hop_samples,
             n_mels,
-            mel_cache: Vec::new(),
-            mel_cache_frames: 0,
-            total_mel_frames: 0,
         }
     }
 
@@ -366,40 +534,30 @@ impl MelBuffer {
         }
     }
 
-    /// Consume audio for a given number of frames, advancing by a potentially different amount.
-    /// Returns the audio slice and updates the buffer, keeping proper overlap for streaming.
+    /// Consume audio for a given number of mel frames.
     ///
-    /// The STFT requires `window_samples` of audio for each frame, but frames
-    /// advance by `hop_samples`. So for `frames_to_return` frames we need:
-    ///   `window_samples + (frames_to_return - 1) * hop_samples` samples
-    ///
-    /// For streaming, we advance by `frames_to_advance` which may be less than
-    /// `frames_to_return` to maintain overlap (lookahead context) between chunks.
-    /// This is critical for streaming: chunk_size determines how many frames to
-    /// process, but shift_size determines how far to advance the audio pointer.
+    /// For streaming, we need to consume `chunk_size` frames worth of audio
+    /// but only advance by `shift_size` frames worth.
     ///
     /// # Arguments
-    /// * `frames_to_return` - Number of mel frames worth of audio to return (chunk_size)
-    /// * `frames_to_advance` - Number of mel frames worth of audio to drain from buffer (shift_size)
-    pub fn consume_frames(
-        &mut self,
-        frames_to_return: usize,
-        frames_to_advance: usize,
-    ) -> Vec<f32> {
-        // Total samples needed to produce frames_to_return mel frames
+    /// * `chunk_frames` - Number of mel frames to extract
+    /// * `shift_frames` - Number of mel frames to advance the buffer
+    ///
+    /// # Returns
+    /// Audio samples for computing `chunk_frames` mel frames
+    pub fn consume_frames(&mut self, chunk_frames: usize, shift_frames: usize) -> Vec<f32> {
+        // Samples needed to compute chunk_frames mel frames
         let samples_needed =
-            self.window_samples + (frames_to_return.saturating_sub(1)) * self.hop_samples;
+            self.window_samples + (chunk_frames.saturating_sub(1)) * self.hop_samples;
         let samples_to_take = samples_needed.min(self.audio_buffer.len());
 
-        // Copy out the audio for processing (don't drain yet)
+        // Copy the audio (don't drain yet)
         let audio: Vec<f32> = self.audio_buffer[..samples_to_take].to_vec();
 
-        // Advance the buffer by shift_size frames, NOT chunk_size frames
-        // This keeps (chunk_size - shift_size) frames of overlap for the next chunk
-        // which provides the lookahead context needed for streaming accuracy
-        let samples_to_advance = frames_to_advance * self.hop_samples;
-        let samples_to_drain = samples_to_advance.min(self.audio_buffer.len());
-        self.audio_buffer.drain(..samples_to_drain);
+        // Advance by shift_frames worth of samples
+        let samples_to_advance = shift_frames * self.hop_samples;
+        let drain_count = samples_to_advance.min(self.audio_buffer.len());
+        self.audio_buffer.drain(..drain_count);
 
         audio
     }
@@ -440,65 +598,12 @@ impl MelBuffer {
         (mean, std)
     }
 
-    /// Add mel frames to the cache.
-    ///
-    /// The mel cache stores recent mel frames to provide pre_encode_cache context
-    /// for subsequent chunks. We keep up to `max_cache_frames` most recent frames.
-    ///
-    /// # Arguments
-    /// * `mel_frames` - Mel frames as [n_frames, n_mels] in row-major order
-    /// * `n_frames` - Number of frames in mel_frames
-    /// * `max_cache_frames` - Maximum number of frames to keep in cache
-    pub fn add_mel_to_cache(
-        &mut self,
-        mel_frames: &[f32],
-        n_frames: usize,
-        max_cache_frames: usize,
-    ) {
-        // Append new frames
-        self.mel_cache.extend_from_slice(mel_frames);
-        self.mel_cache_frames += n_frames;
-        self.total_mel_frames += n_frames;
-
-        // Trim to keep only max_cache_frames most recent
-        if self.mel_cache_frames > max_cache_frames {
-            let frames_to_drop = self.mel_cache_frames - max_cache_frames;
-            let elements_to_drop = frames_to_drop * self.n_mels;
-            self.mel_cache.drain(..elements_to_drop);
-            self.mel_cache_frames = max_cache_frames;
-        }
-    }
-
-    /// Get pre_encode_cache mel frames (the last N frames from cache).
-    ///
-    /// Returns mel frames as [n_frames, n_mels] in row-major order.
-    /// Returns fewer frames if cache doesn't have enough.
-    ///
-    /// # Arguments
-    /// * `n_frames` - Number of frames to retrieve
-    pub fn get_pre_encode_cache(&self, n_frames: usize) -> (Vec<f32>, usize) {
-        let available = self.mel_cache_frames.min(n_frames);
-        if available == 0 {
-            return (Vec::new(), 0);
-        }
-
-        // Get the last `available` frames from cache
-        let start_frame = self.mel_cache_frames - available;
-        let start_idx = start_frame * self.n_mels;
-        let mel_data = self.mel_cache[start_idx..].to_vec();
-
-        (mel_data, available)
-    }
-
     /// Reset the buffer state.
     pub fn reset(&mut self) {
         self.audio_buffer.clear();
         self.feature_sum.fill(0.0);
         self.feature_sum_sq.fill(0.0);
         self.frames_processed = 0;
-        self.mel_cache.clear();
-        self.mel_cache_frames = 0;
-        self.total_mel_frames = 0;
     }
 }
 
@@ -542,17 +647,14 @@ pub fn compute_streaming_config(
     // This follows NeMo's setup_streaming_params() logic exactly
     let (lookahead_steps, cache_drop_size) = if att_context_style == "chunked_limited" {
         // Chunked limited: lookahead is just right context, no cache drop
-        // lookahead_steps = att_context_size[1] (right context)
         (right_context.max(0) as usize, 0)
     } else {
         // Regular style: lookahead accumulates through layers
-        // lookahead_steps = att_context_size[1] * n_layers + conv_context[1] * n_layers
         let lookahead = if right_context >= 0 {
             (right_context as usize) * n_layers + conv_context.1 * n_layers
         } else {
             0
         };
-        // cache_drop_size = lookahead_steps for regular style
         (lookahead, lookahead)
     };
 
@@ -568,7 +670,6 @@ pub fn compute_streaming_config(
 
     // Compute sampling frames from subsampling
     // NeMo's ConvSubsampling.get_sampling_frames() returns [1, subsampling_factor]
-    // This is important for correct chunk size calculation in streaming
     let sampling_frames = (1, subsampling_factor);
 
     // Chunk size in pre-subsampled frames
@@ -580,35 +681,22 @@ pub fn compute_streaming_config(
     );
 
     // Shift size - how many pre-subsampled frames to advance each step
-    // NeMo: shift_size = [sampling_frames[0] + sampling_frames[1] * (lookahead_steps - cache_drop_size),
-    //                     sampling_frames[1] + sampling_frames[1] * (lookahead_steps - cache_drop_size)]
     let shift_size = (
         sampling_frames.0 + sampling_frames.1 * lookahead_steps.saturating_sub(cache_drop_size),
         sampling_frames.1 + sampling_frames.1 * lookahead_steps.saturating_sub(cache_drop_size),
     );
 
     // Valid output length - how many OUTPUT frames are valid per chunk
-    // NeMo: valid_out_len = (shift_size[1] - sampling_frames[1]) // subsampling_factor + 1
-    // For chunked_limited with lookahead_steps = right_context and cache_drop_size = 0:
-    //   shift_size[1] = sampling_frames[1] + sampling_frames[1] * lookahead_steps
-    //                 = sampling_frames[1] * (1 + lookahead_steps)
-    //   valid_out_len = (sampling_frames[1] * (1 + lookahead_steps) - sampling_frames[1]) / subsampling_factor + 1
-    //                 = (sampling_frames[1] * lookahead_steps) / subsampling_factor + 1
-    //                 = lookahead_steps + 1 (when sampling_frames[1] == subsampling_factor)
     let valid_out_len = if sampling_frames.1 > 0 {
         (shift_size.1 - sampling_frames.1) / subsampling_factor + 1
     } else {
         shift_size.1 / subsampling_factor
     };
 
-    // Pre-encode cache size (for subsampling overlap)
-    // For dw_striding: cache = kernel_size - 1 for each conv layer
-    let pre_encode_cache = match subsampling_factor {
-        8 => (6, 7), // 3 conv layers with kernel 3
-        4 => (4, 5),
-        2 => (2, 3),
-        _ => (0, 0),
-    };
+    // Pre-encode cache size
+    // NeMo's dw_striding subsampling returns [0, subsampling_factor + 1]
+    // This is different from what we had before!
+    let pre_encode_cache = (0, subsampling_factor + 1);
 
     // Drop extra pre-encoded frames after subsampling
     // NeMo: drop_extra_pre_encoded = 1 + (pre_encode_cache_size[1] - 1) // subsampling_factor
@@ -620,7 +708,7 @@ pub fn compute_streaming_config(
 
     tracing::debug!(
         "Streaming config: mode={}, style={}, lookahead_steps={}, cache_drop={}, \
-         chunk_size={:?}, shift_size={:?}, valid_out_len={}, drop_extra={}",
+         chunk_size={:?}, shift_size={:?}, valid_out_len={}, pre_encode={:?}, drop_extra={}",
         mode_idx,
         att_context_style,
         lookahead_steps,
@@ -628,6 +716,7 @@ pub fn compute_streaming_config(
         chunk_size,
         shift_size,
         valid_out_len,
+        pre_encode_cache,
         drop_extra
     );
 
@@ -718,8 +807,8 @@ mod tests {
             last_channel_cache_size: 70,
             last_time_cache_size: 8,
             valid_out_len: 10,
-            pre_encode_cache_size: (6, 7),
-            drop_extra_pre_encoded: 1,
+            pre_encode_cache_size: (0, 9),
+            drop_extra_pre_encoded: 2,
             lookahead_frames: 13,
             mode_idx: 0,
             left_context: 70,
@@ -730,44 +819,7 @@ mod tests {
         assert_eq!(config.chunk_size_for_step(false), 120);
         assert_eq!(config.shift_size_for_step(true), 80);
         assert_eq!(config.shift_size_for_step(false), 100);
-    }
-
-    #[test]
-    fn test_mel_cache() {
-        let mut buffer = MelBuffer::new(16000, 0.025, 0.01, 80);
-        let n_mels = 80;
-
-        // Initially cache should be empty
-        let (cache, frames) = buffer.get_pre_encode_cache(7);
-        assert_eq!(frames, 0);
-        assert!(cache.is_empty());
-
-        // Add 10 frames worth of mel data (stored as [frames, n_mels])
-        let mel_chunk1: Vec<f32> = (0..10 * n_mels).map(|i| i as f32).collect();
-        buffer.add_mel_to_cache(&mel_chunk1, 10, 15);
-        assert_eq!(buffer.mel_cache_frames, 10);
-        assert_eq!(buffer.total_mel_frames, 10);
-
-        // Request 7 frames - should get last 7 frames
-        let (cache, frames) = buffer.get_pre_encode_cache(7);
-        assert_eq!(frames, 7);
-        // Last 7 frames start at frame index 3 (frames 3-9)
-        // First value should be (3 * n_mels) = 240
-        assert_eq!(cache[0], (3 * n_mels) as f32);
-        assert_eq!(cache.len(), 7 * n_mels);
-
-        // Add another 10 frames, with max_cache=15
-        // Total would be 20, but should trim to 15
-        let mel_chunk2: Vec<f32> = (100..100 + 10 * n_mels).map(|i| i as f32).collect();
-        buffer.add_mel_to_cache(&mel_chunk2, 10, 15);
-        assert_eq!(buffer.mel_cache_frames, 15);
-        assert_eq!(buffer.total_mel_frames, 20);
-
-        // Request 7 frames from 15-frame cache
-        let (cache, frames) = buffer.get_pre_encode_cache(7);
-        assert_eq!(frames, 7);
-        // Last 7 frames are frames 8-14 of the cache
-        // These should all be from mel_chunk2 (values starting at 100 + offset)
-        assert_eq!(cache.len(), 7 * n_mels);
+        assert_eq!(config.pre_encode_cache_for_step(true), 0);
+        assert_eq!(config.pre_encode_cache_for_step(false), 9);
     }
 }

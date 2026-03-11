@@ -40,7 +40,10 @@ pub use models::{
     RnntStreamingSession,
 };
 pub use modules::MelSpectrogram;
-pub use streaming::{EncoderCache, MelBuffer, StreamingConfig, StreamingModeInfo, StreamingOutput};
+pub use streaming::{
+    EncoderCache, MelBuffer, StreamingConfig, StreamingMelBuffer, StreamingModeInfo,
+    StreamingOutput,
+};
 
 /// Prelude for convenient imports.
 pub mod prelude {

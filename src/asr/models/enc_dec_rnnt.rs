@@ -35,8 +35,8 @@ use crate::asr::modules::{
     ConformerEncoder, LstmState, MelSpectrogram, RNNTDecoder, RNNTJoint, StatelessTransducerDecoder,
 };
 use crate::asr::streaming::{
-    compute_streaming_config, get_streaming_modes, EncoderCache, MelBuffer, StreamingConfig,
-    StreamingModeInfo, StreamingOutput,
+    compute_streaming_config, get_streaming_modes, EncoderCache, StreamingConfig,
+    StreamingMelBuffer, StreamingModeInfo, StreamingOutput,
 };
 use crate::core::checkpoint::NemoCheckpoint;
 use crate::core::config::from_yaml_str;
@@ -703,17 +703,17 @@ impl EncDecRNNTModel {
                 config.shift_size.0, config.shift_size.1
             );
             eprintln!(
-                "[DEBUG]   valid_out_len={}, lookahead_frames={}",
-                config.valid_out_len, config.lookahead_frames
+                "[DEBUG]   pre_encode_cache: first={}, subsequent={}",
+                config.pre_encode_cache_size.0, config.pre_encode_cache_size.1
+            );
+            eprintln!(
+                "[DEBUG]   valid_out_len={}, drop_extra_pre_encoded={}",
+                config.valid_out_len, config.drop_extra_pre_encoded
             );
             eprintln!("[DEBUG]   cache_drop_size={}", config.cache_drop_size);
             eprintln!(
                 "[DEBUG]   last_channel_cache_size={}, last_time_cache_size={}",
                 config.last_channel_cache_size, config.last_time_cache_size
-            );
-            eprintln!(
-                "[DEBUG]   left_context={}, right_context={}",
-                config.left_context, config.right_context
             );
         }
 
@@ -731,17 +731,18 @@ impl EncDecRNNTModel {
 
         // Create mel buffer
         let preprocessor_config = self.preprocessor.config();
-        let mel_buffer = MelBuffer::new(
+        let n_mels = preprocessor_config.features;
+        let mel_buffer = StreamingMelBuffer::new(
             preprocessor_config.sample_rate,
             preprocessor_config.window_size,
             preprocessor_config.window_stride,
-            preprocessor_config.features,
+            n_mels,
         );
 
         if debug {
             eprintln!(
-                "[DEBUG]   mel_buffer: window_samples={}, hop_samples={}",
-                mel_buffer.window_samples, mel_buffer.hop_samples
+                "[DEBUG]   mel_buffer: window_samples={}, hop_samples={}, n_mels={}",
+                mel_buffer.window_samples, mel_buffer.hop_samples, n_mels
             );
             eprintln!(
                 "[DEBUG]   subsampling_factor={}",
@@ -764,6 +765,7 @@ impl EncDecRNNTModel {
             accumulated_tokens: vec![Vec::new(); batch_size],
             is_first_chunk: true,
             blank_id: self.blank_id,
+            n_mels,
         })
     }
 
@@ -777,6 +779,11 @@ impl EncDecRNNTModel {
     }
 
     /// Process an audio chunk and return partial transcription.
+    ///
+    /// This follows NeMo's streaming approach:
+    /// 1. Convert audio to mel spectrogram and append to mel buffer
+    /// 2. Extract mel chunks with pre_encode_cache overlap
+    /// 3. Process through encoder and decoder
     pub fn process_chunk(
         &mut self,
         session: &mut RnntStreamingSession,
@@ -785,132 +792,116 @@ impl EncDecRNNTModel {
         let debug = Self::debug_enabled();
         let batch_size = session.encoder_cache.batch_size();
 
-        // Add audio to buffer
+        // Step 1: Add audio to buffer
         session.mel_buffer.add_audio(audio_chunk);
 
         if debug {
             eprintln!(
-                "[DEBUG] process_chunk: received {} samples, buffer now has {} samples",
+                "[DEBUG] process_chunk: received {} audio samples, audio_buffer has {} samples",
                 audio_chunk.len(),
-                session.mel_buffer.audio_buffer.len()
+                session.mel_buffer.audio_samples_available()
             );
         }
 
-        // Process all complete chunks in the buffer
-        let mut all_new_tokens: Vec<Vec<usize>> = vec![Vec::new(); batch_size];
-        let mut chunks_processed_this_call = 0;
+        // Step 2: Compute mel for all available audio and append to mel buffer
+        // This mimics NeMo's approach of pre-computing mel upfront
+        let computable = session.mel_buffer.computable_frames();
+        if computable > 0 {
+            let audio_data = session.mel_buffer.take_audio();
+            let audio = Array::from_slice(&audio_data, &[1, audio_data.len() as i32]);
 
-        loop {
-            // Check if we have enough audio for the next chunk
-            // To get N mel frames, we need: window_length + (N - 1) * hop_length samples
-            let chunk_frames = session.config.chunk_size_for_step(session.is_first_chunk);
-            let shift_frames = session.config.shift_size_for_step(session.is_first_chunk);
-            let hop_length = self.preprocessor.hop_length();
-            let window_length = self.preprocessor.window_length();
-            let chunk_samples = window_length + chunk_frames.saturating_sub(1) * hop_length;
+            // Compute mel spectrogram [1, n_mels, time]
+            let (features, _) = self.preprocessor.forward(&audio, None)?;
+            features.eval()?;
+
+            // Extract mel data and append to buffer
+            // features is [batch=1, n_mels, time]
+            let n_mels = features.dim(1) as usize;
+            let n_frames = features.dim(2) as usize;
+
+            // Flatten to get mel data
+            let features_flat = features.reshape(&[-1])?;
+            features_flat.eval()?;
+            let mel_data: &[f32] = features_flat.as_slice();
+
+            session.mel_buffer.append_mel(mel_data, n_frames);
 
             if debug {
                 eprintln!(
-                    "[DEBUG]   checking: need {} samples (window={} + {}*{} hop), have {}",
-                    chunk_samples,
-                    window_length,
-                    chunk_frames.saturating_sub(1),
-                    hop_length,
-                    session.mel_buffer.audio_buffer.len()
+                    "[DEBUG]   computed {} mel frames, mel_buffer now has {} total frames",
+                    n_frames, session.mel_buffer.total_frames
                 );
             }
+        }
 
-            if session.mel_buffer.audio_buffer.len() < chunk_samples {
-                if debug {
-                    eprintln!("[DEBUG]   not enough audio, breaking loop");
+        // Step 3: Process all complete mel chunks
+        let mut all_new_tokens: Vec<Vec<usize>> = vec![Vec::new(); batch_size];
+        let mut chunks_processed = 0;
+
+        loop {
+            // Get chunk parameters for current step
+            let chunk_size = session.config.chunk_size_for_step(session.is_first_chunk);
+            let shift_size = session.config.shift_size_for_step(session.is_first_chunk);
+            let pre_encode_cache = session
+                .config
+                .pre_encode_cache_for_step(session.is_first_chunk);
+            let drop_extra = if session.is_first_chunk {
+                0
+            } else {
+                session.config.drop_extra_pre_encoded
+            };
+
+            // Check if we have enough mel frames
+            let remaining = session.mel_buffer.remaining_frames();
+            if remaining < chunk_size {
+                if debug && chunks_processed == 0 {
+                    eprintln!(
+                        "[DEBUG]   need {} mel frames for chunk, have {} remaining",
+                        chunk_size, remaining
+                    );
                 }
                 break;
             }
+            if debug {
+                eprintln!(
+                    "[DEBUG]   extracting chunk: chunk_size={}, shift_size={}, pre_encode_cache={}, drop_extra={}",
+                    chunk_size, shift_size, pre_encode_cache, drop_extra
+                );
+                eprintln!(
+                    "[DEBUG]   mel_buffer: buffer_idx={}, total_frames={}",
+                    session.mel_buffer.buffer_idx, session.mel_buffer.total_frames
+                );
+            }
 
-            // ============================================================
-            // MEL SPECTROGRAM COMPUTATION WITH PRE_ENCODE CACHE
-            // ============================================================
-            //
-            // NeMo's approach (for reference):
-            // 1. Pre-computes entire mel spectrogram upfront
-            // 2. For chunk N at mel position `idx`:
-            //    - Extracts mel[idx:idx+chunk_size] as the chunk
-            //    - Prepends mel[idx-pre_encode_cache:idx] as context
-            //    - These pre_encode frames are the SAME frames from previous chunk
-            //    - Encoder drops output from pre_encode frames after subsampling
-            //
-            // Our approach (incremental streaming):
-            // 1. Compute mel for each audio chunk separately
-            // 2. Store the last N mel frames in mel_cache after each chunk
-            // 3. Prepend mel_cache frames to new chunk's mel before encoding
-            // 4. This reuses the SAME mel values NeMo would use
-            //
-            // Key insight: The pre_encode_cache provides convolution context for
-            // the subsampling layer. By reusing stored mel frames, we ensure
-            // the subsampling sees consistent input at chunk boundaries.
-            // ============================================================
-
-            // Extract audio for this chunk (no overlap - we handle pre_encode via mel cache)
-            let audio_data = session
+            // Extract mel chunk with pre_encode_cache overlap
+            let (mel_chunk, chunk_len) = session
                 .mel_buffer
-                .consume_frames(chunk_frames, shift_frames);
+                .extract_chunk(chunk_size, shift_size, pre_encode_cache)
+                .ok_or_else(|| crate::core::error::Error::model("Failed to extract mel chunk"))?;
 
             if debug {
                 eprintln!(
-                    "[DEBUG]   consumed {} audio samples (chunk={} frames, shift={} frames), buffer now has {}",
-                    audio_data.len(),
-                    chunk_frames,
-                    shift_frames,
-                    session.mel_buffer.audio_buffer.len()
+                    "[DEBUG]   extracted {} mel frames (chunk_size={} + cache={})",
+                    chunk_len,
+                    chunk_size,
+                    chunk_len.saturating_sub(chunk_size)
                 );
-            }
-
-            // Convert to Array
-            let audio = Array::from_slice(&audio_data, &[1, audio_data.len() as i32]);
-
-            // Compute mel features for this chunk's audio
-            let (chunk_mel, _) = self.preprocessor.forward(&audio, None)?;
-            chunk_mel.eval()?;
-
-            let chunk_mel_frames = chunk_mel.dim(2) as usize;
-            let n_mels = chunk_mel.dim(1) as usize;
-
-            // KNOWN ISSUE: Mel frame alignment at chunk boundaries
-            // =======================================================
-            // NeMo computes mel for entire audio upfront, then slices into chunks.
-            // We compute mel per chunk, which causes alignment issues due to STFT
-            // center padding. Each chunk's mel has extra frames (~2) that overlap
-            // with the previous/next chunk.
-            //
-            // This causes the "duplicate token" issue where the last word of chunk N
-            // may be partially repeated at the start of chunk N+1.
-            //
-            // TODO: Fix by either:
-            // 1. Pre-compute all mel upfront (requires knowing total audio length)
-            // 2. Implement streaming mel with proper boundary handling
-            // 3. Use a sliding window mel buffer with correct position tracking
-            //
-            // For now, we pass the raw mel and accept the slight duplication.
-            // The transcription is still mostly correct, just with occasional
-            // repeated words at chunk boundaries.
-            let features = chunk_mel;
-
-            let total_mel_frames = features.dim(2) as usize;
-
-            if debug {
+                // Show mel stats
+                let mel_min = mel_chunk.iter().cloned().fold(f32::INFINITY, f32::min);
+                let mel_max = mel_chunk.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                let mel_mean: f32 = mel_chunk.iter().sum::<f32>() / mel_chunk.len() as f32;
                 eprintln!(
-                    "[DEBUG]   chunk mel: {} frames (expected ~{}, +{} from center padding)",
-                    total_mel_frames,
-                    chunk_frames,
-                    total_mel_frames.saturating_sub(chunk_frames)
+                    "[DEBUG]   mel_chunk stats: min={:.3}, max={:.3}, mean={:.3}",
+                    mel_min, mel_max, mel_mean
                 );
             }
+
+            // Convert mel chunk to Array [1, n_mels, chunk_len]
+            let n_mels = session.n_mels;
+            let features = Array::from_slice(&mel_chunk, &[1, n_mels as i32, chunk_len as i32]);
 
             // Get lengths for encoder
-            let seq_len = features.dim(2);
-            let lengths = Array::from_slice(&[seq_len as i32], &[1]);
-
-            let _ = total_mel_frames; // suppress unused warning
+            let lengths = Array::from_slice(&[chunk_len as i32], &[1]);
 
             // Run encoder with cache
             let cache_len_before = session.encoder_cache.last_channel_len.as_slice::<i64>()[0];
@@ -922,10 +913,10 @@ impl EncDecRNNTModel {
                     &session.encoder_cache.last_channel,
                     &session.encoder_cache.last_time,
                     &session.encoder_cache.last_channel_len,
-                    session.config.drop_extra_pre_encoded,
+                    drop_extra,
                 )?;
 
-            // Update cache
+            // Update encoder cache
             session.encoder_cache.last_channel = cache_channel_next;
             session.encoder_cache.last_time = cache_time_next;
             session.encoder_cache.last_channel_len = cache_len_next;
@@ -940,30 +931,40 @@ impl EncDecRNNTModel {
 
             if debug {
                 eprintln!(
-                    "[DEBUG]   encoder output: {} frames (raw), cache: {} -> {}",
+                    "[DEBUG]   encoder: {} output frames, cache {} -> {}",
                     raw_enc_len, cache_len_before, cache_len_after
+                );
+                // Show encoder output stats
+                let enc_flat = encoded.reshape(&[-1]).unwrap();
+                enc_flat.eval().unwrap();
+                let enc_slice: &[f32] = enc_flat.as_slice();
+                let enc_min = enc_slice.iter().cloned().fold(f32::INFINITY, f32::min);
+                let enc_max = enc_slice.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                let enc_mean: f32 = enc_slice.iter().sum::<f32>() / enc_slice.len() as f32;
+                eprintln!(
+                    "[DEBUG]   encoder output stats: min={:.3}, max={:.3}, mean={:.3}",
+                    enc_min, enc_max, enc_mean
                 );
             }
 
-            // CRITICAL: Truncate encoder output to valid_out_len
-            // This is essential for streaming - we only decode frames that have
-            // complete context. The lookahead frames will be re-processed in
-            // the next chunk with more context.
+            // Truncate to valid_out_len
             let valid_out_len = session.config.valid_out_len;
             let enc_seq_len = raw_enc_len.min(valid_out_len);
 
             if debug {
                 eprintln!(
-                    "[DEBUG]   valid_out_len={}, decoding {} frames (is_first={})",
-                    valid_out_len, enc_seq_len, session.is_first_chunk
+                    "[DEBUG]   valid_out_len={}, decoding {} frames",
+                    valid_out_len, enc_seq_len
                 );
             }
 
+            // Decode
             const MAX_SYMBOLS_PER_STEP: usize = 10;
             let mut tokens_this_chunk = Vec::new();
+            let mut blank_count = 0;
+            let mut non_blank_count = 0;
 
             for b in 0..batch_size {
-                // Process each encoder frame
                 for t in 0..enc_seq_len {
                     let enc_frame =
                         encoded.index((b as i32..b as i32 + 1, t as i32..t as i32 + 1, ..));
@@ -971,27 +972,25 @@ impl EncDecRNNTModel {
                     let mut symbols_emitted = 0;
 
                     loop {
-                        // Get prediction output
                         let last_token = session.last_tokens[b]
                             .map(|tok| Array::from_slice(&[tok as i32], &[1, 1]));
                         let (pred_output, new_state) = self
                             .decoder
                             .predict_one(last_token.as_ref(), &session.decoder_states[b])?;
 
-                        // Compute joint output
                         let log_probs = self.joint.forward_one(&enc_frame, &pred_output)?;
                         log_probs.eval()?;
 
-                        // Get argmax
                         let prediction = argmax_axis(&log_probs, -1, false)?;
                         prediction.eval()?;
                         let pred_token = prediction.as_slice::<u32>()[0] as usize;
 
                         if pred_token == session.blank_id {
+                            blank_count += 1;
                             break;
                         }
 
-                        // Emit token
+                        non_blank_count += 1;
                         all_new_tokens[b].push(pred_token);
                         session.accumulated_tokens[b].push(pred_token);
                         session.last_tokens[b] = Some(pred_token);
@@ -1007,7 +1006,13 @@ impl EncDecRNNTModel {
             }
 
             if debug {
-                // Decode tokens to show what we got
+                eprintln!(
+                    "[DEBUG]   decoding: {} encoder frames, {} blank emissions, {} non-blank tokens",
+                    enc_seq_len, blank_count, non_blank_count
+                );
+            }
+
+            if debug {
                 let token_text = if let Some(tokenizer) = &self.tokenizer {
                     let ids: Vec<u32> = tokens_this_chunk.iter().map(|&t| t as u32).collect();
                     tokenizer.decode_piece_ids(&ids).unwrap_or_default()
@@ -1015,32 +1020,26 @@ impl EncDecRNNTModel {
                     format!("{:?}", tokens_this_chunk)
                 };
                 eprintln!(
-                    "[DEBUG]   decoded {} tokens this chunk: {:?} -> \"{}\"",
+                    "[DEBUG]   decoded {} tokens: \"{}\"",
                     tokens_this_chunk.len(),
-                    tokens_this_chunk,
                     token_text
                 );
             }
 
             session.is_first_chunk = false;
-            chunks_processed_this_call += 1;
+            chunks_processed += 1;
         }
 
-        if debug && chunks_processed_this_call > 0 {
+        if debug && chunks_processed > 0 {
             eprintln!(
-                "[DEBUG] processed {} internal chunks, total accumulated tokens: {}",
-                chunks_processed_this_call,
+                "[DEBUG] processed {} mel chunks, accumulated {} tokens",
+                chunks_processed,
                 session
                     .accumulated_tokens
                     .get(0)
                     .map(|t| t.len())
                     .unwrap_or(0)
             );
-        }
-
-        // If we didn't process any chunks, return empty output
-        if session.is_first_chunk {
-            return Ok(StreamingOutput::default());
         }
 
         // Build output texts from accumulated tokens
@@ -1067,32 +1066,56 @@ impl EncDecRNNTModel {
     }
 
     /// Finalize streaming and get final transcription.
+    ///
+    /// This processes any remaining audio and mel frames in the buffer.
     pub fn finalize_streaming(
         &mut self,
         mut session: RnntStreamingSession,
     ) -> Result<StreamingOutput> {
-        // Process any remaining audio - may need multiple chunks
-        while !session.mel_buffer.audio_buffer.is_empty() {
-            let min_samples = self.preprocessor.window_length();
-            let buffer_len = session.mel_buffer.audio_buffer.len();
+        let debug = Self::debug_enabled();
 
-            // If we have less than minimum samples, pad and do final processing
-            if buffer_len < min_samples {
-                session.mel_buffer.audio_buffer.resize(min_samples, 0.0);
+        // Process any remaining audio samples
+        if session.mel_buffer.audio_samples_available() > 0 {
+            let min_samples = self.preprocessor.window_length();
+            let available = session.mel_buffer.audio_samples_available();
+
+            if debug {
+                eprintln!("[DEBUG] finalize: {} audio samples remaining", available);
             }
 
-            let remaining: Vec<f32> = session.mel_buffer.audio_buffer.drain(..).collect();
-            let output = self.process_chunk(&mut session, &remaining)?;
+            // Pad if needed to compute at least one frame
+            if available < min_samples {
+                let padding = vec![0.0f32; min_samples - available];
+                session.mel_buffer.add_audio(&padding);
+            }
 
-            // If process_chunk didn't consume anything, break to avoid infinite loop
-            if output.tokens.iter().all(|t| t.is_empty())
-                && !session.mel_buffer.audio_buffer.is_empty()
+            // Process remaining audio
+            self.process_chunk(&mut session, &[])?;
+        }
+
+        // Process any remaining mel frames
+        while !session.mel_buffer.is_empty() {
+            let remaining = session.mel_buffer.remaining_frames();
+            if remaining == 0 {
+                break;
+            }
+
+            if debug {
+                eprintln!("[DEBUG] finalize: {} mel frames remaining", remaining);
+            }
+
+            // Try to process remaining frames
+            let result = self.process_chunk(&mut session, &[])?;
+
+            // Break if no progress was made
+            if result.tokens.iter().all(|t| t.is_empty())
+                && session.mel_buffer.remaining_frames() == remaining
             {
                 break;
             }
         }
 
-        // Final output
+        // Final output with all accumulated tokens
         let batch_size = session.accumulated_tokens.len();
         let mut final_tokens = Vec::with_capacity(batch_size);
         let mut final_texts = Vec::with_capacity(batch_size);
@@ -1119,6 +1142,11 @@ impl EncDecRNNTModel {
 }
 
 /// Streaming session state for RNNT models.
+///
+/// This session manages the streaming state following NeMo's approach:
+/// 1. Audio is incrementally converted to mel frames
+/// 2. Mel frames are stored in a buffer
+/// 3. Chunks are extracted with pre_encode_cache overlap
 pub struct RnntStreamingSession {
     /// Streaming configuration
     pub config: StreamingConfig,
@@ -1126,8 +1154,8 @@ pub struct RnntStreamingSession {
     /// Encoder cache state
     pub encoder_cache: EncoderCache,
 
-    /// Audio/feature buffer
-    pub mel_buffer: MelBuffer,
+    /// Mel spectrogram buffer (stores pre-computed mel frames)
+    pub mel_buffer: StreamingMelBuffer,
 
     /// Decoder states for each batch sample
     pub decoder_states: Vec<DecoderState>,
@@ -1138,11 +1166,14 @@ pub struct RnntStreamingSession {
     /// All accumulated tokens for each batch sample
     pub accumulated_tokens: Vec<Vec<usize>>,
 
-    /// Whether this is the first chunk
+    /// Whether this is the first chunk (determines chunk_size and pre_encode_cache)
     pub is_first_chunk: bool,
 
     /// Blank token ID
     blank_id: usize,
+
+    /// Number of mel features
+    n_mels: usize,
 }
 
 /// Load a WAV file and return samples and sample rate.
