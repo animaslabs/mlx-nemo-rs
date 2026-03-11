@@ -437,8 +437,11 @@ impl EncDecCTCModel {
         session.mel_buffer.add_audio(audio_chunk);
 
         // Check if we have enough audio for a chunk
-        let chunk_samples = session.config.chunk_size_for_step(session.is_first_chunk)
-            * self.preprocessor.hop_length();
+        let chunk_frames = session.config.chunk_size_for_step(session.is_first_chunk);
+        let shift_frames = session.config.shift_size_for_step(session.is_first_chunk);
+        let hop_length = self.preprocessor.hop_length();
+        let window_length = self.preprocessor.window_length();
+        let chunk_samples = window_length + chunk_frames.saturating_sub(1) * hop_length;
 
         if session.mel_buffer.audio_buffer.len() < chunk_samples {
             // Not enough audio yet
@@ -446,9 +449,10 @@ impl EncDecCTCModel {
         }
 
         // Extract audio for this chunk
+        // CRITICAL: Feed chunk_frames to encoder but only advance by shift_frames
         let audio_data = session
             .mel_buffer
-            .consume_frames(session.config.chunk_size_for_step(session.is_first_chunk));
+            .consume_frames(chunk_frames, shift_frames);
 
         // Convert to Array
         let audio = Array::from_slice(&audio_data, &[1, audio_data.len() as i32]);
@@ -487,6 +491,7 @@ impl EncDecCTCModel {
                 &session.encoder_cache.last_channel,
                 &session.encoder_cache.last_time,
                 &session.encoder_cache.last_channel_len,
+                session.config.drop_extra_pre_encoded,
             )?;
 
         // Update cache

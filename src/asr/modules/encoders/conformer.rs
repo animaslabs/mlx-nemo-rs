@@ -288,6 +288,7 @@ impl ConformerEncoder {
         cache_last_channel: &Array,
         cache_last_time: &Array,
         cache_last_channel_len: &Array,
+        drop_extra_pre_encoded: usize,
     ) -> Result<(Array, Array, Array, Array, Array)> {
         let debug = std::env::var("NEMO_DEBUG")
             .map(|v| v == "1")
@@ -299,9 +300,30 @@ impl ConformerEncoder {
         let input_frames = x.dim(1);
 
         // Subsampling
-        let (mut x, lengths) = self.subsampling.forward(&x, lengths)?;
+        let (mut x, mut lengths) = self.subsampling.forward(&x, lengths)?;
 
         let subsampled_frames = x.dim(1);
+
+        // Drop extra pre-encoded frames for streaming
+        // This is needed because the subsampling convolutions produce extra frames
+        // at chunk boundaries that should be discarded to match offline behavior.
+        // Only apply when we have cache (not on first chunk).
+        let filled_cache_len_check = cache_last_channel_len.as_slice::<i64>()[0];
+        if drop_extra_pre_encoded > 0 && filled_cache_len_check > 0 {
+            let drop = drop_extra_pre_encoded as i32;
+            x = x.index((.., drop.., ..));
+            lengths = mlx_rs::ops::clip(
+                &(&lengths - &Array::from_int(drop)),
+                (&Array::from_int(0), ()),
+            )?;
+            if debug {
+                eprintln!(
+                    "[DEBUG]   encoder: dropped {} extra pre-encoded frames, now {} frames",
+                    drop_extra_pre_encoded,
+                    x.dim(1)
+                );
+            }
+        }
 
         if debug {
             eprintln!(

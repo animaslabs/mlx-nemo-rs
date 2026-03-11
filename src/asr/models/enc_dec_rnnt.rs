@@ -803,17 +803,18 @@ impl EncDecRNNTModel {
         loop {
             // Check if we have enough audio for the next chunk
             // To get N mel frames, we need: window_length + (N - 1) * hop_length samples
-            let target_frames = session.config.chunk_size_for_step(session.is_first_chunk);
+            let chunk_frames = session.config.chunk_size_for_step(session.is_first_chunk);
+            let shift_frames = session.config.shift_size_for_step(session.is_first_chunk);
             let hop_length = self.preprocessor.hop_length();
             let window_length = self.preprocessor.window_length();
-            let chunk_samples = window_length + target_frames.saturating_sub(1) * hop_length;
+            let chunk_samples = window_length + chunk_frames.saturating_sub(1) * hop_length;
 
             if debug {
                 eprintln!(
                     "[DEBUG]   checking: need {} samples (window={} + {}*{} hop), have {}",
                     chunk_samples,
                     window_length,
-                    target_frames.saturating_sub(1),
+                    chunk_frames.saturating_sub(1),
                     hop_length,
                     session.mel_buffer.audio_buffer.len()
                 );
@@ -826,37 +827,143 @@ impl EncDecRNNTModel {
                 break;
             }
 
-            // Extract audio for this chunk
-            let audio_data = session
-                .mel_buffer
-                .consume_frames(session.config.chunk_size_for_step(session.is_first_chunk));
+            // Get pre_encode_cache size for this step
+            // This determines how many extra mel frames we need as left context for subsampling
+            let pre_encode_cache_size = session
+                .config
+                .pre_encode_cache_for_step(session.is_first_chunk);
+
+            // Calculate audio needed for pre_encode_cache mel frames
+            // Each mel frame requires hop_length additional samples beyond the first frame
+            let pre_encode_audio_samples = if !session.is_first_chunk && pre_encode_cache_size > 0 {
+                pre_encode_cache_size * hop_length
+            } else {
+                0
+            };
+
+            // Extract audio for this chunk including pre_encode context
+            // We include extra audio at the START to generate pre_encode_cache mel frames
+            // This ensures the mel computation has proper context for the subsampling convolutions
+            //
+            // Total mel frames needed: pre_encode_cache_size + chunk_frames
+            // Audio needed: window_length + (total_frames - 1) * hop_length
+            let total_mel_frames = pre_encode_cache_size + chunk_frames;
+            let total_audio_samples =
+                window_length + total_mel_frames.saturating_sub(1) * hop_length;
+
+            // But we need to track how much to READ vs how much to ADVANCE
+            // We READ: total_audio_samples (for pre_encode + chunk)
+            // We ADVANCE: shift_frames * hop_length (normal progression)
+            //
+            // The complication: on first chunk, we don't have pre_encode audio yet
+            // On subsequent chunks, we keep (pre_encode_cache_size * hop_length) extra audio
+            let audio_to_read = if session.is_first_chunk {
+                // First chunk: no pre_encode cache, just read chunk audio
+                chunk_samples
+            } else {
+                // Subsequent chunks: read pre_encode + chunk audio
+                // We need to start reading from (pre_encode_cache_size * hop) samples before
+                // the current chunk start, which means we need that much extra in the buffer
+                total_audio_samples
+            };
+
+            // For advancing, we advance by shift_frames worth of audio MINUS the pre_encode
+            // audio needed for the next chunk. This keeps extra samples in the buffer.
+            //
+            // After chunk N, the next chunk N+1 needs pre_encode_cache audio from BEFORE
+            // its start position. We keep that audio by not draining it.
+            //
+            // For first chunk: keep pre_encode_cache_size[1] * hop for next chunk
+            // For subsequent chunks: keep pre_encode_cache_size[1] * hop for next chunk
+            let next_pre_encode_samples = session.config.pre_encode_cache_size.1 * hop_length;
+            let audio_to_advance = if session.is_first_chunk {
+                // First chunk advances by shift, but keeps pre_encode audio for next chunk
+                shift_frames * hop_length - next_pre_encode_samples
+            } else {
+                // Subsequent chunks: the pre_encode audio was at the START of what we read,
+                // so we advance by the full shift amount. The next pre_encode comes from
+                // the audio that remains after this chunk.
+                shift_frames * hop_length - next_pre_encode_samples
+            };
+
+            // Check if we have enough audio
+            // On subsequent chunks, we need extra audio for pre_encode context
+            if session.mel_buffer.audio_buffer.len() < audio_to_read {
+                if debug {
+                    eprintln!(
+                        "[DEBUG]   not enough audio for pre_encode: need {}, have {}",
+                        audio_to_read,
+                        session.mel_buffer.audio_buffer.len()
+                    );
+                }
+                break;
+            }
+
+            // Read audio (without draining yet)
+            let audio_data: Vec<f32> = session.mel_buffer.audio_buffer[..audio_to_read].to_vec();
+
+            // Advance the buffer by shift amount only
+            let actual_drain = audio_to_advance.min(session.mel_buffer.audio_buffer.len());
+            session.mel_buffer.audio_buffer.drain(..actual_drain);
 
             if debug {
                 eprintln!(
-                    "[DEBUG]   consumed {} audio samples, buffer now has {}",
+                    "[DEBUG]   read {} audio samples, advanced by {}, buffer now has {}",
                     audio_data.len(),
+                    actual_drain,
                     session.mel_buffer.audio_buffer.len()
                 );
+                if !session.is_first_chunk {
+                    eprintln!(
+                        "[DEBUG]   pre_encode context: {} mel frames ({} samples)",
+                        pre_encode_cache_size, pre_encode_audio_samples
+                    );
+                }
             }
 
             // Convert to Array
             let audio = Array::from_slice(&audio_data, &[1, audio_data.len() as i32]);
 
             // Compute mel features with standard normalization
+            // This produces mel frames for the entire audio segment (pre_encode + chunk)
             let (features, _) = self.preprocessor.forward(&audio, None)?;
+            features.eval()?;
 
-            // Get lengths
-            let seq_len = features.dim(2);
-            let lengths = Array::from_slice(&[seq_len as i32], &[1]);
+            // Get actual number of mel frames produced
+            let total_mel_frames_actual = features.dim(2) as usize;
 
             if debug {
                 eprintln!(
-                    "[DEBUG]   mel features shape: [{}, {}, {}]",
+                    "[DEBUG]   mel features shape: [{}, {}, {}] (expected ~{} frames)",
                     features.dim(0),
                     features.dim(1),
-                    features.dim(2)
+                    features.dim(2),
+                    total_mel_frames
                 );
             }
+
+            // Get lengths for encoder
+            let seq_len = features.dim(2);
+            let lengths = Array::from_slice(&[seq_len as i32], &[1]);
+
+            // Determine drop_extra for this chunk
+            // On first chunk: no pre_encode, so use normal drop_extra_pre_encoded
+            // On subsequent chunks: we have pre_encode frames that will be dropped by encoder
+            let drop_extra = if session.is_first_chunk {
+                session.config.drop_extra_pre_encoded
+            } else {
+                // The pre_encode frames generate extra subsampled output that needs to be dropped
+                // drop = base_drop + ceil(pre_encode_cache_size / subsampling_factor)
+                // But actually, the encoder's drop_extra_pre_encoded should handle this
+                // since it's designed for exactly this case
+                session.config.drop_extra_pre_encoded
+            };
+
+            let _ = (
+                total_mel_frames_actual,
+                drop_extra,
+                pre_encode_audio_samples,
+            ); // suppress unused warnings
 
             // Run encoder with cache
             let cache_len_before = session.encoder_cache.last_channel_len.as_slice::<i64>()[0];
@@ -868,6 +975,7 @@ impl EncDecRNNTModel {
                     &session.encoder_cache.last_channel,
                     &session.encoder_cache.last_time,
                     &session.encoder_cache.last_channel_len,
+                    session.config.drop_extra_pre_encoded,
                 )?;
 
             // Update cache

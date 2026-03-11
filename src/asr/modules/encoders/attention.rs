@@ -334,28 +334,39 @@ impl RelPositionMultiHeadAttention {
 
                 let total = cache_len + seq_len;
 
-                // Update cache: keep cache_len frames, drop cache_drop_size, add query states
-                // new_cache = concat(cache[cache_drop_size:], x[:, :keep_size, :])
-                let keep_size = (seq_len - self.cache_drop_size as i32).max(0);
-                let new_cache = if self.cache_drop_size > 0 {
-                    let cache_keep = cache_tensor.index((.., self.cache_drop_size as i32.., ..));
-                    if keep_size > 0 {
-                        let x_keep = x.index((.., ..keep_size, ..));
-                        ops::concatenate_axis(&[&cache_keep, &x_keep], 1)?
+                // Update cache following NeMo's logic:
+                // q_keep_size = seq_len - cache_drop_size
+                // new_cache = concat(cache[q_keep_size:], x[:q_keep_size])
+                //
+                // This implements a sliding window where:
+                // - We drop q_keep_size frames from the START of the cache
+                // - We add the first q_keep_size frames of the new input
+                // - When cache_drop_size = 0, q_keep_size = seq_len, so we drop seq_len
+                //   old frames and add all seq_len new frames
+                let q_keep_size = (seq_len - self.cache_drop_size as i32).max(0);
+                let new_cache = if q_keep_size > 0 {
+                    // Drop first q_keep_size frames from cache (if cache is big enough)
+                    let cache_keep = if cache_len > q_keep_size {
+                        cache_tensor.index((.., q_keep_size.., ..))
                     } else {
-                        cache_keep
-                    }
+                        // Cache is smaller than q_keep_size, keep nothing from old cache
+                        ops::zeros::<f32>(&[batch_size, 0, x.dim(2) as i32])?
+                    };
+                    // Keep first q_keep_size frames from current input
+                    let x_keep = x.index((.., ..q_keep_size, ..));
+                    ops::concatenate_axis(&[&cache_keep, &x_keep], 1)?
                 } else {
-                    // No drop, just append
-                    ops::concatenate_axis(&[cache_tensor, x], 1)?
+                    // q_keep_size <= 0 means we drop all, just keep new input
+                    x.clone()
                 };
 
                 (total, Some(new_cache))
             } else {
                 // Cache tensor exists but is empty - start fresh
-                let keep_size = (seq_len - self.cache_drop_size as i32).max(0);
-                let new_cache = if keep_size > 0 {
-                    x.index((.., ..keep_size, ..))
+                // Keep first q_keep_size frames from current input
+                let q_keep_size = (seq_len - self.cache_drop_size as i32).max(0);
+                let new_cache = if q_keep_size > 0 {
+                    x.index((.., ..q_keep_size, ..))
                 } else {
                     ops::zeros::<f32>(&[batch_size, 0, x.dim(2) as i32])?
                 };
@@ -363,9 +374,9 @@ impl RelPositionMultiHeadAttention {
             }
         } else {
             // No cache at all - first chunk, start building cache
-            let keep_size = (seq_len - self.cache_drop_size as i32).max(0);
-            let new_cache = if keep_size > 0 {
-                x.index((.., ..keep_size, ..))
+            let q_keep_size = (seq_len - self.cache_drop_size as i32).max(0);
+            let new_cache = if q_keep_size > 0 {
+                x.index((.., ..q_keep_size, ..))
             } else {
                 ops::zeros::<f32>(&[batch_size, 0, x.dim(2) as i32])?
             };
