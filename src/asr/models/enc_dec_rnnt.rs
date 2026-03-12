@@ -804,10 +804,10 @@ impl EncDecRNNTModel {
         }
 
         // Step 2: Compute mel for all available audio and append to mel buffer
-        // This mimics NeMo's approach of pre-computing mel upfront
-        let computable = session.mel_buffer.computable_frames();
-        if computable > 0 {
-            let audio_data = session.mel_buffer.take_audio();
+        // Use take_audio_with_overlap to ensure consistent mel features at chunk boundaries.
+        // The STFT window overlaps between frames, so we keep some audio samples
+        // from the end to avoid boundary effects.
+        if let Some(audio_data) = session.mel_buffer.take_audio_with_overlap() {
             let audio = Array::from_slice(&audio_data, &[1, audio_data.len() as i32]);
 
             // Compute mel spectrogram [1, n_mels, time]

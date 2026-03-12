@@ -393,6 +393,44 @@ impl StreamingMelBuffer {
         std::mem::take(&mut self.audio_buffer)
     }
 
+    /// Get audio samples for mel computation, keeping overlap for next computation.
+    ///
+    /// This is crucial for streaming: the STFT window overlaps between frames,
+    /// so we need to keep `window_samples - hop_samples` samples from the end
+    /// to ensure consistent mel features at chunk boundaries.
+    ///
+    /// Returns None if there's not enough audio for at least one frame.
+    pub fn take_audio_with_overlap(&mut self) -> Option<Vec<f32>> {
+        let computable = self.computable_frames();
+        if computable == 0 {
+            return None;
+        }
+
+        // Calculate how many samples we'll consume for `computable` frames
+        // Last frame starts at position (computable - 1) * hop_samples
+        // and extends window_samples, so total needed is:
+        // (computable - 1) * hop_samples + window_samples
+        let samples_used = (computable - 1) * self.hop_samples + self.window_samples;
+
+        // We need to keep window_samples - hop_samples for overlap
+        // Actually, we keep everything after the last complete frame's start
+        // which is (computable - 1) * hop_samples + hop_samples = computable * hop_samples
+        let keep_from = computable * self.hop_samples;
+
+        // Take all audio up to (and including) what's needed for the last frame
+        let audio: Vec<f32> =
+            self.audio_buffer[..samples_used.min(self.audio_buffer.len())].to_vec();
+
+        // Keep the overlap portion
+        if keep_from < self.audio_buffer.len() {
+            self.audio_buffer = self.audio_buffer[keep_from..].to_vec();
+        } else {
+            self.audio_buffer.clear();
+        }
+
+        Some(audio)
+    }
+
     /// Get the number of remaining mel frames to process.
     pub fn remaining_frames(&self) -> usize {
         self.total_frames.saturating_sub(self.buffer_idx)
