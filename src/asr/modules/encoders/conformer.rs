@@ -124,12 +124,8 @@ fn create_attention_mask(
     max_audio_length: i32,
     cache_len: i32,
     filled_cache_len: i32,
-    seq_len: i32,
+    _seq_len: i32,
 ) -> Result<Array> {
-    let debug = std::env::var("MASK_DEBUG")
-        .map(|v| v == "1")
-        .unwrap_or(false);
-
     // Create base attention mask [1, max_audio_length, max_audio_length]
     // In NeMo, this starts as all True (all positions visible),
     // then gets masked based on context style
@@ -197,21 +193,6 @@ fn create_attention_mask(
 
     // Invert: NeMo returns inverted mask at the end (True means ignore)
     let att_mask = mlx_rs::ops::logical_not(&att_mask)?;
-
-    if debug {
-        att_mask.eval()?;
-        let mask_sum: f32 =
-            mlx_rs::ops::sum(&att_mask.as_type::<f32>()?, None)?.as_slice::<f32>()[0];
-        eprintln!(
-            "[MASK_DEBUG] att_context_size={:?}, style={}, max_len={}, cache_len={}, filled={}, seq_len={}",
-            att_context_size, att_context_style, max_audio_length, cache_len, filled_cache_len, seq_len
-        );
-        eprintln!(
-            "[MASK_DEBUG] mask shape: {:?}, masked positions: {}",
-            att_mask.shape(),
-            mask_sum
-        );
-    }
 
     Ok(att_mask)
 }
@@ -530,41 +511,11 @@ impl ConformerEncoder {
         cache_last_channel_len: &Array,
         drop_extra_pre_encoded: usize,
     ) -> Result<(Array, Array, Array, Array, Array)> {
-        let debug = std::env::var("NEMO_DEBUG")
-            .map(|v| v == "1")
-            .unwrap_or(false);
-
         // Transpose from [B, F, T] to [B, T, F] for processing
         let x = mlx_rs::ops::transpose_axes(features, &[0, 2, 1])?;
 
-        let input_frames = x.dim(1);
-
         // Subsampling
         let (mut x, mut lengths) = self.subsampling.forward(&x, lengths)?;
-
-        let subsampled_frames = x.dim(1);
-
-        // Debug: check subsampling output (before xscale)
-        if debug {
-            x.eval()?;
-            let x_slice: &[f32] = x.as_slice();
-            let d_model = x.dim(2) as usize;
-            eprintln!(
-                "[DEBUG]   after subsampling (before xscale): shape {:?}",
-                x.shape(),
-            );
-            // Print first 3 values of frames 0, 1, 2
-            for frame in 0..3.min(x.dim(1) as usize) {
-                let start = frame * d_model;
-                eprintln!(
-                    "[DEBUG]     frame {}: [{:.4}, {:.4}, {:.4}, ...]",
-                    frame,
-                    x_slice.get(start).unwrap_or(&0.0),
-                    x_slice.get(start + 1).unwrap_or(&0.0),
-                    x_slice.get(start + 2).unwrap_or(&0.0),
-                );
-            }
-        }
 
         // Drop extra pre-encoded frames for streaming
         // This is needed because the subsampling convolutions produce extra frames
@@ -578,43 +529,12 @@ impl ConformerEncoder {
                 &(&lengths - &Array::from_int(drop)),
                 (&Array::from_int(0), ()),
             )?;
-            if debug {
-                x.eval()?;
-                let x_slice: &[f32] = x.as_slice();
-                eprintln!(
-                    "[DEBUG]   encoder: dropped {} extra pre-encoded frames, now {} frames, first values [{:.4}, {:.4}, {:.4}]",
-                    drop_extra_pre_encoded,
-                    x.dim(1),
-                    x_slice.get(0).unwrap_or(&0.0),
-                    x_slice.get(1).unwrap_or(&0.0),
-                    x_slice.get(2).unwrap_or(&0.0),
-                );
-            }
-        }
-
-        if debug {
-            eprintln!(
-                "[DEBUG]   encoder: input {} frames -> subsampled {} frames (factor {})",
-                input_frames, subsampled_frames, self.config.subsampling_factor
-            );
         }
 
         // Scale input by sqrt(d_model) if xscaling is enabled
         let xscale = self.pos_enc.xscale();
         if xscale != 1.0 {
             x = &x * Array::from_f32(xscale);
-            if debug {
-                x.eval()?;
-                let x_slice: &[f32] = x.as_slice();
-                eprintln!(
-                    "[DEBUG]   after xscale ({}): shape {:?}, first values [{:.4}, {:.4}, {:.4}]",
-                    xscale,
-                    x.shape(),
-                    x_slice.get(0).unwrap_or(&0.0),
-                    x_slice.get(1).unwrap_or(&0.0),
-                    x_slice.get(2).unwrap_or(&0.0),
-                );
-            }
         }
 
         let seq_len = x.dim(1) as i32;
@@ -627,13 +547,6 @@ impl ConformerEncoder {
         // Total length for K/V is cache_size + seq_len (full buffer, not just filled)
         // NeMo uses full buffer and relies on mask to hide unfilled positions
         let total_len = cache_size + seq_len;
-
-        if debug {
-            eprintln!(
-                "[DEBUG]   encoder: seq_len={}, cache_size={}, filled_cache={}, total_len={}",
-                seq_len, cache_size, filled_cache_len, total_len
-            );
-        }
 
         // Generate positional encoding for total length (full buffer + current)
         // This should cover positions for all K/V that attention will see
@@ -657,13 +570,6 @@ impl ConformerEncoder {
             None
         };
 
-        if debug && att_mask.is_some() {
-            eprintln!(
-                "[DEBUG]   encoder: created attention mask, shape {:?}",
-                att_mask.as_ref().unwrap().shape()
-            );
-        }
-
         // Initialize output caches
         let mut cache_channel_next = Vec::with_capacity(self.layers.len());
         let mut cache_time_next = Vec::with_capacity(self.layers.len());
@@ -673,28 +579,6 @@ impl ConformerEncoder {
             // Extract per-layer cache: [batch, cache_size, d_model] and [batch, d_model, time_cache]
             let layer_cache_channel_full = cache_last_channel.index((layer_idx as i32, .., .., ..));
             let layer_cache_time = cache_last_time.index((layer_idx as i32, .., .., ..));
-
-            // Debug: show cache and input stats for first layer on chunk 2
-            if debug && layer_idx == 0 && filled_cache_len > 0 {
-                x.eval()?;
-                let x_slice: &[f32] = x.as_slice();
-
-                // Show input stats
-                let x_min: f32 = x_slice.iter().cloned().fold(f32::INFINITY, f32::min);
-                let x_max: f32 = x_slice.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-                eprintln!(
-                    "[DEBUG]   layer 0: input shape {:?}, min={:.4}, max={:.4}",
-                    x.shape(),
-                    x_min,
-                    x_max,
-                );
-                eprintln!(
-                    "[DEBUG]     input first values [{:.4}, {:.4}, {:.4}]",
-                    x_slice.get(0).unwrap_or(&0.0),
-                    x_slice.get(1).unwrap_or(&0.0),
-                    x_slice.get(2).unwrap_or(&0.0),
-                );
-            }
 
             // Pass full cache buffer to layer, along with filled length
             // The attention layer will extract the filled portion internally
@@ -711,69 +595,6 @@ impl ConformerEncoder {
             )?;
 
             x = x_out;
-
-            // Debug: show layer 0 output and cache for comparison with Python
-            if debug && layer_idx == 0 {
-                x.eval()?;
-                let x_slice: &[f32] = x.as_slice();
-                let d_model = x.dim(2) as usize;
-                eprintln!("[DEBUG]   layer 0 output (first 3 frames, first 5 dims):");
-                for frame in 0..3.min(x.dim(1) as usize) {
-                    let start = frame * d_model;
-                    eprintln!(
-                        "[DEBUG]     frame {}: [{:.4}, {:.4}, {:.4}, {:.4}, {:.4}, ...]",
-                        frame,
-                        x_slice.get(start).unwrap_or(&0.0),
-                        x_slice.get(start + 1).unwrap_or(&0.0),
-                        x_slice.get(start + 2).unwrap_or(&0.0),
-                        x_slice.get(start + 3).unwrap_or(&0.0),
-                        x_slice.get(start + 4).unwrap_or(&0.0),
-                    );
-                }
-            }
-
-            // Debug: show cache state for layer 0
-            if debug && layer_idx == 0 {
-                if let Some(ref nc) = new_channel {
-                    nc.eval()?;
-                    let nc_slice: &[f32] = nc.as_slice();
-                    let nc_time = nc.dim(1) as usize;
-                    let d_model = nc.dim(2) as usize;
-
-                    // Find non-zero positions by checking row sums
-                    let mut non_zero_positions = Vec::new();
-                    for t in 0..nc_time {
-                        let row_start = t * d_model;
-                        let row_sum: f32 = nc_slice[row_start..row_start + d_model]
-                            .iter()
-                            .map(|v| v.abs())
-                            .sum();
-                        if row_sum > 1e-6 {
-                            non_zero_positions.push(t);
-                        }
-                    }
-                    eprintln!(
-                        "[DEBUG]   layer 0 new_cache: shape {:?}, non-zero positions: {:?}",
-                        nc.shape(),
-                        non_zero_positions
-                    );
-
-                    // Print first 5 filled positions' values (for comparison with Python)
-                    eprintln!("[DEBUG]   layer 0 cache values at filled positions:");
-                    for &pos in non_zero_positions.iter().take(5) {
-                        let row_start = pos * d_model;
-                        eprintln!(
-                            "[DEBUG]     pos {}: [{:.6}, {:.6}, {:.6}, {:.6}, {:.6}, ...]",
-                            pos,
-                            nc_slice.get(row_start).unwrap_or(&0.0),
-                            nc_slice.get(row_start + 1).unwrap_or(&0.0),
-                            nc_slice.get(row_start + 2).unwrap_or(&0.0),
-                            nc_slice.get(row_start + 3).unwrap_or(&0.0),
-                            nc_slice.get(row_start + 4).unwrap_or(&0.0),
-                        );
-                    }
-                }
-            }
 
             // Update cache: the attention layer returns new_cache from sliding window
             // We need to store it properly in the full cache buffer
@@ -799,24 +620,6 @@ impl ConformerEncoder {
                 cache_channel_next.push(updated_cache);
             }
             if let Some(nt) = new_time {
-                // Debug: show time cache for layer 0
-                if debug && layer_idx == 0 {
-                    nt.eval()?;
-                    let nt_slice: &[f32] = nt.as_slice();
-                    // Shape is [batch, d_model, time_cache]
-                    eprintln!("[DEBUG]   layer 0 time cache: shape {:?}", nt.shape(),);
-                    // Print first channel, all time positions
-                    let time_cache_size = nt.dim(2) as usize;
-                    let first_channel_values: Vec<f32> = (0..time_cache_size)
-                        .map(|t| nt_slice.get(t).cloned().unwrap_or(0.0))
-                        .collect();
-                    eprintln!(
-                        "[DEBUG]     first channel, all {} time positions: {:?}",
-                        time_cache_size, first_channel_values
-                    );
-                    let sum: f32 = nt_slice.iter().sum();
-                    eprintln!("[DEBUG]     sum: {:.4}", sum);
-                }
                 cache_time_next.push(nt);
             }
         }
@@ -1271,23 +1074,6 @@ impl ConformerBlock {
         let (conv_out, new_cache_time) =
             self.conv.forward_with_cache(&conv_out, cache_last_time)?;
 
-        // Debug: show conv output
-        let conv_debug = std::env::var("CONV_DEBUG")
-            .map(|v| v == "1")
-            .unwrap_or(false);
-        if conv_debug {
-            conv_out.eval()?;
-            let conv_slice: &[f32] = conv_out.as_slice();
-            eprintln!(
-                "[CONV_DEBUG] conv output frame 0, first 5 values: [{:.4}, {:.4}, {:.4}, {:.4}, {:.4}]",
-                conv_slice.get(0).unwrap_or(&0.0),
-                conv_slice.get(1).unwrap_or(&0.0),
-                conv_slice.get(2).unwrap_or(&0.0),
-                conv_slice.get(3).unwrap_or(&0.0),
-                conv_slice.get(4).unwrap_or(&0.0),
-            );
-        }
-
         let x = &residual + &conv_out;
 
         // Feed-forward 2 (half-step residual)
@@ -1530,25 +1316,6 @@ impl ConvolutionModule {
         let sigmoid_x2 = mlx_rs::ops::sigmoid(&x2)?;
         let x = &x1 * &sigmoid_x2;
 
-        // Debug: show GLU output
-        let glu_debug = std::env::var("GLU_DEBUG")
-            .map(|v| v == "1")
-            .unwrap_or(false);
-        if glu_debug {
-            x.eval()?;
-            // x is [batch, seq_len, d_model], we want last 8 frames of first channel
-            // So x[0, seq_len-8:seq_len, 0]
-            let seq_len = x.dim(1) as usize;
-            let x_slice: &[f32] = x.as_slice();
-            eprintln!("[GLU_DEBUG] GLU output shape: {:?}", x.shape());
-            // GLU output is [batch, seq_len, d_model], so channel 0 values are at indices [frame * d_model]
-            let d_model_usize = self.d_model;
-            let last_8: Vec<f32> = (seq_len.saturating_sub(8)..seq_len)
-                .map(|t| x_slice.get(t * d_model_usize).cloned().unwrap_or(0.0))
-                .collect();
-            eprintln!("[GLU_DEBUG] First channel, last 8 frames: {:?}", last_8);
-        }
-
         // For streaming: use cache instead of padding
         let (x, new_cache) = if let Some(cache_tensor) = cache {
             // cache: [batch, d_model, cache_len]
@@ -1564,25 +1331,6 @@ impl ConvolutionModule {
             let total_len = x_with_cache.dim(2) as usize;
             let cache_start = total_len.saturating_sub(cache_size);
             let new_cache = x_with_cache.index((.., .., cache_start as i32..));
-
-            // Debug: show cache update
-            let cache_debug = std::env::var("CACHE_DEBUG")
-                .map(|v| v == "1")
-                .unwrap_or(false);
-            if cache_debug {
-                new_cache.eval()?;
-                let nc_slice: &[f32] = new_cache.as_slice();
-                // new_cache is [batch, d_model, cache_size], so first channel values are at indices [0, 1, 2, ..., cache_size-1]
-                let first_channel: Vec<f32> = (0..cache_size)
-                    .map(|t| nc_slice.get(t).cloned().unwrap_or(0.0))
-                    .collect();
-                eprintln!("[CACHE_DEBUG] new_cache shape: {:?}", new_cache.shape());
-                eprintln!("[CACHE_DEBUG] First channel values: {:?}", first_channel);
-                eprintln!(
-                    "[CACHE_DEBUG] total_len={}, cache_start={}, cache_size={}",
-                    total_len, cache_start, cache_size
-                );
-            }
 
             // Transpose back to [batch, total_len, d_model] for conv
             let x_for_conv = mlx_rs::ops::transpose_axes(&x_with_cache, &[0, 2, 1])?;

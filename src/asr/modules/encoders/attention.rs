@@ -319,7 +319,7 @@ impl RelPositionMultiHeadAttention {
         x: &Array,
         pos_emb: &Array,
         cache: Option<&Array>,
-        cache_filled_len: i32,
+        _cache_filled_len: i32,
         att_mask: Option<&Array>,
     ) -> Result<(Array, Option<Array>)> {
         let batch_size = x.dim(0) as i32;
@@ -327,10 +327,6 @@ impl RelPositionMultiHeadAttention {
         let d_model = x.dim(2) as i32;
         let n_heads = self.n_heads as i32;
         let head_dim = self.head_dim as i32;
-
-        let debug = std::env::var("ATTN_DEBUG")
-            .map(|v| v == "1")
-            .unwrap_or(false);
 
         // NeMo-style cache handling:
         // 1. Concatenate FULL cache buffer with input (mask handles unfilled positions)
@@ -365,17 +361,6 @@ impl RelPositionMultiHeadAttention {
             } else {
                 cache_tensor.clone()
             };
-
-            if debug {
-                eprintln!(
-                    "[ATTN_DEBUG] cache_size={}, seq_len={}, total_len={}, new_cache_len={}, filled={}",
-                    cache_size,
-                    seq_len,
-                    total,
-                    new_cache.dim(1),
-                    cache_filled_len
-                );
-            }
 
             (kv_input, total, Some(new_cache))
         } else {
@@ -429,15 +414,6 @@ impl RelPositionMultiHeadAttention {
 
         // Apply rel_shift and truncate to total_len
         let matrix_bd = Self::rel_shift(&matrix_bd)?;
-
-        if debug {
-            eprintln!(
-                "[ATTN_DEBUG] matrix_bd after rel_shift: {:?}, truncating to {}",
-                matrix_bd.shape(),
-                total_len
-            );
-        }
-
         let matrix_bd = matrix_bd.index((.., .., .., ..total_len));
 
         // Combine and scale
@@ -451,40 +427,6 @@ impl RelPositionMultiHeadAttention {
             // Where mask is True (masked/padding), set score to -inf
             let neg_inf = Array::from_f32(f32::NEG_INFINITY);
             scores = ops::r#where(&mask, &neg_inf, &scores)?;
-
-            if debug {
-                mask.eval()?;
-                let mask_sum: f32 = ops::sum(&mask.as_type::<f32>()?, None)?.as_slice::<f32>()[0];
-                eprintln!(
-                    "[ATTN_DEBUG] mask shape: {:?}, masked positions: {}",
-                    mask.shape(),
-                    mask_sum
-                );
-
-                // Show scores stats before softmax
-                scores.eval()?;
-                let scores_flat = scores.reshape(&[-1]).unwrap();
-                scores_flat.eval().unwrap();
-                let scores_slice: &[f32] = scores_flat.as_slice();
-                // Filter out -inf
-                let finite_scores: Vec<f32> = scores_slice
-                    .iter()
-                    .cloned()
-                    .filter(|v| v.is_finite())
-                    .collect();
-                if !finite_scores.is_empty() {
-                    let min = finite_scores.iter().cloned().fold(f32::INFINITY, f32::min);
-                    let max = finite_scores
-                        .iter()
-                        .cloned()
-                        .fold(f32::NEG_INFINITY, f32::max);
-                    let mean: f32 = finite_scores.iter().sum::<f32>() / finite_scores.len() as f32;
-                    eprintln!(
-                        "[ATTN_DEBUG] scores (finite only): min={:.4}, max={:.4}, mean={:.4}, count={}",
-                        min, max, mean, finite_scores.len()
-                    );
-                }
-            }
         }
 
         // Softmax
@@ -501,21 +443,6 @@ impl RelPositionMultiHeadAttention {
 
         // Output projection
         let output = self.linear_out.forward(&context)?;
-
-        // Debug: show attention output
-        if debug {
-            output.eval()?;
-            let out_slice: &[f32] = output.as_slice();
-            let d_model = output.dim(2) as usize;
-            eprintln!(
-                "[ATTN_DEBUG] output frame 0, first 5 values: [{:.4}, {:.4}, {:.4}, {:.4}, {:.4}]",
-                out_slice.get(0).unwrap_or(&0.0),
-                out_slice.get(1).unwrap_or(&0.0),
-                out_slice.get(2).unwrap_or(&0.0),
-                out_slice.get(3).unwrap_or(&0.0),
-                out_slice.get(4).unwrap_or(&0.0),
-            );
-        }
 
         Ok((output, new_cache))
     }
