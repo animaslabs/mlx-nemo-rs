@@ -460,6 +460,30 @@ impl RelPositionMultiHeadAttention {
                     mask.shape(),
                     mask_sum
                 );
+
+                // Show scores stats before softmax
+                scores.eval()?;
+                let scores_flat = scores.reshape(&[-1]).unwrap();
+                scores_flat.eval().unwrap();
+                let scores_slice: &[f32] = scores_flat.as_slice();
+                // Filter out -inf
+                let finite_scores: Vec<f32> = scores_slice
+                    .iter()
+                    .cloned()
+                    .filter(|v| v.is_finite())
+                    .collect();
+                if !finite_scores.is_empty() {
+                    let min = finite_scores.iter().cloned().fold(f32::INFINITY, f32::min);
+                    let max = finite_scores
+                        .iter()
+                        .cloned()
+                        .fold(f32::NEG_INFINITY, f32::max);
+                    let mean: f32 = finite_scores.iter().sum::<f32>() / finite_scores.len() as f32;
+                    eprintln!(
+                        "[ATTN_DEBUG] scores (finite only): min={:.4}, max={:.4}, mean={:.4}, count={}",
+                        min, max, mean, finite_scores.len()
+                    );
+                }
             }
         }
 
@@ -477,6 +501,21 @@ impl RelPositionMultiHeadAttention {
 
         // Output projection
         let output = self.linear_out.forward(&context)?;
+
+        // Debug: show attention output
+        if debug {
+            output.eval()?;
+            let out_slice: &[f32] = output.as_slice();
+            let d_model = output.dim(2) as usize;
+            eprintln!(
+                "[ATTN_DEBUG] output frame 0, first 5 values: [{:.4}, {:.4}, {:.4}, {:.4}, {:.4}]",
+                out_slice.get(0).unwrap_or(&0.0),
+                out_slice.get(1).unwrap_or(&0.0),
+                out_slice.get(2).unwrap_or(&0.0),
+                out_slice.get(3).unwrap_or(&0.0),
+                out_slice.get(4).unwrap_or(&0.0),
+            );
+        }
 
         Ok((output, new_cache))
     }

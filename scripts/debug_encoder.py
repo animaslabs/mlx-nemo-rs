@@ -1,200 +1,191 @@
 #!/usr/bin/env python3
-"""Debug script to dump NeMo encoder outputs for comparison."""
-
-import argparse
-import sys
-import warnings
-
-warnings.filterwarnings("ignore")
+"""
+Debug script to extract encoder intermediate values for comparison with Rust.
+"""
 
 import torch
 import numpy as np
-from pathlib import Path
+import soundfile as sf
+import warnings
+import os
+
+os.environ["PYTHONWARNINGS"] = "ignore"
+warnings.filterwarnings("ignore")
+
+import nemo.collections.asr as nemo_asr
+from nemo.collections.asr.parts.utils.streaming_utils import (
+    CacheAwareStreamingAudioBuffer,
+)
 
 
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--model", required=True, help="Path to .nemo model")
-    parser.add_argument("audio", help="Path to audio file")
-    parser.add_argument("--mode", type=int, default=0, help="Streaming mode index")
-    parser.add_argument(
-        "--chunk-ms", type=int, default=100, help="Chunk size in milliseconds"
-    )
-    parser.add_argument(
-        "--num-chunks", type=int, default=3, help="Number of chunks to process"
-    )
-    args = parser.parse_args()
-
     # Load model
-    print(f"Loading model from: {args.model}", file=sys.stderr)
-    import nemo.collections.asr as nemo_asr
-
-    model = nemo_asr.models.ASRModel.restore_from(args.model, map_location="cpu")
+    model_path = "../models/nvidia/nemotron-speech-streaming-en-0.6b/nemotron-speech-streaming-en-0.6b.nemo"
+    print(f"Loading model from: {model_path}")
+    model = nemo_asr.models.EncDecRNNTBPEModel.restore_from(model_path)
     model.eval()
-    print(f"Model loaded", file=sys.stderr)
-
-    # Setup encoder for streaming (uses default att_context_size from model)
-    model.encoder.setup_streaming_params()
-
-    streaming_cfg = model.encoder.streaming_cfg
-
-    print(f"\nStreaming config:", file=sys.stderr)
-    print(f"  chunk_size: {streaming_cfg.chunk_size}", file=sys.stderr)
-    print(f"  shift_size: {streaming_cfg.shift_size}", file=sys.stderr)
-    print(
-        f"  pre_encode_cache_size: {streaming_cfg.pre_encode_cache_size}",
-        file=sys.stderr,
-    )
-    print(f"  valid_out_len: {streaming_cfg.valid_out_len}", file=sys.stderr)
-    print(
-        f"  last_channel_cache_size: {streaming_cfg.last_channel_cache_size}",
-        file=sys.stderr,
-    )
 
     # Load audio
-    import soundfile as sf
+    audio_path = "../samples/Speaker26_004_16k.wav"
+    audio, sr = sf.read(audio_path, dtype="float32")
+    print(f"Audio: {len(audio)} samples at {sr} Hz")
 
-    print(f"\nLoading audio: {args.audio}", file=sys.stderr)
-    audio, sr = sf.read(args.audio, dtype="float32")
-    if sr != 16000:
-        import librosa
-
-        audio = librosa.resample(audio, orig_sr=sr, target_sr=16000)
-        sr = 16000
-    print(f"Audio duration: {len(audio) / sr:.2f}s", file=sys.stderr)
-
-    # Initialize streaming
-    chunk_samples = int(args.chunk_ms * sr / 1000)
-    print(
-        f"\nProcessing in {args.chunk_ms}ms chunks ({chunk_samples} samples)",
-        file=sys.stderr,
-    )
-
-    # Get initial cache state
-    cache_last_channel, cache_last_time, cache_last_channel_len = (
-        model.encoder.get_initial_cache_state(batch_size=1, device="cpu")
-    )
-
-    # Compute features for full audio and process in chunks
-    audio_tensor = torch.tensor(audio).unsqueeze(0)
-    preprocessor = model.preprocessor
-
-    # Buffer for mel frames
-    mel_buffer = None
-    mel_idx = 0
-    audio_idx = 0
-
-    # Get chunk parameters
-    chunk_size_first = (
-        streaming_cfg.chunk_size[0]
-        if isinstance(streaming_cfg.chunk_size, list)
-        else streaming_cfg.chunk_size
-    )
-    chunk_size_rest = (
-        streaming_cfg.chunk_size[1]
-        if isinstance(streaming_cfg.chunk_size, list)
-        else streaming_cfg.chunk_size
-    )
-    shift_size_first = (
-        streaming_cfg.shift_size[0]
-        if isinstance(streaming_cfg.shift_size, list)
-        else streaming_cfg.shift_size
-    )
-    shift_size_rest = (
-        streaming_cfg.shift_size[1]
-        if isinstance(streaming_cfg.shift_size, list)
-        else streaming_cfg.shift_size
-    )
-    pre_encode_first = (
-        streaming_cfg.pre_encode_cache_size[0]
-        if isinstance(streaming_cfg.pre_encode_cache_size, list)
-        else 0
-    )
-    pre_encode_rest = (
-        streaming_cfg.pre_encode_cache_size[1]
-        if isinstance(streaming_cfg.pre_encode_cache_size, list)
-        else streaming_cfg.pre_encode_cache_size
-    )
-
-    chunk_num = 0
-    while audio_idx < len(audio) and chunk_num < args.num_chunks:
-        # Add audio chunk
-        end_idx = min(audio_idx + chunk_samples, len(audio))
-        audio_chunk = audio_tensor[:, audio_idx:end_idx]
-        audio_idx = end_idx
-
-        # Compute mel for this chunk
-        length = torch.tensor([audio_chunk.shape[1]])
-        with torch.no_grad():
-            processed_signal, _ = preprocessor(input_signal=audio_chunk, length=length)
-
-        # Append to mel buffer
-        if mel_buffer is None:
-            mel_buffer = processed_signal
+    # Setup streaming mode 0
+    mode_idx = 0
+    if hasattr(model.encoder, "att_context_size_all"):
+        att_context_size = model.encoder.att_context_size_all[mode_idx]
+        if hasattr(model.encoder, "set_default_att_context_size"):
+            model.encoder.set_default_att_context_size(att_context_size)
         else:
-            mel_buffer = torch.cat([mel_buffer, processed_signal], dim=2)
+            model.encoder.att_context_size = att_context_size
+            model.encoder.setup_streaming_params()
+    else:
+        model.encoder.setup_streaming_params()
 
-        # Check if we have enough mel frames
-        chunk_size = chunk_size_first if chunk_num == 0 else chunk_size_rest
-        pre_encode_cache = pre_encode_first if chunk_num == 0 else pre_encode_rest
+    # Get streaming config
+    streaming_cfg = model.encoder.streaming_cfg
+    print(f"\nStreaming config:")
+    print(f"  chunk_size: {streaming_cfg.chunk_size}")
+    print(f"  shift_size: {streaming_cfg.shift_size}")
+    print(f"  pre_encode_cache_size: {streaming_cfg.pre_encode_cache_size}")
+    print(f"  drop_extra_pre_encoded: {streaming_cfg.drop_extra_pre_encoded}")
+    print(f"  valid_out_len: {streaming_cfg.valid_out_len}")
 
-        total_needed = chunk_size + pre_encode_cache
-        available = mel_buffer.shape[2] - mel_idx
+    # Create streaming buffer
+    streaming_buffer = CacheAwareStreamingAudioBuffer(
+        model=model, online_normalization=False
+    )
+    processed_signal, processed_signal_length, stream_id = (
+        streaming_buffer.append_audio_file(audio_path, stream_id=-1)
+    )
 
-        if available < total_needed:
-            continue
+    # Get initial cache
+    batch_size = 1
+    cache_last_channel, cache_last_time, cache_last_channel_len = (
+        model.encoder.get_initial_cache_state(batch_size=batch_size)
+    )
 
-        # Extract mel chunk
-        start = mel_idx - pre_encode_cache if chunk_num > 0 else mel_idx
-        end = start + total_needed
-        mel_chunk = mel_buffer[:, :, max(0, start) : end]
+    # Process first two chunks
+    print("\n" + "=" * 60)
+    print("Processing chunks...")
+    print("=" * 60)
 
-        # Advance buffer index
-        shift_size = shift_size_first if chunk_num == 0 else shift_size_rest
-        mel_idx += shift_size
+    # Hook to capture subsampling output
+    subsampling_output = [None]
+    pos_emb_output = [None]
 
-        print(f"\n=== Chunk {chunk_num + 1} ===", file=sys.stderr)
-        print(f"  mel_chunk shape: {mel_chunk.shape}", file=sys.stderr)
-        print(
-            f"  cache_last_channel_len: {cache_last_channel_len.item()}",
-            file=sys.stderr,
-        )
+    def hook_subsampling(module, input, output):
+        if isinstance(output, tuple):
+            subsampling_output[0] = output[0].detach().clone()
+        else:
+            subsampling_output[0] = output.detach().clone()
 
-        # Run encoder
-        lengths = torch.tensor([mel_chunk.shape[2]])
-        with torch.no_grad():
-            result = model.encoder.forward(
-                audio_signal=mel_chunk,
-                length=lengths,
-                cache_last_channel=cache_last_channel,
-                cache_last_time=cache_last_time,
-                cache_last_channel_len=cache_last_channel_len,
+    def hook_pos_enc(module, input, output):
+        if isinstance(output, tuple):
+            pos_emb_output[0] = (output[0].detach().clone(), output[1].detach().clone())
+        else:
+            pos_emb_output[0] = output.detach().clone()
+
+    # Register hooks
+    hook_handle_sub = model.encoder.pre_encode.register_forward_hook(hook_subsampling)
+    hook_handle_pos = model.encoder.pos_enc.register_forward_hook(hook_pos_enc)
+
+    try:
+        for step_num, (chunk_audio, chunk_lengths) in enumerate(streaming_buffer):
+            if step_num > 1:
+                break
+
+            drop_extra = streaming_cfg.drop_extra_pre_encoded if step_num > 0 else 0
+
+            print(f"\n{'=' * 60}")
+            print(f"CHUNK {step_num}")
+            print(f"{'=' * 60}")
+            print(
+                f"Mel input shape: {chunk_audio.shape}, length: {chunk_lengths.item()}"
             )
+            print(f"drop_extra_pre_encoded: {drop_extra}")
 
-        (
-            encoded,
-            encoded_len,
-            cache_last_channel,
-            cache_last_time,
-            cache_last_channel_len,
-        ) = result
+            # Print first mel frame values
+            print(f"\nMel input (first 5 frames, first 3 bins):")
+            for t in range(min(5, chunk_audio.shape[2])):
+                print(
+                    f"  frame {t}: [{chunk_audio[0, 0, t]:.4f}, {chunk_audio[0, 1, t]:.4f}, {chunk_audio[0, 2, t]:.4f}, ...]"
+                )
 
-        # encoded is [B, D, T], transpose to [B, T, D]
-        encoded = encoded.transpose(1, 2)
+            with torch.inference_mode():
+                # Process through model
+                result = model.conformer_stream_step(
+                    processed_signal=chunk_audio,
+                    processed_signal_length=chunk_lengths,
+                    cache_last_channel=cache_last_channel,
+                    cache_last_time=cache_last_time,
+                    cache_last_channel_len=cache_last_channel_len,
+                    drop_extra_pre_encoded=drop_extra,
+                    return_transcription=True,
+                    previous_hypotheses=None,
+                    previous_pred_out=None,
+                )
+                # Unpack based on actual return values
+                if len(result) == 6:
+                    (
+                        best_hyp,
+                        cache_last_channel,
+                        cache_last_time,
+                        cache_last_channel_len,
+                        previous_hypotheses,
+                        previous_pred_out,
+                    ) = result
+                else:
+                    best_hyp = result[0]
+                    cache_last_channel = (
+                        result[1] if len(result) > 1 else cache_last_channel
+                    )
+                    cache_last_time = result[2] if len(result) > 2 else cache_last_time
+                    cache_last_channel_len = (
+                        result[3] if len(result) > 3 else cache_last_channel_len
+                    )
 
-        print(f"  encoded shape: {encoded.shape}", file=sys.stderr)
-        print(
-            f"  new cache_last_channel_len: {cache_last_channel_len.item()}",
-            file=sys.stderr,
-        )
+                # Print subsampling output
+                if subsampling_output[0] is not None:
+                    sub_out = subsampling_output[0]
+                    print(f"\nSubsampling output shape: {sub_out.shape}")
+                    print(f"Subsampling output (first 3 frames, first 5 dims):")
+                    for t in range(min(3, sub_out.shape[1])):
+                        vals = sub_out[0, t, :5].tolist()
+                        print(
+                            f"  frame {t}: [{', '.join(f'{v:.4f}' for v in vals)}, ...]"
+                        )
 
-        # Print first frame values
-        first_frame = encoded[0, 0, :10].numpy()
-        print(f"  first frame[:10]: {first_frame.tolist()}")
+                # Print positional encoding info
+                if pos_emb_output[0] is not None:
+                    if isinstance(pos_emb_output[0], tuple):
+                        x_out, pos_emb = pos_emb_output[0]
+                        print(
+                            f"\nAfter pos_enc: x shape {x_out.shape}, pos_emb shape {pos_emb.shape}"
+                        )
+                        print(f"x (first 3 frames, first 5 dims):")
+                        for t in range(min(3, x_out.shape[1])):
+                            vals = x_out[0, t, :5].tolist()
+                            print(
+                                f"  frame {t}: [{', '.join(f'{v:.4f}' for v in vals)}, ...]"
+                            )
+                        print(f"pos_emb (first 3 positions, first 5 dims):")
+                        for t in range(min(3, pos_emb.shape[1])):
+                            vals = pos_emb[0, t, :5].tolist()
+                            print(
+                                f"  pos {t}: [{', '.join(f'{v:.4f}' for v in vals)}, ...]"
+                            )
 
-        chunk_num += 1
+                # Print transcription
+                print(f"\nTranscription: '{best_hyp}'")
+                print(f"cache_last_channel_len: {cache_last_channel_len}")
 
-    print("\nDone!", file=sys.stderr)
+    finally:
+        hook_handle_sub.remove()
+        hook_handle_pos.remove()
+
+    print("\n" + "=" * 60)
+    print("Done!")
 
 
 if __name__ == "__main__":
