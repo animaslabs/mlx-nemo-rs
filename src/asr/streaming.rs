@@ -518,7 +518,7 @@ impl StreamingMelBuffer {
             for mel_idx in 0..self.n_mels {
                 // Source: buffer[local_frame * n_mels + mel_idx]
                 let src_idx = local_frame * self.n_mels + mel_idx;
-                // Destination: output[mel_idx * total_extract + frame_offset]
+                // Destination: output[mel_idx * total_extract + frame_idx]
                 let dst_idx = mel_idx * total_extract + frame_offset;
                 if src_idx < self.mel_buffer.len() {
                     mel_chunk[dst_idx] = self.mel_buffer[src_idx];

@@ -1038,13 +1038,6 @@ impl EncDecRNNTModel {
             let mut non_blank_count = 0;
 
             // Debug: track if we're in the "stall zone"
-            let total_tokens_before = session
-                .accumulated_tokens
-                .get(0)
-                .map(|t| t.len())
-                .unwrap_or(0);
-            let in_stall_zone = total_tokens_before >= 185 && total_tokens_before <= 200;
-
             for b in 0..batch_size {
                 for t in 0..enc_seq_len {
                     let enc_frame =
@@ -1061,45 +1054,6 @@ impl EncDecRNNTModel {
 
                         let log_probs = self.joint.forward_one(&enc_frame, &pred_output)?;
                         log_probs.eval()?;
-
-                        // Debug: in stall zone, show log_probs details
-                        if debug && in_stall_zone && t == 0 && symbols_emitted == 0 {
-                            // Show pred_output stats
-                            let pred_flat = pred_output.reshape(&[-1]).unwrap();
-                            pred_flat.eval().unwrap();
-                            let pred_slice: &[f32] = pred_flat.as_slice();
-                            let pred_min = pred_slice.iter().cloned().fold(f32::INFINITY, f32::min);
-                            let pred_max =
-                                pred_slice.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-                            let pred_mean: f32 =
-                                pred_slice.iter().sum::<f32>() / pred_slice.len() as f32;
-
-                            // Show enc_frame stats
-                            let enc_flat = enc_frame.reshape(&[-1]).unwrap();
-                            enc_flat.eval().unwrap();
-                            let enc_slice: &[f32] = enc_flat.as_slice();
-                            let enc_min = enc_slice.iter().cloned().fold(f32::INFINITY, f32::min);
-                            let enc_max =
-                                enc_slice.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-
-                            let lp_flat = log_probs.reshape(&[-1]).unwrap();
-                            lp_flat.eval().unwrap();
-                            let lp_slice: &[f32] = lp_flat.as_slice();
-                            let blank_logprob = lp_slice
-                                .get(session.blank_id)
-                                .copied()
-                                .unwrap_or(f32::NEG_INFINITY);
-
-                            // Find top 5 non-blank
-                            let mut indexed: Vec<_> = lp_slice.iter().enumerate().collect();
-                            indexed.sort_by(|a, b| b.1.partial_cmp(a.1).unwrap());
-                            let top5: Vec<(usize, f32)> =
-                                indexed.iter().take(5).map(|&(i, &v)| (i, v)).collect();
-
-                            let last_tok = session.last_tokens[b];
-                            eprintln!("[DEBUG JOINT] tokens={}, last_tok={:?}, enc=[{:.3},{:.3}], pred=[{:.3},{:.3},{:.4}], blank_lp={:.4}, top5={:?}", 
-                                     total_tokens_before, last_tok, enc_min, enc_max, pred_min, pred_max, pred_mean, blank_logprob, top5);
-                        }
 
                         let prediction = argmax_axis(&log_probs, -1, false)?;
                         prediction.eval()?;

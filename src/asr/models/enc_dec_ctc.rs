@@ -507,6 +507,7 @@ impl EncDecCTCModel {
 
         // Greedy decode
         let token_sequences = greedy_decode(&log_probs, &encoded_lengths, self.blank_id)?;
+        println!("token_sequences: {:?}", token_sequences);
 
         // Merge with previous tokens using LCS
         let delay = session.config.lookahead_frames;
