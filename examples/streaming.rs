@@ -160,8 +160,8 @@ fn main() -> mlx_nemo::Result<()> {
         // Display partial result if text changed
         if !output.text.is_empty() && output.text[0] != last_text {
             // Clear line and print new text
-            print!("\r\x1b[K"); // Clear line
-            print!("{}", output.text[0]);
+            // print!("\r\x1b[K"); // Clear line
+            print!("{:?}", output);
             io::stdout().flush().unwrap();
             last_text = output.text[0].clone();
         }
