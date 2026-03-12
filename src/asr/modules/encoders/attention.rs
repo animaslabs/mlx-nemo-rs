@@ -313,22 +313,34 @@ impl RelPositionMultiHeadAttention {
 
     /// Forward pass with cache support for streaming inference.
     ///
-    /// This implements NeMo's attention caching approach:
-    /// 1. Concatenate filled cache with input BEFORE QKV projection
-    /// 2. Project Q from input only, K/V from concatenated cache+input
-    /// 3. Use attention mask to ignore unfilled cache positions
-    /// 4. Update cache using sliding window
+    /// This implements NeMo's cache-aware streaming attention (arXiv:2312.17279):
+    ///
+    /// 1. **Cache Content**: The cache stores `h_k` values - the **input to self-attention**
+    ///    (i.e., the layer-normed hidden states from previous chunks). This is NOT the
+    ///    projected K/V values, and NOT the attention output.
+    ///
+    /// 2. **K/V Computation**: K and V are computed from `concat(cache, current_input)`.
+    ///    This means cached states get re-projected through linear_k/linear_v each chunk,
+    ///    which is intentional: it allows relative positional encoding to work correctly
+    ///    across the full context window.
+    ///
+    /// 3. **Cache Update**: Uses sliding window - old frames are dropped and new input
+    ///    frames are appended. The cache size is bounded by `left_context`.
+    ///
+    /// 4. **Attention Mask**: Unfilled cache positions (during warmup) are masked out
+    ///    to prevent attending to zero-padding.
     ///
     /// # Arguments
-    /// * `x` - Input tensor [batch, seq_len, d_model]
+    /// * `x` - Input tensor [batch, seq_len, d_model] (hidden states h_k to attend over)
     /// * `pos_emb` - Positional embeddings [1, 2*total_len-1, d_model]
-    /// * `cache` - Optional full cache buffer [batch, cache_size, d_model]
+    /// * `cache` - Optional full cache buffer [batch, cache_size, d_model] containing
+    ///             previous chunks' attention inputs (h values)
     /// * `cache_filled_len` - How many frames of cache are valid (0 if no cache)
     /// * `att_mask` - Optional attention mask [batch, seq_len, total_len] where True=masked
     ///
     /// # Returns
     /// * Output tensor [batch, seq_len, d_model]
-    /// * Updated cache tensor [batch, new_cache_len, d_model]
+    /// * Updated cache tensor [batch, cache_size, d_model] for next chunk
     pub fn forward_with_cache(
         &mut self,
         x: &Array,
@@ -346,14 +358,17 @@ impl RelPositionMultiHeadAttention {
         let call_count = ATTENTION_CALL_COUNT.fetch_add(1, Ordering::SeqCst);
         let debug = attention_debug_enabled();
 
-        // NeMo-style cache handling:
-        // 1. Concatenate FULL cache buffer with input (mask handles unfilled positions)
-        // 2. Project Q from input, K/V from concatenated
-        // 3. Update cache using sliding window
+        // NeMo cache-aware streaming (arXiv:2312.17279 Section 3.3):
         //
-        // IMPORTANT: Unlike our previous approach, NeMo uses the FULL cache buffer
-        // (including unfilled/zero positions) and relies on the attention mask to
-        // hide unfilled positions. This keeps K/V length = cache_size + seq_len.
+        // The cache stores h_k values (input to self-attention layer). For K/V computation:
+        //   key = value = concat(cache, current_input)
+        //
+        // This re-projects cached h values through linear_k/linear_v each chunk.
+        // This is intentional and correct: relative positional encoding needs to be
+        // computed over the full context (cache + current), so we can't cache K/V directly.
+        //
+        // We use the FULL cache buffer (including unfilled/zero positions) and rely
+        // on the attention mask to hide unfilled positions during warmup.
 
         let (kv_input, total_len, new_cache) = if let Some(cache_tensor) = cache {
             let cache_size = cache_tensor.dim(1) as i32;
