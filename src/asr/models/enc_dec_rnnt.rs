@@ -811,8 +811,7 @@ impl EncDecRNNTModel {
         // Step 2: Compute mel incrementally from pending audio.
         // Only process new audio samples, not the entire history.
         // This gives O(1) memory usage instead of O(n²).
-        let new_frames = session.mel_buffer.computable_new_frames();
-        if new_frames > 0 {
+        if session.mel_buffer.has_pending_audio() {
             // Get pending audio (includes overlap for STFT continuity)
             let audio_data = session.mel_buffer.get_pending_audio();
             let audio_len = audio_data.len();
@@ -831,13 +830,30 @@ impl EncDecRNNTModel {
             features_flat.eval()?;
             let mel_data: &[f32] = features_flat.as_slice();
 
-            // For incremental processing, we need to skip frames that overlap with
-            // previously computed mel. The overlap comes from keeping window_samples
-            // of audio for STFT continuity.
-            let frames_to_skip = computed_frames.saturating_sub(new_frames);
+            // For incremental processing, we need to figure out which frames are truly "new".
+            // The overlap audio (window_samples) produces some frames at the start that
+            // overlap with previously computed frames. However, due to center padding in STFT,
+            // these frames won't be identical to what we computed before.
+            //
+            // The correct approach: track how many audio samples we've actually advanced by,
+            // and compute how many new frames that corresponds to.
+            //
+            // We keep window_samples (400) of overlap. Each hop is hop_samples (160).
+            // So the overlap produces floor(window_samples / hop_samples) = 2 frames of overlap.
+            // Plus 1 for the center padding effect = ~3 frames we should skip.
+            let overlap_samples = session.mel_buffer.window_samples;
+            let hop = session.mel_buffer.hop_samples;
+            // Frames from overlap region (these overlap with previous computation)
+            let overlap_frames = overlap_samples / hop;
+
             let prev_frames = session.mel_buffer.total_frames;
 
-            if frames_to_skip > 0 {
+            // On first chunk (prev_frames == 0), don't skip anything
+            // On subsequent chunks, skip the overlap frames
+            let frames_to_skip = if prev_frames == 0 { 0 } else { overlap_frames };
+            let frames_to_append = computed_frames.saturating_sub(frames_to_skip);
+
+            if frames_to_skip > 0 && frames_to_append > 0 {
                 // Skip the overlapping frames, only append truly new ones
                 let n_mels = session.n_mels;
                 // mel_data is [n_mels, time] flattened, so we need to extract
@@ -848,7 +864,9 @@ impl EncDecRNNTModel {
                             .map(move |frame_idx| mel_data[mel_idx * computed_frames + frame_idx])
                     })
                     .collect();
-                session.mel_buffer.append_mel(&new_mel_data, new_frames);
+                session
+                    .mel_buffer
+                    .append_mel(&new_mel_data, frames_to_append);
             } else {
                 // All frames are new
                 session.mel_buffer.append_mel(mel_data, computed_frames);
@@ -859,8 +877,8 @@ impl EncDecRNNTModel {
 
             if debug {
                 eprintln!(
-                    "[DEBUG]   computed {} new mel frames from {} audio samples (total: {} -> {})",
-                    new_frames, audio_len, prev_frames, session.mel_buffer.total_frames
+                    "[DEBUG]   appended {} mel frames from {} audio samples (total: {} -> {}), preprocessor returned {}, skipped {} (overlap={})",
+                    frames_to_append, audio_len, prev_frames, session.mel_buffer.total_frames, computed_frames, frames_to_skip, overlap_frames
                 );
             }
         }

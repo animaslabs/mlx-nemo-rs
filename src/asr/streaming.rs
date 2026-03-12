@@ -384,25 +384,11 @@ impl StreamingMelBuffer {
         self.audio_buffer.len()
     }
 
-    /// Get the number of new mel frames that can be computed from pending audio.
+    /// Check if there is enough pending audio to compute at least one mel frame.
     ///
-    /// For incremental computation, we calculate based on total audio fed to the stream.
-    /// With center padding: n_frames = floor(total_audio / hop_samples) + 1
-    pub fn computable_new_frames(&self) -> usize {
-        if self.audio_buffer.len() < self.window_samples {
-            return 0;
-        }
-
-        // Calculate how many total frames should exist from all audio fed so far
-        let total_possible_frames = self.total_audio_samples / self.hop_samples + 1;
-
-        // New frames = total possible - already computed
-        total_possible_frames.saturating_sub(self.total_frames)
-    }
-
-    /// Check if there is pending audio that can produce new mel frames.
+    /// We need at least window_samples worth of audio to compute any frames.
     pub fn has_pending_audio(&self) -> bool {
-        self.computable_new_frames() > 0
+        self.audio_buffer.len() >= self.window_samples
     }
 
     /// Append pre-computed mel frames to the buffer.
@@ -923,13 +909,10 @@ mod tests {
         // Add 1 second of audio
         buffer.add_audio(&vec![0.0f32; 16000]);
         assert_eq!(buffer.audio_samples_available(), 16000);
+        assert!(buffer.has_pending_audio(), "Should have pending audio");
 
-        // Check computable frames: total_audio / hop + 1 = 16000 / 160 + 1 = 101
-        let new_frames = buffer.computable_new_frames();
-        assert!(new_frames > 0, "Should be able to compute new frames");
-        assert_eq!(new_frames, 101);
-
-        // Simulate appending mel frames
+        // Simulate appending mel frames (what preprocessor would return)
+        // 16000 samples -> floor(16000/160) + 1 = 101 frames
         let dummy_mel = vec![0.0f32; 80 * 101]; // [n_mels, time] format
         buffer.append_mel(&dummy_mel, 101);
         assert_eq!(buffer.total_frames, 101);
@@ -946,14 +929,12 @@ mod tests {
         // Add more audio
         buffer.add_audio(&vec![0.0f32; 1600]); // 0.1s more
 
-        // Total audio is now 17600, so total frames = 17600/160 + 1 = 111
-        // We already have 101 frames, so new = 10
-        let new_frames2 = buffer.computable_new_frames();
-        assert_eq!(
-            new_frames2, 10,
-            "Should compute 10 new frames, got {}",
-            new_frames2
+        // Should still have pending audio (overlap + new = 400 + 1600 = 2000 samples)
+        assert!(
+            buffer.has_pending_audio(),
+            "Should have pending audio after adding more"
         );
+        assert_eq!(buffer.audio_samples_available(), 2000);
     }
 
     #[test]
@@ -991,17 +972,31 @@ mod tests {
             buffer.add_audio(&vec![0.0f32; 1600]);
 
             // Simulate mel computation and processing
-            let new_frames = buffer.computable_new_frames();
-            if new_frames > 0 {
-                let dummy_mel = vec![0.0f32; 80 * new_frames];
-                buffer.append_mel(&dummy_mel, new_frames);
-                buffer.drain_processed_audio();
+            if buffer.has_pending_audio() {
+                // Compute how many frames from current audio buffer
+                // Formula: audio_len / hop + 1
+                let audio_len = buffer.audio_samples_available();
+                let computed_frames = audio_len / buffer.hop_samples + 1;
 
-                // Advance buffer_idx
-                buffer.buffer_idx = buffer.total_frames;
+                // Skip overlap frames (except on first iteration)
+                let overlap_frames = if buffer.total_frames == 0 {
+                    0
+                } else {
+                    buffer.window_samples / buffer.hop_samples
+                };
+                let new_frames = computed_frames.saturating_sub(overlap_frames);
 
-                // Trim old frames (keep 20 for cache)
-                buffer.trim_old_frames(20);
+                if new_frames > 0 {
+                    let dummy_mel = vec![0.0f32; 80 * new_frames];
+                    buffer.append_mel(&dummy_mel, new_frames);
+                    buffer.drain_processed_audio();
+
+                    // Advance buffer_idx
+                    buffer.buffer_idx = buffer.total_frames;
+
+                    // Trim old frames (keep 20 for cache)
+                    buffer.trim_old_frames(20);
+                }
             }
         }
 
