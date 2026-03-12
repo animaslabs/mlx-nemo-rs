@@ -1122,6 +1122,27 @@ impl EncDecRNNTModel {
         }
 
         // Process any remaining mel frames
+        // If there are remaining frames but not enough for a full chunk, pad with zeros
+        let chunk_size = session.config.chunk_size_for_step(session.is_first_chunk);
+        let remaining = session.mel_buffer.remaining_frames();
+
+        if remaining > 0 && remaining < chunk_size {
+            // Pad mel buffer with zeros to make a full chunk
+            let frames_to_pad = chunk_size - remaining;
+            let n_mels = session.n_mels;
+
+            if debug {
+                eprintln!(
+                    "[DEBUG] finalize: padding {} mel frames to make full chunk of {}",
+                    frames_to_pad, chunk_size
+                );
+            }
+
+            // Create zero padding in [n_mels, time] format (which append_mel expects)
+            let padding = vec![0.0f32; n_mels * frames_to_pad];
+            session.mel_buffer.append_mel(&padding, frames_to_pad);
+        }
+
         while !session.mel_buffer.is_empty() {
             let remaining = session.mel_buffer.remaining_frames();
             if remaining == 0 {
