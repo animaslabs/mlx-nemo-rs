@@ -103,6 +103,221 @@ fn causal_pad_2d(x: &Array, kernel_size: usize, _stride: usize) -> Result<Array>
     Ok(x)
 }
 
+/// Create attention mask for streaming inference.
+///
+/// This implements NeMo's `_create_masks()` function for 'chunked_limited' style
+/// attention context windowing and offset-based masking for unfilled cache positions.
+///
+/// # Arguments
+/// * `att_context_size` - (left_context, right_context) in frames
+/// * `att_context_style` - "chunked_limited" or "regular"
+/// * `max_audio_length` - Total length: filled_cache + seq_len
+/// * `cache_len` - Full cache buffer size (for slicing the mask)
+/// * `filled_cache_len` - How many cache frames are actually valid
+/// * `seq_len` - Current input sequence length
+///
+/// # Returns
+/// Boolean mask [1, seq_len, max_audio_length] where True = masked (ignore)
+fn create_attention_mask(
+    att_context_size: (i32, i32),
+    att_context_style: &str,
+    max_audio_length: i32,
+    cache_len: i32,
+    filled_cache_len: i32,
+    seq_len: i32,
+) -> Result<Array> {
+    let debug = std::env::var("MASK_DEBUG")
+        .map(|v| v == "1")
+        .unwrap_or(false);
+
+    // Create base attention mask [1, max_audio_length, max_audio_length]
+    // In NeMo, this starts as all True (all positions visible),
+    // then gets masked based on context style
+    let mut att_mask = mlx_rs::ops::ones::<bool>(&[1, max_audio_length, max_audio_length])?;
+
+    let (left_context, right_context) = att_context_size;
+
+    if att_context_style == "chunked_limited" {
+        // Chunked limited masking (NeMo conformer_encoder.py lines 803-822)
+        if right_context == -1 {
+            // Unlimited right context - only apply left context via triu
+            if left_context >= 0 {
+                att_mask = apply_triu(&att_mask, -left_context)?;
+            }
+        } else {
+            // Chunked limited: chunk_size = right_context + 1
+            let chunk_size = right_context + 1;
+            let left_chunks_num = if left_context >= 0 {
+                left_context / chunk_size
+            } else {
+                10000 // effectively unlimited
+            };
+
+            // Create chunk-based visibility mask
+            att_mask = create_chunked_limited_mask(max_audio_length, chunk_size, left_chunks_num)?;
+        }
+    } else {
+        // Regular style - simple triangular masking
+        if left_context >= 0 {
+            att_mask = apply_triu(&att_mask, -left_context)?;
+        }
+        if right_context >= 0 {
+            att_mask = apply_tril(&att_mask, right_context)?;
+        }
+    }
+
+    // Apply offset masking for unfilled cache positions (NeMo lines 831-835)
+    // offset = cache_len - filled_cache_len (how many zeros at start of cache)
+    let offset = cache_len - filled_cache_len;
+    if offset > 0 {
+        // Create pad_mask: positions >= offset are valid
+        // First create range [0, 1, 2, ..., max_audio_length-1]
+        let range_vals: Vec<i32> = (0..max_audio_length).collect();
+        let range = Array::from_slice(&range_vals, &[1, max_audio_length]);
+
+        // pad_mask[i] = (range[i] >= offset)
+        let offset_arr = Array::from_int(offset);
+        let valid_positions = range.ge(&offset_arr)?;
+
+        // Broadcast to [1, max_audio_length, max_audio_length] and AND with att_mask
+        // For each query position, keys must be at valid positions
+        let valid_positions = valid_positions.reshape(&[1, 1, max_audio_length])?;
+        att_mask = att_mask.logical_and(&valid_positions)?;
+    }
+
+    // Slice to get [1, seq_len, max_audio_length]
+    // This removes the cache rows, keeping only query rows for the current input
+    // NeMo: att_mask = att_mask[:, cache_len:]
+    //
+    // With max_audio_length = cache_size + seq_len:
+    // - Positions 0..cache_len are cache positions
+    // - Positions cache_len..max_audio_length are current input positions
+    // We want the mask for queries at positions cache_len..max_audio_length
+    let att_mask = att_mask.index((.., cache_len.., ..));
+
+    // Invert: NeMo returns inverted mask at the end (True means ignore)
+    let att_mask = mlx_rs::ops::logical_not(&att_mask)?;
+
+    if debug {
+        att_mask.eval()?;
+        let mask_sum: f32 =
+            mlx_rs::ops::sum(&att_mask.as_type::<f32>()?, None)?.as_slice::<f32>()[0];
+        eprintln!(
+            "[MASK_DEBUG] att_context_size={:?}, style={}, max_len={}, cache_len={}, filled={}, seq_len={}",
+            att_context_size, att_context_style, max_audio_length, cache_len, filled_cache_len, seq_len
+        );
+        eprintln!(
+            "[MASK_DEBUG] mask shape: {:?}, masked positions: {}",
+            att_mask.shape(),
+            mask_sum
+        );
+    }
+
+    Ok(att_mask)
+}
+
+/// Apply upper triangular masking (triu) to attention mask.
+///
+/// Sets positions below the diagonal to False.
+/// diagonal=0 means main diagonal, negative shifts down.
+fn apply_triu(mask: &Array, diagonal: i32) -> Result<Array> {
+    let shape = mask.shape();
+    let rows = shape[1] as i32;
+    let cols = shape[2] as i32;
+
+    // Create row indices [0, 1, 2, ...]
+    let row_indices: Vec<i32> = (0..rows).collect();
+    let row_arr = Array::from_slice(&row_indices, &[rows, 1]);
+
+    // Create col indices [0, 1, 2, ...]
+    let col_indices: Vec<i32> = (0..cols).collect();
+    let col_arr = Array::from_slice(&col_indices, &[1, cols]);
+
+    // Upper triangular: col >= row + diagonal
+    // Equivalent to: col - row >= diagonal
+    let diff = &col_arr - &row_arr;
+    let diag_arr = Array::from_int(diagonal);
+    let triu_mask = diff.ge(&diag_arr)?;
+
+    // Reshape to [1, rows, cols] and AND with mask
+    let triu_mask = triu_mask.reshape(&[1, rows, cols])?;
+    Ok(mask.logical_and(&triu_mask)?)
+}
+
+/// Apply lower triangular masking (tril) to attention mask.
+///
+/// Sets positions above the diagonal to False.
+/// diagonal=0 means main diagonal, positive shifts up.
+fn apply_tril(mask: &Array, diagonal: i32) -> Result<Array> {
+    let shape = mask.shape();
+    let rows = shape[1] as i32;
+    let cols = shape[2] as i32;
+
+    // Create row indices [0, 1, 2, ...]
+    let row_indices: Vec<i32> = (0..rows).collect();
+    let row_arr = Array::from_slice(&row_indices, &[rows, 1]);
+
+    // Create col indices [0, 1, 2, ...]
+    let col_indices: Vec<i32> = (0..cols).collect();
+    let col_arr = Array::from_slice(&col_indices, &[1, cols]);
+
+    // Lower triangular: col <= row + diagonal
+    // Equivalent to: col - row <= diagonal
+    let diff = &col_arr - &row_arr;
+    let diag_arr = Array::from_int(diagonal);
+    let tril_mask = diff.le(&diag_arr)?;
+
+    // Reshape to [1, rows, cols] and AND with mask
+    let tril_mask = tril_mask.reshape(&[1, rows, cols])?;
+    Ok(mask.logical_and(&tril_mask)?)
+}
+
+/// Create chunked limited attention mask.
+///
+/// Each position can only attend to positions within its own chunk
+/// and a number of preceding chunks.
+///
+/// NeMo implementation (conformer_encoder.py lines 816-822):
+/// ```python
+/// chunk_idx = torch.arange(0, max_audio_length, dtype=torch.int, device=device)
+/// chunk_idx = torch.div(chunk_idx, chunk_size, rounding_mode="trunc")
+/// diff_chunks = chunk_idx.unsqueeze(1) - chunk_idx.unsqueeze(0)
+/// chunked_limited_mask = torch.logical_and(
+///     torch.le(diff_chunks, left_chunks_num), torch.ge(diff_chunks, 0)
+/// )
+/// ```
+fn create_chunked_limited_mask(
+    max_audio_length: i32,
+    chunk_size: i32,
+    left_chunks_num: i32,
+) -> Result<Array> {
+    // Create position indices and compute chunk indices
+    let indices: Vec<i32> = (0..max_audio_length).collect();
+    let chunk_idx: Vec<i32> = indices.iter().map(|&i| i / chunk_size).collect();
+
+    // Create 2D diff_chunks: diff_chunks[i, j] = chunk_idx[i] - chunk_idx[j]
+    // This is query_chunk - key_chunk
+    let mut diff_chunks = Vec::with_capacity((max_audio_length * max_audio_length) as usize);
+    for &qi in &chunk_idx {
+        for &ki in &chunk_idx {
+            diff_chunks.push(qi - ki);
+        }
+    }
+    let diff_chunks = Array::from_slice(&diff_chunks, &[max_audio_length, max_audio_length]);
+
+    // Mask: 0 <= diff_chunks <= left_chunks_num
+    // i.e., query can attend to key if key is in same chunk or up to left_chunks_num chunks back
+    let zero = Array::from_int(0);
+    let left_limit = Array::from_int(left_chunks_num);
+
+    let ge_zero = diff_chunks.ge(&zero)?;
+    let le_left = diff_chunks.le(&left_limit)?;
+    let mask = ge_zero.logical_and(&le_left)?;
+
+    // Reshape to [1, max_audio_length, max_audio_length]
+    Ok(mask.reshape(&[1, max_audio_length, max_audio_length])?)
+}
+
 /// Conformer encoder for ASR.
 ///
 /// This implements the Conformer architecture as used in NeMo's ASR models,
@@ -121,6 +336,13 @@ pub struct ConformerEncoder {
 
     /// Final layer normalization
     final_norm: nn::LayerNorm,
+
+    /// Attention context size (left, right) for streaming
+    /// Parsed from config.att_context_size
+    att_context_size: Option<(i32, i32)>,
+
+    /// Attention context style ("regular" or "chunked_limited")
+    att_context_style: String,
 }
 
 impl ConformerEncoder {
@@ -146,12 +368,24 @@ impl ConformerEncoder {
         // Final layer norm
         let final_norm = nn::LayerNorm::new(d_model as i32)?;
 
+        // Extract attention context configuration for streaming
+        let att_context_size = config
+            .att_context_size
+            .as_ref()
+            .and_then(|cs| cs.get_default());
+        let att_context_style = config
+            .att_context_style
+            .clone()
+            .unwrap_or_else(|| "regular".to_string());
+
         Ok(Self {
             config,
             subsampling,
             pos_enc,
             layers,
             final_norm,
+            att_context_size,
+            att_context_style,
         })
     }
 
@@ -268,12 +502,18 @@ impl ConformerEncoder {
 
     /// Forward pass with streaming cache support.
     ///
+    /// This implements NeMo's streaming forward with:
+    /// 1. Attention mask creation based on att_context_size and att_context_style
+    /// 2. Full cache buffer passed to layers (not just filled portion)
+    /// 3. Proper cache update with sliding window
+    ///
     /// # Arguments
     /// * `features` - Input features [batch, features, time]
     /// * `lengths` - Sequence lengths [batch]
     /// * `cache_last_channel` - MHA cache [num_layers, batch, cache_len, d_model]
     /// * `cache_last_time` - Conv cache [num_layers, batch, d_model, time_cache]
     /// * `cache_last_channel_len` - Cache fill level [batch]
+    /// * `drop_extra_pre_encoded` - Frames to drop after subsampling
     ///
     /// # Returns
     /// * Encoded features [batch, d_model, time']
@@ -331,7 +571,6 @@ impl ConformerEncoder {
         // at chunk boundaries that should be discarded to match offline behavior.
         // NeMo applies this on ALL chunks (whenever cache_last_channel is not None),
         // which in streaming mode is always.
-        let filled_cache_len_check = cache_last_channel_len.as_slice::<i64>()[0];
         if drop_extra_pre_encoded > 0 {
             let drop = drop_extra_pre_encoded as i32;
             x = x.index((.., drop.., ..));
@@ -378,15 +617,16 @@ impl ConformerEncoder {
             }
         }
 
-        let seq_len = x.dim(1);
-        let cache_size = cache_last_channel.dim(2); // Allocated cache size
+        let seq_len = x.dim(1) as i32;
+        let cache_size = cache_last_channel.dim(2) as i32; // Allocated cache size
 
         // Get the actual filled cache length (use first batch element, assume all same)
         cache_last_channel_len.eval()?;
         let filled_cache_len = cache_last_channel_len.as_slice::<i64>()[0].max(0) as i32;
 
-        // Total length is filled cache + new sequence (for attention K/V)
-        let total_len = filled_cache_len + seq_len;
+        // Total length for K/V is cache_size + seq_len (full buffer, not just filled)
+        // NeMo uses full buffer and relies on mask to hide unfilled positions
+        let total_len = cache_size + seq_len;
 
         if debug {
             eprintln!(
@@ -395,9 +635,34 @@ impl ConformerEncoder {
             );
         }
 
-        // Generate positional encoding for total length (filled cache + current)
+        // Generate positional encoding for total length (full buffer + current)
         // This should cover positions for all K/V that attention will see
         let pos_emb = self.pos_enc.get_encoding(total_len as usize)?;
+
+        // Create attention mask if we have context configuration
+        // NeMo: att_mask = _create_masks(...); att_mask = att_mask[:, cache_len:]
+        //
+        // The mask is created for the full buffer (cache_size + seq_len = total_len),
+        // and offset masking hides the unfilled cache positions.
+        let att_mask = if let Some(ctx) = self.att_context_size {
+            Some(create_attention_mask(
+                ctx,
+                &self.att_context_style,
+                total_len,        // Full buffer: cache_size + seq_len
+                cache_size,       // Full cache buffer size (for slicing)
+                filled_cache_len, // How much is filled (for offset masking)
+                seq_len,          // Current sequence length
+            )?)
+        } else {
+            None
+        };
+
+        if debug && att_mask.is_some() {
+            eprintln!(
+                "[DEBUG]   encoder: created attention mask, shape {:?}",
+                att_mask.as_ref().unwrap().shape()
+            );
+        }
 
         // Initialize output caches
         let mut cache_channel_next = Vec::with_capacity(self.layers.len());
@@ -409,43 +674,10 @@ impl ConformerEncoder {
             let layer_cache_channel_full = cache_last_channel.index((layer_idx as i32, .., .., ..));
             let layer_cache_time = cache_last_time.index((layer_idx as i32, .., .., ..));
 
-            // Only use the filled portion of the channel cache
-            // Cache is stored with newest at the end, so we take the last `filled_cache_len` frames
-            let cache_start = (cache_size - filled_cache_len).max(0);
-            let layer_cache_channel = if filled_cache_len > 0 {
-                layer_cache_channel_full.index((.., cache_start.., ..))
-            } else {
-                // Empty cache - create empty tensor with right shape
-                mlx_rs::ops::zeros::<f32>(&[x.dim(0) as i32, 0, x.dim(2) as i32])?
-            };
-
             // Debug: show cache and input stats for first layer on chunk 2
             if debug && layer_idx == 0 && filled_cache_len > 0 {
-                layer_cache_channel.eval()?;
                 x.eval()?;
-                let cache_slice: &[f32] = layer_cache_channel.as_slice();
                 let x_slice: &[f32] = x.as_slice();
-
-                // Show cache stats
-                let cache_len_actual = layer_cache_channel.dim(1);
-                let cache_min: f32 = cache_slice.iter().cloned().fold(f32::INFINITY, f32::min);
-                let cache_max: f32 = cache_slice
-                    .iter()
-                    .cloned()
-                    .fold(f32::NEG_INFINITY, f32::max);
-                eprintln!(
-                    "[DEBUG]   layer 0: cache shape {:?}, cache_len={}, min={:.4}, max={:.4}",
-                    layer_cache_channel.shape(),
-                    cache_len_actual,
-                    cache_min,
-                    cache_max,
-                );
-                eprintln!(
-                    "[DEBUG]     cache first values [{:.4}, {:.4}, {:.4}]",
-                    cache_slice.get(0).unwrap_or(&0.0),
-                    cache_slice.get(1).unwrap_or(&0.0),
-                    cache_slice.get(2).unwrap_or(&0.0),
-                );
 
                 // Show input stats
                 let x_min: f32 = x_slice.iter().cloned().fold(f32::INFINITY, f32::min);
@@ -464,45 +696,37 @@ impl ConformerEncoder {
                 );
             }
 
+            // Pass full cache buffer to layer, along with filled length
+            // The attention layer will extract the filled portion internally
             let (x_out, new_channel, new_time) = layer.forward_with_cache(
                 &x,
                 &pos_emb,
-                if filled_cache_len > 0 {
-                    Some(&layer_cache_channel)
-                } else {
-                    None
-                },
-                // Only pass time cache if we have some context (not the first chunk)
-                // On first chunk, the conv module should apply its own causal padding
+                Some(&layer_cache_channel_full),
+                filled_cache_len,
                 if filled_cache_len > 0 {
                     Some(&layer_cache_time)
                 } else {
                     None
                 },
-                None, // att_mask
+                att_mask.as_ref(),
             )?;
 
             x = x_out;
 
-            // For the output cache, we need to maintain the full cache size.
-            // The attention layer returns a new cache containing the new input frames (sliding window).
-            // We need to properly slide the old cache content and append the new cache.
+            // Update cache: the attention layer returns new_cache from sliding window
+            // We need to store it properly in the full cache buffer
             //
-            // NeMo's approach: Always pass full cache (with zeros) and use attention mask.
-            // Our approach: Extract only filled portion, so we need to reconstruct the full cache.
-            //
-            // The attention returns: new_cache = concat(old_cache[q_keep_size:], x[:q_keep_size])
-            // When we pass only filled frames, new_cache will be smaller than cache_size.
-            // We reconstruct by: full_cache = concat(old_full_cache[new_cache_len:], new_cache)
+            // The attention returns: new_cache = concat(old_filled[q_keep_size:], x[:q_keep_size])
+            // We need to place this at the END of the full cache buffer
             if let Some(nc) = new_channel {
-                let nc_len = nc.dim(1);
+                let nc_len = nc.dim(1) as i32;
                 let updated_cache = if nc_len < cache_size {
-                    // Slide the old cache content and append new cache
-                    // Keep the portion of old cache that wasn't covered by new cache
-                    let old_keep_start = nc_len as i32; // Drop first nc_len frames from old cache
-                    let old_keep = layer_cache_channel_full.index((.., old_keep_start.., ..));
-                    // Concatenate: [old_keep | new_cache]
-                    mlx_rs::ops::concatenate_axis(&[&old_keep, &nc], 1)?
+                    // Pad with zeros at the beginning to maintain cache_size
+                    let pad_size = cache_size - nc_len;
+                    let batch = nc.dim(0) as i32;
+                    let d_model = nc.dim(2) as i32;
+                    let zeros = mlx_rs::ops::zeros::<f32>(&[batch, pad_size, d_model])?;
+                    mlx_rs::ops::concatenate_axis(&[&zeros, &nc], 1)?
                 } else if nc_len > cache_size {
                     // Truncate from the left (keep newest)
                     let start = nc_len - cache_size;
@@ -537,7 +761,7 @@ impl ConformerEncoder {
 
         // Update cache length: clamp(old_len + seq_len, max=cache_size)
         let cache_channel_len_next = mlx_rs::ops::clip(
-            &(cache_last_channel_len + &Array::from_int(seq_len as i32)),
+            &(cache_last_channel_len + &Array::from_int(seq_len)),
             ((), &Array::from_int(cache_size)),
         )?;
 
@@ -923,9 +1147,10 @@ impl ConformerBlock {
     /// # Arguments
     /// * `x` - Input tensor [batch, seq_len, d_model]
     /// * `pos_emb` - Positional embeddings
-    /// * `cache_last_channel` - Optional MHA cache [batch, cache_len, d_model]
+    /// * `cache_last_channel` - Optional full MHA cache buffer [batch, cache_size, d_model]
+    /// * `cache_filled_len` - How many frames of MHA cache are valid
     /// * `cache_last_time` - Optional conv cache [batch, d_model, time_cache]
-    /// * `att_mask` - Optional attention mask
+    /// * `att_mask` - Optional attention mask [batch, seq_len, total_len] where True=masked
     ///
     /// # Returns
     /// * Output tensor [batch, seq_len, d_model]
@@ -936,6 +1161,7 @@ impl ConformerBlock {
         x: &Array,
         pos_emb: &Array,
         cache_last_channel: Option<&Array>,
+        cache_filled_len: i32,
         cache_last_time: Option<&Array>,
         att_mask: Option<&Array>,
     ) -> Result<(Array, Option<Array>, Option<Array>)> {
@@ -950,9 +1176,13 @@ impl ConformerBlock {
         // Self-attention with cache
         let residual = x.clone();
         let attn_out = self.self_attn_norm.forward(&x)?;
-        let (attn_out, new_cache_channel) =
-            self.self_attn
-                .forward_with_cache(&attn_out, pos_emb, cache_last_channel, att_mask)?;
+        let (attn_out, new_cache_channel) = self.self_attn.forward_with_cache(
+            &attn_out,
+            pos_emb,
+            cache_last_channel,
+            cache_filled_len,
+            att_mask,
+        )?;
         let x = &residual + &attn_out;
 
         // Convolution with cache

@@ -160,6 +160,10 @@ pub struct RelPositionMultiHeadAttention {
 
     /// Cache drop size for streaming (frames to drop from cache per step)
     pub cache_drop_size: usize,
+
+    /// Attention context size (left, right) for streaming masking
+    /// This is stored here for debugging but masking is done at encoder level
+    pub att_context_size: Option<(i32, i32)>,
 }
 
 impl RelPositionMultiHeadAttention {
@@ -194,6 +198,7 @@ impl RelPositionMultiHeadAttention {
             pos_bias_u,
             pos_bias_v,
             cache_drop_size: 0,
+            att_context_size: None,
         })
     }
 
@@ -293,95 +298,103 @@ impl RelPositionMultiHeadAttention {
 
     /// Forward pass with cache support for streaming inference.
     ///
+    /// This implements NeMo's attention caching approach:
+    /// 1. Concatenate filled cache with input BEFORE QKV projection
+    /// 2. Project Q from input only, K/V from concatenated cache+input
+    /// 3. Use attention mask to ignore unfilled cache positions
+    /// 4. Update cache using sliding window
+    ///
     /// # Arguments
     /// * `x` - Input tensor [batch, seq_len, d_model]
-    /// * `pos_emb` - Positional embeddings [1, 2*total_len-1, d_model] where total_len = cache_len + seq_len
-    /// * `cache` - Optional cache tensor [batch, cache_len, d_model] containing previous key/value states
-    /// * `att_mask` - Optional attention mask [batch, seq_len, total_len]
+    /// * `pos_emb` - Positional embeddings [1, 2*total_len-1, d_model]
+    /// * `cache` - Optional full cache buffer [batch, cache_size, d_model]
+    /// * `cache_filled_len` - How many frames of cache are valid (0 if no cache)
+    /// * `att_mask` - Optional attention mask [batch, seq_len, total_len] where True=masked
     ///
     /// # Returns
     /// * Output tensor [batch, seq_len, d_model]
-    /// * Updated cache tensor [batch, new_cache_len, d_model] (if cache was provided)
+    /// * Updated cache tensor [batch, new_cache_len, d_model]
     pub fn forward_with_cache(
         &mut self,
         x: &Array,
         pos_emb: &Array,
         cache: Option<&Array>,
+        cache_filled_len: i32,
         att_mask: Option<&Array>,
     ) -> Result<(Array, Option<Array>)> {
         let batch_size = x.dim(0) as i32;
         let seq_len = x.dim(1) as i32;
+        let d_model = x.dim(2) as i32;
         let n_heads = self.n_heads as i32;
         let head_dim = self.head_dim as i32;
 
-        // Project Q, K, V from current input
-        let q = self.linear_q.forward(x)?;
-        let mut k = self.linear_k.forward(x)?;
-        let mut v = self.linear_v.forward(x)?;
+        let debug = std::env::var("ATTN_DEBUG")
+            .map(|v| v == "1")
+            .unwrap_or(false);
 
-        // Handle cache: concatenate with current K, V
-        let (total_len, new_cache) = if let Some(cache_tensor) = cache {
-            let cache_len = cache_tensor.dim(1) as i32;
+        // NeMo-style cache handling:
+        // 1. Concatenate FULL cache buffer with input (mask handles unfilled positions)
+        // 2. Project Q from input, K/V from concatenated
+        // 3. Update cache using sliding window
+        //
+        // IMPORTANT: Unlike our previous approach, NeMo uses the FULL cache buffer
+        // (including unfilled/zero positions) and relies on the attention mask to
+        // hide unfilled positions. This keeps K/V length = cache_size + seq_len.
 
-            if cache_len > 0 {
-                // Project cache through K, V (cache contains raw hidden states)
-                let cache_k = self.linear_k.forward(cache_tensor)?;
-                let cache_v = self.linear_v.forward(cache_tensor)?;
+        let (kv_input, total_len, new_cache) = if let Some(cache_tensor) = cache {
+            let cache_size = cache_tensor.dim(1) as i32;
 
-                // Concatenate: [batch, cache_len + seq_len, d_model]
-                k = ops::concatenate_axis(&[&cache_k, &k], 1)?;
-                v = ops::concatenate_axis(&[&cache_v, &v], 1)?;
+            // NeMo's update_cache: key = value = concat(cache, input)
+            // Use FULL cache buffer, not just filled portion
+            let kv_input = ops::concatenate_axis(&[cache_tensor, x], 1)?;
+            let total = cache_size + seq_len;
 
-                let total = cache_len + seq_len;
+            // Update cache: sliding window
+            // q_keep_size = seq_len - cache_drop_size (frames to keep from input)
+            // The cache stores values at the END of the buffer
+            // new_cache = concat(old_cache[q_keep_size:], x[:q_keep_size])
+            let q_keep_size = (seq_len - self.cache_drop_size as i32).max(0);
 
-                // Update cache following NeMo's logic:
-                // q_keep_size = seq_len - cache_drop_size
-                // new_cache = concat(cache[q_keep_size:], x[:q_keep_size])
-                //
-                // This implements a sliding window where:
-                // - We drop q_keep_size frames from the START of the cache
-                // - We add the first q_keep_size frames of the new input
-                // - When cache_drop_size = 0, q_keep_size = seq_len, so we drop seq_len
-                //   old frames and add all seq_len new frames
-                let q_keep_size = (seq_len - self.cache_drop_size as i32).max(0);
-                let new_cache = if q_keep_size > 0 {
-                    // Drop first q_keep_size frames from cache (if cache is big enough)
-                    let cache_keep = if cache_len > q_keep_size {
-                        cache_tensor.index((.., q_keep_size.., ..))
-                    } else {
-                        // Cache is smaller than q_keep_size, keep nothing from old cache
-                        ops::zeros::<f32>(&[batch_size, 0, x.dim(2) as i32])?
-                    };
-                    // Keep first q_keep_size frames from current input
-                    let x_keep = x.index((.., ..q_keep_size, ..));
-                    ops::concatenate_axis(&[&cache_keep, &x_keep], 1)?
-                } else {
-                    // q_keep_size <= 0 means we drop all, just keep new input
-                    x.clone()
-                };
-
-                (total, Some(new_cache))
+            // For the new cache, we slide the window:
+            // - Drop first q_keep_size frames from the old cache
+            // - Append first q_keep_size frames from current input
+            let new_cache = if q_keep_size > 0 {
+                let cache_keep = cache_tensor.index((.., q_keep_size.., ..));
+                let x_keep = x.index((.., ..q_keep_size, ..));
+                ops::concatenate_axis(&[&cache_keep, &x_keep], 1)?
             } else {
-                // Cache tensor exists but is empty - start fresh
-                // Keep first q_keep_size frames from current input
-                let q_keep_size = (seq_len - self.cache_drop_size as i32).max(0);
-                let new_cache = if q_keep_size > 0 {
-                    x.index((.., ..q_keep_size, ..))
-                } else {
-                    ops::zeros::<f32>(&[batch_size, 0, x.dim(2) as i32])?
-                };
-                (seq_len, Some(new_cache))
+                cache_tensor.clone()
+            };
+
+            if debug {
+                eprintln!(
+                    "[ATTN_DEBUG] cache_size={}, seq_len={}, total_len={}, new_cache_len={}, filled={}",
+                    cache_size,
+                    seq_len,
+                    total,
+                    new_cache.dim(1),
+                    cache_filled_len
+                );
             }
+
+            (kv_input, total, Some(new_cache))
         } else {
-            // No cache at all - first chunk, start building cache
+            // No cache at all - non-streaming or first chunk
             let q_keep_size = (seq_len - self.cache_drop_size as i32).max(0);
             let new_cache = if q_keep_size > 0 {
                 x.index((.., ..q_keep_size, ..))
             } else {
-                ops::zeros::<f32>(&[batch_size, 0, x.dim(2) as i32])?
+                ops::zeros::<f32>(&[batch_size, 0, d_model])?
             };
-            (seq_len, Some(new_cache))
+            (x.clone(), seq_len, Some(new_cache))
         };
+
+        // Project Q from input only (NeMo: query = input, unchanged)
+        let q = self.linear_q.forward(x)?;
+
+        // Project K, V from concatenated cache+input (NeMo style)
+        let k = self.linear_k.forward(&kv_input)?;
+        let v = self.linear_v.forward(&kv_input)?;
 
         // Reshape Q to multi-head: [batch, seq_len, n_heads, head_dim]
         let q = q.reshape(&[batch_size, seq_len, n_heads, head_dim])?;
@@ -417,10 +430,6 @@ impl RelPositionMultiHeadAttention {
         // Apply rel_shift and truncate to total_len
         let matrix_bd = Self::rel_shift(&matrix_bd)?;
 
-        // Debug: check matrix_bd before truncation
-        let debug = std::env::var("ATTN_DEBUG")
-            .map(|v| v == "1")
-            .unwrap_or(false);
         if debug {
             eprintln!(
                 "[ATTN_DEBUG] matrix_bd after rel_shift: {:?}, truncating to {}",
@@ -439,9 +448,19 @@ impl RelPositionMultiHeadAttention {
         if let Some(mask) = att_mask {
             // mask: [batch, seq_len, total_len] -> [batch, 1, seq_len, total_len]
             let mask = mask.reshape(&[batch_size, 1, seq_len, total_len])?;
-            // Where mask is True (padding), set score to -inf
+            // Where mask is True (masked/padding), set score to -inf
             let neg_inf = Array::from_f32(f32::NEG_INFINITY);
             scores = ops::r#where(&mask, &neg_inf, &scores)?;
+
+            if debug {
+                mask.eval()?;
+                let mask_sum: f32 = ops::sum(&mask.as_type::<f32>()?, None)?.as_slice::<f32>()[0];
+                eprintln!(
+                    "[ATTN_DEBUG] mask shape: {:?}, masked positions: {}",
+                    mask.shape(),
+                    mask_sum
+                );
+            }
         }
 
         // Softmax

@@ -845,11 +845,14 @@ impl EncDecRNNTModel {
             let pre_encode_cache = session
                 .config
                 .pre_encode_cache_for_step(session.is_first_chunk);
-            // NeMo applies drop_extra_pre_encoded on ALL chunks in streaming mode
-            // (whenever cache_last_channel is not None, which is always in streaming).
-            // This is needed because the pre_encode_cache overlap causes extra frames
-            // at chunk boundaries after subsampling.
-            let drop_extra = session.config.drop_extra_pre_encoded;
+            // NeMo applies drop_extra_pre_encoded on subsequent chunks only (not the first).
+            // The Python streaming script passes drop_extra_pre_encoded=0 for step_num=0.
+            // This is because the first chunk doesn't have pre_encode_cache overlap.
+            let drop_extra = if session.is_first_chunk {
+                0 // Don't drop on first chunk
+            } else {
+                session.config.drop_extra_pre_encoded
+            };
 
             // Check if we have enough mel frames
             let remaining = session.mel_buffer.remaining_frames();
