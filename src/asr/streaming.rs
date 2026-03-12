@@ -296,8 +296,8 @@ impl Default for StreamingOutput {
 /// - Shift: 112 frames per step (after first)
 #[derive(Debug, Clone)]
 pub struct StreamingMelBuffer {
-    /// Pre-computed mel frames stored as [n_mels, total_frames]
-    /// This matches NeMo's buffer format which is [batch, features, time]
+    /// Pre-computed mel frames stored as [time, n_mels] (internal format for efficient frame access)
+    /// This is transposed from the preprocessor output [batch, n_mels, time]
     pub mel_buffer: Vec<f32>,
 
     /// Number of mel features (e.g., 128)
@@ -309,8 +309,9 @@ pub struct StreamingMelBuffer {
     /// Current position in mel buffer (analogous to NeMo's buffer_idx)
     pub buffer_idx: usize,
 
-    /// Audio samples waiting to be converted to mel
-    pub audio_buffer: Vec<f32>,
+    /// ALL accumulated audio samples since stream start.
+    /// We keep all audio to ensure mel computation matches Python's full-audio approach.
+    pub all_audio: Vec<f32>,
 
     /// Sample rate
     pub sample_rate: u32,
@@ -320,11 +321,20 @@ pub struct StreamingMelBuffer {
 
     /// Hop size in samples
     pub hop_samples: usize,
+
+    /// FFT size
+    pub n_fft: usize,
 }
 
 impl StreamingMelBuffer {
     /// Create a new streaming mel buffer.
-    pub fn new(sample_rate: u32, window_size: f32, window_stride: f32, n_mels: usize) -> Self {
+    pub fn new(
+        sample_rate: u32,
+        window_size: f32,
+        window_stride: f32,
+        n_mels: usize,
+        n_fft: usize,
+    ) -> Self {
         let window_samples = (window_size * sample_rate as f32) as usize;
         let hop_samples = (window_stride * sample_rate as f32) as usize;
 
@@ -333,16 +343,31 @@ impl StreamingMelBuffer {
             n_mels,
             total_frames: 0,
             buffer_idx: 0,
-            audio_buffer: Vec::new(),
+            all_audio: Vec::new(),
             sample_rate,
             window_samples,
             hop_samples,
+            n_fft,
         }
     }
 
-    /// Add audio samples to be converted to mel frames.
+    /// Add audio samples to the accumulated buffer.
     pub fn add_audio(&mut self, samples: &[f32]) {
-        self.audio_buffer.extend_from_slice(samples);
+        self.all_audio.extend_from_slice(samples);
+    }
+
+    /// Get all accumulated audio for mel computation.
+    /// This ensures mel is computed from the full audio stream, matching Python's approach.
+    pub fn get_all_audio(&self) -> &[f32] {
+        &self.all_audio
+    }
+
+    /// Clear mel buffer and set new mel frames computed from full audio.
+    /// This replaces the mel buffer entirely with newly computed frames.
+    pub fn set_mel(&mut self, mel: &[f32], num_frames: usize) {
+        self.mel_buffer.clear();
+        self.total_frames = 0;
+        self.append_mel(mel, num_frames);
     }
 
     /// Append pre-computed mel frames to the buffer.
@@ -374,61 +399,26 @@ impl StreamingMelBuffer {
 
     /// Get the number of audio samples available.
     pub fn audio_samples_available(&self) -> usize {
-        self.audio_buffer.len()
+        self.all_audio.len()
     }
 
-    /// Get the number of mel frames we can compute from buffered audio.
+    /// Get the number of mel frames that can be computed from all accumulated audio.
+    /// With STFT center padding, n_frames = floor(audio_len / hop_samples) + 1
     pub fn computable_frames(&self) -> usize {
-        if self.audio_buffer.len() < self.window_samples {
+        if self.all_audio.len() < self.window_samples {
             0
         } else {
-            (self.audio_buffer.len() - self.window_samples) / self.hop_samples + 1
+            // With center padding of n_fft/2 on each side:
+            // padded_len = audio_len + n_fft
+            // n_frames = (padded_len - n_fft) / hop_samples + 1 = audio_len / hop_samples + 1
+            self.all_audio.len() / self.hop_samples + 1
         }
     }
 
-    /// Get audio samples and clear the audio buffer.
-    /// Returns (samples, can_compute_more) where can_compute_more indicates
-    /// if there are enough samples for at least one frame.
-    pub fn take_audio(&mut self) -> Vec<f32> {
-        std::mem::take(&mut self.audio_buffer)
-    }
-
-    /// Get audio samples for mel computation, keeping overlap for next computation.
-    ///
-    /// This is crucial for streaming: the STFT window overlaps between frames,
-    /// so we need to keep `window_samples - hop_samples` samples from the end
-    /// to ensure consistent mel features at chunk boundaries.
-    ///
-    /// Returns None if there's not enough audio for at least one frame.
-    pub fn take_audio_with_overlap(&mut self) -> Option<Vec<f32>> {
-        let computable = self.computable_frames();
-        if computable == 0 {
-            return None;
-        }
-
-        // Calculate how many samples we'll consume for `computable` frames
-        // Last frame starts at position (computable - 1) * hop_samples
-        // and extends window_samples, so total needed is:
-        // (computable - 1) * hop_samples + window_samples
-        let samples_used = (computable - 1) * self.hop_samples + self.window_samples;
-
-        // We need to keep window_samples - hop_samples for overlap
-        // Actually, we keep everything after the last complete frame's start
-        // which is (computable - 1) * hop_samples + hop_samples = computable * hop_samples
-        let keep_from = computable * self.hop_samples;
-
-        // Take all audio up to (and including) what's needed for the last frame
-        let audio: Vec<f32> =
-            self.audio_buffer[..samples_used.min(self.audio_buffer.len())].to_vec();
-
-        // Keep the overlap portion
-        if keep_from < self.audio_buffer.len() {
-            self.audio_buffer = self.audio_buffer[keep_from..].to_vec();
-        } else {
-            self.audio_buffer.clear();
-        }
-
-        Some(audio)
+    /// Check if there are new audio samples that haven't been converted to mel yet.
+    /// Returns true if computing mel from all_audio would produce more frames than we have.
+    pub fn has_new_audio(&self) -> bool {
+        self.computable_frames() > self.total_frames
     }
 
     /// Get the number of remaining mel frames to process.
@@ -507,7 +497,7 @@ impl StreamingMelBuffer {
         self.mel_buffer.clear();
         self.total_frames = 0;
         self.buffer_idx = 0;
-        self.audio_buffer.clear();
+        self.all_audio.clear();
     }
 }
 

@@ -737,6 +737,7 @@ impl EncDecRNNTModel {
             preprocessor_config.window_size,
             preprocessor_config.window_stride,
             n_mels,
+            preprocessor_config.n_fft,
         );
 
         if debug {
@@ -803,20 +804,22 @@ impl EncDecRNNTModel {
             );
         }
 
-        // Step 2: Compute mel for all available audio and append to mel buffer
-        // Use take_audio_with_overlap to ensure consistent mel features at chunk boundaries.
-        // The STFT window overlaps between frames, so we keep some audio samples
-        // from the end to avoid boundary effects.
-        if let Some(audio_data) = session.mel_buffer.take_audio_with_overlap() {
-            let audio = Array::from_slice(&audio_data, &[1, audio_data.len() as i32]);
+        // Step 2: Compute mel from ALL accumulated audio to ensure consistency with Python.
+        // Python's NeMo computes all mel features upfront from the full audio.
+        // To match this, we recompute mel from all accumulated audio each time.
+        // This is less efficient but guarantees identical mel features.
+        if session.mel_buffer.has_new_audio() {
+            // Clone audio to avoid borrow issues
+            let audio_data: Vec<f32> = session.mel_buffer.get_all_audio().to_vec();
+            let audio_len = audio_data.len();
+            let audio = Array::from_slice(&audio_data, &[1, audio_len as i32]);
 
-            // Compute mel spectrogram [1, n_mels, time]
+            // Compute mel spectrogram from ALL audio [1, n_mels, time]
             let (features, _) = self.preprocessor.forward(&audio, None)?;
             features.eval()?;
 
-            // Extract mel data and append to buffer
+            // Extract mel data
             // features is [batch=1, n_mels, time]
-            let n_mels = features.dim(1) as usize;
             let n_frames = features.dim(2) as usize;
 
             // Flatten to get mel data
@@ -824,12 +827,15 @@ impl EncDecRNNTModel {
             features_flat.eval()?;
             let mel_data: &[f32] = features_flat.as_slice();
 
-            session.mel_buffer.append_mel(mel_data, n_frames);
+            // Replace mel buffer with newly computed frames
+            // This ensures mel features always match what Python would compute
+            let prev_frames = session.mel_buffer.total_frames;
+            session.mel_buffer.set_mel(mel_data, n_frames);
 
             if debug {
                 eprintln!(
-                    "[DEBUG]   computed {} mel frames, mel_buffer now has {} total frames",
-                    n_frames, session.mel_buffer.total_frames
+                    "[DEBUG]   recomputed mel from {} audio samples: {} frames (was {})",
+                    audio_len, n_frames, prev_frames
                 );
             }
         }
