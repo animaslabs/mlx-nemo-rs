@@ -688,6 +688,10 @@ impl EncDecRNNTModel {
             ));
         }
 
+        // Reset attention and encoder debug counters for fresh streaming session
+        crate::asr::modules::encoders::attention::reset_attention_counter();
+        crate::asr::modules::encoders::reset_encoder_counter();
+
         // Compute streaming configuration
         let config = compute_streaming_config(self.encoder.config(), mode_idx, 10000)?;
 
@@ -804,38 +808,59 @@ impl EncDecRNNTModel {
             );
         }
 
-        // Step 2: Compute mel from ALL accumulated audio to ensure consistency with Python.
-        // Python's NeMo computes all mel features upfront from the full audio.
-        // To match this, we recompute mel from all accumulated audio each time.
-        // This is less efficient but guarantees identical mel features.
-        if session.mel_buffer.has_new_audio() {
-            // Clone audio to avoid borrow issues
-            let audio_data: Vec<f32> = session.mel_buffer.get_all_audio().to_vec();
+        // Step 2: Compute mel incrementally from pending audio.
+        // Only process new audio samples, not the entire history.
+        // This gives O(1) memory usage instead of O(n²).
+        let new_frames = session.mel_buffer.computable_new_frames();
+        if new_frames > 0 {
+            // Get pending audio (includes overlap for STFT continuity)
+            let audio_data = session.mel_buffer.get_pending_audio();
             let audio_len = audio_data.len();
-            let audio = Array::from_slice(&audio_data, &[1, audio_len as i32]);
+            let audio = Array::from_slice(audio_data, &[1, audio_len as i32]);
 
-            // Compute mel spectrogram from ALL audio [1, n_mels, time]
+            // Compute mel spectrogram from pending audio [1, n_mels, time]
             let (features, _) = self.preprocessor.forward(&audio, None)?;
             features.eval()?;
 
             // Extract mel data
             // features is [batch=1, n_mels, time]
-            let n_frames = features.dim(2) as usize;
+            let computed_frames = features.dim(2) as usize;
 
             // Flatten to get mel data
             let features_flat = features.reshape(&[-1])?;
             features_flat.eval()?;
             let mel_data: &[f32] = features_flat.as_slice();
 
-            // Replace mel buffer with newly computed frames
-            // This ensures mel features always match what Python would compute
+            // For incremental processing, we need to skip frames that overlap with
+            // previously computed mel. The overlap comes from keeping window_samples
+            // of audio for STFT continuity.
+            let frames_to_skip = computed_frames.saturating_sub(new_frames);
             let prev_frames = session.mel_buffer.total_frames;
-            session.mel_buffer.set_mel(mel_data, n_frames);
+
+            if frames_to_skip > 0 {
+                // Skip the overlapping frames, only append truly new ones
+                let n_mels = session.n_mels;
+                // mel_data is [n_mels, time] flattened, so we need to extract
+                // frames starting from frames_to_skip
+                let new_mel_data: Vec<f32> = (0..n_mels)
+                    .flat_map(|mel_idx| {
+                        (frames_to_skip..computed_frames)
+                            .map(move |frame_idx| mel_data[mel_idx * computed_frames + frame_idx])
+                    })
+                    .collect();
+                session.mel_buffer.append_mel(&new_mel_data, new_frames);
+            } else {
+                // All frames are new
+                session.mel_buffer.append_mel(mel_data, computed_frames);
+            }
+
+            // Drain excess audio samples, keeping overlap for next computation
+            session.mel_buffer.drain_processed_audio();
 
             if debug {
                 eprintln!(
-                    "[DEBUG]   recomputed mel from {} audio samples: {} frames (was {})",
-                    audio_len, n_frames, prev_frames
+                    "[DEBUG]   computed {} new mel frames from {} audio samples (total: {} -> {})",
+                    new_frames, audio_len, prev_frames, session.mel_buffer.total_frames
                 );
             }
         }
@@ -905,7 +930,7 @@ impl EncDecRNNTModel {
                 );
                 // Show first few mel frames
                 // mel_chunk is [n_mels, time] format, so frame t, freq f = mel_chunk[f * chunk_len + t]
-                let n_mels = session.n_mels;
+                let _n_mels = session.n_mels;
                 eprintln!(
                     "[DEBUG]   First 5 mel frames (first 3 freq bins each), format=[n_mels, time]:"
                 );
@@ -992,6 +1017,14 @@ impl EncDecRNNTModel {
             let mut blank_count = 0;
             let mut non_blank_count = 0;
 
+            // Debug: track if we're in the "stall zone"
+            let total_tokens_before = session
+                .accumulated_tokens
+                .get(0)
+                .map(|t| t.len())
+                .unwrap_or(0);
+            let in_stall_zone = total_tokens_before >= 185 && total_tokens_before <= 200;
+
             for b in 0..batch_size {
                 for t in 0..enc_seq_len {
                     let enc_frame =
@@ -1008,6 +1041,45 @@ impl EncDecRNNTModel {
 
                         let log_probs = self.joint.forward_one(&enc_frame, &pred_output)?;
                         log_probs.eval()?;
+
+                        // Debug: in stall zone, show log_probs details
+                        if debug && in_stall_zone && t == 0 && symbols_emitted == 0 {
+                            // Show pred_output stats
+                            let pred_flat = pred_output.reshape(&[-1]).unwrap();
+                            pred_flat.eval().unwrap();
+                            let pred_slice: &[f32] = pred_flat.as_slice();
+                            let pred_min = pred_slice.iter().cloned().fold(f32::INFINITY, f32::min);
+                            let pred_max =
+                                pred_slice.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                            let pred_mean: f32 =
+                                pred_slice.iter().sum::<f32>() / pred_slice.len() as f32;
+
+                            // Show enc_frame stats
+                            let enc_flat = enc_frame.reshape(&[-1]).unwrap();
+                            enc_flat.eval().unwrap();
+                            let enc_slice: &[f32] = enc_flat.as_slice();
+                            let enc_min = enc_slice.iter().cloned().fold(f32::INFINITY, f32::min);
+                            let enc_max =
+                                enc_slice.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+
+                            let lp_flat = log_probs.reshape(&[-1]).unwrap();
+                            lp_flat.eval().unwrap();
+                            let lp_slice: &[f32] = lp_flat.as_slice();
+                            let blank_logprob = lp_slice
+                                .get(session.blank_id)
+                                .copied()
+                                .unwrap_or(f32::NEG_INFINITY);
+
+                            // Find top 5 non-blank
+                            let mut indexed: Vec<_> = lp_slice.iter().enumerate().collect();
+                            indexed.sort_by(|a, b| b.1.partial_cmp(a.1).unwrap());
+                            let top5: Vec<(usize, f32)> =
+                                indexed.iter().take(5).map(|&(i, &v)| (i, v)).collect();
+
+                            let last_tok = session.last_tokens[b];
+                            eprintln!("[DEBUG JOINT] tokens={}, last_tok={:?}, enc=[{:.3},{:.3}], pred=[{:.3},{:.3},{:.4}], blank_lp={:.4}, top5={:?}", 
+                                     total_tokens_before, last_tok, enc_min, enc_max, pred_min, pred_max, pred_mean, blank_logprob, top5);
+                        }
 
                         let prediction = argmax_axis(&log_probs, -1, false)?;
                         prediction.eval()?;
@@ -1038,6 +1110,14 @@ impl EncDecRNNTModel {
                     "[DEBUG]   decoding: {} encoder frames, {} blank emissions, {} non-blank tokens",
                     enc_seq_len, blank_count, non_blank_count
                 );
+
+                // Additional debug: show accumulated token count
+                let total_tokens = session
+                    .accumulated_tokens
+                    .get(0)
+                    .map(|t| t.len())
+                    .unwrap_or(0);
+                eprintln!("[DEBUG]   total accumulated: {} tokens", total_tokens);
             }
 
             if debug {
@@ -1056,17 +1136,25 @@ impl EncDecRNNTModel {
 
             session.is_first_chunk = false;
             chunks_processed += 1;
+
+            // Trim old mel frames to bound memory usage.
+            // Keep enough frames for the largest pre_encode_cache we might need.
+            let max_pre_encode_cache = session.config.pre_encode_cache_size.1;
+            session.mel_buffer.trim_old_frames(max_pre_encode_cache);
         }
 
         if debug && chunks_processed > 0 {
+            let (audio_bytes, mel_bytes) = session.mel_buffer.memory_stats();
             eprintln!(
-                "[DEBUG] processed {} mel chunks, accumulated {} tokens",
+                "[DEBUG] processed {} mel chunks, accumulated {} tokens (buffer mem: audio={}KB, mel={}KB)",
                 chunks_processed,
                 session
                     .accumulated_tokens
                     .get(0)
                     .map(|t| t.len())
-                    .unwrap_or(0)
+                    .unwrap_or(0),
+                audio_bytes / 1024,
+                mel_bytes / 1024
             );
         }
 

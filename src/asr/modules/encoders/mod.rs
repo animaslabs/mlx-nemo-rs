@@ -3,7 +3,8 @@
 //! Encoders transform preprocessed audio features into higher-level
 //! acoustic representations.
 
-mod attention;
+pub mod attention;
 mod conformer;
 
+pub use conformer::reset_encoder_counter;
 pub use conformer::ConformerEncoder;

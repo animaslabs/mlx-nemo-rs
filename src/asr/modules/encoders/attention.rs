@@ -4,11 +4,26 @@
 //! as used in NeMo's Conformer ASR models.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use mlx_rs::ops::indexing::IndexOp;
 use mlx_rs::{builder::Builder, module::Module, nn, ops, Array};
 
 use crate::core::error::{Error, Result};
+
+/// Global counter for attention forward calls (for debugging)
+static ATTENTION_CALL_COUNT: AtomicU64 = AtomicU64::new(0);
+
+fn attention_debug_enabled() -> bool {
+    std::env::var("NEMO_DEBUG_ATTN")
+        .map(|v| v == "1")
+        .unwrap_or(false)
+}
+
+/// Reset the attention call counter (call at start of streaming session)
+pub fn reset_attention_counter() {
+    ATTENTION_CALL_COUNT.store(0, Ordering::SeqCst);
+}
 
 /// Relative positional encoding generator.
 ///
@@ -328,6 +343,9 @@ impl RelPositionMultiHeadAttention {
         let n_heads = self.n_heads as i32;
         let head_dim = self.head_dim as i32;
 
+        let call_count = ATTENTION_CALL_COUNT.fetch_add(1, Ordering::SeqCst);
+        let debug = attention_debug_enabled();
+
         // NeMo-style cache handling:
         // 1. Concatenate FULL cache buffer with input (mask handles unfilled positions)
         // 2. Project Q from input, K/V from concatenated
@@ -416,6 +434,28 @@ impl RelPositionMultiHeadAttention {
         let matrix_bd = Self::rel_shift(&matrix_bd)?;
         let matrix_bd = matrix_bd.index((.., .., .., ..total_len));
 
+        // Debug: check matrix_bd stats after rel_shift (only at specific points)
+        let debug_relshift = std::env::var("NEMO_DEBUG_RELSHIFT")
+            .map(|v| v == "1")
+            .unwrap_or(false);
+        let encoder_call = call_count / 24;
+        if debug_relshift
+            && call_count % 24 == 0
+            && (encoder_call < 5 || encoder_call == 35 || encoder_call == 135)
+        {
+            matrix_bd.eval()?;
+            let bd_flat = matrix_bd.reshape(&[-1])?;
+            bd_flat.eval()?;
+            let bd_slice: &[f32] = bd_flat.as_slice();
+            let bd_min = bd_slice.iter().cloned().fold(f32::INFINITY, f32::min);
+            let bd_max = bd_slice.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            let bd_mean: f32 = bd_slice.iter().sum::<f32>() / bd_slice.len() as f32;
+            eprintln!(
+                "[RELSHIFT DEBUG] enc_call={}, seq_len={}, total_len={}, matrix_bd: min={:.4}, max={:.4}, mean={:.4}",
+                encoder_call, seq_len, total_len, bd_min, bd_max, bd_mean
+            );
+        }
+
         // Combine and scale
         let scale = (head_dim as f32).sqrt();
         let mut scores = (&matrix_ac + &matrix_bd) / Array::from_f32(scale);
@@ -431,6 +471,59 @@ impl RelPositionMultiHeadAttention {
 
         // Softmax
         let attn_weights = ops::softmax_axis(&scores, -1, None)?;
+
+        // Debug: print attention stats periodically (only layer 0, every ~100 encoder calls)
+        // Each encoder call has 24 layers, so call_count/24 gives encoder call number
+        let encoder_call = call_count / 24;
+        if debug
+            && call_count % 24 == 0
+            && (encoder_call < 10
+                || encoder_call % 50 == 0
+                || (encoder_call >= 130 && encoder_call <= 145))
+        {
+            attn_weights.eval()?;
+            let aw_flat = attn_weights.reshape(&[-1])?;
+            aw_flat.eval()?;
+            let aw_slice: &[f32] = aw_flat.as_slice();
+            let aw_min = aw_slice.iter().cloned().fold(f32::INFINITY, f32::min);
+            let aw_max = aw_slice.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            let aw_mean: f32 = aw_slice.iter().sum::<f32>() / aw_slice.len() as f32;
+
+            // Check attention entropy (low entropy = attending to few positions)
+            let entropy: f32 = aw_slice
+                .iter()
+                .filter(|&&x| x > 1e-10)
+                .map(|&x| -x * x.ln())
+                .sum::<f32>()
+                / (n_heads * seq_len) as f32;
+
+            eprintln!(
+                "[ATTN DEBUG] enc_call={}, layer=0, seq_len={}, total_len={}, pos_emb_len={}",
+                encoder_call,
+                seq_len,
+                total_len,
+                pos_emb.dim(1)
+            );
+            eprintln!(
+                "[ATTN DEBUG]   attn_weights: min={:.6}, max={:.6}, mean={:.6}, entropy={:.4}",
+                aw_min, aw_max, aw_mean, entropy
+            );
+
+            // Print first row of attention weights for head 0 (where is query 0 attending?)
+            let first_row = attn_weights.index((0, 0, 0, ..));
+            first_row.eval()?;
+            let row_slice: &[f32] = first_row.as_slice();
+            let top_5: Vec<(usize, f32)> = {
+                let mut indexed: Vec<_> =
+                    row_slice.iter().enumerate().map(|(i, &v)| (i, v)).collect();
+                indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+                indexed.into_iter().take(5).collect()
+            };
+            eprintln!(
+                "[ATTN DEBUG]   query[0] top-5 attended positions: {:?}",
+                top_5
+            );
+        }
 
         // Apply attention to values: [batch, n_heads, seq_len, head_dim]
         let context = ops::matmul(&attn_weights, &v)?;

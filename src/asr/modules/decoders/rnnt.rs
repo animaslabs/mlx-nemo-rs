@@ -839,6 +839,39 @@ impl RNNTJoint {
         // Project prediction: [B, joint_hidden]
         let pred_proj = self.linear(&pred, &self.pred_proj_weight, self.pred_proj_bias.as_ref())?;
 
+        // Debug: compare encoder vs prediction projection magnitudes
+        let debug_joint = std::env::var("NEMO_DEBUG_JOINT")
+            .map(|v| v == "1")
+            .unwrap_or(false);
+        if debug_joint {
+            enc_proj.eval()?;
+            pred_proj.eval()?;
+            let enc_flat = enc_proj.reshape(&[-1])?;
+            let pred_flat = pred_proj.reshape(&[-1])?;
+            enc_flat.eval()?;
+            pred_flat.eval()?;
+            let enc_slice: &[f32] = enc_flat.as_slice();
+            let pred_slice: &[f32] = pred_flat.as_slice();
+            let enc_std = {
+                let mean: f32 = enc_slice.iter().sum::<f32>() / enc_slice.len() as f32;
+                (enc_slice.iter().map(|&v| (v - mean).powi(2)).sum::<f32>()
+                    / enc_slice.len() as f32)
+                    .sqrt()
+            };
+            let pred_std = {
+                let mean: f32 = pred_slice.iter().sum::<f32>() / pred_slice.len() as f32;
+                (pred_slice.iter().map(|&v| (v - mean).powi(2)).sum::<f32>()
+                    / pred_slice.len() as f32)
+                    .sqrt()
+            };
+            let enc_norm: f32 = enc_slice.iter().map(|v| v.powi(2)).sum::<f32>().sqrt();
+            let pred_norm: f32 = pred_slice.iter().map(|v| v.powi(2)).sum::<f32>().sqrt();
+            eprintln!(
+                "[JOINT DEBUG] enc_proj: std={:.4}, norm={:.4}; pred_proj: std={:.4}, norm={:.4}; ratio={:.4}",
+                enc_std, enc_norm, pred_std, pred_norm, enc_norm / pred_norm
+            );
+        }
+
         // Add
         let joint = ops::add(&enc_proj, &pred_proj)?;
 

@@ -279,13 +279,13 @@ impl Default for StreamingOutput {
 
 /// Streaming audio buffer that mirrors NeMo's CacheAwareStreamingAudioBuffer.
 ///
-/// This buffer pre-computes mel spectrograms from audio and provides chunks
+/// This buffer incrementally computes mel spectrograms from audio and provides chunks
 /// with proper overlap (pre_encode_cache) for streaming inference.
 ///
 /// # NeMo Streaming Flow
 ///
 /// NeMo's streaming works as follows:
-/// 1. Audio is converted to mel spectrogram upfront (or incrementally)
+/// 1. Audio is converted to mel spectrogram incrementally
 /// 2. Mel frames are stored in a buffer
 /// 3. Chunks are extracted with overlap: `[pre_encode_cache frames | chunk_size frames]`
 /// 4. Buffer index advances by `shift_size` frames
@@ -294,6 +294,12 @@ impl Default for StreamingOutput {
 /// - First chunk: 105 mel frames (pre_encode_cache=0)
 /// - Subsequent: 112 + 9 = 121 mel frames (pre_encode_cache=9)
 /// - Shift: 112 frames per step (after first)
+///
+/// # Memory Efficiency
+///
+/// This implementation uses incremental mel computation to maintain O(1) memory:
+/// - Audio buffer only keeps unprocessed samples plus overlap for STFT windowing
+/// - Mel buffer can be trimmed after chunks are extracted
 #[derive(Debug, Clone)]
 pub struct StreamingMelBuffer {
     /// Pre-computed mel frames stored as [time, n_mels] (internal format for efficient frame access)
@@ -303,15 +309,19 @@ pub struct StreamingMelBuffer {
     /// Number of mel features (e.g., 128)
     pub n_mels: usize,
 
-    /// Total mel frames in buffer
+    /// Total mel frames in buffer (including any that have been trimmed from the start)
     pub total_frames: usize,
 
     /// Current position in mel buffer (analogous to NeMo's buffer_idx)
     pub buffer_idx: usize,
 
-    /// ALL accumulated audio samples since stream start.
-    /// We keep all audio to ensure mel computation matches Python's full-audio approach.
-    pub all_audio: Vec<f32>,
+    /// Sliding window audio buffer - only keeps samples needed for next mel computation.
+    /// Contains: overlap samples from previous computation + new unprocessed samples.
+    audio_buffer: Vec<f32>,
+
+    /// Total number of audio samples that have been fed to this stream.
+    /// This is cumulative and never decreases - used for frame count calculations.
+    total_audio_samples: usize,
 
     /// Sample rate
     pub sample_rate: u32,
@@ -324,6 +334,10 @@ pub struct StreamingMelBuffer {
 
     /// FFT size
     pub n_fft: usize,
+
+    /// Offset for mel_buffer indexing after trimming.
+    /// When we trim old mel frames, this tracks how many frames were removed.
+    mel_buffer_offset: usize,
 }
 
 impl StreamingMelBuffer {
@@ -343,31 +357,52 @@ impl StreamingMelBuffer {
             n_mels,
             total_frames: 0,
             buffer_idx: 0,
-            all_audio: Vec::new(),
+            audio_buffer: Vec::new(),
+            total_audio_samples: 0,
             sample_rate,
             window_samples,
             hop_samples,
             n_fft,
+            mel_buffer_offset: 0,
         }
     }
 
-    /// Add audio samples to the accumulated buffer.
+    /// Add audio samples to the buffer for incremental processing.
     pub fn add_audio(&mut self, samples: &[f32]) {
-        self.all_audio.extend_from_slice(samples);
+        self.audio_buffer.extend_from_slice(samples);
+        self.total_audio_samples += samples.len();
     }
 
-    /// Get all accumulated audio for mel computation.
-    /// This ensures mel is computed from the full audio stream, matching Python's approach.
-    pub fn get_all_audio(&self) -> &[f32] {
-        &self.all_audio
+    /// Get the pending audio samples that need mel computation.
+    /// Returns audio with necessary overlap for STFT continuity.
+    pub fn get_pending_audio(&self) -> &[f32] {
+        &self.audio_buffer
     }
 
-    /// Clear mel buffer and set new mel frames computed from full audio.
-    /// This replaces the mel buffer entirely with newly computed frames.
-    pub fn set_mel(&mut self, mel: &[f32], num_frames: usize) {
-        self.mel_buffer.clear();
-        self.total_frames = 0;
-        self.append_mel(mel, num_frames);
+    /// Get total audio samples in buffer (pending processing).
+    pub fn audio_samples_available(&self) -> usize {
+        self.audio_buffer.len()
+    }
+
+    /// Get the number of new mel frames that can be computed from pending audio.
+    ///
+    /// For incremental computation, we calculate based on total audio fed to the stream.
+    /// With center padding: n_frames = floor(total_audio / hop_samples) + 1
+    pub fn computable_new_frames(&self) -> usize {
+        if self.audio_buffer.len() < self.window_samples {
+            return 0;
+        }
+
+        // Calculate how many total frames should exist from all audio fed so far
+        let total_possible_frames = self.total_audio_samples / self.hop_samples + 1;
+
+        // New frames = total possible - already computed
+        total_possible_frames.saturating_sub(self.total_frames)
+    }
+
+    /// Check if there is pending audio that can produce new mel frames.
+    pub fn has_pending_audio(&self) -> bool {
+        self.computable_new_frames() > 0
     }
 
     /// Append pre-computed mel frames to the buffer.
@@ -397,28 +432,42 @@ impl StreamingMelBuffer {
         self.total_frames += num_frames;
     }
 
-    /// Get the number of audio samples available.
-    pub fn audio_samples_available(&self) -> usize {
-        self.all_audio.len()
-    }
+    /// Drain excess audio samples from buffer, keeping enough for STFT overlap.
+    ///
+    /// After computing mel frames, call this to free memory from audio samples
+    /// that are no longer needed. We keep window_samples worth of overlap to
+    /// ensure STFT continuity at chunk boundaries.
+    pub fn drain_processed_audio(&mut self) {
+        // Keep enough samples for STFT overlap (window_samples worth)
+        // This ensures continuity at chunk boundaries
+        let keep_samples = self.window_samples;
 
-    /// Get the number of mel frames that can be computed from all accumulated audio.
-    /// With STFT center padding, n_frames = floor(audio_len / hop_samples) + 1
-    pub fn computable_frames(&self) -> usize {
-        if self.all_audio.len() < self.window_samples {
-            0
-        } else {
-            // With center padding of n_fft/2 on each side:
-            // padded_len = audio_len + n_fft
-            // n_frames = (padded_len - n_fft) / hop_samples + 1 = audio_len / hop_samples + 1
-            self.all_audio.len() / self.hop_samples + 1
+        if self.audio_buffer.len() > keep_samples {
+            let drain_count = self.audio_buffer.len() - keep_samples;
+            self.audio_buffer.drain(..drain_count);
         }
     }
 
-    /// Check if there are new audio samples that haven't been converted to mel yet.
-    /// Returns true if computing mel from all_audio would produce more frames than we have.
-    pub fn has_new_audio(&self) -> bool {
-        self.computable_frames() > self.total_frames
+    /// Trim old mel frames that are no longer needed.
+    ///
+    /// Call this periodically to free memory from mel frames that have been
+    /// processed and are no longer needed for pre_encode_cache.
+    ///
+    /// # Arguments
+    /// * `keep_frames` - Minimum number of frames to keep before buffer_idx
+    ///                   (should be >= max pre_encode_cache size)
+    pub fn trim_old_frames(&mut self, keep_frames: usize) {
+        // Calculate how many frames we can safely remove
+        // We need to keep at least `keep_frames` before the current buffer_idx
+        let buffer_local_idx = self.buffer_idx.saturating_sub(self.mel_buffer_offset);
+        let can_trim = buffer_local_idx.saturating_sub(keep_frames);
+
+        if can_trim > 0 {
+            // Remove old frames from the beginning of mel_buffer
+            let elements_to_remove = can_trim * self.n_mels;
+            self.mel_buffer.drain(..elements_to_remove);
+            self.mel_buffer_offset += can_trim;
+        }
     }
 
     /// Get the number of remaining mel frames to process.
@@ -463,6 +512,7 @@ impl StreamingMelBuffer {
         }
 
         // Calculate start position accounting for pre_encode_cache
+        // Also account for mel_buffer_offset when frames have been trimmed
         let cache_start = self.buffer_idx.saturating_sub(pre_encode_cache);
         let cache_frames_available = self.buffer_idx - cache_start;
 
@@ -474,10 +524,14 @@ impl StreamingMelBuffer {
         let mut mel_chunk = vec![0.0f32; self.n_mels * total_extract];
 
         for frame_offset in 0..total_extract {
+            // Global frame index
             let frame = cache_start + frame_offset;
+            // Local index in mel_buffer (accounting for trimmed frames)
+            let local_frame = frame.saturating_sub(self.mel_buffer_offset);
+
             for mel_idx in 0..self.n_mels {
-                // Source: buffer[frame * n_mels + mel_idx]
-                let src_idx = frame * self.n_mels + mel_idx;
+                // Source: buffer[local_frame * n_mels + mel_idx]
+                let src_idx = local_frame * self.n_mels + mel_idx;
                 // Destination: output[mel_idx * total_extract + frame_offset]
                 let dst_idx = mel_idx * total_extract + frame_offset;
                 if src_idx < self.mel_buffer.len() {
@@ -497,7 +551,16 @@ impl StreamingMelBuffer {
         self.mel_buffer.clear();
         self.total_frames = 0;
         self.buffer_idx = 0;
-        self.all_audio.clear();
+        self.audio_buffer.clear();
+        self.total_audio_samples = 0;
+        self.mel_buffer_offset = 0;
+    }
+
+    /// Get memory usage statistics for debugging.
+    pub fn memory_stats(&self) -> (usize, usize) {
+        let audio_bytes = self.audio_buffer.len() * std::mem::size_of::<f32>();
+        let mel_bytes = self.mel_buffer.len() * std::mem::size_of::<f32>();
+        (audio_bytes, mel_bytes)
     }
 }
 
@@ -849,5 +912,114 @@ mod tests {
         assert_eq!(config.shift_size_for_step(false), 100);
         assert_eq!(config.pre_encode_cache_for_step(true), 0);
         assert_eq!(config.pre_encode_cache_for_step(false), 9);
+    }
+
+    #[test]
+    fn test_streaming_mel_buffer_incremental() {
+        let mut buffer = StreamingMelBuffer::new(16000, 0.025, 0.01, 80, 512);
+        assert_eq!(buffer.window_samples, 400);
+        assert_eq!(buffer.hop_samples, 160);
+
+        // Add 1 second of audio
+        buffer.add_audio(&vec![0.0f32; 16000]);
+        assert_eq!(buffer.audio_samples_available(), 16000);
+
+        // Check computable frames: total_audio / hop + 1 = 16000 / 160 + 1 = 101
+        let new_frames = buffer.computable_new_frames();
+        assert!(new_frames > 0, "Should be able to compute new frames");
+        assert_eq!(new_frames, 101);
+
+        // Simulate appending mel frames
+        let dummy_mel = vec![0.0f32; 80 * 101]; // [n_mels, time] format
+        buffer.append_mel(&dummy_mel, 101);
+        assert_eq!(buffer.total_frames, 101);
+
+        // Drain processed audio
+        buffer.drain_processed_audio();
+
+        // After processing, audio buffer should be trimmed to just overlap
+        assert!(
+            buffer.audio_samples_available() <= buffer.window_samples,
+            "Audio buffer should be bounded after processing"
+        );
+
+        // Add more audio
+        buffer.add_audio(&vec![0.0f32; 1600]); // 0.1s more
+
+        // Total audio is now 17600, so total frames = 17600/160 + 1 = 111
+        // We already have 101 frames, so new = 10
+        let new_frames2 = buffer.computable_new_frames();
+        assert_eq!(
+            new_frames2, 10,
+            "Should compute 10 new frames, got {}",
+            new_frames2
+        );
+    }
+
+    #[test]
+    fn test_streaming_mel_buffer_trim() {
+        let mut buffer = StreamingMelBuffer::new(16000, 0.025, 0.01, 80, 512);
+
+        // Add mel frames
+        let dummy_mel = vec![1.0f32; 80 * 100];
+        buffer.append_mel(&dummy_mel, 100);
+        assert_eq!(buffer.total_frames, 100);
+
+        // Advance buffer_idx (simulating chunk extraction)
+        buffer.buffer_idx = 50;
+
+        // Trim, keeping 10 frames before buffer_idx
+        buffer.trim_old_frames(10);
+
+        // Should have trimmed 40 frames (50 - 10)
+        assert_eq!(buffer.mel_buffer_offset, 40);
+
+        // Mel buffer should now have 60 frames worth of data (100 - 40)
+        assert_eq!(buffer.mel_buffer.len(), 60 * 80);
+
+        // total_frames should still reflect logical count
+        assert_eq!(buffer.total_frames, 100);
+    }
+
+    #[test]
+    fn test_streaming_mel_buffer_memory_bounded() {
+        let mut buffer = StreamingMelBuffer::new(16000, 0.025, 0.01, 80, 512);
+
+        // Simulate a long stream by repeatedly adding and processing audio
+        for _ in 0..100 {
+            // Add 0.1s of audio
+            buffer.add_audio(&vec![0.0f32; 1600]);
+
+            // Simulate mel computation and processing
+            let new_frames = buffer.computable_new_frames();
+            if new_frames > 0 {
+                let dummy_mel = vec![0.0f32; 80 * new_frames];
+                buffer.append_mel(&dummy_mel, new_frames);
+                buffer.drain_processed_audio();
+
+                // Advance buffer_idx
+                buffer.buffer_idx = buffer.total_frames;
+
+                // Trim old frames (keep 20 for cache)
+                buffer.trim_old_frames(20);
+            }
+        }
+
+        // After processing 10 seconds of audio, memory should still be bounded
+        let (audio_bytes, mel_bytes) = buffer.memory_stats();
+
+        // Audio buffer should be O(window_samples) ~ 400 * 4 = 1.6KB
+        assert!(
+            audio_bytes < 10_000,
+            "Audio buffer should be bounded, got {} bytes",
+            audio_bytes
+        );
+
+        // Mel buffer should be O(keep_frames * n_mels) ~ 20 * 80 * 4 = 6.4KB
+        assert!(
+            mel_bytes < 50_000,
+            "Mel buffer should be bounded, got {} bytes",
+            mel_bytes
+        );
     }
 }

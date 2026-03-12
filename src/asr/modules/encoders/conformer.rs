@@ -4,6 +4,7 @@
 //! for effective speech feature encoding.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use mlx_rs::builder::Builder;
 use mlx_rs::module::Module;
@@ -14,6 +15,14 @@ use mlx_rs::Array;
 use super::attention::{RelPositionMultiHeadAttention, RelPositionalEncoding};
 use crate::asr::config::EncoderConfig;
 use crate::core::error::Result;
+
+/// Global counter for encoder forward calls (for debugging)
+static ENCODER_CALL_COUNT: AtomicU64 = AtomicU64::new(0);
+
+/// Reset the encoder call counter (call at start of streaming session)
+pub fn reset_encoder_counter() {
+    ENCODER_CALL_COUNT.store(0, Ordering::SeqCst);
+}
 
 /// Helper to load LayerNorm weights
 fn load_layer_norm(layer: &mut nn::LayerNorm, weights: &HashMap<String, Array>, prefix: &str) {
@@ -126,6 +135,15 @@ fn create_attention_mask(
     filled_cache_len: i32,
     _seq_len: i32,
 ) -> Result<Array> {
+    let debug = std::env::var("NEMO_DEBUG_MASK")
+        .map(|v| v == "1")
+        .unwrap_or(false);
+
+    if debug {
+        eprintln!("[MASK DEBUG] att_context_size={:?}, style={}, max_audio_len={}, cache_len={}, filled={}, seq_len={}",
+                 att_context_size, att_context_style, max_audio_length, cache_len, filled_cache_len, _seq_len);
+    }
+
     // Create base attention mask [1, max_audio_length, max_audio_length]
     // In NeMo, this starts as all True (all positions visible),
     // then gets masked based on context style
@@ -165,6 +183,17 @@ fn create_attention_mask(
     // Apply offset masking for unfilled cache positions (NeMo lines 831-835)
     // offset = cache_len - filled_cache_len (how many zeros at start of cache)
     let offset = cache_len - filled_cache_len;
+
+    if debug {
+        eprintln!(
+            "[MASK DEBUG] offset={} (cache_len={} - filled={})",
+            offset, cache_len, filled_cache_len
+        );
+        if offset < 0 {
+            eprintln!("[MASK WARNING] Negative offset detected! This indicates cache overflow.");
+        }
+    }
+
     if offset > 0 {
         // Create pad_mask: positions >= offset are valid
         // First create range [0, 1, 2, ..., max_audio_length-1]
@@ -193,6 +222,23 @@ fn create_attention_mask(
 
     // Invert: NeMo returns inverted mask at the end (True means ignore)
     let att_mask = mlx_rs::ops::logical_not(&att_mask)?;
+
+    if debug {
+        att_mask.eval()?;
+        // Count how many positions are visible (False = visible after inversion)
+        let flat = att_mask.reshape(&[-1])?;
+        flat.eval()?;
+        let flat_slice: &[bool] = flat.as_slice();
+        let visible_count = flat_slice.iter().filter(|&&x| !x).count();
+        let total = flat_slice.len();
+        eprintln!(
+            "[MASK DEBUG] output shape={:?}, visible={}/{} ({:.1}%)",
+            att_mask.shape(),
+            visible_count,
+            total,
+            100.0 * visible_count as f64 / total as f64
+        );
+    }
 
     Ok(att_mask)
 }
@@ -574,6 +620,30 @@ impl ConformerEncoder {
         let mut cache_channel_next = Vec::with_capacity(self.layers.len());
         let mut cache_time_next = Vec::with_capacity(self.layers.len());
 
+        // Track encoder calls for debugging
+        let enc_call = ENCODER_CALL_COUNT.fetch_add(1, Ordering::SeqCst);
+
+        // Debug encoder input stats
+        let debug_layers = std::env::var("NEMO_DEBUG_LAYERS")
+            .map(|v| v == "1")
+            .unwrap_or(false);
+        if debug_layers && (enc_call < 5 || enc_call == 135 || enc_call == 200 || enc_call == 270) {
+            x.eval()?;
+            let flat = x.reshape(&[-1])?;
+            flat.eval()?;
+            let slice: &[f32] = flat.as_slice();
+            let min = slice.iter().cloned().fold(f32::INFINITY, f32::min);
+            let max = slice.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            let mean: f32 = slice.iter().sum::<f32>() / slice.len() as f32;
+            let var: f32 =
+                slice.iter().map(|&v| (v - mean).powi(2)).sum::<f32>() / slice.len() as f32;
+            let std = var.sqrt();
+            eprintln!(
+                "[ENCODER DEBUG] enc={}, seq_len={}, encoder_input: min={:.4}, max={:.4}, mean={:.4}, std={:.4}",
+                enc_call, seq_len, min, max, mean, std
+            );
+        }
+
         // Process through conformer blocks with cache
         for (layer_idx, layer) in self.layers.iter_mut().enumerate() {
             // Extract per-layer cache: [batch, cache_size, d_model] and [batch, d_model, time_cache]
@@ -592,6 +662,8 @@ impl ConformerEncoder {
                 filled_cache_len,
                 Some(&layer_cache_time), // Always pass conv cache
                 att_mask.as_ref(),
+                layer_idx,
+                enc_call,
             )?;
 
             x = x_out;
@@ -624,6 +696,24 @@ impl ConformerEncoder {
             }
         }
 
+        // Debug encoder output stats
+        if debug_layers && (enc_call < 5 || enc_call == 135 || enc_call == 200 || enc_call == 270) {
+            x.eval()?;
+            let flat = x.reshape(&[-1])?;
+            flat.eval()?;
+            let slice: &[f32] = flat.as_slice();
+            let min = slice.iter().cloned().fold(f32::INFINITY, f32::min);
+            let max = slice.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            let mean: f32 = slice.iter().sum::<f32>() / slice.len() as f32;
+            let var: f32 =
+                slice.iter().map(|&v| (v - mean).powi(2)).sum::<f32>() / slice.len() as f32;
+            let std = var.sqrt();
+            eprintln!(
+                "[ENCODER DEBUG] enc={}, encoder_output: min={:.4}, max={:.4}, mean={:.4}, std={:.4}",
+                enc_call, min, max, mean, std
+            );
+        }
+
         // Transpose back to [B, D, T]
         let x = mlx_rs::ops::transpose_axes(&x, &[0, 2, 1])?;
 
@@ -642,11 +732,79 @@ impl ConformerEncoder {
             cache_last_time.clone()
         };
 
+        // Debug: track cache length
+        let debug_cache_len = std::env::var("NEMO_DEBUG_CACHE_LEN")
+            .map(|v| v == "1")
+            .unwrap_or(false);
+
+        if debug_cache_len {
+            eprintln!(
+                "[CACHE_LEN DEBUG] seq_len={}, cache_size={}, filled_before={}",
+                seq_len, cache_size, filled_cache_len
+            );
+        }
+
         // Update cache length: clamp(old_len + seq_len, max=cache_size)
         let cache_channel_len_next = mlx_rs::ops::clip(
             &(cache_last_channel_len + &Array::from_int(seq_len)),
             ((), &Array::from_int(cache_size)),
         )?;
+
+        // Verify and debug the result
+        cache_channel_len_next.eval()?;
+        let filled_after = cache_channel_len_next.as_slice::<i64>()[0];
+
+        if debug_cache_len {
+            eprintln!(
+                "[CACHE_LEN DEBUG] filled_after={}, expected_max={}",
+                filled_after, cache_size
+            );
+
+            // Flag potential issues
+            if filled_after > cache_size as i64 {
+                eprintln!(
+                    "[CACHE_LEN WARNING] Cache length {} exceeds cache_size {}!",
+                    filled_after, cache_size
+                );
+            }
+        }
+
+        // Safety: ensure cache length never exceeds cache_size
+        // This guards against any issues with the clip operation
+        // Note: cache_last_channel_len is i64, so we need to match that type
+        let cache_channel_len_next = if filled_after > cache_size as i64 {
+            if debug_cache_len {
+                eprintln!(
+                    "[CACHE_LEN FIX] Clamping {} to {}",
+                    filled_after, cache_size
+                );
+            }
+            Array::from_slice(&[cache_size as i64], &[1])
+        } else {
+            cache_channel_len_next
+        };
+
+        // Debug: check cache statistics
+        let debug_cache = std::env::var("NEMO_DEBUG_CACHE")
+            .map(|v| v == "1")
+            .unwrap_or(false);
+        if debug_cache {
+            // Check first layer's new cache
+            let first_cache = cache_channel_next.index((0, .., .., ..));
+            first_cache.eval()?;
+            let fc_flat = first_cache.reshape(&[-1])?;
+            fc_flat.eval()?;
+            let fc_slice: &[f32] = fc_flat.as_slice();
+            let fc_min = fc_slice.iter().cloned().fold(f32::INFINITY, f32::min);
+            let fc_max = fc_slice.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            let fc_mean: f32 = fc_slice.iter().sum::<f32>() / fc_slice.len() as f32;
+            let fc_var: f32 = fc_slice.iter().map(|&x| (x - fc_mean).powi(2)).sum::<f32>()
+                / fc_slice.len() as f32;
+            eprintln!(
+                "[CACHE DEBUG] layer0 cache: min={:.4}, max={:.4}, mean={:.4}, var={:.6}",
+                fc_min, fc_max, fc_mean, fc_var
+            );
+        }
 
         Ok((
             x,
@@ -1034,6 +1192,8 @@ impl ConformerBlock {
     /// * `cache_filled_len` - How many frames of MHA cache are valid
     /// * `cache_last_time` - Optional conv cache [batch, d_model, time_cache]
     /// * `att_mask` - Optional attention mask [batch, seq_len, total_len] where True=masked
+    /// * `layer_idx` - Layer index for debugging
+    /// * `enc_call` - Encoder call count for debugging
     ///
     /// # Returns
     /// * Output tensor [batch, seq_len, d_model]
@@ -1047,18 +1207,67 @@ impl ConformerBlock {
         cache_filled_len: i32,
         cache_last_time: Option<&Array>,
         att_mask: Option<&Array>,
+        layer_idx: usize,
+        enc_call: u64,
     ) -> Result<(Array, Option<Array>, Option<Array>)> {
+        let debug_layers = std::env::var("NEMO_DEBUG_LAYERS")
+            .map(|v| v == "1")
+            .unwrap_or(false);
+
+        // Helper to compute tensor stats
+        let compute_stats = |arr: &Array, name: &str| -> Result<()> {
+            if !debug_layers {
+                return Ok(());
+            }
+            arr.eval()?;
+            let flat = arr.reshape(&[-1])?;
+            flat.eval()?;
+            let slice: &[f32] = flat.as_slice();
+            let min = slice.iter().cloned().fold(f32::INFINITY, f32::min);
+            let max = slice.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            let mean: f32 = slice.iter().sum::<f32>() / slice.len() as f32;
+            let var: f32 =
+                slice.iter().map(|&v| (v - mean).powi(2)).sum::<f32>() / slice.len() as f32;
+            let std = var.sqrt();
+            eprintln!(
+                "[LAYER DEBUG] enc={}, layer={}, {}: min={:.4}, max={:.4}, mean={:.4}, std={:.4}",
+                enc_call, layer_idx, name, min, max, mean, std
+            );
+            Ok(())
+        };
+
+        // Only debug specific encoder calls and layers to avoid too much output
+        let should_debug = debug_layers
+            && (layer_idx == 0 || layer_idx == 11 || layer_idx == 23)
+            && (enc_call < 5 || enc_call == 135 || enc_call == 200 || enc_call == 270);
+
+        if should_debug {
+            compute_stats(x, "input")?;
+        }
+
         // Feed-forward 1 (half-step residual)
         let residual = x.clone();
         let ff1_out = self.ff1_norm.forward(x)?;
+        if should_debug {
+            compute_stats(&ff1_out, "ff1_norm")?;
+        }
         let ff1_out = self.ff1.forward(&ff1_out)?;
+        if should_debug {
+            compute_stats(&ff1_out, "ff1_out")?;
+        }
         let half = Array::from_f32(0.5);
         let scaled_ff1 = &half * &ff1_out;
         let x = &residual + &scaled_ff1;
+        if should_debug {
+            compute_stats(&x, "after_ff1")?;
+        }
 
         // Self-attention with cache
         let residual = x.clone();
         let attn_out = self.self_attn_norm.forward(&x)?;
+        if should_debug {
+            compute_stats(&attn_out, "attn_norm")?;
+        }
         let (attn_out, new_cache_channel) = self.self_attn.forward_with_cache(
             &attn_out,
             pos_emb,
@@ -1066,25 +1275,52 @@ impl ConformerBlock {
             cache_filled_len,
             att_mask,
         )?;
+        if should_debug {
+            compute_stats(&attn_out, "attn_out")?;
+        }
         let x = &residual + &attn_out;
+        if should_debug {
+            compute_stats(&x, "after_attn")?;
+        }
 
         // Convolution with cache
         let residual = x.clone();
         let conv_out = self.conv_norm.forward(&x)?;
+        if should_debug {
+            compute_stats(&conv_out, "conv_norm")?;
+        }
         let (conv_out, new_cache_time) =
             self.conv.forward_with_cache(&conv_out, cache_last_time)?;
+        if should_debug {
+            compute_stats(&conv_out, "conv_out")?;
+        }
 
         let x = &residual + &conv_out;
+        if should_debug {
+            compute_stats(&x, "after_conv")?;
+        }
 
         // Feed-forward 2 (half-step residual)
         let residual = x.clone();
         let ff2_out = self.ff2_norm.forward(&x)?;
+        if should_debug {
+            compute_stats(&ff2_out, "ff2_norm")?;
+        }
         let ff2_out = self.ff2.forward(&ff2_out)?;
+        if should_debug {
+            compute_stats(&ff2_out, "ff2_out")?;
+        }
         let scaled_ff2 = &half * &ff2_out;
         let x = &residual + &scaled_ff2;
+        if should_debug {
+            compute_stats(&x, "after_ff2")?;
+        }
 
         // Final layer norm
         let x = self.final_norm.forward(&x)?;
+        if should_debug {
+            compute_stats(&x, "final_out")?;
+        }
 
         Ok((x, new_cache_channel, new_cache_time))
     }
