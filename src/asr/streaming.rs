@@ -321,7 +321,7 @@ pub struct StreamingMelBuffer {
 
     /// Total number of audio samples that have been fed to this stream.
     /// This is cumulative and never decreases - used for frame count calculations.
-    total_audio_samples: usize,
+    pub total_audio_samples: usize,
 
     /// Sample rate
     pub sample_rate: u32,

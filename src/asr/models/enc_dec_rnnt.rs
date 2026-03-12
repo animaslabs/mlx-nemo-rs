@@ -831,27 +831,26 @@ impl EncDecRNNTModel {
             let mel_data: &[f32] = features_flat.as_slice();
 
             // For incremental processing, we need to figure out which frames are truly "new".
-            // The overlap audio (window_samples) produces some frames at the start that
-            // overlap with previously computed frames. However, due to center padding in STFT,
-            // these frames won't be identical to what we computed before.
             //
-            // The correct approach: track how many audio samples we've actually advanced by,
-            // and compute how many new frames that corresponds to.
+            // The key insight: we know exactly how many frames SHOULD exist based on
+            // total_audio_samples. The formula with center padding is:
+            //   expected_total_frames = total_audio_samples / hop_samples + 1
             //
-            // We keep window_samples (400) of overlap. Each hop is hop_samples (160).
-            // So the overlap produces floor(window_samples / hop_samples) = 2 frames of overlap.
-            // Plus 1 for the center padding effect = ~3 frames we should skip.
-            let overlap_samples = session.mel_buffer.window_samples;
+            // So the number of NEW frames to append is:
+            //   frames_to_append = expected_total_frames - total_frames (already in buffer)
+            //
+            // We then take the LAST frames_to_append frames from the preprocessor output,
+            // which correspond to the newest audio.
             let hop = session.mel_buffer.hop_samples;
-            // Frames from overlap region (these overlap with previous computation)
-            let overlap_frames = overlap_samples / hop;
+            let total_audio = session.mel_buffer.total_audio_samples;
+            let expected_total_frames = total_audio / hop + 1;
 
             let prev_frames = session.mel_buffer.total_frames;
+            let frames_to_append = expected_total_frames.saturating_sub(prev_frames);
 
-            // On first chunk (prev_frames == 0), don't skip anything
-            // On subsequent chunks, skip the overlap frames
-            let frames_to_skip = if prev_frames == 0 { 0 } else { overlap_frames };
-            let frames_to_append = computed_frames.saturating_sub(frames_to_skip);
+            // The frames to skip are at the START of the preprocessor output
+            // (they correspond to the overlap audio region)
+            let frames_to_skip = computed_frames.saturating_sub(frames_to_append);
 
             if frames_to_skip > 0 && frames_to_append > 0 {
                 // Skip the overlapping frames, only append truly new ones
@@ -867,18 +866,19 @@ impl EncDecRNNTModel {
                 session
                     .mel_buffer
                     .append_mel(&new_mel_data, frames_to_append);
-            } else {
-                // All frames are new
+            } else if frames_to_append > 0 {
+                // All frames are new (first chunk case)
                 session.mel_buffer.append_mel(mel_data, computed_frames);
             }
+            // else: no new frames to append (shouldn't happen in normal operation)
 
             // Drain excess audio samples, keeping overlap for next computation
             session.mel_buffer.drain_processed_audio();
 
             if debug {
                 eprintln!(
-                    "[DEBUG]   appended {} mel frames from {} audio samples (total: {} -> {}), preprocessor returned {}, skipped {} (overlap={})",
-                    frames_to_append, audio_len, prev_frames, session.mel_buffer.total_frames, computed_frames, frames_to_skip, overlap_frames
+                    "[DEBUG]   appended {} mel frames from {} audio samples (total: {} -> {}, expected: {}), preprocessor returned {}, skipped {}",
+                    frames_to_append, audio_len, prev_frames, session.mel_buffer.total_frames, expected_total_frames, computed_frames, frames_to_skip
                 );
             }
         }
@@ -886,6 +886,7 @@ impl EncDecRNNTModel {
         // Step 3: Process all complete mel chunks
         let mut all_new_tokens: Vec<Vec<usize>> = vec![Vec::new(); batch_size];
         let mut chunks_processed = 0;
+        let mut total_encoder_frames_this_call = 0usize;
 
         loop {
             // Get chunk parameters for current step
@@ -1021,6 +1022,7 @@ impl EncDecRNNTModel {
             // Truncate to valid_out_len
             let valid_out_len = session.config.valid_out_len;
             let enc_seq_len = raw_enc_len.min(valid_out_len);
+            total_encoder_frames_this_call += enc_seq_len;
 
             if debug {
                 eprintln!(
@@ -1164,8 +1166,9 @@ impl EncDecRNNTModel {
         if debug && chunks_processed > 0 {
             let (audio_bytes, mel_bytes) = session.mel_buffer.memory_stats();
             eprintln!(
-                "[DEBUG] processed {} mel chunks, accumulated {} tokens (buffer mem: audio={}KB, mel={}KB)",
+                "[DEBUG] processed {} mel chunks, {} encoder frames, accumulated {} tokens (buffer mem: audio={}KB, mel={}KB)",
                 chunks_processed,
+                total_encoder_frames_this_call,
                 session
                     .accumulated_tokens
                     .get(0)
@@ -1173,6 +1176,27 @@ impl EncDecRNNTModel {
                     .unwrap_or(0),
                 audio_bytes / 1024,
                 mel_bytes / 1024
+            );
+        }
+
+        // High-level debug: show progress summary every N calls
+        if debug {
+            let total_audio_sec = session.mel_buffer.total_audio_samples as f32
+                / session.mel_buffer.sample_rate as f32;
+            let total_mel_frames = session.mel_buffer.total_frames;
+            let mel_idx = session.mel_buffer.buffer_idx;
+            let tokens = session
+                .accumulated_tokens
+                .get(0)
+                .map(|t| t.len())
+                .unwrap_or(0);
+            eprintln!(
+                "[DEBUG SUMMARY] audio={:.2}s, mel_frames={}, mel_idx={}, remaining={}, tokens={}",
+                total_audio_sec,
+                total_mel_frames,
+                mel_idx,
+                total_mel_frames.saturating_sub(mel_idx),
+                tokens
             );
         }
 
