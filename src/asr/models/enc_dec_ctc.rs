@@ -90,6 +90,7 @@ pub struct EncDecCTCModel {
     tokenizer: Option<SentencePieceProcessor>,
     /// Blank token ID for CTC (typically last token in vocab)
     blank_id: usize,
+    chunk_count: usize,
 }
 
 impl EncDecCTCModel {
@@ -118,6 +119,7 @@ impl EncDecCTCModel {
             decoder,
             tokenizer: None,
             blank_id,
+            chunk_count: 0,
         })
     }
 
@@ -413,7 +415,8 @@ impl EncDecCTCModel {
         // This handles preemphasis state and remainder buffer internally
         let mel_features = self.preprocessor.process_chunk(audio_chunk)?;
 
-        tracing::debug!("Got mel_features size {:?}", mel_features.size());
+        tracing::debug!("PROCESS CHUNK #{}: Got mel_features size {:?}", self.chunk_count, mel_features.size());
+        self.chunk_count += 1;
 
         // Check if we got any frames
         let n_frames = mel_features.dim(1) as usize;

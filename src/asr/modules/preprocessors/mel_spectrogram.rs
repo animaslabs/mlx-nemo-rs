@@ -263,7 +263,7 @@ impl MelSpectrogram {
         // Frame i requires samples [i*hop, i*hop + win_samples)
         // So for n_frames, we need: (n_frames-1)*hop + win_samples samples
         let n_frames = self.compute_frame_count(raw_audio.len());
-        tracing::debug!("process_chunk raw_audio len: {} num audio samples: {} remainder len: {} mel n_frames: {}",
+        tracing::trace!("process_chunk raw_audio len: {} num audio samples: {} remainder len: {} mel n_frames: {}",
             raw_audio.len(), samples.len(), self.remainder.len(), n_frames);
 
         if n_frames == 0 {
@@ -288,7 +288,7 @@ impl MelSpectrogram {
         }
 
         // Take only the samples we need for processing
-        let audio_to_process = raw_audio[..samples_needed].to_vec();
+        let mut audio_to_process = raw_audio[..samples_needed].to_vec();
 
         // Apply preemphasis with state tracking
         let audio_to_process = self.apply_preemphasis(&audio_to_process);
@@ -1085,22 +1085,14 @@ mod tests {
 
         // Preemph state should be updated (last sample of samples_needed)
         // samples_needed = (1-1)*160 + 400 = 400, so preemph_last = chunk1[399] = 399/500 ≈ 0.798
-        assert!(
-            mel.preemph_last > 0.7,
-            "preemph_last should be updated after processing, got {}",
-            mel.preemph_last
-        );
+        assert!(mel.preemph_last > 0.7, "preemph_last should be updated after processing, got {}", mel.preemph_last);
 
         // Second chunk - combined with remainder should produce more frames
         let chunk2: Vec<f32> = (500..1000).map(|i| i as f32 / 1000.0).collect();
         mel.process_chunk(&chunk2).unwrap();
 
         // State should update again
-        assert!(
-            mel.preemph_last > 0.5,
-            "preemph_last should remain updated, got {}",
-            mel.preemph_last
-        );
+        assert!(mel.preemph_last > 0.5, "preemph_last should remain updated, got {}", mel.preemph_last);
     }
 
     // ==================== Normalization Tests ====================
