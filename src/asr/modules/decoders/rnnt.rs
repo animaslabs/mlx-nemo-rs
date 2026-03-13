@@ -712,6 +712,13 @@ impl RNNTJoint {
     ) -> Result<Self> {
         let joint_hidden = config.joint_hidden;
         let activation = JointActivation::from_str(&config.activation);
+        tracing::debug!(
+            "RNNTJoint::new encoder_hidden {} pred_hidden {} vocab_size {} activation {:?}",
+            encoder_hidden,
+            pred_hidden,
+            vocab_size,
+            activation
+        );
 
         // Initialize weights with zeros (will be loaded from checkpoint)
         let encoder_proj_weight =
@@ -840,10 +847,7 @@ impl RNNTJoint {
         let pred_proj = self.linear(&pred, &self.pred_proj_weight, self.pred_proj_bias.as_ref())?;
 
         // Debug: compare encoder vs prediction projection magnitudes
-        let debug_joint = std::env::var("NEMO_DEBUG_JOINT")
-            .map(|v| v == "1")
-            .unwrap_or(false);
-        if debug_joint {
+        {
             enc_proj.eval()?;
             pred_proj.eval()?;
             let enc_flat = enc_proj.reshape(&[-1])?;
@@ -866,9 +870,13 @@ impl RNNTJoint {
             };
             let enc_norm: f32 = enc_slice.iter().map(|v| v.powi(2)).sum::<f32>().sqrt();
             let pred_norm: f32 = pred_slice.iter().map(|v| v.powi(2)).sum::<f32>().sqrt();
-            eprintln!(
-                "[JOINT DEBUG] enc_proj: std={:.4}, norm={:.4}; pred_proj: std={:.4}, norm={:.4}; ratio={:.4}",
-                enc_std, enc_norm, pred_std, pred_norm, enc_norm / pred_norm
+            tracing::trace!(
+                enc_proj_std = enc_std,
+                enc_proj_norm = enc_norm,
+                pred_proj_std = pred_std,
+                pred_proj_norm = pred_norm,
+                ratio = enc_norm / pred_norm,
+                "joint network projection magnitudes"
             );
         }
 

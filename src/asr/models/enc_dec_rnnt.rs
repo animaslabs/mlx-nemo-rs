@@ -695,31 +695,21 @@ impl EncDecRNNTModel {
         // Compute streaming configuration
         let config = compute_streaming_config(self.encoder.config(), mode_idx, 10000)?;
 
-        let debug = Self::debug_enabled();
-        if debug {
-            eprintln!("[DEBUG] init_streaming: mode_idx={}", mode_idx);
-            eprintln!(
-                "[DEBUG]   chunk_size: first={}, subsequent={}",
-                config.chunk_size.0, config.chunk_size.1
-            );
-            eprintln!(
-                "[DEBUG]   shift_size: first={}, subsequent={}",
-                config.shift_size.0, config.shift_size.1
-            );
-            eprintln!(
-                "[DEBUG]   pre_encode_cache: first={}, subsequent={}",
-                config.pre_encode_cache_size.0, config.pre_encode_cache_size.1
-            );
-            eprintln!(
-                "[DEBUG]   valid_out_len={}, drop_extra_pre_encoded={}",
-                config.valid_out_len, config.drop_extra_pre_encoded
-            );
-            eprintln!("[DEBUG]   cache_drop_size={}", config.cache_drop_size);
-            eprintln!(
-                "[DEBUG]   last_channel_cache_size={}, last_time_cache_size={}",
-                config.last_channel_cache_size, config.last_time_cache_size
-            );
-        }
+        tracing::debug!(
+            mode_idx,
+            chunk_size_first = config.chunk_size.0,
+            chunk_size_subsequent = config.chunk_size.1,
+            shift_size_first = config.shift_size.0,
+            shift_size_subsequent = config.shift_size.1,
+            pre_encode_cache_first = config.pre_encode_cache_size.0,
+            pre_encode_cache_subsequent = config.pre_encode_cache_size.1,
+            valid_out_len = config.valid_out_len,
+            drop_extra_pre_encoded = config.drop_extra_pre_encoded,
+            cache_drop_size = config.cache_drop_size,
+            last_channel_cache_size = config.last_channel_cache_size,
+            last_time_cache_size = config.last_time_cache_size,
+            "init_streaming configuration"
+        );
 
         // Setup encoder
         self.encoder.setup_streaming(config.cache_drop_size);
@@ -744,16 +734,13 @@ impl EncDecRNNTModel {
             preprocessor_config.n_fft,
         );
 
-        if debug {
-            eprintln!(
-                "[DEBUG]   mel_buffer: window_samples={}, hop_samples={}, n_mels={}",
-                mel_buffer.window_samples, mel_buffer.hop_samples, n_mels
-            );
-            eprintln!(
-                "[DEBUG]   subsampling_factor={}",
-                self.encoder.subsampling_factor()
-            );
-        }
+        tracing::debug!(
+            window_samples = mel_buffer.window_samples,
+            hop_samples = mel_buffer.hop_samples,
+            n_mels,
+            subsampling_factor = self.encoder.subsampling_factor(),
+            "mel_buffer configuration"
+        );
 
         // Initialize decoder state for each batch sample
         let mut decoder_states = Vec::with_capacity(batch_size);
@@ -775,15 +762,6 @@ impl EncDecRNNTModel {
     }
 
     /// Process an audio chunk and return partial transcription.
-    /// Enable debug output for streaming inference.
-    /// Set via environment variable: NEMO_DEBUG=1
-    fn debug_enabled() -> bool {
-        std::env::var("NEMO_DEBUG")
-            .map(|v| v == "1")
-            .unwrap_or(false)
-    }
-
-    /// Process an audio chunk and return partial transcription.
     ///
     /// This follows NeMo's streaming approach:
     /// 1. Convert audio to mel spectrogram and append to mel buffer
@@ -794,19 +772,16 @@ impl EncDecRNNTModel {
         session: &mut RnntStreamingSession,
         audio_chunk: &[f32],
     ) -> Result<StreamingOutput> {
-        let debug = Self::debug_enabled();
         let batch_size = session.encoder_cache.batch_size();
 
         // Step 1: Add audio to buffer
         session.mel_buffer.add_audio(audio_chunk);
 
-        if debug {
-            eprintln!(
-                "[DEBUG] process_chunk: received {} audio samples, audio_buffer has {} samples",
-                audio_chunk.len(),
-                session.mel_buffer.audio_samples_available()
-            );
-        }
+        tracing::trace!(
+            audio_samples_received = audio_chunk.len(),
+            audio_buffer_samples = session.mel_buffer.audio_samples_available(),
+            "process_chunk: received audio"
+        );
 
         // Step 2: Compute mel incrementally from pending audio.
         // Only process new audio samples, not the entire history.
@@ -875,12 +850,16 @@ impl EncDecRNNTModel {
             // Drain excess audio samples, keeping overlap for next computation
             session.mel_buffer.drain_processed_audio();
 
-            if debug {
-                eprintln!(
-                    "[DEBUG]   appended {} mel frames from {} audio samples (total: {} -> {}, expected: {}), preprocessor returned {}, skipped {}",
-                    frames_to_append, audio_len, prev_frames, session.mel_buffer.total_frames, expected_total_frames, computed_frames, frames_to_skip
-                );
-            }
+            tracing::trace!(
+                frames_appended = frames_to_append,
+                audio_samples = audio_len,
+                total_frames_before = prev_frames,
+                total_frames_after = session.mel_buffer.total_frames,
+                expected_total_frames,
+                preprocessor_frames = computed_frames,
+                frames_skipped = frames_to_skip,
+                "appended mel frames from audio"
+            );
         }
 
         // Step 3: Process all complete mel chunks
@@ -907,24 +886,24 @@ impl EncDecRNNTModel {
             // Check if we have enough mel frames
             let remaining = session.mel_buffer.remaining_frames();
             if remaining < chunk_size {
-                if debug && chunks_processed == 0 {
-                    eprintln!(
-                        "[DEBUG]   need {} mel frames for chunk, have {} remaining",
-                        chunk_size, remaining
+                if chunks_processed == 0 {
+                    tracing::trace!(
+                        chunk_size_needed = chunk_size,
+                        frames_remaining = remaining,
+                        "need more mel frames for chunk"
                     );
                 }
                 break;
             }
-            if debug {
-                eprintln!(
-                    "[DEBUG]   extracting chunk: chunk_size={}, shift_size={}, pre_encode_cache={}, drop_extra={}",
-                    chunk_size, shift_size, pre_encode_cache, drop_extra
-                );
-                eprintln!(
-                    "[DEBUG]   mel_buffer: buffer_idx={}, total_frames={}",
-                    session.mel_buffer.buffer_idx, session.mel_buffer.total_frames
-                );
-            }
+            tracing::debug!(
+                chunk_size,
+                shift_size,
+                pre_encode_cache,
+                drop_extra,
+                buffer_idx = session.mel_buffer.buffer_idx,
+                total_frames = session.mel_buffer.total_frames,
+                "extracting mel chunk"
+            );
 
             // Extract mel chunk with pre_encode_cache overlap
             let (mel_chunk, chunk_len) = session
@@ -932,35 +911,31 @@ impl EncDecRNNTModel {
                 .extract_chunk(chunk_size, shift_size, pre_encode_cache)
                 .ok_or_else(|| crate::core::error::Error::model("Failed to extract mel chunk"))?;
 
-            if debug {
-                eprintln!(
-                    "[DEBUG]   extracted {} mel frames (chunk_size={} + cache={})",
-                    chunk_len,
-                    chunk_size,
-                    chunk_len.saturating_sub(chunk_size)
-                );
-                // Show mel stats
+            {
                 let mel_min = mel_chunk.iter().cloned().fold(f32::INFINITY, f32::min);
                 let mel_max = mel_chunk.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
                 let mel_mean: f32 = mel_chunk.iter().sum::<f32>() / mel_chunk.len() as f32;
-                eprintln!(
-                    "[DEBUG]   mel_chunk stats: min={:.3}, max={:.3}, mean={:.3}",
-                    mel_min, mel_max, mel_mean
+                tracing::trace!(
+                    frames_extracted = chunk_len,
+                    chunk_size,
+                    cache_frames = chunk_len.saturating_sub(chunk_size),
+                    mel_min,
+                    mel_max,
+                    mel_mean,
+                    "extracted mel chunk"
                 );
-                // Show first few mel frames
+                // Show first few mel frames at trace level
                 // mel_chunk is [n_mels, time] format, so frame t, freq f = mel_chunk[f * chunk_len + t]
-                let _n_mels = session.n_mels;
-                eprintln!(
-                    "[DEBUG]   First 5 mel frames (first 3 freq bins each), format=[n_mels, time]:"
-                );
                 for t in 0..5.min(chunk_len) {
-                    // Get freq bins 0, 1, 2 for frame t
-                    let f0 = mel_chunk.get(0 * chunk_len + t).unwrap_or(&0.0);
-                    let f1 = mel_chunk.get(1 * chunk_len + t).unwrap_or(&0.0);
+                    let f0 = mel_chunk.get(t).unwrap_or(&0.0);
+                    let f1 = mel_chunk.get(chunk_len + t).unwrap_or(&0.0);
                     let f2 = mel_chunk.get(2 * chunk_len + t).unwrap_or(&0.0);
-                    eprintln!(
-                        "[DEBUG]     frame {}: [{:.4}, {:.4}, {:.4}, ...]",
-                        t, f0, f1, f2,
+                    tracing::trace!(
+                        frame = t,
+                        freq_bin_0 = f0,
+                        freq_bin_1 = f1,
+                        freq_bin_2 = f2,
+                        "mel frame values"
                     );
                 }
             }
@@ -998,11 +973,7 @@ impl EncDecRNNTModel {
             let raw_enc_len = encoded_lengths.as_slice::<i32>()[0] as usize;
             let cache_len_after = session.encoder_cache.last_channel_len.as_slice::<i64>()[0];
 
-            if debug {
-                eprintln!(
-                    "[DEBUG]   encoder: {} output frames, cache {} -> {}",
-                    raw_enc_len, cache_len_before, cache_len_after
-                );
+            {
                 // Show encoder output stats
                 let enc_flat = encoded.reshape(&[-1]).unwrap();
                 enc_flat.eval().unwrap();
@@ -1010,13 +981,17 @@ impl EncDecRNNTModel {
                 let enc_min = enc_slice.iter().cloned().fold(f32::INFINITY, f32::min);
                 let enc_max = enc_slice.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
                 let enc_mean: f32 = enc_slice.iter().sum::<f32>() / enc_slice.len() as f32;
-                eprintln!(
-                    "[DEBUG]   encoder output stats: min={:.3}, max={:.3}, mean={:.3}",
-                    enc_min, enc_max, enc_mean
-                );
-                // Print first 10 values of first frame (for comparison with NeMo)
                 let first_10: Vec<f32> = enc_slice.iter().take(10).cloned().collect();
-                eprintln!("[DEBUG]   first frame[:10]: {:?}", first_10);
+                tracing::trace!(
+                    output_frames = raw_enc_len,
+                    cache_len_before,
+                    cache_len_after,
+                    enc_min,
+                    enc_max,
+                    enc_mean,
+                    ?first_10,
+                    "encoder output"
+                );
             }
 
             // Truncate to valid_out_len
@@ -1024,12 +999,11 @@ impl EncDecRNNTModel {
             let enc_seq_len = raw_enc_len.min(valid_out_len);
             total_encoder_frames_this_call += enc_seq_len;
 
-            if debug {
-                eprintln!(
-                    "[DEBUG]   valid_out_len={}, decoding {} frames",
-                    valid_out_len, enc_seq_len
-                );
-            }
+            tracing::trace!(
+                valid_out_len,
+                frames_to_decode = enc_seq_len,
+                "decoding encoder frames"
+            );
 
             // Decode
             const MAX_SYMBOLS_PER_STEP: usize = 10;
@@ -1079,32 +1053,26 @@ impl EncDecRNNTModel {
                 }
             }
 
-            if debug {
-                eprintln!(
-                    "[DEBUG]   decoding: {} encoder frames, {} blank emissions, {} non-blank tokens",
-                    enc_seq_len, blank_count, non_blank_count
-                );
-
-                // Additional debug: show accumulated token count
+            {
                 let total_tokens = session
                     .accumulated_tokens
                     .get(0)
                     .map(|t| t.len())
                     .unwrap_or(0);
-                eprintln!("[DEBUG]   total accumulated: {} tokens", total_tokens);
-            }
-
-            if debug {
                 let token_text = if let Some(tokenizer) = &self.tokenizer {
                     let ids: Vec<u32> = tokens_this_chunk.iter().map(|&t| t as u32).collect();
                     tokenizer.decode_piece_ids(&ids).unwrap_or_default()
                 } else {
                     format!("{:?}", tokens_this_chunk)
                 };
-                eprintln!(
-                    "[DEBUG]   decoded {} tokens: \"{}\"",
-                    tokens_this_chunk.len(),
-                    token_text
+                tracing::debug!(
+                    encoder_frames = enc_seq_len,
+                    blank_emissions = blank_count,
+                    non_blank_tokens = non_blank_count,
+                    total_accumulated = total_tokens,
+                    tokens_this_chunk = tokens_this_chunk.len(),
+                    decoded_text = %token_text,
+                    "decoding results"
                 );
             }
 
@@ -1117,24 +1085,24 @@ impl EncDecRNNTModel {
             session.mel_buffer.trim_old_frames(max_pre_encode_cache);
         }
 
-        if debug && chunks_processed > 0 {
+        if chunks_processed > 0 {
             let (audio_bytes, mel_bytes) = session.mel_buffer.memory_stats();
-            eprintln!(
-                "[DEBUG] processed {} mel chunks, {} encoder frames, accumulated {} tokens (buffer mem: audio={}KB, mel={}KB)",
+            tracing::trace!(
                 chunks_processed,
-                total_encoder_frames_this_call,
-                session
+                encoder_frames = total_encoder_frames_this_call,
+                accumulated_tokens = session
                     .accumulated_tokens
                     .get(0)
                     .map(|t| t.len())
                     .unwrap_or(0),
-                audio_bytes / 1024,
-                mel_bytes / 1024
+                audio_buffer_kb = audio_bytes / 1024,
+                mel_buffer_kb = mel_bytes / 1024,
+                "processed mel chunks"
             );
         }
 
-        // High-level debug: show progress summary every N calls
-        if debug {
+        // High-level debug: show progress summary
+        {
             let total_audio_sec = session.mel_buffer.total_audio_samples as f32
                 / session.mel_buffer.sample_rate as f32;
             let total_mel_frames = session.mel_buffer.total_frames;
@@ -1144,13 +1112,13 @@ impl EncDecRNNTModel {
                 .get(0)
                 .map(|t| t.len())
                 .unwrap_or(0);
-            eprintln!(
-                "[DEBUG SUMMARY] audio={:.2}s, mel_frames={}, mel_idx={}, remaining={}, tokens={}",
-                total_audio_sec,
+            tracing::trace!(
+                audio_seconds = total_audio_sec,
                 total_mel_frames,
                 mel_idx,
-                total_mel_frames.saturating_sub(mel_idx),
-                tokens
+                remaining_frames = total_mel_frames.saturating_sub(mel_idx),
+                tokens,
+                "streaming progress summary"
             );
         }
 
@@ -1184,16 +1152,15 @@ impl EncDecRNNTModel {
         &mut self,
         mut session: RnntStreamingSession,
     ) -> Result<StreamingOutput> {
-        let debug = Self::debug_enabled();
-
         // Process any remaining audio samples
         if session.mel_buffer.audio_samples_available() > 0 {
             let min_samples = self.preprocessor.window_length();
             let available = session.mel_buffer.audio_samples_available();
 
-            if debug {
-                eprintln!("[DEBUG] finalize: {} audio samples remaining", available);
-            }
+            tracing::debug!(
+                audio_samples_remaining = available,
+                "finalize: processing remaining audio"
+            );
 
             // Pad if needed to compute at least one frame
             if available < min_samples {
@@ -1215,12 +1182,11 @@ impl EncDecRNNTModel {
             let frames_to_pad = chunk_size - remaining;
             let n_mels = session.n_mels;
 
-            if debug {
-                eprintln!(
-                    "[DEBUG] finalize: padding {} mel frames to make full chunk of {}",
-                    frames_to_pad, chunk_size
-                );
-            }
+            tracing::debug!(
+                frames_to_pad,
+                chunk_size,
+                "finalize: padding mel frames for full chunk"
+            );
 
             // Create zero padding in [n_mels, time] format (which append_mel expects)
             let padding = vec![0.0f32; n_mels * frames_to_pad];
@@ -1233,9 +1199,10 @@ impl EncDecRNNTModel {
                 break;
             }
 
-            if debug {
-                eprintln!("[DEBUG] finalize: {} mel frames remaining", remaining);
-            }
+            tracing::debug!(
+                mel_frames_remaining = remaining,
+                "finalize: processing remaining mel frames"
+            );
 
             // Try to process remaining frames
             let result = self.process_chunk(&mut session, &[])?;

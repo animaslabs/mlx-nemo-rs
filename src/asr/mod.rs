@@ -29,12 +29,14 @@
 
 pub mod config;
 pub mod decoding;
+pub mod mel_stream;
 pub mod models;
 pub mod modules;
 pub mod streaming;
 
 // Re-exports
 pub use config::*;
+pub use mel_stream::{MelStream, MelStreamConfig, MelStreamIter};
 pub use models::{
     CtcStreamingSession, DebugOutput, EncDecCTCModel, EncDecRNNTModel, RnntDecodingStrategy,
     RnntStreamingSession,

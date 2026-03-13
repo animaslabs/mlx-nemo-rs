@@ -16,8 +16,17 @@ use std::io::{self, Write};
 use std::time::Instant;
 
 use mlx_nemo::asr::{EncDecRNNTModel, StreamingModeInfo};
+use tracing_subscriber::{fmt, EnvFilter};
 
 fn main() -> mlx_nemo::Result<()> {
+    // Initialize tracing subscriber with debug level
+    // Can be overridden with RUST_LOG env var (e.g., RUST_LOG=debug)
+    fmt()
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("debug")),
+        )
+        .init();
+
     let args: Vec<String> = std::env::args().collect();
 
     // Parse arguments
@@ -161,7 +170,7 @@ fn main() -> mlx_nemo::Result<()> {
         if !output.text.is_empty() && output.text[0] != last_text {
             // Clear line and print new text
             // print!("\r\x1b[K"); // Clear line
-            print!("{:?}", output);
+            // print!("{:?}", output);
             io::stdout().flush().unwrap();
             last_text = output.text[0].clone();
         }
@@ -181,6 +190,7 @@ fn main() -> mlx_nemo::Result<()> {
 
     println!("\n--- Statistics ---");
     println!("Audio duration: {:.2}s", audio_duration);
+    println!("Audio num samples: {}", samples.len());
     println!("Processing time: {:.2}s", elapsed);
     println!("Real-time factor: {:.2}x", rtf);
     println!("Chunks processed: {}", chunks_processed);

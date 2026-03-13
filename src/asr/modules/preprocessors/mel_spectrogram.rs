@@ -42,6 +42,11 @@ impl MelSpectrogram {
         let mel_filterbank =
             Self::create_mel_filterbank(n_mels, n_fft, sample_rate, lowfreq, highfreq)?;
 
+        tracing::debug!(
+            "MelSpectrogram::new sample_rate: {} win_length: {} hop_length: {}, n_fft: {}, n_mels: {}",
+            sample_rate, win_length, hop_length, n_fft, n_mels);
+        tracing::debug!("config: {:?}", config);
+
         Ok(Self {
             config,
             mel_filterbank,
@@ -185,6 +190,45 @@ impl MelSpectrogram {
         };
 
         // Skip dither for streaming (it's typically only used in training anyway)
+
+        // Compute STFT
+        let stft_result = self.stft(&audio)?;
+
+        // Compute power spectrum
+        let power_spectrum = self.complex_abs_squared(&stft_result)?;
+
+        // Apply Mel filterbank
+        let mel_spec = mlx_rs::ops::einsum(
+            "mf,bft->bmt",
+            &[self.mel_filterbank.clone(), power_spectrum],
+        )?;
+
+        // Apply log with guard for numerical stability
+        let mel_spec = &mel_spec + &Array::from_f32(2.0_f32.powi(-24));
+        let log_mel_spec = mlx_rs::ops::log(&mel_spec)?;
+
+        Ok(log_mel_spec)
+    }
+
+    /// Process audio without preemphasis (for streaming with external state tracking).
+    ///
+    /// Used by `MelStream` which handles preemphasis externally to maintain
+    /// state across chunk boundaries for perfect streaming continuity.
+    ///
+    /// # Arguments
+    /// * `audio` - Audio waveform tensor [batch, time] with preemphasis already applied
+    ///
+    /// # Returns
+    /// * Raw log-mel features [batch, n_mels, frames]
+    pub fn forward_no_preemph(&self, audio: &Array) -> Result<Array> {
+        // Ensure audio is 2D [batch, time]
+        let audio = if audio.ndim() == 1 {
+            audio.reshape(&[1, -1])?
+        } else {
+            audio.clone()
+        };
+
+        // Skip preemphasis - caller has already applied it
 
         // Compute STFT
         let stft_result = self.stft(&audio)?;

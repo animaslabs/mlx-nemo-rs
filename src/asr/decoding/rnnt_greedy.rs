@@ -6,6 +6,7 @@
 
 use mlx_rs::ops::indexing::{argmax_axis, IndexOp};
 use mlx_rs::Array;
+use tracing::{debug, instrument, trace};
 
 use crate::asr::modules::{RNNTJoint, StatelessTransducerDecoder};
 use crate::core::error::Result;
@@ -32,6 +33,10 @@ const DEFAULT_MAX_SYMBOLS_PER_STEP: usize = 10;
 ///
 /// # Returns
 /// * Vector of decoded token sequences for each batch item
+#[instrument(
+    skip(encoder_output, encoder_lengths, decoder, joint),
+    fields(batch_size, blank_id, max_symbols_per_step)
+)]
 pub fn rnnt_greedy_decode(
     encoder_output: &Array,
     encoder_lengths: &Array,
@@ -46,6 +51,14 @@ pub fn rnnt_greedy_decode(
     let batch_size = encoder_output.shape()[0] as usize;
     let max_symbols = max_symbols_per_step.unwrap_or(DEFAULT_MAX_SYMBOLS_PER_STEP);
 
+    debug!(
+        batch_size,
+        encoder_shape = ?encoder_output.shape(),
+        blank_id,
+        max_symbols,
+        "Starting RNN-T greedy decode"
+    );
+
     // Get encoder lengths as a vector
     let lengths_i32 = encoder_lengths.as_type::<i32>()?;
     lengths_i32.eval()?;
@@ -58,6 +71,8 @@ pub fn rnnt_greedy_decode(
     for b in 0..batch_size {
         let seq_len = lengths_data[b] as usize;
         let mut tokens = Vec::new();
+
+        debug!(batch_idx = b, seq_len, "Processing sequence");
 
         // Initialize decoder state for this sequence
         let mut state = decoder.initialize_state(1)?;
@@ -90,8 +105,18 @@ pub fn rnnt_greedy_decode(
                 prediction.eval()?;
                 let pred_token = prediction.as_slice::<u32>()[0] as usize;
 
+                trace!(
+                    batch_idx = b,
+                    frame = t,
+                    pred_token,
+                    is_blank = pred_token == blank_id,
+                    symbols_emitted,
+                    "Joint prediction"
+                );
+
                 if pred_token == blank_id {
                     // Blank: advance to next encoder frame
+                    trace!(batch_idx = b, frame = t, "Blank emitted, advancing frame");
                     break;
                 }
 
@@ -100,8 +125,22 @@ pub fn rnnt_greedy_decode(
                 state = new_state;
                 symbols_emitted += 1;
 
+                trace!(
+                    batch_idx = b,
+                    frame = t,
+                    token = pred_token,
+                    total_tokens = tokens.len(),
+                    "Token emitted"
+                );
+
                 if symbols_emitted >= max_symbols {
                     // Safety limit reached, advance frame
+                    debug!(
+                        batch_idx = b,
+                        frame = t,
+                        symbols_emitted,
+                        "Max symbols per step reached"
+                    );
                     break;
                 }
             }
@@ -109,8 +148,18 @@ pub fn rnnt_greedy_decode(
             t += 1;
         }
 
+        debug!(
+            batch_idx = b,
+            num_tokens = tokens.len(),
+            "Sequence decoding complete"
+        );
         results.push(tokens);
     }
+
+    debug!(
+        total_tokens = results.iter().map(|r| r.len()).sum::<usize>(),
+        "RNN-T greedy decode complete"
+    );
 
     Ok(results)
 }
@@ -136,6 +185,10 @@ fn last_token_array(tokens: &[usize]) -> Result<Array> {
 ///
 /// # Returns
 /// * Vector of decoded token sequences for each batch item
+#[instrument(
+    skip(encoder_output, encoder_lengths, decoder, joint),
+    fields(batch_size, blank_id, max_symbols_per_step)
+)]
 pub fn rnnt_greedy_decode_batched(
     encoder_output: &Array,
     encoder_lengths: &Array,
@@ -150,6 +203,14 @@ pub fn rnnt_greedy_decode_batched(
     let batch_size = encoder_output.shape()[0] as usize;
     let max_symbols = max_symbols_per_step.unwrap_or(DEFAULT_MAX_SYMBOLS_PER_STEP);
 
+    debug!(
+        batch_size,
+        encoder_shape = ?encoder_output.shape(),
+        blank_id,
+        max_symbols,
+        "Starting batched RNN-T greedy decode"
+    );
+
     // Get encoder lengths as a vector
     let lengths_i32 = encoder_lengths.as_type::<i32>()?;
     lengths_i32.eval()?;
@@ -161,12 +222,18 @@ pub fn rnnt_greedy_decode_batched(
     let mut time_indices: Vec<usize> = vec![0; batch_size];
     let mut finished: Vec<bool> = vec![false; batch_size];
 
+    let mut iteration = 0;
+
     // Process until all sequences are done
     loop {
         // Check if all sequences are finished
         if finished.iter().all(|&f| f) {
+            debug!(iterations = iteration, "All sequences finished");
             break;
         }
+
+        iteration += 1;
+        trace!(iteration, "Processing iteration");
 
         // Build batch of encoder frames for active sequences
         let mut enc_frames = Vec::new();
@@ -180,6 +247,7 @@ pub fn rnnt_greedy_decode_batched(
                     active_indices.push(b);
                 } else {
                     finished[b] = true;
+                    debug!(batch_idx = b, "Sequence finished (end of frames)");
                 }
             }
         }
@@ -187,6 +255,8 @@ pub fn rnnt_greedy_decode_batched(
         if active_indices.is_empty() {
             break;
         }
+
+        trace!(active_count = active_indices.len(), "Active sequences");
 
         // For simplicity, process one step at a time for each active sequence
         // A more optimized version would batch the joint computation
@@ -221,20 +291,43 @@ pub fn rnnt_greedy_decode_batched(
                 prediction.eval()?;
                 let pred_token = prediction.as_slice::<u32>()[0] as usize;
 
+                trace!(
+                    batch_idx = b,
+                    frame = t,
+                    pred_token,
+                    is_blank = pred_token == blank_id,
+                    "Batched joint prediction"
+                );
+
                 if pred_token == blank_id {
                     // Advance to next frame
                     time_indices[b] += 1;
+                    trace!(
+                        batch_idx = b,
+                        new_frame = time_indices[b],
+                        "Advancing frame"
+                    );
                     break;
                 }
 
                 // Emit token
                 results[b].push(pred_token);
+                trace!(
+                    batch_idx = b,
+                    token = pred_token,
+                    total_tokens = results[b].len(),
+                    "Token emitted (batched)"
+                );
 
                 // Update state (simplified - in full implementation would update batch state)
                 symbols_emitted += 1;
 
                 if symbols_emitted >= max_symbols {
                     time_indices[b] += 1;
+                    debug!(
+                        batch_idx = b,
+                        symbols_emitted, "Max symbols per step reached (batched)"
+                    );
                     break;
                 }
             }
@@ -242,9 +335,19 @@ pub fn rnnt_greedy_decode_batched(
             // Check if sequence is finished
             if time_indices[b] >= lengths_data[b] as usize {
                 finished[b] = true;
+                debug!(
+                    batch_idx = b,
+                    num_tokens = results[b].len(),
+                    "Sequence finished"
+                );
             }
         }
     }
+
+    debug!(
+        total_tokens = results.iter().map(|r| r.len()).sum::<usize>(),
+        "Batched RNN-T greedy decode complete"
+    );
 
     Ok(results)
 }

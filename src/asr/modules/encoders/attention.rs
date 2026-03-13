@@ -14,12 +14,6 @@ use crate::core::error::{Error, Result};
 /// Global counter for attention forward calls (for debugging)
 static ATTENTION_CALL_COUNT: AtomicU64 = AtomicU64::new(0);
 
-fn attention_debug_enabled() -> bool {
-    std::env::var("NEMO_DEBUG_ATTN")
-        .map(|v| v == "1")
-        .unwrap_or(false)
-}
-
 /// Reset the attention call counter (call at start of streaming session)
 pub fn reset_attention_counter() {
     ATTENTION_CALL_COUNT.store(0, Ordering::SeqCst);
@@ -356,7 +350,6 @@ impl RelPositionMultiHeadAttention {
         let head_dim = self.head_dim as i32;
 
         let call_count = ATTENTION_CALL_COUNT.fetch_add(1, Ordering::SeqCst);
-        let debug = attention_debug_enabled();
 
         // NeMo cache-aware streaming (arXiv:2312.17279 Section 3.3):
         //
@@ -450,14 +443,8 @@ impl RelPositionMultiHeadAttention {
         let matrix_bd = matrix_bd.index((.., .., .., ..total_len));
 
         // Debug: check matrix_bd stats after rel_shift (only at specific points)
-        let debug_relshift = std::env::var("NEMO_DEBUG_RELSHIFT")
-            .map(|v| v == "1")
-            .unwrap_or(false);
         let encoder_call = call_count / 24;
-        if debug_relshift
-            && call_count % 24 == 0
-            && (encoder_call < 5 || encoder_call == 35 || encoder_call == 135)
-        {
+        if call_count % 24 == 0 && (encoder_call < 5 || encoder_call == 35 || encoder_call == 135) {
             matrix_bd.eval()?;
             let bd_flat = matrix_bd.reshape(&[-1])?;
             bd_flat.eval()?;
@@ -465,9 +452,14 @@ impl RelPositionMultiHeadAttention {
             let bd_min = bd_slice.iter().cloned().fold(f32::INFINITY, f32::min);
             let bd_max = bd_slice.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
             let bd_mean: f32 = bd_slice.iter().sum::<f32>() / bd_slice.len() as f32;
-            eprintln!(
-                "[RELSHIFT DEBUG] enc_call={}, seq_len={}, total_len={}, matrix_bd: min={:.4}, max={:.4}, mean={:.4}",
-                encoder_call, seq_len, total_len, bd_min, bd_max, bd_mean
+            tracing::trace!(
+                encoder_call,
+                seq_len,
+                total_len,
+                bd_min,
+                bd_max,
+                bd_mean,
+                "rel_shift matrix_bd stats"
             );
         }
 
@@ -489,9 +481,7 @@ impl RelPositionMultiHeadAttention {
 
         // Debug: print attention stats periodically (only layer 0, every ~100 encoder calls)
         // Each encoder call has 24 layers, so call_count/24 gives encoder call number
-        let encoder_call = call_count / 24;
-        if debug
-            && call_count % 24 == 0
+        if call_count % 24 == 0
             && (encoder_call < 10
                 || encoder_call % 50 == 0
                 || (encoder_call >= 130 && encoder_call <= 145))
@@ -512,18 +502,6 @@ impl RelPositionMultiHeadAttention {
                 .sum::<f32>()
                 / (n_heads * seq_len) as f32;
 
-            eprintln!(
-                "[ATTN DEBUG] enc_call={}, layer=0, seq_len={}, total_len={}, pos_emb_len={}",
-                encoder_call,
-                seq_len,
-                total_len,
-                pos_emb.dim(1)
-            );
-            eprintln!(
-                "[ATTN DEBUG]   attn_weights: min={:.6}, max={:.6}, mean={:.6}, entropy={:.4}",
-                aw_min, aw_max, aw_mean, entropy
-            );
-
             // Print first row of attention weights for head 0 (where is query 0 attending?)
             let first_row = attn_weights.index((0, 0, 0, ..));
             first_row.eval()?;
@@ -534,9 +512,18 @@ impl RelPositionMultiHeadAttention {
                 indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
                 indexed.into_iter().take(5).collect()
             };
-            eprintln!(
-                "[ATTN DEBUG]   query[0] top-5 attended positions: {:?}",
-                top_5
+            tracing::trace!(
+                encoder_call,
+                layer = 0,
+                seq_len,
+                total_len,
+                pos_emb_len = pos_emb.dim(1),
+                aw_min,
+                aw_max,
+                aw_mean,
+                entropy,
+                ?top_5,
+                "attention weights stats"
             );
         }
 

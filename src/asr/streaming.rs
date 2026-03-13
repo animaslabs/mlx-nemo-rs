@@ -492,6 +492,7 @@ impl StreamingMelBuffer {
             if self.buffer_idx >= self.total_frames {
                 return None;
             }
+            tracing::warn!("PARTIAL CHUNK!!");
             // Handle partial final chunk
             let remaining = self.total_frames - self.buffer_idx;
             return self.extract_chunk(remaining, remaining, pre_encode_cache);
@@ -504,6 +505,7 @@ impl StreamingMelBuffer {
 
         // Total frames to extract: cache + chunk
         let total_extract = cache_frames_available + chunk_size;
+        tracing::trace!("total_extract {}", total_extract);
 
         // Internal buffer is [time, n_mels]: buffer[frame * n_mels + mel_idx]
         // Output needs to be [n_mels, time] for encoder: output[mel_idx * time + frame_idx]

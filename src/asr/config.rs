@@ -214,7 +214,8 @@ fn default_dither() -> f32 {
     1e-5
 }
 fn default_preemph() -> Option<f32> {
-    Some(0.97)
+    // Some(0.97) // JJK TEST
+    None
 }
 
 /// Encoder configuration.
