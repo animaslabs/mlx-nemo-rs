@@ -5,4 +5,4 @@
 
 mod mel_spectrogram;
 
-pub use mel_spectrogram::MelSpectrogram;
+pub use mel_spectrogram::{MelSpectrogram, MelSpectrogramConfig};

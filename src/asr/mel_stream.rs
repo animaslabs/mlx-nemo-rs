@@ -499,10 +499,10 @@ impl<'a> ExactSizeIterator for MelStreamIter<'a> {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::asr::config::PreprocessorConfig;
+    use crate::asr::modules::preprocessors::MelSpectrogramConfig;
 
-    fn test_preprocessor_config() -> PreprocessorConfig {
-        PreprocessorConfig {
+    fn test_mel_config() -> MelSpectrogramConfig {
+        MelSpectrogramConfig {
             sample_rate: 16000,
             window_size: 0.025,  // 400 samples
             window_stride: 0.01, // 160 samples (hop)
@@ -512,11 +512,9 @@ mod tests {
             log: true,
             normalize: "NA".to_string(), // No normalization for testing
             dither: 0.0,
-            pad_to: 0,
             preemph: Some(0.97),
-            lowfreq: Some(0.0),
-            highfreq: None,
-            target: None,
+            fmin: 0.0,
+            fmax: None,
         }
     }
 
@@ -532,7 +530,7 @@ mod tests {
     }
 
     fn create_test_stream() -> MelStream {
-        let preproc = MelSpectrogram::new(test_preprocessor_config()).unwrap();
+        let preproc = MelSpectrogram::new(test_mel_config()).unwrap();
         MelStream::new(test_stream_config(), preproc)
     }
 
@@ -836,11 +834,11 @@ mod tests {
         // Create batch stream with larger capacity
         let mut batch_config = test_stream_config();
         batch_config.capacity = 200;
-        let preproc = MelSpectrogram::new(test_preprocessor_config()).unwrap();
+        let preproc = MelSpectrogram::new(test_mel_config()).unwrap();
         let mut batch_stream = MelStream::new(batch_config.clone(), preproc);
 
         // Create streaming stream
-        let preproc2 = MelSpectrogram::new(test_preprocessor_config()).unwrap();
+        let preproc2 = MelSpectrogram::new(test_mel_config()).unwrap();
         let mut stream_stream = MelStream::new(batch_config, preproc2);
 
         // Generate test audio

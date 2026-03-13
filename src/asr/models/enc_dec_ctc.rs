@@ -95,7 +95,7 @@ pub struct EncDecCTCModel {
 impl EncDecCTCModel {
     /// Create a new model from configuration.
     pub fn new(config: AsrModelConfig) -> Result<Self> {
-        let preprocessor = MelSpectrogram::new(config.preprocessor.clone())?;
+        let preprocessor = MelSpectrogram::new(config.preprocessor.clone().into())?;
         let encoder = ConformerEncoder::new(config.encoder.clone())?;
 
         // Determine vocabulary size from config or default
@@ -399,7 +399,10 @@ impl EncDecCTCModel {
             self.encoder.d_model(),
         )?;
 
-        // Create mel buffer
+        // Reset preprocessor streaming state (remainder buffer, preemphasis state)
+        self.preprocessor.reset();
+
+        // Create mel buffer for running normalization stats
         let preprocessor_config = self.preprocessor.config();
         let mel_buffer = MelBuffer::new(
             preprocessor_config.sample_rate,
@@ -420,6 +423,9 @@ impl EncDecCTCModel {
 
     /// Process an audio chunk and return partial transcription.
     ///
+    /// Uses the streaming mel spectrogram API which maintains preemphasis
+    /// state and audio remainder buffer internally for seamless chunk boundaries.
+    ///
     /// # Arguments
     /// * `session` - Mutable reference to the streaming session
     /// * `audio_chunk` - Audio samples [batch, samples] or [samples] for single stream
@@ -433,49 +439,25 @@ impl EncDecCTCModel {
     ) -> Result<StreamingOutput> {
         let batch_size = session.encoder_cache.batch_size();
 
-        // Add audio to buffer
-        session.mel_buffer.add_audio(audio_chunk);
+        // Use the streaming mel spectrogram API
+        // This handles preemphasis state and remainder buffer internally
+        let mel_features = self.preprocessor.process_chunk(audio_chunk)?;
 
-        // Check if we have enough audio for a chunk
-        let chunk_frames = session.config.chunk_size_for_step(session.is_first_chunk);
-        let shift_frames = session.config.shift_size_for_step(session.is_first_chunk);
-        let hop_length = self.preprocessor.hop_length();
-        let window_length = self.preprocessor.window_length();
-        let chunk_samples = window_length + chunk_frames.saturating_sub(1) * hop_length;
+        tracing::debug!("Got mel_features size {:?}", mel_features.size());
 
-        if session.mel_buffer.audio_buffer.len() < chunk_samples {
-            // Not enough audio yet
+        // Check if we got any frames
+        let n_frames = mel_features.dim(1) as usize;
+        if n_frames == 0 {
             return Ok(StreamingOutput::default());
         }
 
-        // Extract audio for this chunk
-        let audio_data = session
-            .mel_buffer
-            .consume_frames(chunk_frames, shift_frames);
+        // Reshape to [batch=1, n_mels, frames] for encoder
+        let features =
+            mel_features.reshape(&[1, mel_features.dim(0), mel_features.dim(1) as i32])?;
 
-        // Convert to Array
-        let audio = Array::from_slice(&audio_data, &[1, audio_data.len() as i32]);
-
-        // Compute mel features (without normalization for streaming)
-        let features = self.preprocessor.forward_unnormalized(&audio)?;
-
-        // For streaming, we use buffer-based normalization
-        let (mean, std) = session.mel_buffer.get_norm_stats();
-        let mean_arr = Array::from_slice(&mean, &[session.mel_buffer.n_mels as i32]);
-        let std_arr = Array::from_slice(&std, &[session.mel_buffer.n_mels as i32]);
-
-        // Update running stats with new features
-        features.eval()?;
-        let features_flat: Vec<f32> = features.as_slice().to_vec();
-        session.mel_buffer.update_stats(&features_flat);
-
-        // Normalize with running stats (or skip if not enough data)
-        let features = if session.mel_buffer.frames_processed > 10 {
-            self.preprocessor
-                .normalize_with_stats(&features, &mean_arr, &std_arr)?
-        } else {
-            features
-        };
+        // Note: Normalization is handled by the preprocessor based on its config.
+        // The MelBuffer is kept for potential future running-stats normalization,
+        // but currently unused since per_feature normalization in the preprocessor suffices.
 
         // Get lengths
         let seq_len = features.dim(2);
@@ -545,23 +527,45 @@ impl EncDecCTCModel {
 
     /// Finalize streaming and get final transcription.
     ///
-    /// Processes any remaining audio in the buffer and returns
-    /// the complete transcription.
+    /// Flushes any remaining audio in the preprocessor's remainder buffer
+    /// and returns the complete transcription.
     pub fn finalize_streaming(
         &mut self,
         mut session: CtcStreamingSession,
     ) -> Result<StreamingOutput> {
-        // Process any remaining audio in the buffer
-        if !session.mel_buffer.audio_buffer.is_empty() {
-            // Pad to minimum chunk size if needed
-            let min_samples = self.preprocessor.window_length();
-            if session.mel_buffer.audio_buffer.len() < min_samples {
-                session.mel_buffer.audio_buffer.resize(min_samples, 0.0);
-            }
+        // Flush any remaining audio in the preprocessor's remainder buffer
+        let final_mel = self.preprocessor.flush()?;
+        let n_frames = final_mel.dim(1) as usize;
 
-            // Process final chunk
-            let remaining: Vec<f32> = session.mel_buffer.audio_buffer.drain(..).collect();
-            let _ = self.process_chunk(&mut session, &remaining)?;
+        if n_frames > 0 {
+            // Process final frames through encoder
+            let features = final_mel.reshape(&[1, final_mel.dim(0), final_mel.dim(1) as i32])?;
+
+            // Note: Normalization is handled by the preprocessor based on its config.
+
+            let seq_len = features.dim(2);
+            let lengths = Array::from_slice(&[seq_len as i32], &[1]);
+
+            let drop_extra = session.config.drop_extra_pre_encoded;
+
+            let (encoded, encoded_lengths, _, _, _) = self.encoder.forward_streaming(
+                &features,
+                &lengths,
+                &session.encoder_cache.last_channel,
+                &session.encoder_cache.last_time,
+                &session.encoder_cache.last_channel_len,
+                drop_extra,
+            )?;
+
+            let log_probs = self.decoder.forward(&encoded)?;
+            let token_sequences = greedy_decode(&log_probs, &encoded_lengths, self.blank_id)?;
+
+            // Merge final tokens
+            let delay = session.config.lookahead_frames;
+            for (i, new_tokens) in token_sequences.into_iter().enumerate() {
+                let merged = lcs_merge_buffer(&session.prev_tokens[i], &new_tokens, delay, 5, 1);
+                session.prev_tokens[i] = merged;
+            }
         }
 
         // Final decode of accumulated tokens

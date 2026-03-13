@@ -181,7 +181,7 @@ pub struct EncDecRNNTModel {
 impl EncDecRNNTModel {
     /// Create a new model from configuration.
     pub fn new(config: AsrModelConfig) -> Result<Self> {
-        let preprocessor = MelSpectrogram::new(config.preprocessor.clone())?;
+        let preprocessor = MelSpectrogram::new(config.preprocessor.clone().into())?;
         let encoder = ConformerEncoder::new(config.encoder.clone())?;
 
         // Determine vocabulary size from config or default
@@ -714,6 +714,9 @@ impl EncDecRNNTModel {
         // Setup encoder
         self.encoder.setup_streaming(config.cache_drop_size);
 
+        // Reset preprocessor streaming state (remainder buffer, preemphasis state)
+        self.preprocessor.reset();
+
         // Create encoder cache
         let encoder_cache = EncoderCache::new(
             self.encoder.num_layers(),
@@ -764,9 +767,13 @@ impl EncDecRNNTModel {
     /// Process an audio chunk and return partial transcription.
     ///
     /// This follows NeMo's streaming approach:
-    /// 1. Convert audio to mel spectrogram and append to mel buffer
-    /// 2. Extract mel chunks with pre_encode_cache overlap
-    /// 3. Process through encoder and decoder
+    /// 1. Convert audio to mel spectrogram using the streaming mel API
+    /// 2. Append mel frames to the buffer for chunked extraction
+    /// 3. Extract mel chunks with pre_encode_cache overlap
+    /// 4. Process through encoder and decoder
+    ///
+    /// The preprocessor maintains preemphasis state and audio remainder buffer
+    /// internally for seamless chunk boundaries.
     pub fn process_chunk(
         &mut self,
         session: &mut RnntStreamingSession,
@@ -774,91 +781,38 @@ impl EncDecRNNTModel {
     ) -> Result<StreamingOutput> {
         let batch_size = session.encoder_cache.batch_size();
 
-        // Step 1: Add audio to buffer
-        session.mel_buffer.add_audio(audio_chunk);
+        // Step 1: Use the streaming mel spectrogram API
+        // This handles preemphasis state and remainder buffer internally
+        let mel_features = self.preprocessor.process_chunk(audio_chunk)?;
 
-        tracing::trace!(
-            audio_samples_received = audio_chunk.len(),
-            audio_buffer_samples = session.mel_buffer.audio_samples_available(),
-            "process_chunk: received audio"
-        );
+        tracing::debug!("Got mel_features {:?}", mel_features.shape());
 
-        // Step 2: Compute mel incrementally from pending audio.
-        // Only process new audio samples, not the entire history.
-        // This gives O(1) memory usage instead of O(n²).
-        if session.mel_buffer.has_pending_audio() {
-            // Get pending audio (includes overlap for STFT continuity)
-            let audio_data = session.mel_buffer.get_pending_audio();
-            let audio_len = audio_data.len();
-            let audio = Array::from_slice(audio_data, &[1, audio_len as i32]);
+        // Track total audio samples for logging
+        session.mel_buffer.total_audio_samples += audio_chunk.len();
 
-            // Compute mel spectrogram from pending audio [1, n_mels, time]
-            let (features, _) = self.preprocessor.forward(&audio, None)?;
-            features.eval()?;
+        // Check if we got any frames
+        let n_frames = mel_features.dim(1) as usize;
+        if n_frames > 0 {
+            // Step 2: Append mel frames to the buffer
+            // mel_features is [n_mels, time], flatten and append
+            let mel_flat = mel_features.reshape(&[-1])?;
+            mel_flat.eval()?;
+            let mel_data: &[f32] = mel_flat.as_slice();
 
-            // Extract mel data
-            // features is [batch=1, n_mels, time]
-            let computed_frames = features.dim(2) as usize;
+            session.mel_buffer.append_mel(mel_data, n_frames);
 
-            // Flatten to get mel data
-            let features_flat = features.reshape(&[-1])?;
-            features_flat.eval()?;
-            let mel_data: &[f32] = features_flat.as_slice();
-
-            // For incremental processing, we need to figure out which frames are truly "new".
-            //
-            // The key insight: we know exactly how many frames SHOULD exist based on
-            // total_audio_samples. The formula with center padding is:
-            //   expected_total_frames = total_audio_samples / hop_samples + 1
-            //
-            // So the number of NEW frames to append is:
-            //   frames_to_append = expected_total_frames - total_frames (already in buffer)
-            //
-            // We then take the LAST frames_to_append frames from the preprocessor output,
-            // which correspond to the newest audio.
-            let hop = session.mel_buffer.hop_samples;
-            let total_audio = session.mel_buffer.total_audio_samples;
-            let expected_total_frames = total_audio / hop + 1;
-
-            let prev_frames = session.mel_buffer.total_frames;
-            let frames_to_append = expected_total_frames.saturating_sub(prev_frames);
-
-            // The frames to skip are at the START of the preprocessor output
-            // (they correspond to the overlap audio region)
-            let frames_to_skip = computed_frames.saturating_sub(frames_to_append);
-
-            if frames_to_skip > 0 && frames_to_append > 0 {
-                // Skip the overlapping frames, only append truly new ones
-                let n_mels = session.n_mels;
-                // mel_data is [n_mels, time] flattened, so we need to extract
-                // frames starting from frames_to_skip
-                let new_mel_data: Vec<f32> = (0..n_mels)
-                    .flat_map(|mel_idx| {
-                        (frames_to_skip..computed_frames)
-                            .map(move |frame_idx| mel_data[mel_idx * computed_frames + frame_idx])
-                    })
-                    .collect();
-                session
-                    .mel_buffer
-                    .append_mel(&new_mel_data, frames_to_append);
-            } else if frames_to_append > 0 {
-                // All frames are new (first chunk case)
-                session.mel_buffer.append_mel(mel_data, computed_frames);
-            }
-            // else: no new frames to append (shouldn't happen in normal operation)
-
-            // Drain excess audio samples, keeping overlap for next computation
-            session.mel_buffer.drain_processed_audio();
-
-            tracing::trace!(
-                frames_appended = frames_to_append,
-                audio_samples = audio_len,
-                total_frames_before = prev_frames,
-                total_frames_after = session.mel_buffer.total_frames,
-                expected_total_frames,
-                preprocessor_frames = computed_frames,
-                frames_skipped = frames_to_skip,
+            tracing::debug!(
+                frames_appended = n_frames,
+                audio_samples = audio_chunk.len(),
+                total_frames = session.mel_buffer.total_frames,
                 "appended mel frames from audio"
+            );
+        } else if audio_chunk.is_empty() {
+            // Empty chunk is ok, just process any buffered mel frames
+        } else {
+            tracing::trace!(
+                audio_samples = audio_chunk.len(),
+                "not enough audio for mel frames yet"
             );
         }
 
@@ -1147,29 +1101,28 @@ impl EncDecRNNTModel {
 
     /// Finalize streaming and get final transcription.
     ///
-    /// This processes any remaining audio and mel frames in the buffer.
+    /// Flushes any remaining audio in the preprocessor's remainder buffer
+    /// and processes any remaining mel frames.
     pub fn finalize_streaming(
         &mut self,
         mut session: RnntStreamingSession,
     ) -> Result<StreamingOutput> {
-        // Process any remaining audio samples
-        if session.mel_buffer.audio_samples_available() > 0 {
-            let min_samples = self.preprocessor.window_length();
-            let available = session.mel_buffer.audio_samples_available();
+        // Flush any remaining audio in the preprocessor's remainder buffer
+        let final_mel = self.preprocessor.flush()?;
+        final_mel.eval()?;
+
+        let n_frames = final_mel.dim(1) as usize;
+        if n_frames > 0 {
+            // Append final mel frames to buffer
+            let mel_flat = final_mel.reshape(&[-1])?;
+            mel_flat.eval()?;
+            let mel_data: &[f32] = mel_flat.as_slice();
+            session.mel_buffer.append_mel(mel_data, n_frames);
 
             tracing::debug!(
-                audio_samples_remaining = available,
-                "finalize: processing remaining audio"
+                final_mel_frames = n_frames,
+                "finalize: flushed remaining audio to mel frames"
             );
-
-            // Pad if needed to compute at least one frame
-            if available < min_samples {
-                let padding = vec![0.0f32; min_samples - available];
-                session.mel_buffer.add_audio(&padding);
-            }
-
-            // Process remaining audio
-            self.process_chunk(&mut session, &[])?;
         }
 
         // Process any remaining mel frames
