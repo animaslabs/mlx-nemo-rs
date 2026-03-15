@@ -1202,62 +1202,50 @@ impl ConformerBlock {
         layer_idx: usize,
         enc_call: u64,
     ) -> Result<(Array, Option<Array>, Option<Array>)> {
-        // Helper to compute tensor stats using tracing
-        let compute_stats = |arr: &Array, name: &str| -> Result<()> {
-            arr.eval()?;
-            let flat = arr.reshape(&[-1])?;
-            flat.eval()?;
-            let slice: &[f32] = flat.as_slice();
-            let min = slice.iter().cloned().fold(f32::INFINITY, f32::min);
-            let max = slice.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-            let mean: f32 = slice.iter().sum::<f32>() / slice.len() as f32;
-            let var: f32 =
-                slice.iter().map(|&v| (v - mean).powi(2)).sum::<f32>() / slice.len() as f32;
-            let std = var.sqrt();
-            tracing::trace!(
-                enc_call,
-                layer_idx,
-                stage = name,
-                min,
-                max,
-                mean,
-                std,
-                "layer tensor stats"
-            );
-            Ok(())
-        };
+        // // Helper to compute tensor stats using tracing
+        // let compute_stats = |arr: &Array, name: &str| -> Result<()> {
+        //     arr.eval()?;
+        //     let flat = arr.reshape(&[-1])?;
+        //     flat.eval()?;
+        //     let slice: &[f32] = flat.as_slice();
+        //     let min = slice.iter().cloned().fold(f32::INFINITY, f32::min);
+        //     let max = slice.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        //     let mean: f32 = slice.iter().sum::<f32>() / slice.len() as f32;
+        //     let var: f32 =
+        //         slice.iter().map(|&v| (v - mean).powi(2)).sum::<f32>() / slice.len() as f32;
+        //     let std = var.sqrt();
+        //     tracing::trace!(
+        //         enc_call,
+        //         layer_idx,
+        //         stage = name,
+        //         min,
+        //         max,
+        //         mean,
+        //         std,
+        //         "layer tensor stats"
+        //     );
+        //     Ok(())
+        // };
 
-        // Only debug specific encoder calls and layers to avoid too much output
-        let should_debug = (layer_idx == 0 || layer_idx == 11 || layer_idx == 23)
-            && (enc_call < 5 || enc_call == 135 || enc_call == 200 || enc_call == 270);
+        // // Only debug specific encoder calls and layers to avoid too much output
+        // let should_debug = (layer_idx == 0 || layer_idx == 11 || layer_idx == 23)
+        //     && (enc_call < 5 || enc_call == 135 || enc_call == 200 || enc_call == 270);
 
-        if should_debug {
-            compute_stats(x, "input")?;
-        }
+        // if should_debug {
+        //     compute_stats(x, "input")?;
+        // }
 
         // Feed-forward 1 (half-step residual)
         let residual = x.clone();
         let ff1_out = self.ff1_norm.forward(x)?;
-        if should_debug {
-            compute_stats(&ff1_out, "ff1_norm")?;
-        }
         let ff1_out = self.ff1.forward(&ff1_out)?;
-        if should_debug {
-            compute_stats(&ff1_out, "ff1_out")?;
-        }
         let half = Array::from_f32(0.5);
         let scaled_ff1 = &half * &ff1_out;
         let x = &residual + &scaled_ff1;
-        if should_debug {
-            compute_stats(&x, "after_ff1")?;
-        }
 
         // Self-attention with cache
         let residual = x.clone();
         let attn_out = self.self_attn_norm.forward(&x)?;
-        if should_debug {
-            compute_stats(&attn_out, "attn_norm")?;
-        }
         let (attn_out, new_cache_channel) = self.self_attn.forward_with_cache(
             &attn_out,
             pos_emb,
@@ -1265,52 +1253,25 @@ impl ConformerBlock {
             cache_filled_len,
             att_mask,
         )?;
-        if should_debug {
-            compute_stats(&attn_out, "attn_out")?;
-        }
         let x = &residual + &attn_out;
-        if should_debug {
-            compute_stats(&x, "after_attn")?;
-        }
 
         // Convolution with cache
         let residual = x.clone();
         let conv_out = self.conv_norm.forward(&x)?;
-        if should_debug {
-            compute_stats(&conv_out, "conv_norm")?;
-        }
         let (conv_out, new_cache_time) =
             self.conv.forward_with_cache(&conv_out, cache_last_time)?;
-        if should_debug {
-            compute_stats(&conv_out, "conv_out")?;
-        }
 
         let x = &residual + &conv_out;
-        if should_debug {
-            compute_stats(&x, "after_conv")?;
-        }
 
         // Feed-forward 2 (half-step residual)
         let residual = x.clone();
         let ff2_out = self.ff2_norm.forward(&x)?;
-        if should_debug {
-            compute_stats(&ff2_out, "ff2_norm")?;
-        }
         let ff2_out = self.ff2.forward(&ff2_out)?;
-        if should_debug {
-            compute_stats(&ff2_out, "ff2_out")?;
-        }
         let scaled_ff2 = &half * &ff2_out;
         let x = &residual + &scaled_ff2;
-        if should_debug {
-            compute_stats(&x, "after_ff2")?;
-        }
 
         // Final layer norm
         let x = self.final_norm.forward(&x)?;
-        if should_debug {
-            compute_stats(&x, "final_out")?;
-        }
 
         Ok((x, new_cache_channel, new_cache_time))
     }

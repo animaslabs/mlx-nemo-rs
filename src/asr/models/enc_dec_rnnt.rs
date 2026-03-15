@@ -794,12 +794,8 @@ impl EncDecRNNTModel {
         let n_frames = mel_features.dim(1) as usize;
         if n_frames > 0 {
             // Step 2: Append mel frames to the buffer
-            // mel_features is [n_mels, time], flatten and append
-            let mel_flat = mel_features.reshape(&[-1])?;
-            mel_flat.eval()?;
-            let mel_data: &[f32] = mel_flat.as_slice();
-
-            session.mel_buffer.append_mel(mel_data, n_frames);
+            // mel_features is [n_mels, time], append directly as Array
+            session.mel_buffer.append_mel(&mel_features)?;
 
             tracing::debug!(
                 frames_appended = n_frames,
@@ -894,9 +890,8 @@ impl EncDecRNNTModel {
                 }
             }
 
-            // Convert mel chunk to Array [1, n_mels, chunk_len]
-            let n_mels = session.n_mels;
-            let features = Array::from_slice(&mel_chunk, &[1, n_mels as i32, chunk_len as i32]);
+            // Add batch dimension: [n_mels, time] -> [1, n_mels, time]
+            let features = mel_chunk.reshape(&[1, session.n_mels as i32, chunk_len as i32])?;
 
             // Get lengths for encoder
             let lengths = Array::from_slice(&[chunk_len as i32], &[1]);
@@ -965,7 +960,6 @@ impl EncDecRNNTModel {
             let mut blank_count = 0;
             let mut non_blank_count = 0;
 
-            // Debug: track if we're in the "stall zone"
             for b in 0..batch_size {
                 for t in 0..enc_seq_len {
                     let enc_frame =
@@ -1049,8 +1043,6 @@ impl EncDecRNNTModel {
                     .get(0)
                     .map(|t| t.len())
                     .unwrap_or(0),
-                audio_buffer_kb = audio_bytes / 1024,
-                mel_buffer_kb = mel_bytes / 1024,
                 "processed mel chunks"
             );
         }
@@ -1066,7 +1058,8 @@ impl EncDecRNNTModel {
                 .get(0)
                 .map(|t| t.len())
                 .unwrap_or(0);
-            tracing::trace!(
+            tracing::debug!(
+                audio_samples = session.mel_buffer.total_audio_samples,
                 audio_seconds = total_audio_sec,
                 total_mel_frames,
                 mel_idx,
@@ -1113,11 +1106,8 @@ impl EncDecRNNTModel {
 
         let n_frames = final_mel.dim(1) as usize;
         if n_frames > 0 {
-            // Append final mel frames to buffer
-            let mel_flat = final_mel.reshape(&[-1])?;
-            mel_flat.eval()?;
-            let mel_data: &[f32] = mel_flat.as_slice();
-            session.mel_buffer.append_mel(mel_data, n_frames);
+            // Append final mel frames to buffer (final_mel is already [n_mels, time])
+            session.mel_buffer.append_mel(&final_mel)?;
 
             tracing::debug!(
                 final_mel_frames = n_frames,
@@ -1141,9 +1131,9 @@ impl EncDecRNNTModel {
                 "finalize: padding mel frames for full chunk"
             );
 
-            // Create zero padding in [n_mels, time] format (which append_mel expects)
-            let padding = vec![0.0f32; n_mels * frames_to_pad];
-            session.mel_buffer.append_mel(&padding, frames_to_pad);
+            // Create zero padding Array in [n_mels, time] format
+            let padding = mlx_rs::ops::zeros::<f32>(&[n_mels as i32, frames_to_pad as i32])?;
+            session.mel_buffer.append_mel(&padding)?;
         }
 
         while !session.mel_buffer.is_empty() {

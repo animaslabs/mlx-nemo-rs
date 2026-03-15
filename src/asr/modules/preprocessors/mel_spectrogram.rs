@@ -261,9 +261,11 @@ impl MelSpectrogram {
         raw_audio.extend_from_slice(samples);
 
         // Calculate how many full frames we can compute
+        // Frame i requires samples [i*hop, i*hop + win_samples)
+        // So for n_frames, we need: (n_frames-1)*hop + win_samples samples
         let n_frames = self.compute_frame_count(raw_audio.len());
-        tracing::debug!("process_chunk num audio samples: {} remainder len: {} mel n_frames: {}",
-            samples.len(), self.remainder.len(), n_frames);
+        tracing::debug!("process_chunk raw_audio len: {} num audio samples: {} remainder len: {} mel n_frames: {}",
+            raw_audio.len(), samples.len(), self.remainder.len(), n_frames);
 
         if n_frames == 0 {
             // Not enough audio, save raw samples for next call
@@ -273,22 +275,35 @@ impl MelSpectrogram {
                 .map_err(|e| Error::model(e.to_string()));
         }
 
+        // Calculate samples needed for n_frames and samples consumed (for remainder)
+        // Samples needed: (n_frames - 1) * hop + win_samples
+        // Samples consumed (for next chunk boundary): n_frames * hop
+        let samples_needed = (n_frames - 1) * self.hop_samples + self.win_samples;
+        let samples_consumed = n_frames * self.hop_samples;
+
         // Save remainder BEFORE processing (raw samples that weren't consumed)
-        let consumed = (n_frames - 1) * self.hop_samples + self.win_samples;
-        if consumed < raw_audio.len() {
-            self.remainder = raw_audio[consumed..].to_vec();
+        if samples_consumed < raw_audio.len() {
+            self.remainder = raw_audio[samples_consumed..].to_vec();
         } else {
             self.remainder.clear();
         }
 
-        // Now apply processing only to the samples we're consuming
-        let mut audio_to_process = raw_audio[..consumed].to_vec();
+        // Take only the samples we need for processing
+        let audio_to_process = raw_audio[..samples_needed].to_vec();
 
         // Apply preemphasis with state tracking
-        let mut audio_to_process = self.apply_preemphasis(&audio_to_process);
+        let audio_to_process = self.apply_preemphasis(&audio_to_process);
 
         // Apply dithering (adds small noise for numerical stability)
+        let mut audio_to_process = audio_to_process;
         self.apply_dither(&mut audio_to_process);
+
+        tracing::debug!(
+            "process_chunk audio_to_process len: {} remainder len: {} samples_needed: {}",
+            audio_to_process.len(),
+            self.remainder.len(),
+            samples_needed
+        );
 
         // Compute mel spectrogram
         let mel = self.compute_mel(&audio_to_process)?;
@@ -415,94 +430,6 @@ impl MelSpectrogram {
         };
 
         Ok(mel)
-    }
-
-    /// Process audio and return BOTH pre-normalized and post-normalized mel spectrograms.
-    /// Used for debugging to compare with reference implementations.
-    ///
-    /// # Returns
-    /// Tuple of (pre_norm_mel, post_norm_mel, lengths)
-    pub fn forward_debug(
-        &self,
-        audio: &Array,
-        lengths: Option<&Array>,
-    ) -> Result<(Array, Array, Array)> {
-        // Ensure audio is 2D [batch, time]
-        let audio = if audio.ndim() == 1 {
-            audio.reshape(&[1, -1])?
-        } else {
-            audio.clone()
-        };
-
-        let batch_size = audio.shape()[0];
-        let audio_len = audio.shape()[1];
-
-        // Apply preemphasis if configured
-        let audio = if let Some(coef) = self.config.preemph {
-            self.apply_preemphasis_batch(&audio, coef)?
-        } else {
-            audio
-        };
-
-        // Compute STFT
-        let stft = self.stft_batch(&audio)?;
-
-        // Compute power spectrum
-        let power = self.power_spectrum(&stft)?;
-
-        // Apply mel filterbank
-        let mel = ops::einsum("mf,bft->bmt", &[self.filterbank.clone(), power])?;
-
-        // Apply log compression
-        let mel = if self.config.log {
-            let mel_safe = ops::add(&mel, &self.log_guard)?;
-            ops::log(&mel_safe)?
-        } else {
-            mel
-        };
-
-        // Save pre-normalized
-        let pre_norm_mel = mel.clone();
-
-        // Apply normalization if requested
-        let post_norm_mel = match self.config.normalize.as_str() {
-            "per_feature" => self.normalize_per_feature(&mel)?,
-            _ => mel,
-        };
-
-        // Compute output lengths
-        let out_lengths = if let Some(lens) = lengths {
-            self.compute_output_lengths(lens)?
-        } else {
-            let n_frames = audio_len as usize / self.hop_samples + 1;
-            ops::full::<i32>(&[batch_size], &Array::from_int(n_frames as i32))?
-        };
-
-        Ok((pre_norm_mel, post_norm_mel, out_lengths))
-    }
-
-    /// Normalize features using provided mean and std statistics.
-    pub fn normalize_with_stats(
-        &self,
-        features: &Array,
-        mean: &Array,
-        std: &Array,
-    ) -> Result<Array> {
-        // Ensure mean and std are broadcastable: [1, n_mels, 1]
-        let mean = if mean.ndim() == 1 {
-            mean.reshape(&[1, mean.dim(0) as i32, 1])?
-        } else {
-            mean.clone()
-        };
-        let std = if std.ndim() == 1 {
-            std.reshape(&[1, std.dim(0) as i32, 1])?
-        } else {
-            std.clone()
-        };
-
-        let centered = ops::subtract(features, &mean)?;
-        let std_safe = ops::add(&std, &Array::from_f32(1e-5))?;
-        ops::divide(&centered, &std_safe).map_err(|e| Error::model(e.to_string()))
     }
 
     // ========================================================================
@@ -694,36 +621,83 @@ impl MelSpectrogram {
         ops::add(audio, &noise).map_err(|e| Error::model(e.to_string()))
     }
 
-    /// Compute number of frames from audio length.
+    /// Compute number of frames from audio length for streaming.
     ///
-    /// With center padding: `padded_len = audio_len + n_fft`
-    /// Frame count: `(padded_len - n_fft) / hop + 1 = audio_len / hop + 1`
+    /// For streaming, we use a non-center-padded calculation to ensure
+    /// frame boundaries align across chunks. Each frame requires `win_samples`
+    /// of audio, and frames are spaced `hop_samples` apart.
     ///
-    /// Returns 0 for empty or if there is not enough audio for 1 frame.
+    /// Frame count: `(audio_len - win_samples) / hop + 1` when `audio_len >= win_samples`
+    ///
+    /// Returns 0 if not enough audio for even one complete frame.
     fn compute_frame_count(&self, audio_len: usize) -> usize {
-        if audio_len == 0 {
+        if audio_len < self.win_samples {
             0
         } else {
-            // Number of full frames
-            max(0, audio_len - self.win_samples) / self.hop_samples
+            (audio_len - self.win_samples) / self.hop_samples + 1
         }
     }
 
     /// Compute mel spectrogram from audio samples (internal, streaming path).
     ///
-    /// For streaming, we compute the expected number of frames based on audio length
-    /// and truncate the output to match. The STFT uses center padding which produces
-    /// one extra frame, but for streaming continuity we only want `audio_len / hop`
-    /// frames so that the remainder calculation in `process_chunk` stays consistent.
-    fn compute_mel(&self, audio: &[f32]) -> Result<Array> {
-        // Calculate expected frame count for streaming (no +1, unlike batch mode)
-        let expected_frames = audio.len() / self.hop_samples;
+    /// For streaming, we use STFT **without** center padding to get exactly
+    /// the number of frames that `compute_frame_count` predicts. This ensures
+    /// frame boundaries align correctly across chunks.
+    ///
+    /// The batch mode `forward()` uses center padding for compatibility with
+    /// NeMo's offline processing, but streaming needs precise frame counts.
+    pub fn compute_mel(&self, audio: &[f32]) -> Result<Array> {
+        let audio_len = audio.len();
+        let n_fft = self.config.n_fft;
+        let hop = self.hop_samples;
+        let win_len = self.win_samples;
 
-        // Create array and add batch dimension
-        let audio_arr = Array::from_slice(audio, &[1, audio.len() as i32]);
+        // Calculate expected frames (same formula as compute_frame_count)
+        let n_frames = if audio_len >= win_len {
+            (audio_len - win_len) / hop + 1
+        } else {
+            0
+        };
 
-        // Compute STFT
-        let stft = self.stft_batch(&audio_arr)?;
+        if n_frames == 0 {
+            return Array::zeros::<f32>(&[self.config.features as i32, 0])
+                .map_err(|e| Error::model(e.to_string()));
+        }
+
+        // Frame the audio WITHOUT center padding
+        // Each frame starts at frame_idx * hop and has length n_fft
+        // We need to handle the case where win_len < n_fft (zero-pad each frame)
+        let mut frames_data = Vec::with_capacity(n_frames * n_fft);
+        for frame_idx in 0..n_frames {
+            let start = frame_idx * hop;
+            // The window is applied to win_len samples, but FFT needs n_fft
+            // The window array is already zero-padded to n_fft (centered)
+            for i in 0..n_fft {
+                // Map FFT bin to audio sample, accounting for window centering
+                let win_offset = (n_fft - win_len) / 2;
+                if i >= win_offset && i < win_offset + win_len {
+                    let audio_idx = start + (i - win_offset);
+                    if audio_idx < audio_len {
+                        frames_data.push(audio[audio_idx]);
+                    } else {
+                        frames_data.push(0.0);
+                    }
+                } else {
+                    frames_data.push(0.0); // Zero padding for FFT
+                }
+            }
+        }
+
+        let frames = Array::from_slice(&frames_data, &[1, n_frames as i32, n_fft as i32]);
+
+        // Apply window (already zero-padded to n_fft)
+        let windowed = ops::multiply(&frames, &self.window)?;
+
+        // Compute FFT along last axis
+        let fft_result = fft::rfft(&windowed, Some(n_fft as i32), Some(2))?;
+
+        // Transpose to [batch, freq_bins, frames]
+        let stft = ops::transpose_axes(&fft_result, &[0, 2, 1])?;
 
         // Compute power spectrum
         let power = self.power_spectrum(&stft)?;
@@ -742,13 +716,13 @@ impl MelSpectrogram {
         // Remove batch dimension: [1, n_mels, frames] -> [n_mels, frames]
         let mel = mel.index(0);
 
-        // Truncate to expected frame count for streaming consistency.
-        // stft_batch produces audio_len/hop + 1 frames due to center padding,
-        // but streaming expects exactly audio_len/hop frames.
-        let mel = mel.index((.., ..expected_frames as i32));
-
-        // Evaluate to materialize
-        mlx_rs::transforms::eval([&mel])?;
+        // mlx_rs::transforms::eval([&mel])?;
+        // tracing::trace!(
+        //     audio_len,
+        //     n_frames,
+        //     mel_shape = ?mel.shape(),
+        //     "compute_mel: streaming STFT without center padding"
+        // );
 
         Ok(mel)
     }
@@ -931,7 +905,10 @@ mod tests {
         };
         let mut mel = MelSpectrogram::new(config).unwrap();
 
-        // Push small chunk (100 samples < 160 hop = 0 frames)
+        // With win_samples=400, hop_samples=160:
+        // n_frames = (audio_len - 400) / 160 + 1 when audio_len >= 400
+
+        // Push small chunk (100 samples < 400 win_samples = 0 frames)
         let chunk1 = vec![0.1f32; 100];
         let result1 = mel.process_chunk(&chunk1).unwrap();
 
@@ -939,21 +916,22 @@ mod tests {
         assert_eq!(result1.shape()[0], 128);
         assert_eq!(result1.shape()[1], 0);
 
-        // Push more (100 remainder + 200 new = 300 samples = 1 frame, 140 remainder)
-        let chunk2 = vec![0.1f32; 200];
+        // Push more (100 remainder + 350 new = 450 samples)
+        // n_frames = (450 - 400) / 160 + 1 = 1 frame
+        // samples_consumed = 1 * 160 = 160, remainder = 450 - 160 = 290
+        let chunk2 = vec![0.1f32; 350];
         let result2 = mel.process_chunk(&chunk2).unwrap();
 
-        // 300 / 160 = 1 frame
         assert_eq!(result2.shape()[0], 128);
         assert_eq!(result2.shape()[1], 1);
 
-        // Push more (140 remainder + 500 new = 640 samples = 4 frames)
+        // Push more (290 remainder + 500 new = 790 samples)
+        // n_frames = (790 - 400) / 160 + 1 = 3 frames
         let chunk3 = vec![0.1f32; 500];
         let result3 = mel.process_chunk(&chunk3).unwrap();
 
-        // 640 / 160 = 4 frames
         assert_eq!(result3.shape()[0], 128);
-        assert_eq!(result3.shape()[1], 4);
+        assert_eq!(result3.shape()[1], 3);
     }
 
     #[test]
@@ -1099,20 +1077,31 @@ mod tests {
         };
         let mut mel = MelSpectrogram::new(config).unwrap();
 
-        // First chunk - needs >= 160 samples (hop_samples) to produce a frame
-        let chunk1: Vec<f32> = (0..320).map(|i| i as f32 / 320.0).collect();
+        // With win_samples=400, hop_samples=160:
+        // Need at least 400 samples to produce 1 frame
+        // First chunk - 500 samples produces (500-400)/160 + 1 = 1 frame
+        // samples_consumed = 1 * 160 = 160
+        let chunk1: Vec<f32> = (0..500).map(|i| i as f32 / 500.0).collect();
         mel.process_chunk(&chunk1).unwrap();
 
-        // Preemph state should be updated (last sample of consumed audio)
-        // consumed = 2 * 160 = 320, so preemph_last = chunk1[319] = 319/320 ≈ 0.997
-        assert!(mel.preemph_last > 0.9, "preemph_last should be updated after processing");
+        // Preemph state should be updated (last sample of samples_needed)
+        // samples_needed = (1-1)*160 + 400 = 400, so preemph_last = chunk1[399] = 399/500 ≈ 0.798
+        assert!(
+            mel.preemph_last > 0.7,
+            "preemph_last should be updated after processing, got {}",
+            mel.preemph_last
+        );
 
-        // Second chunk
-        let chunk2: Vec<f32> = (320..640).map(|i| i as f32 / 640.0).collect();
+        // Second chunk - combined with remainder should produce more frames
+        let chunk2: Vec<f32> = (500..1000).map(|i| i as f32 / 1000.0).collect();
         mel.process_chunk(&chunk2).unwrap();
 
         // State should update again
-        assert!(mel.preemph_last > 0.9, "preemph_last should remain high");
+        assert!(
+            mel.preemph_last > 0.5,
+            "preemph_last should remain updated, got {}",
+            mel.preemph_last
+        );
     }
 
     // ==================== Normalization Tests ====================
