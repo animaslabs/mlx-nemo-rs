@@ -938,7 +938,10 @@ impl Subsampling {
         );
         let linear_in = conv_channels * feat_out;
 
-        let out_proj = nn::Linear::new(linear_in as i32, d_model as i32)?;
+        let use_bias = config.effective_use_bias();
+        let out_proj = nn::LinearBuilder::new(linear_in as i32, d_model as i32)
+            .bias(use_bias)
+            .build()?;
 
         Ok(Self {
             subsampling_factor,
@@ -1161,15 +1164,16 @@ impl ConformerBlock {
         let ff_dim = (d_model as f32 * config.ff_expansion_factor) as usize;
         let conv_kernel = config.conv_kernel_size;
         let dropout = config.dropout;
+        let use_bias = config.effective_use_bias();
 
         // Check if causal convolution is requested
         let is_causal = config.is_causal_conv();
 
         Ok(Self {
             d_model,
-            ff1: FeedForward::new(d_model, ff_dim, dropout)?,
+            ff1: FeedForward::new(d_model, ff_dim, dropout, use_bias)?,
             ff1_norm: nn::LayerNorm::new(d_model as i32)?,
-            self_attn: RelPositionMultiHeadAttention::new(d_model, n_heads)?,
+            self_attn: RelPositionMultiHeadAttention::new(d_model, n_heads, use_bias)?,
             self_attn_norm: nn::LayerNorm::new(d_model as i32)?,
             conv: ConvolutionModule::new(
                 d_model,
@@ -1179,7 +1183,7 @@ impl ConformerBlock {
                 is_causal,
             )?,
             conv_norm: nn::LayerNorm::new(d_model as i32)?,
-            ff2: FeedForward::new(d_model, ff_dim, dropout)?,
+            ff2: FeedForward::new(d_model, ff_dim, dropout, use_bias)?,
             ff2_norm: nn::LayerNorm::new(d_model as i32)?,
             final_norm: nn::LayerNorm::new(d_model as i32)?,
         })
@@ -1384,10 +1388,14 @@ struct FeedForward {
 }
 
 impl FeedForward {
-    fn new(d_model: usize, ff_dim: usize, dropout: f32) -> Result<Self> {
+    fn new(d_model: usize, ff_dim: usize, dropout: f32, use_bias: bool) -> Result<Self> {
         Ok(Self {
-            linear1: nn::Linear::new(d_model as i32, ff_dim as i32)?,
-            linear2: nn::Linear::new(ff_dim as i32, d_model as i32)?,
+            linear1: nn::LinearBuilder::new(d_model as i32, ff_dim as i32)
+                .bias(use_bias)
+                .build()?,
+            linear2: nn::LinearBuilder::new(ff_dim as i32, d_model as i32)
+                .bias(use_bias)
+                .build()?,
             dropout,
         })
     }

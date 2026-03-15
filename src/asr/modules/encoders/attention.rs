@@ -177,16 +177,29 @@ pub struct RelPositionMultiHeadAttention {
 
 impl RelPositionMultiHeadAttention {
     /// Create a new relative position multi-head attention module.
-    pub fn new(d_model: usize, n_heads: usize) -> Result<Self> {
+    ///
+    /// # Arguments
+    /// * `d_model` - Model dimension
+    /// * `n_heads` - Number of attention heads
+    /// * `use_bias` - Whether to include bias in Q/K/V/Out linear projections
+    pub fn new(d_model: usize, n_heads: usize, use_bias: bool) -> Result<Self> {
         let head_dim = d_model / n_heads;
 
-        // Create linear projections
-        let linear_q = nn::Linear::new(d_model as i32, d_model as i32)?;
-        let linear_k = nn::Linear::new(d_model as i32, d_model as i32)?;
-        let linear_v = nn::Linear::new(d_model as i32, d_model as i32)?;
-        let linear_out = nn::Linear::new(d_model as i32, d_model as i32)?;
+        // Create linear projections with configurable bias
+        let linear_q = nn::LinearBuilder::new(d_model as i32, d_model as i32)
+            .bias(use_bias)
+            .build()?;
+        let linear_k = nn::LinearBuilder::new(d_model as i32, d_model as i32)
+            .bias(use_bias)
+            .build()?;
+        let linear_v = nn::LinearBuilder::new(d_model as i32, d_model as i32)
+            .bias(use_bias)
+            .build()?;
+        let linear_out = nn::LinearBuilder::new(d_model as i32, d_model as i32)
+            .bias(use_bias)
+            .build()?;
 
-        // Position projection without bias
+        // Position projection always without bias (per NeMo spec)
         let linear_pos = nn::LinearBuilder::new(d_model as i32, d_model as i32)
             .bias(false)
             .build()?;

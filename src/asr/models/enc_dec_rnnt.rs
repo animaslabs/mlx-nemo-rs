@@ -1071,7 +1071,6 @@ impl EncDecRNNTModel {
                 .unwrap_or(0);
             tracing::debug!(
                 audio_samples = session.mel_buffer.total_audio_samples,
-                audio_seconds = total_audio_sec,
                 total_mel_frames,
                 mel_idx,
                 remaining_frames = total_mel_frames.saturating_sub(mel_idx),
