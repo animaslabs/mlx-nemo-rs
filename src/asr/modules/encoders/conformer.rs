@@ -590,6 +590,7 @@ impl ConformerEncoder {
         // Scale input by sqrt(d_model) if xscaling is enabled
         let xscale = self.pos_enc.xscale();
         if xscale != 1.0 {
+            tracing::debug!("Transforming by xscale {}", xscale);
             x = &x * Array::from_f32(xscale);
         }
 
@@ -606,7 +607,24 @@ impl ConformerEncoder {
 
         // Generate positional encoding for total length (full buffer + current)
         // This should cover positions for all K/V that attention will see
+        //
+        // For streaming with cache:
+        //   total_len = cache_size + seq_len
+        //   pos_emb shape = [1, 2*total_len - 1, d_model]
+        //
+        // The positional encoding covers relative positions from +(total_len-1) to -(total_len-1).
+        // After rel_shift in attention, these align correctly with K/V positions 0..total_len.
         let pos_emb = self.pos_enc.get_encoding(total_len as usize)?;
+
+        tracing::trace!(
+            seq_len,
+            cache_size,
+            filled_cache_len,
+            total_len,
+            pos_emb_shape = ?pos_emb.shape(),
+            expected_pos_len = 2 * total_len - 1,
+            "streaming pos_emb dimensions"
+        );
 
         // Create attention mask if we have context configuration
         // NeMo: att_mask = _create_masks(...); att_mask = att_mask[:, cache_len:]

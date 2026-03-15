@@ -1085,14 +1085,22 @@ mod tests {
 
         // Preemph state should be updated (last sample of samples_needed)
         // samples_needed = (1-1)*160 + 400 = 400, so preemph_last = chunk1[399] = 399/500 ≈ 0.798
-        assert!(mel.preemph_last > 0.7, "preemph_last should be updated after processing, got {}", mel.preemph_last);
+        assert!(
+            mel.preemph_last > 0.7,
+            "preemph_last should be updated after processing, got {}",
+            mel.preemph_last
+        );
 
         // Second chunk - combined with remainder should produce more frames
         let chunk2: Vec<f32> = (500..1000).map(|i| i as f32 / 1000.0).collect();
         mel.process_chunk(&chunk2).unwrap();
 
         // State should update again
-        assert!(mel.preemph_last > 0.5, "preemph_last should remain updated, got {}", mel.preemph_last);
+        assert!(
+            mel.preemph_last > 0.5,
+            "preemph_last should remain updated, got {}",
+            mel.preemph_last
+        );
     }
 
     // ==================== Normalization Tests ====================

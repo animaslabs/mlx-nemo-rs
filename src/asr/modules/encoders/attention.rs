@@ -61,6 +61,9 @@ impl RelPositionalEncoding {
     /// Create sinusoidal positional encodings.
     ///
     /// Generates positions from (max_len-1) down to -(max_len-1).
+    ///
+    /// NeMo's layout: pe[:, 0::2] = sin, pe[:, 1::2] = cos
+    /// This means even indices get sin, odd indices get cos.
     fn create_pe(d_model: usize, max_len: usize) -> Result<Array> {
         let pe_len = 2 * max_len - 1;
 
@@ -81,17 +84,26 @@ impl RelPositionalEncoding {
         // Compute angles: positions * div_term -> [pe_len, d_model/2]
         let angles = ops::matmul(&positions, &div_term)?;
 
-        // Compute sin and cos
+        // Compute sin and cos: each is [pe_len, d_model/2]
         let pe_sin = ops::sin(&angles)?;
         let pe_cos = ops::cos(&angles)?;
 
-        // Interleave sin and cos: [pe_len, d_model]
-        // Stack along last axis then reshape
+        // NeMo interleaving: pe[:, 0::2] = sin, pe[:, 1::2] = cos
+        // Stack along last axis then reshape to interleave: [sin0, cos0, sin1, cos1, ...]
+        // This gives the same result as NeMo's indexing pattern.
         let pe_stacked = ops::stack_axis(&[pe_sin, pe_cos], -1)?;
         let pe = pe_stacked.reshape(&[pe_len as i32, d_model as i32])?;
 
         // Add batch dimension: [1, pe_len, d_model]
         let pe = pe.reshape(&[1, pe_len as i32, d_model as i32])?;
+
+        tracing::debug!(
+            pe_len,
+            d_model,
+            max_len,
+            pe_shape = ?pe.shape(),
+            "created relative positional encodings"
+        );
 
         Ok(pe)
     }
@@ -102,10 +114,21 @@ impl RelPositionalEncoding {
     /// covering positions from (seq_len-1) to -(seq_len-1).
     ///
     /// # Arguments
-    /// * `seq_len` - Current sequence length
+    /// * `seq_len` - Current sequence length (total context: cache + current input)
     ///
     /// # Returns
     /// Positional encodings: [1, 2*seq_len-1, d_model]
+    ///
+    /// # NeMo Reference
+    /// In NeMo's RelPositionalEncoding.forward():
+    /// ```python
+    /// input_len = x.size(1) + cache_len
+    /// center_pos = self.pe.size(1) // 2 + 1
+    /// start_pos = center_pos - input_len
+    /// end_pos = center_pos + input_len - 1
+    /// pos_emb = self.pe[:, start_pos:end_pos]
+    /// ```
+    /// This extracts positions centered at 0, giving 2*input_len-1 positions.
     pub fn get_encoding(&self, seq_len: usize) -> Result<Array> {
         if seq_len > self.max_len {
             return Err(Error::model(format!(
@@ -117,10 +140,26 @@ impl RelPositionalEncoding {
         // Calculate slice indices to extract the relevant portion
         // Full PE has positions: [max_len-1, ..., 0, ..., -(max_len-1)]
         // We want positions: [seq_len-1, ..., 0, ..., -(seq_len-1)]
+        //
+        // NeMo's calculation:
+        //   center_pos = pe.size(1) // 2 + 1 = (2*max_len-1) // 2 + 1 = max_len
+        //   start_pos = center_pos - input_len = max_len - seq_len
+        //   end_pos = center_pos + input_len - 1 = max_len + seq_len - 1
+        //   length = end_pos - start_pos = 2*seq_len - 1
         let pe_len = 2 * self.max_len - 1;
         let out_len = 2 * seq_len - 1;
         let start = (pe_len - out_len) / 2;
         let end = start + out_len;
+
+        tracing::trace!(
+            seq_len,
+            pe_len,
+            out_len,
+            start,
+            end,
+            max_len = self.max_len,
+            "extracting positional encoding slice"
+        );
 
         // Slice: pe[:, start:end, :]
         let pe_slice = self.pe.index((.., start as i32..end as i32, ..));
@@ -363,6 +402,22 @@ impl RelPositionMultiHeadAttention {
         let head_dim = self.head_dim as i32;
 
         let call_count = ATTENTION_CALL_COUNT.fetch_add(1, Ordering::SeqCst);
+        let layer_idx = call_count % 24;
+        let encoder_call = call_count / 24;
+
+        // Log dimensions for first few calls to help debug
+        if layer_idx == 0 && encoder_call < 5 {
+            tracing::debug!(
+                encoder_call,
+                batch_size,
+                seq_len,
+                d_model,
+                pos_emb_shape = ?pos_emb.shape(),
+                cache_present = cache.is_some(),
+                cache_drop_size = self.cache_drop_size,
+                "attention forward_with_cache dimensions"
+            );
+        }
 
         // NeMo cache-aware streaming (arXiv:2312.17279 Section 3.3):
         //
@@ -412,6 +467,21 @@ impl RelPositionMultiHeadAttention {
             };
             (x.clone(), seq_len, Some(new_cache))
         };
+
+        // Verify positional encoding dimensions match expectations
+        // pos_emb should be [1, 2*total_len-1, d_model]
+        let expected_pos_len = 2 * total_len - 1;
+        let actual_pos_len = pos_emb.dim(1) as i32;
+        if layer_idx == 0 && actual_pos_len != expected_pos_len {
+            tracing::warn!(
+                encoder_call,
+                total_len,
+                expected_pos_len,
+                actual_pos_len,
+                seq_len,
+                "positional encoding length mismatch!"
+            );
+        }
 
         // Project Q from input only (NeMo: query = input, unchanged)
         let q = self.linear_q.forward(x)?;
@@ -734,5 +804,106 @@ mod tests {
             shifted_data[12], 12.0,
             "Row 2, col 2 should be pos_0 (value 12)"
         );
+    }
+
+    #[test]
+    fn test_rel_positional_encoding_values() {
+        // Test that the positional encoding produces correct sin/cos interleaving
+        // NeMo uses: pe[:, 0::2] = sin, pe[:, 1::2] = cos
+        let d_model = 4;
+        let max_len = 3;
+        let pe = RelPositionalEncoding::new(d_model, max_len, false).unwrap();
+
+        // Get encoding for seq_len=3 -> output shape [1, 5, 4] (2*3-1 = 5 positions)
+        let encoding = pe.get_encoding(3).unwrap();
+        encoding.eval().unwrap();
+
+        let shape = encoding.shape();
+        assert_eq!(shape, &[1, 5, 4]);
+
+        // The positions are: [2, 1, 0, -1, -2] (from pos 2 down to pos -2)
+        let data: &[f32] = encoding.as_slice();
+
+        // For d_model=4, we have div_term for i=0 and i=2:
+        // div_term[0] = exp(0) = 1.0
+        // div_term[1] = exp(-2 * ln(10000) / 4) = exp(-2.3026) ≈ 0.1
+        let div_term_0 = 1.0_f32;
+        let div_term_1 = (-2.0_f32 * 10000.0_f32.ln() / 4.0).exp();
+
+        // Position 2 (index 0 in output): angles = [2*1.0, 2*div_term_1]
+        // pe[0, 0] = sin(2*1.0) = sin(2)
+        // pe[0, 1] = cos(2*1.0) = cos(2)
+        // pe[0, 2] = sin(2*div_term_1)
+        // pe[0, 3] = cos(2*div_term_1)
+        let pos = 2.0_f32;
+        let expected_sin0 = (pos * div_term_0).sin();
+        let expected_cos0 = (pos * div_term_0).cos();
+        let expected_sin1 = (pos * div_term_1).sin();
+        let expected_cos1 = (pos * div_term_1).cos();
+
+        // data layout: [row0, row1, row2, row3, row4] where each row has 4 elements
+        // row 0 = position 2
+        assert!(
+            (data[0] - expected_sin0).abs() < 1e-5,
+            "pe[0,0] should be sin(2*1.0), got {} expected {}",
+            data[0],
+            expected_sin0
+        );
+        assert!(
+            (data[1] - expected_cos0).abs() < 1e-5,
+            "pe[0,1] should be cos(2*1.0), got {} expected {}",
+            data[1],
+            expected_cos0
+        );
+        assert!(
+            (data[2] - expected_sin1).abs() < 1e-5,
+            "pe[0,2] should be sin(2*div_term_1), got {} expected {}",
+            data[2],
+            expected_sin1
+        );
+        assert!(
+            (data[3] - expected_cos1).abs() < 1e-5,
+            "pe[0,3] should be cos(2*div_term_1), got {} expected {}",
+            data[3],
+            expected_cos1
+        );
+
+        // Position 0 (index 2 in output, the center position)
+        let pos_0_row = 2 * 4; // row index 2, 4 elements per row
+        let expected_sin0_at_0 = 0.0_f32.sin(); // sin(0) = 0
+        let expected_cos0_at_0 = 0.0_f32.cos(); // cos(0) = 1
+
+        assert!(
+            (data[pos_0_row] - expected_sin0_at_0).abs() < 1e-5,
+            "pe at position 0 should have sin(0)=0, got {}",
+            data[pos_0_row]
+        );
+        assert!(
+            (data[pos_0_row + 1] - expected_cos0_at_0).abs() < 1e-5,
+            "pe at position 0 should have cos(0)=1, got {}",
+            data[pos_0_row + 1]
+        );
+    }
+
+    #[test]
+    fn test_rel_positional_encoding_streaming_dimensions() {
+        // Test that streaming dimensions work correctly
+        // Simulates: cache_size=70, seq_len=14, total_len=84
+        let d_model = 512;
+        let max_len = 5000;
+        let pe = RelPositionalEncoding::new(d_model, max_len, false).unwrap();
+
+        // Streaming scenario
+        let cache_size = 70;
+        let seq_len = 14;
+        let total_len = cache_size + seq_len;
+
+        let encoding = pe.get_encoding(total_len).unwrap();
+        let shape = encoding.shape();
+
+        // Should be [1, 2*84-1, 512] = [1, 167, 512]
+        assert_eq!(shape[0], 1);
+        assert_eq!(shape[1], 2 * total_len as i32 - 1);
+        assert_eq!(shape[2], d_model as i32);
     }
 }

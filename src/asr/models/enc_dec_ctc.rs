@@ -415,7 +415,11 @@ impl EncDecCTCModel {
         // This handles preemphasis state and remainder buffer internally
         let mel_features = self.preprocessor.process_chunk(audio_chunk)?;
 
-        tracing::debug!("PROCESS CHUNK #{}: Got mel_features size {:?}", self.chunk_count, mel_features.size());
+        tracing::debug!(
+            "PROCESS CHUNK #{}: Got mel_features size {:?}",
+            self.chunk_count,
+            mel_features.size()
+        );
         self.chunk_count += 1;
 
         // Check if we got any frames

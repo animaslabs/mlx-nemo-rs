@@ -787,7 +787,12 @@ impl EncDecRNNTModel {
         // This handles preemphasis state and remainder buffer internally
         let mel_features = self.preprocessor.process_chunk(audio_chunk)?;
 
-        tracing::debug!("PROCESS CHUNK #{} len({}) Got mel_features {:?}", self.chunk_count, audio_chunk.len(), mel_features.shape());
+        tracing::debug!(
+            "PROCESS CHUNK #{} len({}) Got mel_features {:?}",
+            self.chunk_count,
+            audio_chunk.len(),
+            mel_features.shape()
+        );
         self.chunk_count += 1;
 
         // Track total audio samples for logging

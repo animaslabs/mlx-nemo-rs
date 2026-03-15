@@ -8,6 +8,7 @@ use std::collections::HashMap;
 
 use mlx_rs::ops::{self, indexing, indexing::IndexOp};
 use mlx_rs::Array;
+use tracing::{debug, instrument, trace, trace_span};
 
 use crate::asr::config::{DecoderConfig, JointConfig};
 use crate::core::error::{Error, Result};
@@ -91,12 +92,14 @@ impl StatelessTransducerDecoder {
     ///
     /// # Returns
     /// * State tensor of shape [batch_size, context_size - 1] filled with blank_idx
+    #[instrument(skip(self), fields(batch_size, context_size = self.context_size, blank_idx = self.blank_idx))]
     pub fn initialize_state(&self, batch_size: usize) -> Result<Array> {
         // State contains context_size - 1 previous tokens (the current token completes it)
         let state_len = self.context_size.saturating_sub(1).max(1);
         // Create state filled with blank_idx
         let fill_value = Array::from_int(self.blank_idx as i32);
         let state = Array::full::<i32>(&[batch_size as i32, state_len as i32], &fill_value)?;
+        debug!(state_shape = ?state.shape(), "Initialized stateless decoder state");
         Ok(state)
     }
 
@@ -111,6 +114,12 @@ impl StatelessTransducerDecoder {
     /// * `(output, new_state)` where:
     ///   - output: [batch, seq_len (+ 1 if add_sos), pred_hidden]
     ///   - new_state: [batch, context_size - 1] with updated context
+    #[instrument(skip(self, y, state), fields(
+        has_input = y.is_some(),
+        has_state = state.is_some(),
+        add_sos,
+        pred_hidden = self.pred_hidden
+    ))]
     pub fn predict(
         &self,
         y: Option<&Array>,
@@ -126,11 +135,15 @@ impl StatelessTransducerDecoder {
             batch_size.unwrap_or(1)
         };
 
+        trace!(batch_size = batch, "Stateless decoder predict");
+
         if let Some(y) = y {
             // y: [B, U] -> embeddings: [B, U, H]
+            trace!(input_shape = ?y.shape(), "Predicting with tokens");
             self.predict_with_tokens(y, state, add_sos)
         } else {
             // No input tokens - return zero embedding (like pad/blank)
+            trace!("Predicting without tokens (zero embedding)");
             let zeros = Array::zeros::<f32>(&[batch as i32, 1, self.pred_hidden as i32])?;
             let new_state = if let Some(s) = state {
                 s.clone()
@@ -142,6 +155,7 @@ impl StatelessTransducerDecoder {
                 // Prepend SOS (zero vector)
                 let sos = Array::zeros::<f32>(&[batch as i32, 1, self.pred_hidden as i32])?;
                 let output = ops::concatenate_axis(&[&sos, &zeros], 1)?;
+                trace!(output_shape = ?output.shape(), "Output with SOS prepended");
                 Ok((output, new_state))
             } else {
                 Ok((zeros, new_state))
@@ -222,10 +236,18 @@ impl StatelessTransducerDecoder {
     /// * `(output, new_state)` where:
     ///   - output: [batch, 1, pred_hidden]
     ///   - new_state: [batch, context_size - 1]
+    #[instrument(skip(self, y, state), level = "trace", fields(
+        has_token = y.is_some(),
+        state_shape = ?state.shape(),
+        context_size = self.context_size
+    ))]
     pub fn predict_one(&self, y: Option<&Array>, state: &Array) -> Result<(Array, Array)> {
+        let _span = trace_span!("stateless_predict_one").entered();
         let batch = state.shape()[0] as usize;
 
         if let Some(y) = y {
+            trace!(token_shape = ?y.shape(), "Single-step prediction with token");
+
             // Build full context: [state, y]
             let y_i32 = y.as_type::<i32>()?;
             let context = ops::concatenate_axis(&[state, &y_i32], 1)?;
@@ -242,14 +264,17 @@ impl StatelessTransducerDecoder {
             // New state: last context_size - 1 tokens
             let new_state = self.slice_context(&context, 1, self.context_size)?;
 
+            trace!(output_shape = ?output.shape(), new_state_shape = ?new_state.shape(), "Prediction complete");
             Ok((output, new_state))
         } else {
+            trace!("Single-step prediction with blank token");
             // No token - return blank embedding
             let fill_value = Array::from_int(self.blank_idx as i32);
             let blank_idx = Array::full::<i32>(&[batch as i32, 1], &fill_value)?;
             let blank_emb = self.embed(&blank_idx)?;
 
             // State stays the same when outputting blank
+            trace!(output_shape = ?blank_emb.shape(), "Blank embedding returned");
             Ok((blank_emb, state.clone()))
         }
     }
@@ -430,6 +455,7 @@ impl RNNTDecoder {
     ///
     /// # Returns
     /// * LstmState with zero-initialized hidden and cell states
+    #[instrument(skip(self), fields(batch_size, num_layers = self.num_layers, pred_hidden = self.pred_hidden))]
     pub fn initialize_state(&self, batch_size: usize) -> Result<LstmState> {
         // Hidden and cell states: [num_layers, batch, hidden_size]
         let hidden = Array::zeros::<f32>(&[
@@ -442,6 +468,11 @@ impl RNNTDecoder {
             batch_size as i32,
             self.pred_hidden as i32,
         ])?;
+        debug!(
+            hidden_shape = ?hidden.shape(),
+            cell_shape = ?cell.shape(),
+            "Initialized LSTM decoder state"
+        );
         Ok(LstmState { hidden, cell })
     }
 
@@ -455,19 +486,31 @@ impl RNNTDecoder {
     /// * `(output, new_state)` where:
     ///   - output: [batch, 1, pred_hidden]
     ///   - new_state: Updated LstmState
+    #[instrument(skip(self, y, state), level = "trace", fields(
+        has_token = y.is_some(),
+        num_layers = self.num_layers,
+        pred_hidden = self.pred_hidden
+    ))]
     pub fn predict_one(&self, y: Option<&Array>, state: &LstmState) -> Result<(Array, LstmState)> {
+        let _span = trace_span!("lstm_predict_one").entered();
         let batch_size = state.hidden.shape()[1] as usize;
+
+        trace!(batch_size, state_hidden_shape = ?state.hidden.shape(), "LSTM single-step prediction");
 
         // Get embedding for input token
         let embedding = if let Some(y) = y {
             // y: [batch, 1] -> embedding: [batch, 1, pred_hidden]
+            trace!(token_shape = ?y.shape(), "Embedding input token");
             self.embed(y)?
         } else {
             // Use blank token embedding
+            trace!(blank_idx = self.blank_idx, "Embedding blank token");
             let fill_value = Array::from_int(self.blank_idx as i32);
             let blank_idx = Array::full::<i32>(&[batch_size as i32, 1], &fill_value)?;
             self.embed(&blank_idx)?
         };
+
+        trace!(embedding_shape = ?embedding.shape(), "Embedding computed");
 
         // Run through LSTM layers
         // embedding: [batch, 1, pred_hidden]
@@ -476,12 +519,18 @@ impl RNNTDecoder {
         let mut new_cells = Vec::with_capacity(self.num_layers);
 
         for layer_idx in 0..self.num_layers {
+            let _layer_span = trace_span!("lstm_layer", layer = layer_idx).entered();
+
             // Get layer state: [batch, hidden_size]
             let h = state.hidden.index((layer_idx as i32, .., ..));
             let c = state.cell.index((layer_idx as i32, .., ..));
 
+            trace!(layer = layer_idx, h_shape = ?h.shape(), c_shape = ?c.shape(), "Processing LSTM layer");
+
             // Run LSTM cell for this layer
             let (new_h, new_c) = self.lstm_cell(layer_idx, &x.squeeze_axes(&[1])?, &h, &c)?;
+
+            trace!(layer = layer_idx, new_h_shape = ?new_h.shape(), "LSTM layer complete");
 
             // Store new states
             new_hiddens.push(new_h.clone());
@@ -499,6 +548,12 @@ impl RNNTDecoder {
             hidden: new_hidden,
             cell: new_cell,
         };
+
+        trace!(
+            output_shape = ?x.shape(),
+            new_hidden_shape = ?new_state.hidden.shape(),
+            "LSTM prediction complete"
+        );
 
         Ok((x, new_state))
     }
@@ -520,7 +575,17 @@ impl RNNTDecoder {
         h: &Array,
         c: &Array,
     ) -> Result<(Array, Array)> {
+        let _span = trace_span!("lstm_cell", layer = layer_idx).entered();
         let layer = &self.lstm_layers[layer_idx];
+
+        trace!(
+            layer = layer_idx,
+            x_shape = ?x.shape(),
+            h_shape = ?h.shape(),
+            c_shape = ?c.shape(),
+            weight_ih_shape = ?layer.weight_ih.shape(),
+            "Computing LSTM cell gates"
+        );
 
         // Compute gates: i, f, g, o
         // gates = x @ weight_ih^T + bias_ih + h @ weight_hh^T + bias_hh
@@ -530,6 +595,8 @@ impl RNNTDecoder {
         let gates_ih = ops::add(&ops::matmul(x, &weight_ih_t)?, &layer.bias_ih)?;
         let gates_hh = ops::add(&ops::matmul(h, &weight_hh_t)?, &layer.bias_hh)?;
         let gates = ops::add(&gates_ih, &gates_hh)?;
+
+        trace!(gates_shape = ?gates.shape(), "Gates computed");
 
         // Split into 4 gates: [batch, hidden_size] each
         let hidden_size = self.pred_hidden as i32;
@@ -543,6 +610,13 @@ impl RNNTDecoder {
 
         // New hidden state: h_new = o * tanh(c_new)
         let new_h = ops::multiply(&o, &ops::tanh(&new_c)?)?;
+
+        trace!(
+            layer = layer_idx,
+            new_h_shape = ?new_h.shape(),
+            new_c_shape = ?new_c.shape(),
+            "LSTM cell complete"
+        );
 
         Ok((new_h, new_c))
     }
@@ -757,7 +831,15 @@ impl RNNTJoint {
     ///
     /// # Returns
     /// * Log probabilities [batch, time, labels, vocab_size]
+    #[instrument(skip(self, encoder_output, pred_output), fields(
+        encoder_shape = ?encoder_output.shape(),
+        pred_shape = ?pred_output.shape(),
+        joint_hidden = self.joint_hidden,
+        vocab_size = self.vocab_size
+    ))]
     pub fn forward(&self, encoder_output: &Array, pred_output: &Array) -> Result<Array> {
+        let _span = trace_span!("rnnt_joint_forward").entered();
+
         // encoder_output: [B, T, H_enc]
         // pred_output: [B, U, H_pred]
 
@@ -765,19 +847,32 @@ impl RNNTJoint {
         let time = encoder_output.shape()[1];
         let labels = pred_output.shape()[1];
 
+        debug!(
+            batch,
+            time,
+            labels,
+            joint_hidden = self.joint_hidden,
+            vocab_size = self.vocab_size,
+            "Joint forward pass"
+        );
+
         // Project encoder: [B, T, joint_hidden]
+        trace!("Projecting encoder output");
         let enc_proj = self.linear(
             encoder_output,
             &self.encoder_proj_weight,
             self.encoder_proj_bias.as_ref(),
         )?;
+        trace!(enc_proj_shape = ?enc_proj.shape(), "Encoder projection complete");
 
         // Project prediction: [B, U, joint_hidden]
+        trace!("Projecting prediction output");
         let pred_proj = self.linear(
             pred_output,
             &self.pred_proj_weight,
             self.pred_proj_bias.as_ref(),
         )?;
+        trace!(pred_proj_shape = ?pred_proj.shape(), "Prediction projection complete");
 
         // Broadcast add: [B, T, 1, H] + [B, 1, U, H] -> [B, T, U, H]
         // Expand dims for broadcasting
@@ -785,13 +880,17 @@ impl RNNTJoint {
         let pred_expanded = ops::expand_dims(&pred_proj, 1)?; // [B, 1, U, H]
 
         // Add with broadcasting
+        trace!("Broadcasting encoder and prediction projections");
         let joint = ops::add(&enc_expanded, &pred_expanded)?; // [B, T, U, H]
+        trace!(joint_shape = ?joint.shape(), "Joint tensor computed");
 
         // Apply activation
+        trace!(activation = ?self.activation, "Applying activation");
         let activated = self.activation.apply(&joint)?;
 
         // Output projection: [B, T, U, vocab_size]
         // Need to reshape for linear, then reshape back
+        trace!("Computing output projection");
         let joint_flat = ops::reshape(
             &activated,
             &[batch * time * labels, self.joint_hidden as i32],
@@ -804,9 +903,13 @@ impl RNNTJoint {
         )?;
 
         let logits = ops::reshape(&logits_flat, &[batch, time, labels, self.vocab_size as i32])?;
+        trace!(logits_shape = ?logits.shape(), "Logits computed");
 
         // Log softmax over vocabulary dimension
+        trace!("Applying log softmax");
         let log_probs = mlx_rs::nn::log_softmax(&logits, -1)?;
+
+        debug!(output_shape = ?log_probs.shape(), "Joint forward complete");
 
         Ok(log_probs)
     }
@@ -819,9 +922,23 @@ impl RNNTJoint {
     ///
     /// # Returns
     /// * Log probabilities [batch, vocab_size]
+    #[instrument(skip(self, encoder_output, pred_output), level = "trace", fields(
+        encoder_shape = ?encoder_output.shape(),
+        pred_shape = ?pred_output.shape(),
+        joint_hidden = self.joint_hidden,
+        vocab_size = self.vocab_size
+    ))]
     pub fn forward_one(&self, encoder_output: &Array, pred_output: &Array) -> Result<Array> {
+        let _span = trace_span!("rnnt_joint_forward_one").entered();
+
         // encoder_output: [B, 1, H_enc] or [B, H_enc]
         // pred_output: [B, 1, H_pred] or [B, H_pred]
+
+        trace!(
+            encoder_ndim = encoder_output.ndim(),
+            pred_ndim = pred_output.ndim(),
+            "Single-step joint forward"
+        );
 
         // Ensure 2D for linear
         let enc = if encoder_output.ndim() == 3 {
@@ -835,6 +952,8 @@ impl RNNTJoint {
         } else {
             pred_output.clone()
         };
+
+        trace!(enc_shape = ?enc.shape(), pred_shape = ?pred.shape(), "Inputs prepared");
 
         // Project encoder: [B, joint_hidden]
         let enc_proj = self.linear(
@@ -870,23 +989,26 @@ impl RNNTJoint {
             };
             let enc_norm: f32 = enc_slice.iter().map(|v| v.powi(2)).sum::<f32>().sqrt();
             let pred_norm: f32 = pred_slice.iter().map(|v| v.powi(2)).sum::<f32>().sqrt();
-            tracing::trace!(
+            trace!(
                 enc_proj_std = enc_std,
                 enc_proj_norm = enc_norm,
                 pred_proj_std = pred_std,
                 pred_proj_norm = pred_norm,
-                ratio = enc_norm / pred_norm,
-                "joint network projection magnitudes"
+                ratio = enc_norm / (pred_norm + 1e-8),
+                "Joint network projection magnitudes"
             );
         }
 
         // Add
+        trace!("Adding encoder and prediction projections");
         let joint = ops::add(&enc_proj, &pred_proj)?;
 
         // Apply activation
+        trace!(activation = ?self.activation, "Applying activation");
         let activated = self.activation.apply(&joint)?;
 
         // Output projection: [B, vocab_size]
+        trace!("Computing output logits");
         let logits = self.linear(
             &activated,
             &self.joint_proj_weight,
@@ -894,7 +1016,10 @@ impl RNNTJoint {
         )?;
 
         // Log softmax
+        trace!("Applying log softmax");
         let log_probs = mlx_rs::nn::log_softmax(&logits, -1)?;
+
+        trace!(output_shape = ?log_probs.shape(), "Single-step joint forward complete");
 
         Ok(log_probs)
     }
