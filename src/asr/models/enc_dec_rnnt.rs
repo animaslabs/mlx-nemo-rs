@@ -36,7 +36,7 @@ use crate::asr::modules::{
 };
 use crate::asr::streaming::{
     compute_streaming_config, get_streaming_modes, EncoderCache, StreamingConfig,
-    StreamingMelBuffer, StreamingModeInfo, StreamingOutput,
+    StreamingMelBuffer, StreamingModeInfo, StreamingOutput, SubsamplingCache,
 };
 use crate::core::checkpoint::NemoCheckpoint;
 use crate::core::config::from_yaml_str;
@@ -699,14 +699,11 @@ impl EncDecRNNTModel {
 
         tracing::debug!(
             mode_idx,
-            chunk_size_first = config.chunk_size.0,
-            chunk_size_subsequent = config.chunk_size.1,
-            shift_size_first = config.shift_size.0,
-            shift_size_subsequent = config.shift_size.1,
-            pre_encode_cache_first = config.pre_encode_cache_size.0,
-            pre_encode_cache_subsequent = config.pre_encode_cache_size.1,
+            chunk_size_first = config.chunk_size,
+            chunk_size_subsequent = config.chunk_size,
+            shift_size_first = config.shift_size,
+            shift_size_subsequent = config.shift_size,
             valid_out_len = config.valid_out_len,
-            drop_extra_pre_encoded = config.drop_extra_pre_encoded,
             cache_drop_size = config.cache_drop_size,
             last_channel_cache_size = config.last_channel_cache_size,
             last_time_cache_size = config.last_time_cache_size,
@@ -719,6 +716,21 @@ impl EncDecRNNTModel {
         // Reset preprocessor streaming state (remainder buffer, preemphasis state)
         self.preprocessor.reset();
 
+        // Get subsampling parameters from encoder
+        let (n_strides, kernel_size, stride, conv_channels) = self.encoder.subsampling_params();
+        let preprocessor_config = self.preprocessor.config();
+        let n_mels = preprocessor_config.features;
+
+        // Create subsampling cache
+        let subsampling_cache = SubsamplingCache::new(
+            batch_size,
+            n_mels,
+            conv_channels,
+            kernel_size,
+            stride,
+            n_strides,
+        )?;
+
         // Create encoder cache
         let encoder_cache = EncoderCache::new(
             self.encoder.num_layers(),
@@ -726,11 +738,10 @@ impl EncDecRNNTModel {
             config.last_channel_cache_size,
             config.last_time_cache_size,
             self.encoder.d_model(),
+            subsampling_cache,
         )?;
 
-        // Create mel buffer
-        let preprocessor_config = self.preprocessor.config();
-        let n_mels = preprocessor_config.features;
+        // Create mel buffer (no priming needed - subsampling layer handles caching internally)
         let mel_buffer = StreamingMelBuffer::new(
             preprocessor_config.sample_rate,
             preprocessor_config.window_size,
@@ -771,7 +782,7 @@ impl EncDecRNNTModel {
     /// This follows NeMo's streaming approach:
     /// 1. Convert audio to mel spectrogram using the streaming mel API
     /// 2. Append mel frames to the buffer for chunked extraction
-    /// 3. Extract mel chunks with pre_encode_cache overlap
+    /// 3. Extract mel chunks (subsampling layer handles CausalConv2D caching internally)
     /// 4. Process through encoder and decoder
     ///
     /// The preprocessor maintains preemphasis state and audio remainder buffer
@@ -787,7 +798,12 @@ impl EncDecRNNTModel {
         // This handles preemphasis state and remainder buffer internally
         let mel_features = self.preprocessor.process_chunk(audio_chunk)?;
 
-        tracing::debug!("PROCESS CHUNK #{} len({}) Got mel_features {:?}", self.chunk_count, audio_chunk.len(), mel_features.shape());
+        tracing::debug!(
+            "PROCESS CHUNK #{} len({}) Got mel_features {:?}",
+            self.chunk_count,
+            audio_chunk.len(),
+            mel_features.shape()
+        );
         self.chunk_count += 1;
 
         // Track total audio samples for logging
@@ -824,17 +840,6 @@ impl EncDecRNNTModel {
             // Get chunk parameters for current step
             let chunk_size = session.config.chunk_size_for_step(session.is_first_chunk);
             let shift_size = session.config.shift_size_for_step(session.is_first_chunk);
-            let pre_encode_cache = session
-                .config
-                .pre_encode_cache_for_step(session.is_first_chunk);
-            // NeMo applies drop_extra_pre_encoded on subsequent chunks only (not the first).
-            // The Python streaming script passes drop_extra_pre_encoded=0 for step_num=0.
-            // This is because the first chunk doesn't have pre_encode_cache overlap.
-            let drop_extra = if session.is_first_chunk {
-                0 // Don't drop on first chunk
-            } else {
-                session.config.drop_extra_pre_encoded
-            };
 
             // Check if we have enough mel frames
             let remaining = session.mel_buffer.remaining_frames();
@@ -851,18 +856,19 @@ impl EncDecRNNTModel {
             tracing::debug!(
                 chunk_size,
                 shift_size,
-                pre_encode_cache,
-                drop_extra,
                 buffer_idx = session.mel_buffer.buffer_idx,
                 total_frames = session.mel_buffer.total_frames,
                 "extracting mel chunk"
             );
 
-            // Extract mel chunk with pre_encode_cache overlap
+            // Extract mel chunk (no pre_encode_cache overlap needed - subsampling layer caches internally)
             let (mel_chunk, chunk_len) = session
                 .mel_buffer
-                .extract_chunk(chunk_size, shift_size, pre_encode_cache)
+                .extract_chunk(chunk_size, shift_size, 0) // pre_encode_cache=0
                 .ok_or_else(|| crate::core::error::Error::model("Failed to extract mel chunk"))?;
+
+            // mel_chunk is already [n_mels, time] Array from the buffer
+            mel_chunk.eval()?;
 
             {
                 // Flatten the mel chunk to a Vec for debug statistics
@@ -909,23 +915,15 @@ impl EncDecRNNTModel {
             // Get lengths for encoder
             let lengths = Array::from_slice(&[chunk_len as i32], &[1]);
 
-            // Run encoder with cache
+            // Run encoder with cache (subsampling cache handles per-layer caching internally)
             let cache_len_before = session.encoder_cache.last_channel_len.as_slice::<i64>()[0];
 
-            let (encoded, encoded_lengths, cache_channel_next, cache_time_next, cache_len_next) =
-                self.encoder.forward_streaming(
-                    &features,
-                    &lengths,
-                    &session.encoder_cache.last_channel,
-                    &session.encoder_cache.last_time,
-                    &session.encoder_cache.last_channel_len,
-                    drop_extra,
-                )?;
+            let (encoded, encoded_lengths, encoder_cache_next) =
+                self.encoder
+                    .forward_streaming(&features, &lengths, &session.encoder_cache)?;
 
             // Update encoder cache
-            session.encoder_cache.last_channel = cache_channel_next;
-            session.encoder_cache.last_time = cache_time_next;
-            session.encoder_cache.last_channel_len = cache_len_next;
+            session.encoder_cache = encoder_cache_next;
 
             // Transpose encoder output from [B, D, T] to [B, T, D]
             let encoded = mlx_rs::ops::transpose_axes(&encoded, &[0, 2, 1])?;
@@ -1199,15 +1197,15 @@ impl EncDecRNNTModel {
 
 /// Streaming session state for RNNT models.
 ///
-/// This session manages the streaming state following NeMo's approach:
+/// This session manages the streaming state:
 /// 1. Audio is incrementally converted to mel frames
-/// 2. Mel frames are stored in a buffer
-/// 3. Chunks are extracted with pre_encode_cache overlap
+/// 2. Mel frames are stored in a buffer for chunked extraction
+/// 3. Subsampling layer handles CausalConv2D caching internally
 pub struct RnntStreamingSession {
     /// Streaming configuration
     pub config: StreamingConfig,
 
-    /// Encoder cache state
+    /// Encoder cache state (includes subsampling, attention, and conv caches)
     pub encoder_cache: EncoderCache,
 
     /// Mel spectrogram buffer (stores pre-computed mel frames)
@@ -1222,7 +1220,7 @@ pub struct RnntStreamingSession {
     /// All accumulated tokens for each batch sample
     pub accumulated_tokens: Vec<Vec<usize>>,
 
-    /// Whether this is the first chunk (determines chunk_size and pre_encode_cache)
+    /// Whether this is the first chunk (determines chunk_size)
     pub is_first_chunk: bool,
 
     /// Blank token ID

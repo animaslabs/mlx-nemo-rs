@@ -263,7 +263,7 @@ impl MelSpectrogram {
         // Frame i requires samples [i*hop, i*hop + win_samples)
         // So for n_frames, we need: (n_frames-1)*hop + win_samples samples
         let n_frames = self.compute_frame_count(raw_audio.len());
-        tracing::trace!("process_chunk raw_audio len: {} num audio samples: {} remainder len: {} mel n_frames: {}",
+        tracing::debug!("process_chunk raw_audio len: {} num audio samples: {} remainder len: {} mel n_frames: {}",
             raw_audio.len(), samples.len(), self.remainder.len(), n_frames);
 
         if n_frames == 0 {
@@ -288,7 +288,7 @@ impl MelSpectrogram {
         }
 
         // Take only the samples we need for processing
-        let mut audio_to_process = raw_audio[..samples_needed].to_vec();
+        let audio_to_process = raw_audio[..samples_needed].to_vec();
 
         // Apply preemphasis with state tracking
         let audio_to_process = self.apply_preemphasis(&audio_to_process);
@@ -1085,14 +1085,22 @@ mod tests {
 
         // Preemph state should be updated (last sample of samples_needed)
         // samples_needed = (1-1)*160 + 400 = 400, so preemph_last = chunk1[399] = 399/500 ≈ 0.798
-        assert!(mel.preemph_last > 0.7, "preemph_last should be updated after processing, got {}", mel.preemph_last);
+        assert!(
+            mel.preemph_last > 0.7,
+            "preemph_last should be updated after processing, got {}",
+            mel.preemph_last
+        );
 
         // Second chunk - combined with remainder should produce more frames
         let chunk2: Vec<f32> = (500..1000).map(|i| i as f32 / 1000.0).collect();
         mel.process_chunk(&chunk2).unwrap();
 
         // State should update again
-        assert!(mel.preemph_last > 0.5, "preemph_last should remain updated, got {}", mel.preemph_last);
+        assert!(
+            mel.preemph_last > 0.5,
+            "preemph_last should remain updated, got {}",
+            mel.preemph_last
+        );
     }
 
     // ==================== Normalization Tests ====================
@@ -1237,5 +1245,74 @@ mod tests {
         // Values should be in a reasonable range (not -infinity or extreme)
         assert!(min_val.is_finite(), "Min value should be finite");
         assert!(max_val.is_finite(), "Max value should be finite");
+    }
+
+    // ==================== Streaming vs Batch Frame Count Tests ====================
+
+    #[test]
+    fn test_streaming_frame_count_exact() {
+        // Verify that streaming produces exactly the expected number of frames
+        // (no extra frames from center padding)
+        let config = MelSpectrogramConfig {
+            preemph: None,
+            dither: 0.0,
+            ..Default::default()
+        };
+        let mut mel = MelSpectrogram::new(config).unwrap();
+
+        // Test various audio lengths
+        let test_cases = [
+            (400, 1),    // Exactly win_samples -> 1 frame
+            (560, 2),    // (560-400)/160+1 = 2 frames
+            (720, 3),    // (720-400)/160+1 = 3 frames
+            (1600, 8),   // (1600-400)/160+1 = 8 frames
+            (16000, 98), // (16000-400)/160+1 = 98 frames
+        ];
+
+        for (audio_len, expected_frames) in test_cases {
+            mel.reset(); // Reset state between tests
+            let samples = vec![0.1f32; audio_len];
+            let result = mel.process_chunk(&samples).unwrap();
+
+            let actual_frames = result.shape()[1] as usize;
+            assert_eq!(
+                actual_frames, expected_frames,
+                "For audio_len={}, expected {} frames but got {}",
+                audio_len, expected_frames, actual_frames
+            );
+        }
+    }
+
+    #[test]
+    fn test_streaming_vs_batch_different_frame_counts() {
+        // Batch mode uses center padding and produces more frames than streaming
+        // This test documents the expected difference
+        let config = MelSpectrogramConfig {
+            preemph: None,
+            dither: 0.0,
+            ..Default::default()
+        };
+        let mel = MelSpectrogram::new(config.clone()).unwrap();
+        let mut mel_stream = MelSpectrogram::new(config).unwrap();
+
+        let audio_len = 1600;
+        let samples = vec![0.1f32; audio_len];
+
+        // Batch mode: n_frames = audio_len / hop + 1 = 1600/160 + 1 = 11 frames
+        let audio_arr = Array::from_slice(&samples, &[1, audio_len as i32]);
+        let (batch_result, _) = mel.forward(&audio_arr, None).unwrap();
+        let batch_frames = batch_result.shape()[2] as usize;
+
+        // Streaming mode: n_frames = (audio_len - win) / hop + 1 = (1600-400)/160 + 1 = 8 frames
+        let stream_result = mel_stream.process_chunk(&samples).unwrap();
+        let stream_frames = stream_result.shape()[1] as usize;
+
+        // Verify the expected difference
+        assert_eq!(batch_frames, 11, "Batch should produce 11 frames");
+        assert_eq!(stream_frames, 8, "Streaming should produce 8 frames");
+        assert!(
+            batch_frames > stream_frames,
+            "Batch mode should produce more frames due to center padding"
+        );
     }
 }

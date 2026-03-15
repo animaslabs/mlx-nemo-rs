@@ -44,18 +44,105 @@ use mlx_rs::Array;
 use crate::asr::config::EncoderConfig;
 use crate::core::error::{Error, Result};
 
+// =============================================================================
+// Subsampling Cache (CausalConv2D state)
+// =============================================================================
+
+/// Cache state for the subsampling (CausalConv2D) layers.
+///
+/// Each strided CausalConv2D layer in the subsampling module caches the last
+/// `kernel_size - 1` time steps to provide left context for causal convolution.
+/// This eliminates the need for mel frame overlap (`pre_encode_cache`).
+///
+/// For 8x subsampling with kernel_size=3, there are 3 strided conv layers,
+/// each caching 2 time frames.
+///
+/// # Tensor Format
+///
+/// Caches are stored in NCHW format (PyTorch convention) to match Conv2d operations:
+/// - Layer 0: `[B, 1, F=128, T=2]` (input mel features)
+/// - Layer 1: `[B, 256, F=64, T=2]` (after first conv)
+/// - Layer 2: `[B, 256, F=32, T=2]` (after second conv)
+#[derive(Debug, Clone)]
+pub struct SubsamplingCache {
+    /// Per-layer caches in NCHW format: `[batch, channels, freq, time=cache_len]`
+    pub layers: Vec<Array>,
+}
+
+impl SubsamplingCache {
+    /// Create a new subsampling cache initialized to zeros.
+    ///
+    /// # Arguments
+    /// * `batch_size` - Batch size
+    /// * `n_mels` - Number of mel features (e.g., 128)
+    /// * `conv_channels` - Number of conv channels (e.g., 256)
+    /// * `kernel_size` - Kernel size (typically 3)
+    /// * `stride` - Stride (typically 2)
+    /// * `n_strides` - Number of striding CausalConv2D layers (3 for 8x subsampling)
+    pub fn new(
+        batch_size: usize,
+        n_mels: usize,
+        conv_channels: usize,
+        kernel_size: usize,
+        stride: usize,
+        n_strides: usize,
+    ) -> Result<Self> {
+        let cache_len = kernel_size - 1; // = 2 for kernel_size=3
+        let mut layers = Vec::with_capacity(n_strides);
+
+        let mut freq = n_mels;
+        for i in 0..n_strides {
+            // Layer 0 has 1 input channel, subsequent layers have conv_channels
+            let channels = if i == 0 { 1 } else { conv_channels };
+
+            // Cache shape: [B, C, F, T=cache_len] in NCHW format
+            layers.push(mlx_rs::ops::zeros::<f32>(&[
+                batch_size as i32,
+                channels as i32,
+                freq as i32,
+                cache_len as i32,
+            ])?);
+
+            // After each strided CausalConv2D, frequency dimension changes.
+            // NeMo's CausalConv2D uses:
+            //   left_pad = kernel_size - 1 = 2  (causality)
+            //   right_pad = stride - 1 = 1      (stride alignment)
+            // Applied to both axes, so total_pad = left + right = 3
+            // out_F = floor((in_F + total_pad - kernel) / stride) + 1
+            //       = floor((in_F + 3 - 3) / 2) + 1 = floor(in_F / 2) + 1
+            let total_pad = (kernel_size - 1) + (stride - 1); // = 3 for K=3, S=2
+            freq = (freq + total_pad - kernel_size) / stride + 1;
+        }
+
+        Ok(Self { layers })
+    }
+
+    /// Get batch size from cache.
+    pub fn batch_size(&self) -> usize {
+        self.layers.first().map(|a| a.dim(0) as usize).unwrap_or(0)
+    }
+
+    /// Get number of cached layers.
+    pub fn num_layers(&self) -> usize {
+        self.layers.len()
+    }
+
+    /// Get the cache length (time frames per layer).
+    pub fn cache_len(&self) -> usize {
+        self.layers.first().map(|a| a.dim(3) as usize).unwrap_or(0)
+    }
+}
+
 /// Streaming configuration computed from model config.
 ///
 /// This mirrors NeMo's `CacheAwareStreamingConfig` dataclass.
 #[derive(Debug, Clone)]
 pub struct StreamingConfig {
-    /// Size of each chunk at each step (frames after subsampling).
-    /// Tuple of (first_chunk_size, subsequent_chunk_size).
-    pub chunk_size: (usize, usize),
+    /// Size of each chunk at each step (mel frames before subsampling).
+    pub chunk_size: usize,
 
-    /// Size of shift in each step (frames).
-    /// Tuple of (first_shift, subsequent_shift).
-    pub shift_size: (usize, usize),
+    /// Size of shift in each step (mel frames).
+    pub shift_size: usize,
 
     /// Number of frames to drop from the cache per step.
     pub cache_drop_size: usize,
@@ -68,13 +155,6 @@ pub struct StreamingConfig {
 
     /// Number of valid output frames per chunk (matching offline mode).
     pub valid_out_len: usize,
-
-    /// Cache size for pre-encoding (subsampling).
-    /// Tuple of (first_chunk_cache, subsequent_chunk_cache).
-    pub pre_encode_cache_size: (usize, usize),
-
-    /// Number of extra pre-encoded frames to drop.
-    pub drop_extra_pre_encoded: usize,
 
     /// Lookahead frames required (future context).
     pub lookahead_frames: usize,
@@ -91,41 +171,28 @@ pub struct StreamingConfig {
 
 impl StreamingConfig {
     /// Get chunk size for a given step (first or subsequent).
-    pub fn chunk_size_for_step(&self, is_first: bool) -> usize {
-        if is_first {
-            self.chunk_size.0
-        } else {
-            self.chunk_size.1
-        }
+    pub fn chunk_size_for_step(&self, _is_first: bool) -> usize {
+        self.chunk_size
     }
 
     /// Get shift size for a given step (first or subsequent).
-    pub fn shift_size_for_step(&self, is_first: bool) -> usize {
-        if is_first {
-            self.shift_size.0
-        } else {
-            self.shift_size.1
-        }
-    }
-
-    /// Get pre-encode cache size for a given step.
-    pub fn pre_encode_cache_for_step(&self, is_first: bool) -> usize {
-        if is_first {
-            self.pre_encode_cache_size.0
-        } else {
-            self.pre_encode_cache_size.1
-        }
+    pub fn shift_size_for_step(&self, _is_first: bool) -> usize {
+        self.shift_size
     }
 }
 
 /// Encoder cache state for streaming inference.
 ///
-/// Contains the three cache tensors needed for cache-aware streaming:
+/// Contains the cache tensors needed for cache-aware streaming:
+/// - Subsampling cache for CausalConv2D layers
 /// - Attention (channel) cache for key/value states
 /// - Convolution (time) cache for causal conv left context
 /// - Length tracking for proper masking
 #[derive(Debug, Clone)]
 pub struct EncoderCache {
+    /// Cache for subsampling CausalConv2D layers
+    pub subsampling: SubsamplingCache,
+
     /// Cache for MHA layers: [num_layers, batch, cache_len, d_model]
     pub last_channel: Array,
 
@@ -145,12 +212,14 @@ impl EncoderCache {
     /// * `channel_cache_size` - Size of attention cache
     /// * `time_cache_size` - Size of convolution cache (kernel_size - 1)
     /// * `d_model` - Model dimension
+    /// * `subsampling_cache` - Pre-created subsampling cache
     pub fn new(
         num_layers: usize,
         batch_size: usize,
         channel_cache_size: usize,
         time_cache_size: usize,
         d_model: usize,
+        subsampling_cache: SubsamplingCache,
     ) -> Result<Self> {
         let last_channel = mlx_rs::ops::zeros::<f32>(&[
             num_layers as i32,
@@ -169,6 +238,7 @@ impl EncoderCache {
         let last_channel_len = mlx_rs::ops::zeros::<i64>(&[batch_size as i32])?;
 
         Ok(Self {
+            subsampling: subsampling_cache,
             last_channel,
             last_time,
             last_channel_len,
@@ -749,23 +819,17 @@ pub fn compute_streaming_config(
     // Time cache size is conv_kernel - 1 for causal convolutions
     let last_time_cache_size = conv_context.0;
 
-    // Compute sampling frames from subsampling
-    // NeMo's ConvSubsampling.get_sampling_frames() returns [1, subsampling_factor]
-    let sampling_frames = (1, subsampling_factor);
-
-    // Chunk size in pre-subsampled frames
-    // NeMo: chunk_size = [sampling_frames[0] + subsampling_factor * lookahead_steps,
-    //                     sampling_frames[1] + subsampling_factor * lookahead_steps]
-    let chunk_size = (
-        sampling_frames.0 + subsampling_factor * lookahead_steps,
-        sampling_frames.1 + subsampling_factor * lookahead_steps,
-    );
+    // Chunk size in pre-subsampled (mel) frames
+    let chunk_size = subsampling_factor * (lookahead_steps + 1);
 
     // Shift size - how many pre-subsampled frames to advance each step
-    let shift_size = (
-        sampling_frames.0 + sampling_frames.1 * lookahead_steps.saturating_sub(cache_drop_size),
-        sampling_frames.1 + sampling_frames.1 * lookahead_steps.saturating_sub(cache_drop_size),
-    );
+    let shift_size = subsampling_factor * (lookahead_steps.saturating_sub(cache_drop_size) + 1);
+    // (
+    //     // subsampling_factor * (lookahead_steps.saturating_sub(cache_drop_size) + 1),
+    //     // subsampling_factor * (lookahead_steps.saturating_sub(cache_drop_size) + 1),
+    //     sampling_frames.0 + sampling_frames.1 * lookahead_steps.saturating_sub(cache_drop_size),
+    //     sampling_frames.1 + sampling_frames.1 * lookahead_steps.saturating_sub(cache_drop_size),
+    // );
 
     // Valid output length - how many OUTPUT frames are valid per chunk
     let valid_out_len = if sampling_frames.1 > 0 {
@@ -791,7 +855,7 @@ pub fn compute_streaming_config(
 
     tracing::debug!(
         "Streaming config: mode={}, style={}, lookahead_steps={}, cache_drop={}, \
-         chunk_size={:?}, shift_size={:?}, valid_out_len={}, pre_encode={:?}, drop_extra={}",
+         chunk_size={}, shift_size={}, valid_out_len={}",
         mode_idx,
         att_context_style,
         lookahead_steps,
@@ -799,8 +863,6 @@ pub fn compute_streaming_config(
         chunk_size,
         shift_size,
         valid_out_len,
-        pre_encode_cache,
-        drop_extra
     );
 
     Ok(StreamingConfig {
@@ -810,8 +872,6 @@ pub fn compute_streaming_config(
         last_channel_cache_size,
         last_time_cache_size,
         valid_out_len,
-        pre_encode_cache_size: pre_encode_cache,
-        drop_extra_pre_encoded: drop_extra,
         lookahead_frames: lookahead_steps,
         mode_idx,
         left_context,
@@ -851,12 +911,35 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_subsampling_cache_creation() {
+        // Create subsampling cache for 8x downsampling (3 layers), 128 mel bins
+        let cache = SubsamplingCache::new(1, 128, 256, 3, 2, 3).unwrap();
+        assert_eq!(cache.num_layers(), 3);
+        assert_eq!(cache.batch_size(), 1);
+        assert_eq!(cache.cache_len(), 2); // kernel_size - 1 = 3 - 1 = 2
+
+        // Verify layer shapes: [B, C, F, T]
+        // NeMo CausalConv2D uses: left_pad=K-1=2, right_pad=S-1=1
+        // Total padding = 3, so output = floor(in/2) + 1
+        //
+        // Layer 0: [1, 1, 128, 2] - input mel features
+        assert_eq!(cache.layers[0].shape(), &[1, 1, 128, 2]);
+        // Layer 1: [1, 256, 65, 2] - after first conv (freq: floor(128/2)+1 = 65)
+        assert_eq!(cache.layers[1].shape(), &[1, 256, 65, 2]);
+        // Layer 2: [1, 256, 33, 2] - after second conv (freq: floor(65/2)+1 = 33)
+        assert_eq!(cache.layers[2].shape(), &[1, 256, 33, 2]);
+    }
+
+    #[test]
     fn test_encoder_cache_creation() {
-        let cache = EncoderCache::new(24, 1, 70, 8, 1024).unwrap();
+        // Create subsampling cache for 8x downsampling (3 layers), 128 mel bins
+        let subsampling_cache = SubsamplingCache::new(1, 128, 256, 3, 2, 3).unwrap();
+        let cache = EncoderCache::new(24, 1, 70, 8, 1024, subsampling_cache).unwrap();
         assert_eq!(cache.num_layers(), 24);
         assert_eq!(cache.batch_size(), 1);
         assert_eq!(cache.channel_cache_size(), 70);
         assert_eq!(cache.time_cache_size(), 8);
+        assert_eq!(cache.subsampling.num_layers(), 3);
     }
 
     #[test]
@@ -884,14 +967,12 @@ mod tests {
     #[test]
     fn test_streaming_config_chunk_sizes() {
         let config = StreamingConfig {
-            chunk_size: (100, 120),
-            shift_size: (80, 100),
+            chunk_size: 100,
+            shift_size: 80,
             cache_drop_size: 0,
             last_channel_cache_size: 70,
             last_time_cache_size: 8,
             valid_out_len: 10,
-            pre_encode_cache_size: (0, 9),
-            drop_extra_pre_encoded: 2,
             lookahead_frames: 13,
             mode_idx: 0,
             left_context: 70,
@@ -899,7 +980,7 @@ mod tests {
         };
 
         assert_eq!(config.chunk_size_for_step(true), 100);
-        assert_eq!(config.chunk_size_for_step(false), 120);
+        assert_eq!(config.chunk_size_for_step(false), 100);
         assert_eq!(config.shift_size_for_step(true), 80);
         assert_eq!(config.shift_size_for_step(false), 100);
         assert_eq!(config.pre_encode_cache_for_step(true), 0);
