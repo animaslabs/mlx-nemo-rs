@@ -84,8 +84,17 @@ fn load_batch_norm(layer: &mut nn::BatchNorm, weights: &HashMap<String, Array>, 
 /// - left_pad = kernel_size - 1 (for causal behavior on time, and extra preservation on frequency)
 /// - right_pad = (kernel_size - 1) // 2 (additional padding for output size preservation)
 ///
-/// This asymmetric padding ensures the output size is: ceil((input + left_pad + right_pad - kernel) / stride) + 1
-/// which gives us the same output dimensions as NeMo's CausalConv2D.
+/// This asymmetric padding ensures the output size matches NeMo's CausalConv2D.
+///
+/// NeMo's CausalConv2D applies the same asymmetric padding to BOTH time and frequency:
+/// - left_pad = kernel - 1
+/// - right_pad = (kernel - 1) // 2
+///
+/// This gives output size = floor(input / stride) + 1 for both dimensions.
+///
+/// Note: The documentation suggests frequency should use symmetric padding, but
+/// NeMo's actual implementation uses the same padding for both axes. We match
+/// NeMo's behavior to ensure compatibility with pretrained weights.
 fn causal_pad_2d(x: &Array, kernel_size: usize, _stride: usize) -> Result<Array> {
     let batch = x.dim(0) as i32;
     let time = x.dim(1) as i32;
@@ -946,13 +955,22 @@ impl Subsampling {
 
     /// Compute the frequency dimension output size after subsampling convolutions.
     ///
-    /// For NeMo's CausalConv2D with kernel=3, stride=2, the padding is:
-    /// - left_pad = kernel - 1 = 2
-    /// - right_pad = (kernel - 1) / 2 = 1
+    /// NeMo's CausalConv2D applies the same asymmetric padding to BOTH dimensions:
+    /// - left_pad = kernel - 1 = 2 (for k=3)
+    /// - right_pad = (kernel - 1) // 2 = 1 (for k=3)
+    /// - total padding = 3
     ///
     /// Output size = floor((input + left_pad + right_pad - kernel) / stride) + 1
     ///             = floor((input + 2 + 1 - 3) / 2) + 1
     ///             = floor(input / 2) + 1
+    ///
+    /// Example for 128 mel bins with 3 stages (causal mode):
+    ///   128 -> floor(128/2) + 1 = 65
+    ///   65  -> floor(65/2) + 1 = 33
+    ///   33  -> floor(33/2) + 1 = 17
+    ///
+    /// Note: This differs from the documentation which suggests symmetric padding
+    /// for frequency, but matches NeMo's actual CausalConv2D implementation.
     fn compute_freq_output_size(
         feat_in: usize,
         n_strides: usize,
@@ -966,7 +984,6 @@ impl Subsampling {
             if is_causal {
                 // CausalConv2D: output = floor(input / stride) + 1
                 // This comes from: floor((input + (k-1) + (k-1)/2 - k) / stride) + 1
-                //                = floor((input + k - 1 + floor((k-1)/2) - k) / stride) + 1
                 // For k=3: floor((input + 2 + 1 - 3) / 2) + 1 = floor(input / 2) + 1
                 f = f / stride + 1;
             } else {

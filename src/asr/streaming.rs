@@ -481,27 +481,43 @@ impl StreamingMelBuffer {
         let mel_buffer = self.mel_buffer.as_ref()?;
 
         // Calculate start position accounting for pre_encode_cache
-        // Also account for mel_buffer_offset when frames have been trimmed
+        // NeMo pads with zeros if there's not enough history for the cache
         let cache_start = self.buffer_idx.saturating_sub(pre_encode_cache);
         let cache_frames_available = self.buffer_idx - cache_start;
+        let zeros_needed = pre_encode_cache.saturating_sub(cache_frames_available);
 
-        // Total frames to extract: cache + chunk
-        let total_extract = cache_frames_available + chunk_size;
+        // Total frames to extract from buffer: available cache + chunk
+        let frames_from_buffer = cache_frames_available + chunk_size;
+        // Total output frames: zeros padding + frames from buffer
+        let total_extract = zeros_needed + frames_from_buffer;
+
         tracing::debug!(
             self.buffer_idx,
             cache_start,
             cache_frames_available,
+            zeros_needed,
+            frames_from_buffer,
             total_extract,
             "Extracting mel frames"
         );
 
         // Convert global frame indices to local buffer indices
         let local_start = cache_start.saturating_sub(self.mel_buffer_offset);
-        let local_end = local_start + total_extract;
+        let local_end = local_start + frames_from_buffer;
 
         // Extract slice from buffer: mel_buffer[:, local_start:local_end]
         use mlx_rs::ops::indexing::IndexOp;
-        let mel_chunk = mel_buffer.index((.., local_start as i32..local_end as i32));
+        let buffer_chunk = mel_buffer.index((.., local_start as i32..local_end as i32));
+
+        // If we need zero padding, prepend it
+        let mel_chunk = if zeros_needed > 0 {
+            let zeros = mlx_rs::ops::zeros::<f32>(&[self.n_mels as i32, zeros_needed as i32])
+                .expect("Failed to create zero padding");
+            mlx_rs::ops::concatenate_axis(&[&zeros, &buffer_chunk], 1)
+                .expect("Failed to concatenate zero padding")
+        } else {
+            buffer_chunk
+        };
 
         // Advance buffer index
         self.buffer_idx += shift_size;
@@ -758,13 +774,15 @@ pub fn compute_streaming_config(
         shift_size.1 / subsampling_factor
     };
 
-    // Pre-encode cache size
-    // NeMo's dw_striding subsampling returns [0, subsampling_factor + 1]
-    // This is different from what we had before!
+    // Pre-encode cache size (mel frames to prepend for streaming)
+    // NeMo's dw_striding subsampling.get_streaming_cache_size() returns [0, subsampling_factor + 1]
+    // For 8x subsampling: [0, 9]
+    // For 4x subsampling: [0, 5]
     let pre_encode_cache = (0, subsampling_factor + 1);
 
     // Drop extra pre-encoded frames after subsampling
     // NeMo: drop_extra_pre_encoded = 1 + (pre_encode_cache_size[1] - 1) // subsampling_factor
+    // For 9 frames with 8x subsampling: 1 + (9-1)//8 = 1 + 1 = 2
     let drop_extra = if pre_encode_cache.1 >= 1 {
         1 + (pre_encode_cache.1 - 1) / subsampling_factor
     } else {
