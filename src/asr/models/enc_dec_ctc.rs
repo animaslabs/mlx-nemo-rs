@@ -42,7 +42,7 @@ use crate::asr::decoding::{greedy_ctc_merge, greedy_decode, lcs_merge_buffer};
 use crate::asr::modules::{CTCDecoder, ConformerEncoder, MelSpectrogram};
 use crate::asr::streaming::{
     compute_streaming_config, get_streaming_modes, EncoderCache, MelBuffer, StreamingConfig,
-    StreamingModeInfo, StreamingOutput, SubsamplingCache,
+    StreamingModeInfo, StreamingOutput,
 };
 use crate::core::checkpoint::NemoCheckpoint;
 use crate::core::config::from_yaml_str;
@@ -362,20 +362,6 @@ impl EncDecCTCModel {
         // Setup encoder with cache drop size
         self.encoder.setup_streaming(config.cache_drop_size);
 
-        // Get subsampling parameters from encoder
-        let (n_strides, kernel_size, stride, conv_channels) = self.encoder.subsampling_params();
-        let n_mels = self.config.preprocessor.features;
-
-        // Create subsampling cache
-        let subsampling_cache = SubsamplingCache::new(
-            batch_size,
-            n_mels,
-            conv_channels,
-            kernel_size,
-            stride,
-            n_strides,
-        )?;
-
         // Create initial encoder cache
         let encoder_cache = EncoderCache::new(
             self.encoder.num_layers(),
@@ -383,7 +369,6 @@ impl EncDecCTCModel {
             config.last_channel_cache_size,
             config.last_time_cache_size,
             self.encoder.d_model(),
-            subsampling_cache,
         )?;
 
         // Reset preprocessor streaming state (remainder buffer, preemphasis state)
@@ -430,11 +415,7 @@ impl EncDecCTCModel {
         // This handles preemphasis state and remainder buffer internally
         let mel_features = self.preprocessor.process_chunk(audio_chunk)?;
 
-        tracing::debug!(
-            "PROCESS CHUNK #{}: Got mel_features size {:?}",
-            self.chunk_count,
-            mel_features.size()
-        );
+        tracing::debug!("PROCESS CHUNK #{}: Got mel_features size {:?}", self.chunk_count, mel_features.size());
         self.chunk_count += 1;
 
         // Check if we got any frames
@@ -455,13 +436,26 @@ impl EncDecCTCModel {
         let seq_len = features.dim(2);
         let lengths = Array::from_slice(&[seq_len as i32], &[1]);
 
-        // Run encoder with cache (subsampling cache is now per-layer, no mel overlap needed)
-        let (encoded, encoded_lengths, encoder_cache_next) =
-            self.encoder
-                .forward_streaming(&features, &lengths, &session.encoder_cache)?;
+        // NeMo always applies drop_extra_pre_encoded when cache is provided,
+        // even on the first chunk (when cache is empty but not None).
+        // The streaming mode means cache is always passed, so always drop.
+        let drop_extra = session.config.drop_extra_pre_encoded;
+
+        // Run encoder with cache
+        let (encoded, encoded_lengths, cache_channel_next, cache_time_next, cache_len_next) =
+            self.encoder.forward_streaming(
+                &features,
+                &lengths,
+                &session.encoder_cache.last_channel,
+                &session.encoder_cache.last_time,
+                &session.encoder_cache.last_channel_len,
+                drop_extra,
+            )?;
 
         // Update cache
-        session.encoder_cache = encoder_cache_next;
+        session.encoder_cache.last_channel = cache_channel_next;
+        session.encoder_cache.last_time = cache_time_next;
+        session.encoder_cache.last_channel_len = cache_len_next;
 
         // Decode to log probabilities
         let log_probs = self.decoder.forward(&encoded)?;
@@ -525,9 +519,16 @@ impl EncDecCTCModel {
             let seq_len = features.dim(2);
             let lengths = Array::from_slice(&[seq_len as i32], &[1]);
 
-            let (encoded, encoded_lengths, _) =
-                self.encoder
-                    .forward_streaming(&features, &lengths, &session.encoder_cache)?;
+            let drop_extra = session.config.drop_extra_pre_encoded;
+
+            let (encoded, encoded_lengths, _, _, _) = self.encoder.forward_streaming(
+                &features,
+                &lengths,
+                &session.encoder_cache.last_channel,
+                &session.encoder_cache.last_time,
+                &session.encoder_cache.last_channel_len,
+                drop_extra,
+            )?;
 
             let log_probs = self.decoder.forward(&encoded)?;
             let token_sequences = greedy_decode(&log_probs, &encoded_lengths, self.blank_id)?;

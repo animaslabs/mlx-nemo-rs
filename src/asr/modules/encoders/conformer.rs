@@ -14,7 +14,6 @@ use mlx_rs::Array;
 
 use super::attention::{RelPositionMultiHeadAttention, RelPositionalEncoding};
 use crate::asr::config::EncoderConfig;
-use crate::asr::streaming::{EncoderCache, SubsamplingCache};
 use crate::core::error::Result;
 
 /// Global counter for encoder forward calls (for debugging)
@@ -78,10 +77,12 @@ fn load_batch_norm(layer: &mut nn::BatchNorm, weights: &HashMap<String, Array>, 
     }
 }
 
-/// Apply causal padding to the frequency dimension only of a 4D tensor.
+/// Apply causal padding to a 4D tensor [B, T, F, C].
 ///
-/// For non-streaming mode where time is padded externally via mel buffer.
-/// Pads frequency with top=1 to match NeMo's CausalConv2D behavior.
+/// This matches NeMo's CausalConv2D padding behavior, which pads BOTH time and
+/// frequency dimensions the same way:
+/// - left_pad = kernel_size - 1 (for causal behavior on time, and extra preservation on frequency)
+/// - right_pad = (kernel_size - 1) // 2 (additional padding for output size preservation)
 ///
 /// This asymmetric padding ensures the output size matches NeMo's CausalConv2D.
 ///
@@ -100,58 +101,22 @@ fn causal_pad_2d(x: &Array, kernel_size: usize, _stride: usize) -> Result<Array>
     let freq = x.dim(2) as i32;
     let channels = x.dim(3) as i32;
 
-    // NeMo padding amounts
-    let left_pad = (kernel_size - 1) as i32; // 2 for kernel_size=3
-    let right_pad = (stride - 1) as i32; // 1 for stride=2
-    let top_pad = left_pad; // Same as left: 2
-    let bottom_pad = right_pad; // Same as right: 1
+    // NeMo's CausalConv2D uses the same padding for both time and frequency:
+    // left_pad = kernel_size - 1
+    // right_pad = (kernel_size - 1) // 2
+    let left_pad = (kernel_size - 1) as i32;
+    let right_pad = ((kernel_size - 1) / 2) as i32;
 
-    // Pad time axis (left and right): [B, T, F, C] -> [B, T+3, F, C]
+    // Step 1: Pad time dimension (axis 1): [B, T, F, C] -> [B, T+left_pad+right_pad, F, C]
     let time_zeros_left = mlx_rs::ops::zeros::<f32>(&[batch, left_pad, freq, channels])?;
     let time_zeros_right = mlx_rs::ops::zeros::<f32>(&[batch, right_pad, freq, channels])?;
     let x = mlx_rs::ops::concatenate_axis(&[&time_zeros_left, x, &time_zeros_right], 1)?;
 
-    // Update time dimension after padding
+    // Step 2: Pad frequency dimension (axis 2)
     let new_time = time + left_pad + right_pad;
-
-    // Pad frequency axis (top and bottom): [B, T', F, C] -> [B, T', F+3, C]
-    let freq_zeros_top = mlx_rs::ops::zeros::<f32>(&[batch, new_time, top_pad, channels])?;
-    let freq_zeros_bottom = mlx_rs::ops::zeros::<f32>(&[batch, new_time, bottom_pad, channels])?;
-    let x = mlx_rs::ops::concatenate_axis(&[&freq_zeros_top, &x, &freq_zeros_bottom], 2)?;
-
-    Ok(x)
-}
-
-/// Apply causal padding for streaming in NCHW format.
-///
-/// This is used in `forward_streaming` after concatenating with the time cache.
-/// The cache provides the left context (K-1=2 frames) for each layer.
-///
-/// # Input format
-/// NCHW (PyTorch convention): `[batch, channels, freq, time]`
-///
-/// # Padding Strategy
-///
-/// **Time axis**: No padding needed - the cache provides left context.
-/// With cache=2 and no right padding, output = (in+2-3)/2 + 1 = (in-1)/2 + 1
-///
-/// **Freq axis**: Must match NeMo's CausalConv2D to get correct feature dim.
-/// NeMo uses top=2, bottom=1 (total=3), giving:
-/// 128 → 65 → 33 → 17 freq bins = 4352 features
-fn causal_pad_freq_nchw(x: &Array, kernel_size: usize, stride: usize) -> Result<Array> {
-    let batch = x.dim(0) as i32;
-    let channels = x.dim(1) as i32;
-    let time = x.dim(3) as i32;
-
-    // Frequency padding: must match NeMo to get 4352 features
-    // NeMo uses left_pad=K-1=2, right_pad=S-1=1 on freq axis
-    let top_pad = (kernel_size - 1) as i32; // 2
-    let bottom_pad = (stride - 1) as i32; // 1
-
-    // Pad frequency axis only: [B, C, F, T] -> [B, C, F+3, T]
-    let freq_zeros_top = mlx_rs::ops::zeros::<f32>(&[batch, channels, top_pad, time])?;
-    let freq_zeros_bottom = mlx_rs::ops::zeros::<f32>(&[batch, channels, bottom_pad, time])?;
-    let x = mlx_rs::ops::concatenate_axis(&[&freq_zeros_top, x, &freq_zeros_bottom], 2)?;
+    let freq_zeros_left = mlx_rs::ops::zeros::<f32>(&[batch, new_time, left_pad, channels])?;
+    let freq_zeros_right = mlx_rs::ops::zeros::<f32>(&[batch, new_time, right_pad, channels])?;
+    let x = mlx_rs::ops::concatenate_axis(&[&freq_zeros_left, &x, &freq_zeros_right], 2)?;
 
     Ok(x)
 }
@@ -561,18 +526,6 @@ impl ConformerEncoder {
         }
     }
 
-    /// Get subsampling parameters for cache initialization.
-    ///
-    /// Returns (n_strides, kernel_size, stride, conv_channels).
-    pub fn subsampling_params(&self) -> (usize, usize, usize, usize) {
-        (
-            self.subsampling.n_strides(),
-            self.subsampling.kernel_size(),
-            self.subsampling.stride(),
-            self.subsampling.conv_channels(),
-        )
-    }
-
     /// Setup streaming parameters and update layer cache drop sizes.
     ///
     /// This should be called before streaming inference to configure
@@ -587,103 +540,89 @@ impl ConformerEncoder {
     /// Forward pass with streaming cache support.
     ///
     /// This implements NeMo's streaming forward with:
-    /// 1. Per-layer subsampling CausalConv2D caching
-    /// 2. Attention mask creation based on att_context_size and att_context_style
-    /// 3. Full cache buffer passed to layers (not just filled portion)
-    /// 4. Proper cache update with sliding window
+    /// 1. Attention mask creation based on att_context_size and att_context_style
+    /// 2. Full cache buffer passed to layers (not just filled portion)
+    /// 3. Proper cache update with sliding window
     ///
     /// # Arguments
     /// * `features` - Input features [batch, features, time]
     /// * `lengths` - Sequence lengths [batch]
-    /// * `cache` - Encoder cache containing subsampling, attention, and conv caches
+    /// * `cache_last_channel` - MHA cache [num_layers, batch, cache_len, d_model]
+    /// * `cache_last_time` - Conv cache [num_layers, batch, d_model, time_cache]
+    /// * `cache_last_channel_len` - Cache fill level [batch]
+    /// * `drop_extra_pre_encoded` - Frames to drop after subsampling
     ///
     /// # Returns
     /// * Encoded features [batch, d_model, time']
     /// * Output lengths [batch]
-    /// * Updated encoder cache
+    /// * Updated MHA cache
+    /// * Updated conv cache
+    /// * Updated cache fill level
     pub fn forward_streaming(
         &mut self,
         features: &Array,
         lengths: &Array,
-        cache: &EncoderCache,
-    ) -> Result<(Array, Array, EncoderCache)> {
-        // Track encoder calls for debugging
-        let enc_call = ENCODER_CALL_COUNT.fetch_add(1, Ordering::SeqCst);
-
-        tracing::debug!(
-            enc_call,
-            features_shape = ?features.shape(),
-            lengths_shape = ?lengths.shape(),
-            cache_channel_shape = ?cache.last_channel.shape(),
-            cache_time_shape = ?cache.last_time.shape(),
-            cache_len_shape = ?cache.last_channel_len.shape(),
-            subsampling_cache_layers = cache.subsampling.num_layers(),
-            "forward_streaming entry"
-        );
-
+        cache_last_channel: &Array,
+        cache_last_time: &Array,
+        cache_last_channel_len: &Array,
+        drop_extra_pre_encoded: usize,
+    ) -> Result<(Array, Array, Array, Array, Array)> {
         // Transpose from [B, F, T] to [B, T, F] for processing
         let x = mlx_rs::ops::transpose_axes(features, &[0, 2, 1])?;
-        tracing::trace!(enc_call, transposed_shape = ?x.shape(), "after transpose");
 
-        // Subsampling with per-layer cache (no mel frame overlap needed)
-        let (mut x, lengths, subsampling_cache_next) =
-            self.subsampling
-                .forward_streaming(&x, lengths, &cache.subsampling)?;
-        tracing::debug!(
-            enc_call,
-            subsampled_shape = ?x.shape(),
-            subsampled_lengths_shape = ?lengths.shape(),
-            "after subsampling"
-        );
+        // Subsampling
+        let (mut x, mut lengths) = self.subsampling.forward(&x, lengths)?;
+
+        // Drop extra pre-encoded frames for streaming
+        // This is needed because the subsampling convolutions produce extra frames
+        // at chunk boundaries that should be discarded to match offline behavior.
+        // NeMo applies this on ALL chunks (whenever cache_last_channel is not None),
+        // which in streaming mode is always.
+        if drop_extra_pre_encoded > 0 {
+            let drop = drop_extra_pre_encoded as i32;
+            x = x.index((.., drop.., ..));
+            lengths = mlx_rs::ops::clip(
+                &(&lengths - &Array::from_int(drop)),
+                (&Array::from_int(0), ()),
+            )?;
+        }
 
         // Scale input by sqrt(d_model) if xscaling is enabled
         let xscale = self.pos_enc.xscale();
         if xscale != 1.0 {
             x = &x * Array::from_f32(xscale);
-            tracing::trace!(enc_call, xscale, "applied xscaling");
         }
 
         let seq_len = x.dim(1) as i32;
-        let cache_size = cache.last_channel.dim(2) as i32; // Allocated cache size
+        let cache_size = cache_last_channel.dim(2) as i32; // Allocated cache size
 
         // Get the actual filled cache length (use first batch element, assume all same)
-        cache.last_channel_len.eval()?;
-        let filled_cache_len = cache.last_channel_len.as_slice::<i64>()[0].max(0) as i32;
+        cache_last_channel_len.eval()?;
+        let filled_cache_len = cache_last_channel_len.as_slice::<i64>()[0].max(0) as i32;
 
         // Total length for K/V is cache_size + seq_len (full buffer, not just filled)
         // NeMo uses full buffer and relies on mask to hide unfilled positions
         let total_len = cache_size + seq_len;
 
-        tracing::debug!(
-            enc_call,
-            seq_len,
-            cache_size,
-            filled_cache_len,
-            total_len,
-            att_context_size = ?self.att_context_size,
-            att_context_style = %self.att_context_style,
-            "cache and attention parameters"
-        );
-
         // Generate positional encoding for total length (full buffer + current)
         // This should cover positions for all K/V that attention will see
         let pos_emb = self.pos_enc.get_encoding(total_len as usize)?;
-        tracing::trace!(enc_call, pos_emb_shape = ?pos_emb.shape(), "generated positional encoding");
 
         // Create attention mask if we have context configuration
+        // NeMo: att_mask = _create_masks(...); att_mask = att_mask[:, cache_len:]
+        //
+        // The mask is created for the full buffer (cache_size + seq_len = total_len),
+        // and offset masking hides the unfilled cache positions.
         let att_mask = if let Some(ctx) = self.att_context_size {
-            let mask = create_attention_mask(
+            Some(create_attention_mask(
                 ctx,
                 &self.att_context_style,
                 total_len,        // Full buffer: cache_size + seq_len
                 cache_size,       // Full cache buffer size (for slicing)
                 filled_cache_len, // How much is filled (for offset masking)
                 seq_len,          // Current sequence length
-            )?;
-            tracing::trace!(enc_call, mask_shape = ?mask.shape(), "created attention mask");
-            Some(mask)
+            )?)
         } else {
-            tracing::trace!(enc_call, "no attention mask (no context config)");
             None
         };
 
@@ -691,9 +630,11 @@ impl ConformerEncoder {
         let mut cache_channel_next = Vec::with_capacity(self.layers.len());
         let mut cache_time_next = Vec::with_capacity(self.layers.len());
 
+        // Track encoder calls for debugging
+        let enc_call = ENCODER_CALL_COUNT.fetch_add(1, Ordering::SeqCst);
+
         // Debug encoder input stats
-        let should_debug_stats = enc_call < 5 || enc_call % 50 == 0;
-        if should_debug_stats {
+        if enc_call < 5 || enc_call == 135 || enc_call == 200 || enc_call == 270 {
             x.eval()?;
             let flat = x.reshape(&[-1])?;
             flat.eval()?;
@@ -704,44 +645,34 @@ impl ConformerEncoder {
             let var: f32 =
                 slice.iter().map(|&v| (v - mean).powi(2)).sum::<f32>() / slice.len() as f32;
             let std = var.sqrt();
-            tracing::debug!(
+            tracing::trace!(
                 enc_call,
                 seq_len,
                 min,
                 max,
                 mean,
                 std,
-                "encoder input stats (before layers)"
+                "encoder input stats"
             );
         }
-
-        tracing::debug!(
-            enc_call,
-            num_layers = self.layers.len(),
-            "processing conformer layers"
-        );
 
         // Process through conformer blocks with cache
         for (layer_idx, layer) in self.layers.iter_mut().enumerate() {
             // Extract per-layer cache: [batch, cache_size, d_model] and [batch, d_model, time_cache]
-            let layer_cache_channel_full = cache.last_channel.index((layer_idx as i32, .., .., ..));
-            let layer_cache_time = cache.last_time.index((layer_idx as i32, .., .., ..));
-
-            tracing::trace!(
-                enc_call,
-                layer_idx,
-                cache_channel_shape = ?layer_cache_channel_full.shape(),
-                cache_time_shape = ?layer_cache_time.shape(),
-                "layer cache shapes"
-            );
+            let layer_cache_channel_full = cache_last_channel.index((layer_idx as i32, .., .., ..));
+            let layer_cache_time = cache_last_time.index((layer_idx as i32, .., .., ..));
 
             // Pass full cache buffer to layer, along with filled length
+            // The attention layer will extract the filled portion internally
+            // Always pass conv cache, even on first chunk with zeros.
+            // Python's NeMo passes zeros cache which triggers cache path (concat zeros + input),
+            // not the no-cache path (pad input). This ensures consistent cache population.
             let (x_out, new_channel, new_time) = layer.forward_with_cache(
                 &x,
                 &pos_emb,
                 Some(&layer_cache_channel_full),
                 filled_cache_len,
-                Some(&layer_cache_time),
+                Some(&layer_cache_time), // Always pass conv cache
                 att_mask.as_ref(),
                 layer_idx,
                 enc_call,
@@ -749,23 +680,22 @@ impl ConformerEncoder {
 
             x = x_out;
 
-            // Update cache
+            // Update cache: the attention layer returns new_cache from sliding window
+            // We need to store it properly in the full cache buffer
+            //
+            // The attention returns: new_cache = concat(old_filled[q_keep_size:], x[:q_keep_size])
+            // We need to place this at the END of the full cache buffer
             if let Some(nc) = new_channel {
                 let nc_len = nc.dim(1) as i32;
-                tracing::trace!(
-                    enc_call,
-                    layer_idx,
-                    new_cache_len = nc_len,
-                    cache_size,
-                    "updating channel cache"
-                );
                 let updated_cache = if nc_len < cache_size {
+                    // Pad with zeros at the beginning to maintain cache_size
                     let pad_size = cache_size - nc_len;
                     let batch = nc.dim(0) as i32;
                     let d_model = nc.dim(2) as i32;
                     let zeros = mlx_rs::ops::zeros::<f32>(&[batch, pad_size, d_model])?;
                     mlx_rs::ops::concatenate_axis(&[&zeros, &nc], 1)?
                 } else if nc_len > cache_size {
+                    // Truncate from the left (keep newest)
                     let start = nc_len - cache_size;
                     nc.index((.., start.., ..))
                 } else {
@@ -774,18 +704,12 @@ impl ConformerEncoder {
                 cache_channel_next.push(updated_cache);
             }
             if let Some(nt) = new_time {
-                tracing::trace!(
-                    enc_call,
-                    layer_idx,
-                    new_time_cache_shape = ?nt.shape(),
-                    "updating time cache"
-                );
                 cache_time_next.push(nt);
             }
         }
 
         // Debug encoder output stats
-        if should_debug_stats {
+        if enc_call < 5 || enc_call == 135 || enc_call == 200 || enc_call == 270 {
             x.eval()?;
             let flat = x.reshape(&[-1])?;
             flat.eval()?;
@@ -796,50 +720,100 @@ impl ConformerEncoder {
             let var: f32 =
                 slice.iter().map(|&v| (v - mean).powi(2)).sum::<f32>() / slice.len() as f32;
             let std = var.sqrt();
-            tracing::debug!(
-                enc_call,
-                min,
-                max,
-                mean,
-                std,
-                "encoder output stats (after layers)"
-            );
+            tracing::trace!(enc_call, min, max, mean, std, "encoder output stats");
         }
 
         // Transpose back to [B, D, T]
         let x = mlx_rs::ops::transpose_axes(&x, &[0, 2, 1])?;
-        tracing::trace!(enc_call, output_shape = ?x.shape(), "after final transpose");
 
         // Stack caches: [num_layers, batch, ...]
         let cache_channel_next = if !cache_channel_next.is_empty() {
             let refs: Vec<&Array> = cache_channel_next.iter().collect();
             mlx_rs::ops::stack_axis(&refs, 0)?
         } else {
-            cache.last_channel.clone()
+            cache_last_channel.clone()
         };
 
         let cache_time_next = if !cache_time_next.is_empty() {
             let refs: Vec<&Array> = cache_time_next.iter().collect();
             mlx_rs::ops::stack_axis(&refs, 0)?
         } else {
-            cache.last_time.clone()
+            cache_last_time.clone()
         };
+
+        // Debug: track cache length
+        tracing::trace!(
+            seq_len,
+            cache_size,
+            filled_before = filled_cache_len,
+            "cache length tracking"
+        );
 
         // Update cache length: clamp(old_len + seq_len, max=cache_size)
         let cache_channel_len_next = mlx_rs::ops::clip(
-            &(&cache.last_channel_len + &Array::from_int(seq_len)),
+            &(cache_last_channel_len + &Array::from_int(seq_len)),
             ((), &Array::from_int(cache_size)),
         )?;
 
-        // Build updated cache
-        let cache_next = EncoderCache {
-            subsampling: subsampling_cache_next,
-            last_channel: cache_channel_next,
-            last_time: cache_time_next,
-            last_channel_len: cache_channel_len_next,
+        // Verify and debug the result
+        cache_channel_len_next.eval()?;
+        let filled_after = cache_channel_len_next.as_slice::<i64>()[0];
+
+        tracing::trace!(
+            filled_after,
+            expected_max = cache_size,
+            "cache length after update"
+        );
+
+        // Flag potential issues
+        if filled_after > cache_size as i64 {
+            tracing::warn!(filled_after, cache_size, "Cache length exceeds cache_size!");
+        }
+
+        // Safety: ensure cache length never exceeds cache_size
+        // This guards against any issues with the clip operation
+        // Note: cache_last_channel_len is i64, so we need to match that type
+        let cache_channel_len_next = if filled_after > cache_size as i64 {
+            tracing::debug!(
+                from = filled_after,
+                to = cache_size,
+                "clamping cache length"
+            );
+            Array::from_slice(&[cache_size as i64], &[1])
+        } else {
+            cache_channel_len_next
         };
 
-        Ok((x, lengths, cache_next))
+        // Debug: check cache statistics
+        {
+            // Check first layer's new cache
+            let first_cache = cache_channel_next.index((0, .., .., ..));
+            first_cache.eval()?;
+            let fc_flat = first_cache.reshape(&[-1])?;
+            fc_flat.eval()?;
+            let fc_slice: &[f32] = fc_flat.as_slice();
+            let fc_min = fc_slice.iter().cloned().fold(f32::INFINITY, f32::min);
+            let fc_max = fc_slice.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            let fc_mean: f32 = fc_slice.iter().sum::<f32>() / fc_slice.len() as f32;
+            let fc_var: f32 = fc_slice.iter().map(|&x| (x - fc_mean).powi(2)).sum::<f32>()
+                / fc_slice.len() as f32;
+            tracing::trace!(
+                layer = 0,
+                min = fc_min,
+                max = fc_max,
+                mean = fc_mean,
+                var = fc_var,
+                "layer0 cache stats"
+            );
+        }
+
+        Ok((
+            x,
+            lengths,
+            cache_channel_next,
+            cache_time_next,
+            cache_channel_len_next,
+        ))
     }
 }
 
@@ -892,9 +866,6 @@ struct Subsampling {
 
     /// Stride for length calculation
     stride: usize,
-
-    /// Number of striding layers (for cache initialization)
-    n_strides: usize,
 }
 
 impl Subsampling {
@@ -982,28 +953,7 @@ impl Subsampling {
             is_causal,
             kernel_size,
             stride,
-            n_strides,
         })
-    }
-
-    /// Get the number of striding layers (for cache initialization).
-    pub fn n_strides(&self) -> usize {
-        self.n_strides
-    }
-
-    /// Get the kernel size (for cache initialization).
-    pub fn kernel_size(&self) -> usize {
-        self.kernel_size
-    }
-
-    /// Get the stride (for cache initialization).
-    pub fn stride(&self) -> usize {
-        self.stride
-    }
-
-    /// Get the number of conv channels (for cache initialization).
-    pub fn conv_channels(&self) -> usize {
-        self.conv_channels
     }
 
     /// Compute the frequency dimension output size after subsampling convolutions.
@@ -1013,10 +963,8 @@ impl Subsampling {
     /// - right_pad = (kernel - 1) // 2 = 1 (for k=3)
     /// - total padding = 3
     ///
-    /// Applied to BOTH time and frequency axes.
-    ///
-    /// Output size = floor((input + total_pad - kernel) / stride) + 1
-    ///             = floor((input + 3 - 3) / 2) + 1
+    /// Output size = floor((input + left_pad + right_pad - kernel) / stride) + 1
+    ///             = floor((input + 2 + 1 - 3) / 2) + 1
     ///             = floor(input / 2) + 1
     ///
     /// Example for 128 mel bins with 3 stages (causal mode):
@@ -1062,9 +1010,8 @@ impl Subsampling {
         // Add channel dimension: [B, T, F] -> [B, T, F, 1] for MLX Conv2d
         // MLX Conv2d expects (N, H, W, C) format
         let mut x = x.reshape(&[-1, x.dim(1) as i32, x.dim(2) as i32, 1])?;
-        tracing::debug!(shape_after_reshape = ?x.shape(), "added channel dimension");
 
-        // Apply CausalConv2D padding (both time and freq axes) before first conv
+        // Apply causal padding if needed before first conv
         if self.is_causal {
             x = causal_pad_2d(&x, self.kernel_size, self.stride)?;
             tracing::trace!(shape_after_causal_pad = ?x.shape(), "after causal_pad_2d for first conv");
@@ -1074,26 +1021,6 @@ impl Subsampling {
         x = self.first_conv.forward(&x)?;
         tracing::trace!(shape_after_first_conv = ?x.shape(), "after first_conv");
         x = mlx_rs::nn::relu(&x)?;
-
-        // Debug first conv output stats
-        {
-            x.eval()?;
-            let flat = x.reshape(&[-1])?;
-            flat.eval()?;
-            let slice: &[f32] = flat.as_slice();
-            let min = slice.iter().cloned().fold(f32::INFINITY, f32::min);
-            let max = slice.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-            let mean: f32 = slice.iter().sum::<f32>() / slice.len() as f32;
-            let nonzero = slice.iter().filter(|&&v| v != 0.0).count();
-            tracing::debug!(
-                min,
-                max,
-                mean,
-                nonzero_count = nonzero,
-                total = slice.len(),
-                "first conv output stats"
-            );
-        }
 
         // Get parameters for loop since we need to avoid borrow issues
         let is_causal = self.is_causal;
@@ -1107,29 +1034,16 @@ impl Subsampling {
             .zip(self.pointwise_convs.iter_mut())
             .enumerate()
         {
-            // Apply CausalConv2D padding before each depthwise conv
+            // Apply causal padding before each depthwise conv
             if is_causal {
                 x = causal_pad_2d(&x, kernel_size, stride)?;
                 tracing::trace!(conv_idx = i, shape_after_causal_pad = ?x.shape(), "after causal_pad_2d for dw conv");
             }
-            let shape_before = x.shape().to_vec();
             x = dw_conv.forward(&x)?;
             tracing::trace!(conv_idx = i, shape_after_dw = ?x.shape(), "after depthwise conv");
             x = pw_conv.forward(&x)?;
             tracing::trace!(conv_idx = i, shape_after_pw = ?x.shape(), "after pointwise conv");
             x = mlx_rs::nn::relu(&x)?;
-
-            // Debug conv output stats
-            {
-                x.eval()?;
-                let flat = x.reshape(&[-1])?;
-                flat.eval()?;
-                let slice: &[f32] = flat.as_slice();
-                let min = slice.iter().cloned().fold(f32::INFINITY, f32::min);
-                let max = slice.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-                let mean: f32 = slice.iter().sum::<f32>() / slice.len() as f32;
-                tracing::debug!(conv_idx = i, min, max, mean, "dw+pw conv output stats");
-            }
         }
 
         // x is now [B, T', F', C] where T' = T/subsampling_factor, F' = F/subsampling_factor
@@ -1148,7 +1062,6 @@ impl Subsampling {
 
         // Transpose to [B, T', C, F'] to match NeMo's C*F flattening order
         let x = mlx_rs::ops::transpose_axes(&x, &[0, 1, 3, 2])?;
-        tracing::debug!(shape_after_transpose = ?x.shape(), "after transpose");
 
         // Flatten to [B, T', C*F']
         let x = x.reshape(&[batch as i32, time as i32, -1])?;
@@ -1161,22 +1074,20 @@ impl Subsampling {
         // Update lengths based on padding mode
         let mut new_lengths = lengths.clone();
         let n_convs = self.depthwise_convs.len() + 1;
-        let kernel = self.kernel_size as i32;
-        let stride = self.stride as i32;
 
         if is_causal {
-            // No internal time padding - mel buffer is pre-padded externally
-            // Conv output: floor((input - kernel) / stride) + 1
+            // For CausalConv2D: output = floor(input / stride) + 1
+            // This is equivalent to: (input + stride - 1) / stride when we want ceiling behavior
+            // Actually, it's just floor(input / stride) + 1
+            // So we compute: input // 2 + 1 for each conv
             for _ in 0..n_convs {
-                new_lengths = &mlx_rs::ops::floor_divide(
-                    &(&new_lengths - &Array::from_int(kernel)),
-                    &Array::from_int(stride),
-                )? + &Array::from_int(1);
+                new_lengths = &mlx_rs::ops::floor_divide(&new_lengths, &Array::from_int(2))?
+                    + &Array::from_int(1);
             }
         } else {
             // Standard: each stride just halves the length (with symmetric padding preserving dims)
             for _ in 0..n_convs {
-                new_lengths = mlx_rs::ops::floor_divide(&new_lengths, &Array::from_int(stride))?;
+                new_lengths = mlx_rs::ops::floor_divide(&new_lengths, &Array::from_int(2))?;
             }
         }
 
@@ -1187,193 +1098,6 @@ impl Subsampling {
         );
 
         Ok((x, new_lengths))
-    }
-
-    /// Streaming forward pass with explicit per-layer cache.
-    ///
-    /// This implements NeMo's CausalConv2D caching for streaming inference.
-    /// Each strided conv layer maintains a cache of the last `kernel_size - 1`
-    /// time frames to provide left context for causal convolution.
-    ///
-    /// # Arguments
-    /// * `x` - Input mel features `[batch, time, freq]`
-    /// * `lengths` - Sequence lengths `[batch]`
-    /// * `cache` - Per-layer subsampling cache (NCHW format)
-    ///
-    /// # Returns
-    /// * Output `[batch, time', d_model]`
-    /// * New lengths `[batch]`
-    /// * Updated cache
-    ///
-    /// # Cache Format
-    ///
-    /// Each layer's cache is stored in NCHW format `[B, C, F, T=cache_len]`:
-    /// - Layer 0: `[B, 1, 128, 2]` - input mel features
-    /// - Layer 1: `[B, 256, 64, 2]` - after first conv
-    /// - Layer 2: `[B, 256, 32, 2]` - after second conv
-    pub fn forward_streaming(
-        &mut self,
-        x: &Array,
-        lengths: &Array,
-        cache: &SubsamplingCache,
-    ) -> Result<(Array, Array, SubsamplingCache)> {
-        // x: [B, T, F] where F is number of mel features (e.g., 128)
-        let batch = x.dim(0) as i32;
-        let input_time = x.dim(1) as usize;
-        let freq = x.dim(2) as i32;
-
-        tracing::debug!(
-            input_shape = ?x.shape(),
-            input_time,
-            freq,
-            cache_layers = cache.num_layers(),
-            "subsampling forward_streaming entry"
-        );
-
-        let cache_len = self.kernel_size - 1; // = 2 for kernel_size=3
-        let mut new_cache_layers = Vec::with_capacity(cache.num_layers());
-
-        // Convert input to NCHW format: [B, T, F] -> [B, 1, F, T]
-        // MLX needs explicit reshape to add channel dim, then transpose
-        let mut x = x.reshape(&[batch, 1, x.dim(1) as i32, freq])?; // [B, 1, T, F]
-        x = mlx_rs::ops::transpose_axes(&x, &[0, 1, 3, 2])?; // [B, 1, F, T]
-
-        tracing::trace!(shape_nchw = ?x.shape(), "converted to NCHW");
-
-        // ========== Layer 0: first_conv (1 -> conv_channels) ==========
-        {
-            let layer_cache = &cache.layers[0]; // [B, 1, F, cache_len]
-
-            // Concatenate cache + input along time axis (axis 3)
-            // [B, 1, F, cache_len] + [B, 1, F, T] -> [B, 1, F, cache_len + T]
-            let x_with_cache = mlx_rs::ops::concatenate_axis(&[layer_cache, &x], 3)?;
-
-            tracing::trace!(
-                layer = 0,
-                cache_shape = ?layer_cache.shape(),
-                input_shape = ?x.shape(),
-                combined_shape = ?x_with_cache.shape(),
-                "layer 0 cache concat"
-            );
-
-            // Save new cache: last cache_len time frames BEFORE padding/conv
-            // This is the input to the next chunk's convolution
-            let t = x_with_cache.dim(3) as i32;
-            let new_cache = x_with_cache.index((.., .., .., (t - cache_len as i32)..));
-            new_cache_layers.push(new_cache);
-
-            // Apply frequency padding and time right padding, then convert to NHWC for MLX Conv2d
-            let x_padded = causal_pad_freq_nchw(&x_with_cache, self.kernel_size, self.stride)?;
-            // [B, 1, F+1, T'] -> [B, T', F+1, 1] for MLX Conv2d (NHWC)
-            x = mlx_rs::ops::transpose_axes(&x_padded, &[0, 3, 2, 1])?;
-
-            tracing::trace!(
-                padded_shape_nchw = ?x_padded.shape(),
-                nhwc_shape = ?x.shape(),
-                "layer 0 before conv"
-            );
-
-            // Conv2d + ReLU
-            x = self.first_conv.forward(&x)?;
-            x = mlx_rs::nn::relu(&x)?;
-
-            // Convert back to NCHW: [B, T', F', C] -> [B, C, F', T']
-            x = mlx_rs::ops::transpose_axes(&x, &[0, 3, 2, 1])?;
-
-            tracing::trace!(output_nchw = ?x.shape(), "layer 0 after conv");
-        }
-
-        // ========== Layers 1+: depthwise + pointwise pairs ==========
-        for (i, (dw_conv, pw_conv)) in self
-            .depthwise_convs
-            .iter_mut()
-            .zip(self.pointwise_convs.iter_mut())
-            .enumerate()
-        {
-            let layer_idx = i + 1;
-            let layer_cache = &cache.layers[layer_idx]; // [B, C, F, cache_len]
-
-            // Concatenate cache + x along time axis
-            let x_with_cache = mlx_rs::ops::concatenate_axis(&[layer_cache, &x], 3)?;
-
-            tracing::trace!(
-                layer = layer_idx,
-                cache_shape = ?layer_cache.shape(),
-                input_shape = ?x.shape(),
-                combined_shape = ?x_with_cache.shape(),
-                "layer cache concat"
-            );
-
-            // Save new cache
-            let t = x_with_cache.dim(3) as i32;
-            let new_cache = x_with_cache.index((.., .., .., (t - cache_len as i32)..));
-            new_cache_layers.push(new_cache);
-
-            // Apply frequency padding and time right padding, then convert to NHWC
-            let x_padded = causal_pad_freq_nchw(&x_with_cache, self.kernel_size, self.stride)?;
-            x = mlx_rs::ops::transpose_axes(&x_padded, &[0, 3, 2, 1])?; // NCHW -> NHWC
-
-            // Depthwise conv
-            x = dw_conv.forward(&x)?;
-            // Pointwise conv
-            x = pw_conv.forward(&x)?;
-            // ReLU
-            x = mlx_rs::nn::relu(&x)?;
-
-            // Convert back to NCHW
-            x = mlx_rs::ops::transpose_axes(&x, &[0, 3, 2, 1])?;
-
-            tracing::trace!(layer = layer_idx, output_nchw = ?x.shape(), "after conv");
-        }
-
-        // ========== Flatten and project ==========
-        // x is [B, C, F', T'] in NCHW format
-        // Need to convert to [B, T', C*F'] for linear projection
-
-        // Transpose to [B, T', C, F']
-        x = mlx_rs::ops::transpose_axes(&x, &[0, 3, 1, 2])?;
-
-        let batch = x.dim(0);
-        let time = x.dim(1);
-        let channels = x.dim(2);
-        let freq_out = x.dim(3);
-
-        tracing::debug!(batch, time, channels, freq_out, "shape before flatten");
-
-        // Flatten to [B, T', C*F']
-        x = x.reshape(&[batch as i32, time as i32, -1])?;
-
-        // Project to d_model
-        x = self.out_proj.forward(&x)?;
-
-        tracing::debug!(output_shape = ?x.shape(), "subsampling streaming output");
-
-        // ========== Compute output lengths ==========
-        // For streaming with cache, each conv layer output time is:
-        // out_T = floor((in_T + cache_len - kernel) / stride) + 1
-        //       = floor((in_T + 2 - 3) / 2) + 1
-        //       = floor((in_T - 1) / 2) + 1
-        let mut new_lengths = lengths.clone();
-        let n_convs = self.depthwise_convs.len() + 1;
-        let kernel = self.kernel_size as i32;
-        let stride = self.stride as i32;
-        let cache_len_i32 = cache_len as i32;
-
-        for _ in 0..n_convs {
-            // out = floor((in + cache_len - kernel) / stride) + 1
-            new_lengths = &mlx_rs::ops::floor_divide(
-                &(&new_lengths + &Array::from_int(cache_len_i32) - &Array::from_int(kernel)),
-                &Array::from_int(stride),
-            )? + &Array::from_int(1);
-        }
-
-        Ok((
-            x,
-            new_lengths,
-            SubsamplingCache {
-                layers: new_cache_layers,
-            },
-        ))
     }
 
     fn load_weights(&mut self, weights: &HashMap<String, Array>, prefix: &str) -> Result<()> {
