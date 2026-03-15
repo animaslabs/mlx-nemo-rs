@@ -860,6 +860,7 @@ struct Subsampling {
 }
 
 impl Subsampling {
+    #[tracing::instrument(skip(config), fields(feat_in = config.feat_in, d_model = config.d_model, subsampling_factor = config.subsampling_factor))]
     fn new(config: &EncoderConfig) -> Result<Self> {
         let feat_in = config.feat_in;
         let d_model = config.d_model;
@@ -979,6 +980,13 @@ impl Subsampling {
 
     fn forward(&mut self, x: &Array, lengths: &Array) -> Result<(Array, Array)> {
         // x: [B, T, F] where F is number of mel features (e.g., 80 or 128)
+        tracing::trace!(
+            input_shape = ?x.shape(),
+            lengths_shape = ?lengths.shape(),
+            is_causal = self.is_causal,
+            "subsampling forward start"
+        );
+
         // Add channel dimension: [B, T, F] -> [B, T, F, 1] for MLX Conv2d
         // MLX Conv2d expects (N, H, W, C) format
         let mut x = x.reshape(&[-1, x.dim(1) as i32, x.dim(2) as i32, 1])?;
@@ -986,10 +994,12 @@ impl Subsampling {
         // Apply causal padding if needed before first conv
         if self.is_causal {
             x = causal_pad_2d(&x, self.kernel_size, self.stride)?;
+            tracing::trace!(shape_after_causal_pad = ?x.shape(), "after causal_pad_2d for first conv");
         }
 
         // First conv layer with ReLU
         x = self.first_conv.forward(&x)?;
+        tracing::trace!(shape_after_first_conv = ?x.shape(), "after first_conv");
         x = mlx_rs::nn::relu(&x)?;
 
         // Get parameters for loop since we need to avoid borrow issues
@@ -998,17 +1008,21 @@ impl Subsampling {
         let stride = self.stride;
 
         // Apply depthwise + pointwise pairs with ReLU
-        for (dw_conv, pw_conv) in self
+        for (i, (dw_conv, pw_conv)) in self
             .depthwise_convs
             .iter_mut()
             .zip(self.pointwise_convs.iter_mut())
+            .enumerate()
         {
             // Apply causal padding before each depthwise conv
             if is_causal {
                 x = causal_pad_2d(&x, kernel_size, stride)?;
+                tracing::trace!(conv_idx = i, shape_after_causal_pad = ?x.shape(), "after causal_pad_2d for dw conv");
             }
             x = dw_conv.forward(&x)?;
+            tracing::trace!(conv_idx = i, shape_after_dw = ?x.shape(), "after depthwise conv");
             x = pw_conv.forward(&x)?;
+            tracing::trace!(conv_idx = i, shape_after_pw = ?x.shape(), "after pointwise conv");
             x = mlx_rs::nn::relu(&x)?;
         }
 
@@ -1018,15 +1032,24 @@ impl Subsampling {
         // We have: [B, T', F', C] -> transpose to [B, T', C, F'] -> flatten to [B, T', C*F']
         let batch = x.dim(0);
         let time = x.dim(1);
+        tracing::trace!(
+            batch,
+            time,
+            freq = x.dim(2),
+            channels = x.dim(3),
+            "before transpose and flatten"
+        );
 
         // Transpose to [B, T', C, F'] to match NeMo's C*F flattening order
         let x = mlx_rs::ops::transpose_axes(&x, &[0, 1, 3, 2])?;
 
         // Flatten to [B, T', C*F']
         let x = x.reshape(&[batch as i32, time as i32, -1])?;
+        tracing::trace!(shape_after_flatten = ?x.shape(), "after flatten");
 
         // Project to d_model: [B, T', d_model]
         let x = self.out_proj.forward(&x)?;
+        tracing::trace!(shape_after_proj = ?x.shape(), "after out_proj");
 
         // Update lengths based on padding mode
         let mut new_lengths = lengths.clone();
@@ -1047,6 +1070,12 @@ impl Subsampling {
                 new_lengths = mlx_rs::ops::floor_divide(&new_lengths, &Array::from_int(2))?;
             }
         }
+
+        tracing::trace!(
+            output_shape = ?x.shape(),
+            output_lengths_shape = ?new_lengths.shape(),
+            "subsampling forward complete"
+        );
 
         Ok((x, new_lengths))
     }

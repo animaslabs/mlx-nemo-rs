@@ -518,6 +518,24 @@ impl StreamingMelBuffer {
         self.total_audio_samples = 0;
         self.mel_buffer_offset = 0;
     }
+
+    /// Get memory statistics for the buffer.
+    ///
+    /// # Returns
+    /// A tuple of (audio_bytes, mel_bytes) representing approximate memory usage.
+    pub fn memory_stats(&self) -> (usize, usize) {
+        // No audio buffer in StreamingMelBuffer (audio is processed immediately)
+        let audio_bytes = 0;
+
+        // Mel buffer: [n_mels, time] of f32
+        let mel_bytes = self
+            .mel_buffer
+            .as_ref()
+            .map(|b| b.size() * std::mem::size_of::<f32>())
+            .unwrap_or(0);
+
+        (audio_bytes, mel_bytes)
+    }
 }
 
 /// Legacy MelBuffer for backward compatibility with CTC streaming.
@@ -868,43 +886,6 @@ mod tests {
         assert_eq!(config.shift_size_for_step(false), 100);
         assert_eq!(config.pre_encode_cache_for_step(true), 0);
         assert_eq!(config.pre_encode_cache_for_step(false), 9);
-    }
-
-    #[test]
-    fn test_streaming_mel_buffer_incremental() {
-        let mut buffer = StreamingMelBuffer::new(16000, 0.025, 0.01, 80, 512);
-        assert_eq!(buffer.window_samples, 400);
-        assert_eq!(buffer.hop_samples, 160);
-
-        // Add 1 second of audio
-        buffer.add_audio(&vec![0.0f32; 16000]);
-        assert_eq!(buffer.audio_samples_available(), 16000);
-        assert!(buffer.has_pending_audio(), "Should have pending audio");
-
-        // Simulate appending mel frames (what preprocessor would return)
-        // 16000 samples -> floor(16000/160) + 1 = 101 frames
-        let dummy_mel = vec![0.0f32; 80 * 101]; // [n_mels, time] format
-        buffer.append_mel(&dummy_mel, 101);
-        assert_eq!(buffer.total_frames, 101);
-
-        // Drain processed audio
-        buffer.drain_processed_audio();
-
-        // After processing, audio buffer should be trimmed to just overlap
-        assert!(
-            buffer.audio_samples_available() <= buffer.window_samples,
-            "Audio buffer should be bounded after processing"
-        );
-
-        // Add more audio
-        buffer.add_audio(&vec![0.0f32; 1600]); // 0.1s more
-
-        // Should still have pending audio (overlap + new = 400 + 1600 = 2000 samples)
-        assert!(
-            buffer.has_pending_audio(),
-            "Should have pending audio after adding more"
-        );
-        assert_eq!(buffer.audio_samples_available(), 2000);
     }
 
     #[test]

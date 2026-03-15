@@ -30,7 +30,6 @@
 
 use mlx_rs::ops::indexing::IndexOp;
 use mlx_rs::{fft, ops, Array};
-use std::cmp::max;
 use std::f32::consts::PI;
 
 use crate::asr::config::PreprocessorConfig;

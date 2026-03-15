@@ -862,9 +862,19 @@ impl EncDecRNNTModel {
                 .ok_or_else(|| crate::core::error::Error::model("Failed to extract mel chunk"))?;
 
             {
-                let mel_min = mel_chunk.iter().cloned().fold(f32::INFINITY, f32::min);
-                let mel_max = mel_chunk.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-                let mel_mean: f32 = mel_chunk.iter().sum::<f32>() / mel_chunk.len() as f32;
+                // Flatten the mel chunk to a Vec for debug statistics
+                let mel_flat: Vec<f32> = mel_chunk
+                    .flatten(0, -1)
+                    .ok()
+                    .and_then(|a| a.as_slice::<f32>().to_vec().into())
+                    .unwrap_or_default();
+                let mel_min = mel_flat.iter().cloned().fold(f32::INFINITY, f32::min);
+                let mel_max = mel_flat.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                let mel_mean: f32 = if !mel_flat.is_empty() {
+                    mel_flat.iter().sum::<f32>() / mel_flat.len() as f32
+                } else {
+                    0.0
+                };
                 tracing::trace!(
                     frames_extracted = chunk_len,
                     chunk_size,
@@ -875,11 +885,11 @@ impl EncDecRNNTModel {
                     "extracted mel chunk"
                 );
                 // Show first few mel frames at trace level
-                // mel_chunk is [n_mels, time] format, so frame t, freq f = mel_chunk[f * chunk_len + t]
+                // mel_chunk is [n_mels, time] format, so frame t, freq f = mel_flat[f * chunk_len + t]
                 for t in 0..5.min(chunk_len) {
-                    let f0 = mel_chunk.get(t).unwrap_or(&0.0);
-                    let f1 = mel_chunk.get(chunk_len + t).unwrap_or(&0.0);
-                    let f2 = mel_chunk.get(2 * chunk_len + t).unwrap_or(&0.0);
+                    let f0 = mel_flat.get(t).copied().unwrap_or(0.0);
+                    let f1 = mel_flat.get(chunk_len + t).copied().unwrap_or(0.0);
+                    let f2 = mel_flat.get(2 * chunk_len + t).copied().unwrap_or(0.0);
                     tracing::trace!(
                         frame = t,
                         freq_bin_0 = f0,
@@ -1030,14 +1040,15 @@ impl EncDecRNNTModel {
             // Trim old mel frames to bound memory usage.
             // Keep enough frames for the largest pre_encode_cache we might need.
             let max_pre_encode_cache = session.config.pre_encode_cache_size.1;
-            session.mel_buffer.trim_old_frames(max_pre_encode_cache);
+            let _ = session.mel_buffer.trim_old_frames(max_pre_encode_cache);
         }
 
         if chunks_processed > 0 {
-            let (audio_bytes, mel_bytes) = session.mel_buffer.memory_stats();
+            let (_audio_bytes, mel_bytes) = session.mel_buffer.memory_stats();
             tracing::trace!(
                 chunks_processed,
                 encoder_frames = total_encoder_frames_this_call,
+                mel_bytes,
                 accumulated_tokens = session
                     .accumulated_tokens
                     .get(0)
