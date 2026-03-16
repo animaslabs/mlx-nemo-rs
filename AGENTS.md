@@ -41,10 +41,16 @@ cargo xtask download nvidia/parakeet-ctc-0.6b --output ./models  # Custom output
 cargo xtask download nvidia/parakeet-ctc-0.6b --token <token>    # Use HF token for gated models
 ```
 
-## Running Examples
+## Running Rust Examples
 
 ```bash
 cargo run --example transcribe -- --model path/to/model.nemo audio.wav
+```
+
+## Running Python Examples
+
+```bash
+source scripts/.venv/bin/activate && python scripts/streaming.py --model stt_en_fastconformer_hybrid_large_streaming_multi -q samples/2086-149220-0033.wav 2>&1
 ```
 
 ## Code Style Guidelines

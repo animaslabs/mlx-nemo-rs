@@ -8,6 +8,7 @@
 //! - Conformer/FastConformer encoders
 //! - Audio preprocessing (Mel spectrogram)
 //! - Greedy and beam search decoding
+//! - Streaming pipelines (`CacheAwareRNNTPipeline`)
 //!
 //! # Example (CTC Model)
 //!
@@ -18,13 +19,14 @@
 //! let transcriptions = model.transcribe(&["audio.wav"])?;
 //! ```
 //!
-//! # Example (RNN-T Model)
+//! # Example (RNN-T Streaming Pipeline)
 //!
 //! ```rust,ignore
-//! use mlx_nemo::asr::EncDecRNNTModel;
+//! use mlx_nemo::asr::CacheAwareRNNTPipeline;
 //!
-//! let model = EncDecRNNTModel::restore("parakeet-rnnt-0.6b.nemo")?;
-//! let transcriptions = model.transcribe(&["audio.wav"])?;
+//! let mut pipeline = CacheAwareRNNTPipeline::restore("model.nemo", 0)?;
+//! pipeline.set_audio_file("audio.wav")?;
+//! let text = pipeline.run()?;
 //! ```
 
 pub mod config;
@@ -32,6 +34,7 @@ pub mod decoding;
 pub mod mel_stream;
 pub mod models;
 pub mod modules;
+pub mod pipeline;
 pub mod streaming;
 
 // Re-exports
@@ -42,13 +45,15 @@ pub use models::{
     RnntStreamingSession,
 };
 pub use modules::MelSpectrogram;
+pub use pipeline::{CacheAwareRNNTPipeline, TranscribeOutput};
 pub use streaming::{
-    EncoderCache, MelBuffer, StreamingConfig, StreamingMelBuffer, StreamingModeInfo,
-    StreamingOutput,
+    EncoderCache, FeatureBuffer, Frame, MelBuffer, Request, RequestStreamer, StreamingConfig,
+    StreamingMelBuffer, StreamingModeInfo, StreamingOutput,
 };
 
 /// Prelude for convenient imports.
 pub mod prelude {
     pub use super::config::AsrModelConfig;
     pub use super::models::{EncDecCTCModel, EncDecRNNTModel, RnntDecodingStrategy};
+    pub use super::pipeline::CacheAwareRNNTPipeline;
 }

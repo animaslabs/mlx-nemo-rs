@@ -1,7 +1,10 @@
-//! Example: Streaming transcription of audio files using a NeMo ASR model.
+//! Example: Streaming transcription using CacheAwareRNNTPipeline.
 //!
-//! This example demonstrates real-time streaming inference, processing audio
-//! in chunks and displaying partial transcriptions as they become available.
+//! This example demonstrates real-time streaming inference by:
+//! 1. Loading audio from a file
+//! 2. Chunking it into small pieces (simulating live audio)
+//! 3. Feeding chunks incrementally to the pipeline
+//! 4. Displaying partial transcriptions as they become available
 //!
 //! Usage:
 //!   cargo run --example streaming -- --model path/to/model.nemo audio.wav
@@ -15,15 +18,14 @@
 use std::io::{self, Write};
 use std::time::Instant;
 
-use mlx_nemo::asr::{EncDecRNNTModel, StreamingModeInfo};
+use mlx_nemo::asr::{CacheAwareRNNTPipeline, StreamingModeInfo};
 use tracing_subscriber::{fmt, EnvFilter};
 
 fn main() -> mlx_nemo::Result<()> {
-    // Initialize tracing subscriber with debug level
-    // Can be overridden with RUST_LOG env var (e.g., RUST_LOG=debug)
+    // Initialize tracing subscriber
     fmt()
         .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("debug")),
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
         )
         .init();
 
@@ -76,21 +78,17 @@ fn main() -> mlx_nemo::Result<()> {
         std::process::exit(1);
     });
 
-    println!("Loading model from: {}", model_path);
+    // Load pipeline
+    println!("Loading pipeline from: {}", model_path);
     let start = Instant::now();
-    let mut model = EncDecRNNTModel::restore(model_path)?;
-    println!("Model loaded in {:.2}s", start.elapsed().as_secs_f32());
-    println!("Sample rate: {} Hz", model.sample_rate());
+    let mut pipeline = CacheAwareRNNTPipeline::restore(model_path, mode_idx)?;
+    println!("Pipeline loaded in {:.2}s", start.elapsed().as_secs_f32());
 
-    // Check streaming support
-    if !model.supports_streaming() {
-        eprintln!("Error: Model does not support streaming inference.");
-        eprintln!("Use a streaming-capable model like Nemotron.");
-        std::process::exit(1);
-    }
+    let sample_rate = pipeline.sample_rate();
+    println!("Sample rate: {} Hz", sample_rate);
 
     // List available modes
-    let modes = model.streaming_modes();
+    let modes = pipeline.streaming_modes();
     if list_modes || modes.is_empty() {
         println!("\nAvailable streaming modes:");
         print_modes(&modes);
@@ -104,6 +102,19 @@ fn main() -> mlx_nemo::Result<()> {
         std::process::exit(1);
     });
 
+    // Print streaming config
+    let config = pipeline.streaming_config();
+    println!("\nStreaming configuration (mode {}):", mode_idx);
+    println!(
+        "  Chunk size: {} frames (first), {} frames (subsequent)",
+        config.chunk_size.0, config.chunk_size.1
+    );
+    println!(
+        "  Shift size: {} frames (first), {} frames (subsequent)",
+        config.shift_size.0, config.shift_size.1
+    );
+    println!("  Valid output length: {} frames", config.valid_out_len);
+
     // Load audio file
     println!("\nLoading audio: {}", audio_path);
     let (samples, file_sample_rate) = load_audio(audio_path)?;
@@ -116,84 +127,70 @@ fn main() -> mlx_nemo::Result<()> {
     );
 
     // Resample if needed
-    let target_rate = model.sample_rate();
-    let samples = if file_sample_rate != target_rate {
+    let samples = if file_sample_rate != sample_rate {
         println!(
             "Resampling from {} Hz to {} Hz...",
-            file_sample_rate, target_rate
+            file_sample_rate, sample_rate
         );
-        resample_audio(&samples, file_sample_rate, target_rate)?
+        resample_audio(&samples, file_sample_rate, sample_rate)?
     } else {
         samples
     };
 
-    // Initialize streaming session
-    println!("\nInitializing streaming (mode {})", mode_idx);
-    let mut session = model.init_streaming(mode_idx, 1)?;
-    println!(
-        "Chunk size: {} frames (first), {} frames (subsequent)",
-        session.config.chunk_size_for_step(true),
-        session.config.chunk_size_for_step(false)
-    );
-    println!(
-        "Shift size: {} frames (first), {} frames (subsequent)",
-        session.config.shift_size_for_step(true),
-        session.config.shift_size_for_step(false)
-    );
-    println!(
-        "Valid output length: {} frames, Lookahead: {} frames",
-        session.config.valid_out_len, session.config.lookahead_frames
-    );
-    println!(
-        "Cache sizes: channel={}, time={}",
-        session.config.last_channel_cache_size, session.config.last_time_cache_size
-    );
-
     // Calculate chunk size in samples
-    let chunk_samples = (target_rate as f32 * chunk_ms as f32 / 1000.0) as usize;
+    let chunk_samples = (sample_rate as f32 * chunk_ms as f32 / 1000.0) as usize;
     println!(
-        "Processing in {} ms chunks ({} samples)",
+        "\nProcessing in {} ms chunks ({} samples)",
         chunk_ms, chunk_samples
     );
 
-    // Process audio in chunks
+    // Process audio in chunks (simulating live streaming)
     println!("\n--- Streaming Transcription ---");
     let start = Instant::now();
     let mut last_text = String::new();
-    let mut chunks_processed = 0;
+    let mut chunks_fed = 0;
+    let mut transcribe_steps = 0;
 
-    for chunk in samples.chunks(chunk_samples) {
-        let output = model.process_chunk(&mut session, chunk)?;
-        chunks_processed += 1;
+    for (chunk_idx, chunk) in samples.chunks(chunk_samples).enumerate() {
+        // Feed audio chunk to pipeline
+        pipeline.add_audio(chunk);
+        chunks_fed += 1;
 
-        // Display partial result if text changed
-        if !output.text.is_empty() && output.text[0] != last_text {
-            // Clear line and print new text
-            // print!("\r\x1b[K"); // Clear line
-            // print!("{:?}", output);
-            io::stdout().flush().unwrap();
-            last_text = output.text[0].clone();
+        // Check if this is the last chunk
+        let is_last = (chunk_idx + 1) * chunk_samples >= samples.len();
+        if is_last {
+            pipeline.end_stream();
+        }
+
+        // Process any available transcription steps
+        while let Some(output) = pipeline.transcribe_step()? {
+            transcribe_steps += 1;
+
+            // Display partial result if text changed
+            if !output.text.is_empty() && output.text != last_text {
+                print!("\r\x1b[K{}", output.text); // Clear line and print new text
+                io::stdout().flush().unwrap();
+                last_text = output.text.clone();
+            }
+
+            if output.is_final {
+                println!(); // New line after final output
+            }
         }
     }
-
-    // Finalize
-    let final_output = model.finalize_streaming(session)?;
-    println!(); // New line after streaming output
 
     let elapsed = start.elapsed().as_secs_f32();
     let rtf = elapsed / audio_duration;
 
     println!("\n--- Final Result ---");
-    if !final_output.text.is_empty() {
-        println!("Text: {}", final_output.text[0]);
-    }
+    println!("Text: {}", last_text);
 
     println!("\n--- Statistics ---");
     println!("Audio duration: {:.2}s", audio_duration);
-    println!("Audio num samples: {}", samples.len());
     println!("Processing time: {:.2}s", elapsed);
     println!("Real-time factor: {:.2}x", rtf);
-    println!("Chunks processed: {}", chunks_processed);
+    println!("Audio chunks fed: {}", chunks_fed);
+    println!("Transcribe steps: {}", transcribe_steps);
 
     Ok(())
 }

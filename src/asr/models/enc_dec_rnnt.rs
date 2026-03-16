@@ -948,26 +948,39 @@ impl EncDecRNNTModel {
                 let enc_min = enc_slice.iter().cloned().fold(f32::INFINITY, f32::min);
                 let enc_max = enc_slice.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
                 let enc_mean: f32 = enc_slice.iter().sum::<f32>() / enc_slice.len() as f32;
+                let enc_var: f32 = enc_slice
+                    .iter()
+                    .map(|&v| (v - enc_mean).powi(2))
+                    .sum::<f32>()
+                    / enc_slice.len() as f32;
+                let enc_std = enc_var.sqrt();
                 let first_10: Vec<f32> = enc_slice.iter().take(10).cloned().collect();
-                tracing::trace!(
+                // Log at debug level for chunks around problematic areas
+                tracing::debug!(
+                    chunk_idx = chunks_processed,
                     output_frames = raw_enc_len,
                     cache_len_before,
                     cache_len_after,
                     enc_min,
                     enc_max,
                     enc_mean,
+                    enc_std,
                     ?first_10,
-                    "encoder output"
+                    "encoder output stats"
                 );
             }
 
-            // Truncate to valid_out_len
+            // Truncate to valid_out_len, but also respect actual tensor shape
             let valid_out_len = session.config.valid_out_len;
-            let enc_seq_len = raw_enc_len.min(valid_out_len);
+            let actual_tensor_frames = encoded.shape()[1] as usize;
+            // Use the minimum of: what encoder reports, valid_out_len, and actual tensor frames
+            let enc_seq_len = raw_enc_len.min(valid_out_len).min(actual_tensor_frames);
             total_encoder_frames_this_call += enc_seq_len;
 
             tracing::trace!(
                 valid_out_len,
+                raw_enc_len,
+                actual_tensor_frames,
                 frames_to_decode = enc_seq_len,
                 "decoding encoder frames"
             );
@@ -998,6 +1011,28 @@ impl EncDecRNNTModel {
                         let prediction = argmax_axis(&log_probs, -1, false)?;
                         prediction.eval()?;
                         let pred_token = prediction.as_slice::<u32>()[0] as usize;
+
+                        // Debug: log top predictions when we get a blank at first symbol
+                        if pred_token == session.blank_id && symbols_emitted == 0 && t == 0 {
+                            let lp_slice: &[f32] = log_probs.as_slice();
+                            // Get top 5 predictions
+                            let mut indexed: Vec<(usize, f32)> =
+                                lp_slice.iter().cloned().enumerate().collect();
+                            indexed.sort_by(|a, b| {
+                                b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
+                            });
+                            let top5: Vec<(usize, f32)> = indexed.into_iter().take(5).collect();
+                            let blank_prob = lp_slice
+                                .get(session.blank_id)
+                                .copied()
+                                .unwrap_or(f32::NEG_INFINITY);
+                            tracing::debug!(
+                                ?top5,
+                                blank_prob,
+                                blank_id = session.blank_id,
+                                "first frame blank prediction"
+                            );
+                        }
 
                         if pred_token == session.blank_id {
                             blank_count += 1;
@@ -1031,12 +1066,19 @@ impl EncDecRNNTModel {
                 } else {
                     format!("{:?}", tokens_this_chunk)
                 };
+                // Log token IDs for comparison with Python
+                let token_ids_str: String = tokens_this_chunk
+                    .iter()
+                    .map(|t| t.to_string())
+                    .collect::<Vec<_>>()
+                    .join(",");
                 tracing::debug!(
                     encoder_frames = enc_seq_len,
                     blank_emissions = blank_count,
                     non_blank_tokens = non_blank_count,
                     total_accumulated = total_tokens,
                     tokens_this_chunk = tokens_this_chunk.len(),
+                    token_ids = %token_ids_str,
                     decoded_text = %token_text,
                     "decoding results"
                 );

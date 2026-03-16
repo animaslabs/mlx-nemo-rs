@@ -1,18 +1,30 @@
 #!/usr/bin/env python3
 """
-NeMo Streaming ASR Example
+NeMo Streaming ASR using Cache-Aware Pipeline
 
-This script demonstrates real-time streaming inference using NVIDIA NeMo,
-processing audio in chunks and displaying partial transcriptions as they
-become available.
+This script demonstrates real-time streaming inference using NVIDIA NeMo's
+cache-aware pipeline API. It uses CacheAwarePipelineBuilder to create either
+a CacheAwareRNNTPipeline or CacheAwareCTCPipeline for streaming transcription.
+
+The cache-aware approach is based on:
+"Stateful FastConformer with Cache-based Inference for Streaming Automatic
+Speech Recognition" (Noroozi et al., ICASSP 2024)
 
 Usage:
     python scripts/streaming.py \
-        --model models/nvidia/nemotron-speech-streaming-en-0.6b/nemotron-speech-streaming-en-0.6b.nemo \
-        --mode 0 --chunk-ms 100 samples/Speaker26_004_16k.wav
+        --model stt_en_fastconformer_hybrid_large_streaming_multi \
+        --lookahead 80 samples/Speaker26_004_16k.wav
+
+    python scripts/streaming.py \
+        --model nvidia/nemotron-speech-streaming-en-0.6b \
+        --decoder rnnt samples/Speaker26_004_16k.wav
 
 Requirements:
     cd scripts && ./setup.sh
+
+    Requires NeMo 2.2+ with the new inference API:
+    - nemo.collections.asr.inference.factory.pipeline_builder
+    - nemo.collections.asr.inference.pipelines.cache_aware_rnnt_pipeline
 """
 
 import argparse
@@ -26,11 +38,23 @@ from pathlib import Path
 os.environ["PYTHONWARNINGS"] = "ignore"
 warnings.filterwarnings("ignore")
 
+# Encoder step length is 80ms for FastConformer models
+ENCODER_STEP_LENGTH = 80  # ms
+SAMPLE_RATE = 16000  # Hz
+
+# Valid lookahead sizes for multi-lookahead models (in ms)
+VALID_LOOKAHEADS = {
+    0: 0,  # No lookahead
+    80: 1,  # 1 frame = 80ms
+    480: 6,  # 6 frames = 480ms
+    1040: 13,  # 13 frames = 1040ms
+}
+
 
 def check_dependencies():
     """Check if required dependencies are installed."""
     missing = []
-    for module in ["numpy", "torch", "soundfile", "nemo"]:
+    for module in ["numpy", "torch", "soundfile", "nemo", "omegaconf", "hydra"]:
         try:
             __import__(module)
         except ImportError:
@@ -41,6 +65,46 @@ def check_dependencies():
         print("\nInstall with:")
         print("  cd scripts && ./setup.sh")
         sys.exit(1)
+
+    # Check for the new inference API
+    try:
+        from nemo.collections.asr.inference.factory.pipeline_builder import (
+            PipelineBuilder,
+        )
+    except ImportError:
+        print("Error: NeMo's new inference API not found.")
+        print("This script requires NeMo 2.2+ with the cache-aware pipeline API.")
+        print("\nThe following modules are required:")
+        print("  - nemo.collections.asr.inference.factory.pipeline_builder")
+        print("  - nemo.collections.asr.inference.pipelines.cache_aware_rnnt_pipeline")
+        print("\nPlease upgrade NeMo or check your installation.")
+        sys.exit(1)
+
+
+def lookahead_to_att_context(lookahead_ms: int, left_context: int = 70) -> list:
+    """
+    Convert lookahead in milliseconds to attention context size.
+
+    Args:
+        lookahead_ms: Lookahead size in milliseconds (0, 80, 480, or 1040)
+        left_context: Left context size (default: 70 for FastConformer)
+
+    Returns:
+        [left_context, right_context] list for att_context_size config
+    """
+    if lookahead_ms in VALID_LOOKAHEADS:
+        right_context = VALID_LOOKAHEADS[lookahead_ms]
+    else:
+        # For non-standard lookahead, compute frames (80ms per frame)
+        right_context = lookahead_ms // ENCODER_STEP_LENGTH
+        print(
+            f"Warning: Non-standard lookahead {lookahead_ms}ms -> {right_context} frames"
+        )
+        print(
+            f"Valid options for multi-lookahead models: {list(VALID_LOOKAHEADS.keys())} ms"
+        )
+
+    return [left_context, right_context]
 
 
 def load_audio(audio_path: str, target_sample_rate: int = 16000):
@@ -56,73 +120,259 @@ def load_audio(audio_path: str, target_sample_rate: int = 16000):
 
     # Resample if needed
     if sample_rate != target_sample_rate:
-        import librosa
+        try:
+            import librosa
 
-        print(f"Resampling from {sample_rate} Hz to {target_sample_rate} Hz...")
-        data = librosa.resample(data, orig_sr=sample_rate, target_sr=target_sample_rate)
-        sample_rate = target_sample_rate
+            print(f"Resampling from {sample_rate} Hz to {target_sample_rate} Hz...")
+            data = librosa.resample(
+                data, orig_sr=sample_rate, target_sr=target_sample_rate
+            )
+        except ImportError:
+            print(
+                f"Warning: librosa not installed, cannot resample from {sample_rate} Hz"
+            )
+            print("Audio must be 16kHz for accurate transcription.")
 
-    return data, sample_rate
+    return data, target_sample_rate
 
 
-def list_streaming_modes(model):
-    """List available streaming modes from the model's encoder."""
-    if (
-        not hasattr(model.encoder, "streaming_cfg")
-        or model.encoder.streaming_cfg is None
-    ):
-        model.encoder.setup_streaming_params()
+def build_config(args):
+    """
+    Build the pipeline configuration from command-line arguments.
 
-    cfg = model.encoder.streaming_cfg
-    if cfg is None:
-        print("No streaming configuration available.")
-        return
+    Args:
+        args: Parsed command-line arguments
 
-    # Try to get att_context_size which defines streaming modes
-    if hasattr(model.encoder, "att_context_size"):
-        att_context = model.encoder.att_context_size
-        print(f"\nAttention context size: {att_context}")
+    Returns:
+        OmegaConf DictConfig for the pipeline
+    """
+    from omegaconf import OmegaConf
 
-    print("\nStreaming configuration:")
-    print(f"  Chunk size: {cfg.chunk_size}")
-    print(f"  Shift size: {cfg.shift_size}")
-    print(f"  Valid output length: {cfg.valid_out_len}")
-    if hasattr(cfg, "pre_encode_cache_size"):
-        print(f"  Pre-encode cache size: {cfg.pre_encode_cache_size}")
-    if hasattr(cfg, "last_channel_cache_size"):
-        print(f"  Last channel cache size: {cfg.last_channel_cache_size}")
-    if hasattr(cfg, "last_time_cache_size"):
-        print(f"  Last time cache size: {cfg.last_time_cache_size}")
-    if hasattr(cfg, "drop_extra_pre_encoded"):
-        print(f"  Drop extra pre-encoded: {cfg.drop_extra_pre_encoded}")
+    # Load base config
+    config_path = Path(__file__).parent / "streaming_config.yaml"
+    if not config_path.exists():
+        print(f"Error: Config file not found: {config_path}")
+        sys.exit(1)
+
+    cfg = OmegaConf.load(config_path)
+
+    # Apply CLI overrides
+    cfg.asr.model_name = args.model
+    cfg.asr.device = args.device
+
+    # Set compute dtype based on device
+    if args.device == "cuda":
+        cfg.asr.compute_dtype = "bfloat16"
+        cfg.asr.use_amp = True
+    else:
+        cfg.asr.compute_dtype = "float32"
+        cfg.asr.use_amp = False
+
+    # Set attention context size based on lookahead
+    cfg.streaming.att_context_size = lookahead_to_att_context(args.lookahead)
+
+    # Set decoder type
+    cfg.asr_decoding_type = args.decoder
+
+    # Set log level
+    if args.quiet:
+        cfg.log_level = 40  # ERROR
+    elif args.verbose:
+        cfg.log_level = 10  # DEBUG
+    else:
+        cfg.log_level = 30  # WARNING
+
+    return cfg
+
+
+def run_streaming_inference(
+    pipeline, audio_path: str, sample_rate: int, verbose: bool = False
+):
+    """
+    Run streaming inference on an audio file with partial result display.
+
+    This function processes audio through the pipeline and prints partial
+    transcriptions as each chunk is processed.
+
+    Args:
+        pipeline: The cache-aware streaming pipeline
+        audio_path: Path to the audio file
+        sample_rate: Audio sample rate
+        verbose: If True, print debug information
+
+    Returns:
+        tuple: (final_text, elapsed_time, chunks_processed, audio_duration)
+    """
+    import soundfile as sf
+
+    # Get audio duration
+    info = sf.info(audio_path)
+    audio_duration = info.duration
+
+    print(f"Audio duration: {audio_duration:.2f}s")
+
+    # Get the request generator from the pipeline
+    request_generator = pipeline.get_request_generator()
+
+    # Create streaming options
+    from nemo.collections.asr.inference.streaming.framing.request_options import (
+        ASRRequestOptions,
+    )
+
+    options = [ASRRequestOptions()]
+
+    # Set up the request generator with audio files
+    request_generator.set_audio_filepaths([audio_path], options)
+
+    # Start timing
+    start_time = time.time()
+    chunks_processed = 0
+    last_partial = ""
+    accumulated_text = ""
+
+    print("\n--- Streaming Transcription ---")
+
+    # Open a session for streaming
+    pipeline.open_session()
+
+    try:
+        # Process audio through the request generator
+        # The generator yields batches of Request objects (Frame or FeatureBuffer)
+        for requests in request_generator:
+            # Use transcribe_step which handles both frames and feature buffers
+            step_outputs = pipeline.transcribe_step(requests)
+            chunks_processed += 1
+
+            # Process step outputs
+            for step_output in step_outputs:
+                # Print final transcript segments as they're produced
+                if step_output.final_transcript:
+                    final = step_output.final_transcript.strip()
+                    if final:
+                        print(f"[Final] {final}")
+                        if accumulated_text:
+                            accumulated_text += " " + final
+                        else:
+                            accumulated_text = final
+
+                # Print partial transcript updates (shows what's being recognized)
+                partial = step_output.partial_transcript.strip()
+                if partial and partial != last_partial:
+                    if verbose:
+                        print(f"[Partial] {partial}")
+                    last_partial = partial
+
+    finally:
+        pipeline.close_session()
+
+    elapsed = time.time() - start_time
+
+    # Final text is the accumulated finalized transcripts
+    final_text = accumulated_text if accumulated_text else last_partial
+
+    return final_text, elapsed, chunks_processed, audio_duration
+
+
+def run_batch_inference(pipeline, audio_path: str, verbose: bool = False):
+    """
+    Run batch inference on an audio file (simpler, no streaming display).
+
+    Args:
+        pipeline: The cache-aware streaming pipeline
+        audio_path: Path to the audio file
+        verbose: If True, print debug information
+
+    Returns:
+        tuple: (final_text, elapsed_time, audio_duration)
+    """
+    import soundfile as sf
+
+    # Get audio duration
+    info = sf.info(audio_path)
+    audio_duration = info.duration
+
+    print(f"Audio duration: {audio_duration:.2f}s")
+    print("\n--- Processing ---")
+
+    # Run the pipeline
+    start_time = time.time()
+    output = pipeline.run([audio_path])
+    elapsed = time.time() - start_time
+
+    # Extract transcription
+    if output and len(output) > 0:
+        result = output[0]
+        # The result can be a dict or an object depending on output format
+        if isinstance(result, dict):
+            final_text = result.get("text", str(result))
+        elif hasattr(result, "text"):
+            final_text = result.text
+        elif hasattr(result, "transcript"):
+            final_text = result.transcript
+        else:
+            final_text = str(result)
+    else:
+        final_text = ""
+
+    return final_text, elapsed, audio_duration
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Streaming ASR transcription using NVIDIA NeMo"
+        description="Streaming ASR transcription using NeMo Cache-Aware Pipeline",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+    # Basic streaming transcription
+    python scripts/streaming.py \\
+        --model stt_en_fastconformer_hybrid_large_streaming_multi \\
+        samples/Speaker26_004_16k.wav
+
+    # With specific lookahead (latency vs accuracy tradeoff)
+    python scripts/streaming.py \\
+        --model nvidia/nemotron-speech-streaming-en-0.6b \\
+        --lookahead 480 samples/Speaker26_004_16k.wav
+
+    # Using CTC decoder instead of RNNT
+    python scripts/streaming.py \\
+        --model stt_en_fastconformer_hybrid_large_streaming_multi \\
+        --decoder ctc samples/Speaker26_004_16k.wav
+
+Lookahead options for multi-lookahead models:
+    0ms    - Lowest latency, lower accuracy
+    80ms   - Default, good balance (1 frame)
+    480ms  - Higher accuracy (6 frames)
+    1040ms - Highest accuracy, highest latency (13 frames)
+        """,
     )
     parser.add_argument(
-        "--model", "-m", type=str, required=True, help="Path to the .nemo model file"
+        "--model",
+        "-m",
+        type=str,
+        required=True,
+        help="Model name (HuggingFace/NGC) or path to .nemo file. "
+        "Recommended: stt_en_fastconformer_hybrid_large_streaming_multi "
+        "or nvidia/nemotron-speech-streaming-en-0.6b",
     )
     parser.add_argument(
-        "audio", type=str, nargs="?", help="Path to the audio file (.wav)"
+        "audio",
+        type=str,
+        nargs="?",
+        help="Path to the audio file (.wav, 16kHz mono recommended)",
     )
     parser.add_argument(
-        "--mode",
+        "--lookahead",
         type=int,
-        default=0,
-        help="Streaming mode index (0 = lowest latency, default: 0)",
+        default=80,
+        help="Lookahead size in milliseconds (default: 80). "
+        "Valid options for multi-lookahead models: 0, 80, 480, or 1040.",
     )
     parser.add_argument(
-        "--chunk-ms",
-        type=int,
-        default=100,
-        help="Audio chunk size in milliseconds (default: 100)",
-    )
-    parser.add_argument(
-        "--list-modes",
-        action="store_true",
-        help="List available streaming modes and exit",
+        "--decoder",
+        type=str,
+        default="rnnt",
+        choices=["ctc", "rnnt"],
+        help="Decoder type (default: rnnt). RNNT typically has higher accuracy.",
     )
     parser.add_argument(
         "--device",
@@ -132,86 +382,18 @@ def main():
         help="Device to run inference on (default: cpu)",
     )
     parser.add_argument(
-        "--quiet", "-q", action="store_true", help="Suppress NeMo logging output"
+        "--batch",
+        action="store_true",
+        help="Use batch mode (process entire file at once, no streaming display)",
     )
     parser.add_argument(
-        "--verbose",
-        "-v",
-        action="store_true",
-        help="Print each transcription update on a new line (for debugging)",
+        "--quiet", "-q", action="store_true", help="Suppress logging output"
+    )
+    parser.add_argument(
+        "--verbose", "-v", action="store_true", help="Enable verbose/debug output"
     )
 
     args = parser.parse_args()
-
-    # Suppress NeMo logging if requested
-    if args.quiet:
-        import logging
-
-        for logger_name in ["nemo", "nemo_logger", "pytorch_lightning", "lightning"]:
-            logging.getLogger(logger_name).setLevel(logging.ERROR)
-        os.environ["NEMO_LOG_LEVEL"] = "ERROR"
-
-    # Check dependencies
-    check_dependencies()
-
-    # Import heavy dependencies after arg parsing
-    import torch
-    import numpy as np
-
-    # Validate model path
-    model_path = Path(args.model)
-    if not model_path.exists():
-        print(f"Error: Model file not found: {model_path}")
-        return 1
-
-    print(f"Loading model from: {model_path}")
-    load_start = time.time()
-
-    # Import NeMo and load model
-    import nemo.collections.asr as nemo_asr
-
-    model = nemo_asr.models.ASRModel.restore_from(
-        str(model_path), map_location=args.device
-    )
-    model.eval()
-
-    print(f"Model loaded in {time.time() - load_start:.2f}s")
-    print(f"Model type: {type(model).__name__}")
-    sample_rate = model.cfg.preprocessor.sample_rate
-    print(f"Sample rate: {sample_rate} Hz")
-
-    # Check if model supports streaming
-    from nemo.collections.asr.parts.mixins.streaming import StreamingEncoder
-
-    if not isinstance(model.encoder, StreamingEncoder):
-        print("Error: Model does not support streaming inference.")
-        print("Use a streaming-capable model like Nemotron.")
-        return 1
-
-    # Setup streaming parameters
-    # The mode is an index into att_context_size_all (list of [left, right] context sizes)
-    # e.g., [[70, 13], [70, 6], [70, 1], [70, 0]] for nemotron-speech-streaming
-    if hasattr(model.encoder, "att_context_size_all"):
-        att_context_sizes = model.encoder.att_context_size_all
-        if args.mode < 0 or args.mode >= len(att_context_sizes):
-            print(
-                f"Error: Invalid mode {args.mode}. Available modes: 0-{len(att_context_sizes) - 1}"
-            )
-            print(f"  Mode mappings: {list(enumerate(att_context_sizes))}")
-            return 1
-        att_context_size = att_context_sizes[args.mode]
-        if hasattr(model.encoder, "set_default_att_context_size"):
-            model.encoder.set_default_att_context_size(att_context_size)
-        else:
-            model.encoder.att_context_size = att_context_size
-            model.encoder.setup_streaming_params()
-    else:
-        model.encoder.setup_streaming_params()
-
-    # List modes if requested
-    if args.list_modes:
-        list_streaming_modes(model)
-        return 0
 
     # Check for audio file
     if not args.audio:
@@ -224,135 +406,62 @@ def main():
         print(f"Error: Audio file not found: {audio_path}")
         return 1
 
-    # Load audio
-    print(f"\nLoading audio: {audio_path}")
-    samples, file_sample_rate = load_audio(str(audio_path), sample_rate)
-    audio_duration = len(samples) / file_sample_rate
-    print(
-        f"Audio duration: {audio_duration:.2f}s ({len(samples)} samples at {file_sample_rate} Hz)"
-    )
+    # Suppress logging if quiet mode
+    if args.quiet:
+        import logging
 
-    # Setup streaming buffer
-    from nemo.collections.asr.parts.utils.streaming_utils import (
-        CacheAwareStreamingAudioBuffer,
-    )
+        for logger_name in ["nemo", "nemo_logger", "pytorch_lightning", "lightning"]:
+            logging.getLogger(logger_name).setLevel(logging.ERROR)
+        os.environ["NEMO_LOG_LEVEL"] = "ERROR"
 
-    streaming_cfg = model.encoder.streaming_cfg
-    print(f"\nInitializing streaming (mode {args.mode})")
-    if isinstance(streaming_cfg.chunk_size, list):
-        print(
-            f"Chunk size: {streaming_cfg.chunk_size[0]} frames (first), {streaming_cfg.chunk_size[1]} frames (subsequent)"
+    # Check dependencies
+    check_dependencies()
+
+    # Import pipeline builder after dependency check
+    from nemo.collections.asr.inference.factory.pipeline_builder import PipelineBuilder
+
+    # Build configuration
+    print(f"Model: {args.model}")
+    print(f"Device: {args.device}")
+    print(f"Decoder: {args.decoder.upper()}")
+    print(f"Lookahead: {args.lookahead}ms")
+
+    cfg = build_config(args)
+
+    # Build the pipeline
+    print("\nBuilding pipeline...")
+    build_start = time.time()
+    pipeline = PipelineBuilder.build_pipeline(cfg)
+    print(f"Pipeline built in {time.time() - build_start:.2f}s")
+
+    # Run inference
+    print(f"\nProcessing: {audio_path}")
+
+    if args.batch:
+        # Batch mode - process entire file at once
+        final_text, elapsed, audio_duration = run_batch_inference(
+            pipeline, str(audio_path), args.verbose
         )
+        chunks_processed = 1
     else:
-        print(f"Chunk size: {streaming_cfg.chunk_size} frames")
-
-    if isinstance(streaming_cfg.shift_size, list):
-        print(
-            f"Shift size: {streaming_cfg.shift_size[0]} frames (first), {streaming_cfg.shift_size[1]} frames (subsequent)"
-        )
-    else:
-        print(f"Shift size: {streaming_cfg.shift_size} frames")
-
-    print(f"Valid output length: {streaming_cfg.valid_out_len} frames")
-    if hasattr(streaming_cfg, "last_channel_cache_size"):
-        cache_time = getattr(streaming_cfg, "last_time_cache_size", "N/A")
-        print(
-            f"Cache sizes: channel={streaming_cfg.last_channel_cache_size}, time={cache_time}"
+        # Streaming mode - show partial results
+        final_text, elapsed, chunks_processed, audio_duration = run_streaming_inference(
+            pipeline, str(audio_path), SAMPLE_RATE, args.verbose
         )
 
-    # Calculate chunk size in samples
-    chunk_samples = int(sample_rate * args.chunk_ms / 1000)
-    print(f"Processing in {args.chunk_ms} ms chunks ({chunk_samples} samples)")
-
-    # Process audio using streaming buffer
-    streaming_buffer = CacheAwareStreamingAudioBuffer(
-        model=model, online_normalization=False
-    )
-
-    # Add the audio file to the buffer
-    processed_signal, processed_signal_length, stream_id = (
-        streaming_buffer.append_audio_file(str(audio_path), stream_id=-1)
-    )
-
-    # Get initial cache state
-    batch_size = 1
-    cache_last_channel, cache_last_time, cache_last_channel_len = (
-        model.encoder.get_initial_cache_state(batch_size=batch_size)
-    )
-
-    # Process chunks
-    print("\n--- Streaming Transcription ---")
-    start = time.time()
-    last_text = ""
-    chunks_processed = 0
-    previous_hypotheses = None
-    previous_pred_out = None
-
-    streaming_buffer_iter = iter(streaming_buffer)
-
-    for step_num, (chunk_audio, chunk_lengths) in enumerate(streaming_buffer_iter):
-        drop_extra_pre_encoded = (
-            streaming_cfg.drop_extra_pre_encoded if step_num != 0 else 0
-        )
-
-        with torch.inference_mode():
-            result = model.conformer_stream_step(
-                processed_signal=chunk_audio,
-                processed_signal_length=chunk_lengths,
-                cache_last_channel=cache_last_channel,
-                cache_last_time=cache_last_time,
-                cache_last_channel_len=cache_last_channel_len,
-                keep_all_outputs=streaming_buffer.is_buffer_empty(),
-                previous_hypotheses=previous_hypotheses,
-                previous_pred_out=previous_pred_out,
-                drop_extra_pre_encoded=drop_extra_pre_encoded,
-                return_transcription=True,
-                return_log_probs=False,
-            )
-
-            (
-                previous_pred_out,
-                transcribed_texts,
-                cache_last_channel,
-                cache_last_time,
-                cache_last_channel_len,
-                previous_hypotheses,
-            ) = result
-
-        chunks_processed += 1
-
-        # Display partial result if text changed
-        if transcribed_texts:
-            # For RNNT models, transcribed_texts contains Hypothesis objects
-            if hasattr(transcribed_texts[0], "text"):
-                current_text = transcribed_texts[0].text
-            else:
-                current_text = str(transcribed_texts[0])
-
-            if current_text != last_text:
-                if args.verbose:
-                    # Print on new line for verbose/debug mode
-                    print(current_text)
-                else:
-                    # Clear line and print new text (in-place update)
-                    print(f"\r\033[K{current_text}", end="", flush=True)
-                last_text = current_text
-
-    elapsed = time.time() - start
-
-    # Print final newline
-    print()
-
-    # Final result
+    # Print final results
     print("\n--- Final Result ---")
-    print(f"Text: {last_text}")
+    print(f"Text: {final_text}")
 
     # Statistics
     print("\n--- Statistics ---")
     print(f"Audio duration: {audio_duration:.2f}s")
     print(f"Processing time: {elapsed:.2f}s")
     print(f"Real-time factor: {elapsed / audio_duration:.2f}x")
-    print(f"Chunks processed: {chunks_processed}")
+    if not args.batch:
+        print(f"Chunks processed: {chunks_processed}")
+    print(f"Lookahead: {args.lookahead}ms")
+    print(f"Attention context: {cfg.streaming.att_context_size}")
 
     return 0
 

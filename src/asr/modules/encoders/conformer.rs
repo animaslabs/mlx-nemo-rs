@@ -81,31 +81,28 @@ fn load_batch_norm(layer: &mut nn::BatchNorm, weights: &HashMap<String, Array>, 
 ///
 /// This matches NeMo's CausalConv2D padding behavior, which pads BOTH time and
 /// frequency dimensions the same way:
-/// - left_pad = kernel_size - 1 (for causal behavior on time, and extra preservation on frequency)
-/// - right_pad = (kernel_size - 1) // 2 (additional padding for output size preservation)
+/// - left_pad = kernel_size - 1 (causal padding for past context)
+/// - right_pad = stride - 1 (additional padding for proper output size)
 ///
-/// This asymmetric padding ensures the output size matches NeMo's CausalConv2D.
+/// NeMo's CausalConv2D uses F.pad with format (left, right, top, bottom):
+///   F.pad(x, pad=(left_pad, right_pad, left_pad, right_pad))
 ///
-/// NeMo's CausalConv2D applies the same asymmetric padding to BOTH time and frequency:
-/// - left_pad = kernel - 1
-/// - right_pad = (kernel - 1) // 2
+/// For kernel=3, stride=2:
+/// - left_pad = 3 - 1 = 2
+/// - right_pad = 2 - 1 = 1
 ///
-/// This gives output size = floor(input / stride) + 1 for both dimensions.
-///
-/// Note: The documentation suggests frequency should use symmetric padding, but
-/// NeMo's actual implementation uses the same padding for both axes. We match
-/// NeMo's behavior to ensure compatibility with pretrained weights.
-fn causal_pad_2d(x: &Array, kernel_size: usize, _stride: usize) -> Result<Array> {
+/// This gives output size = floor((input + 2 + 1 - 3) / 2) + 1 = floor(input / 2) + 1
+fn causal_pad_2d(x: &Array, kernel_size: usize, stride: usize) -> Result<Array> {
     let batch = x.dim(0) as i32;
     let time = x.dim(1) as i32;
     let freq = x.dim(2) as i32;
     let channels = x.dim(3) as i32;
 
-    // NeMo's CausalConv2D uses the same padding for both time and frequency:
+    // NeMo's CausalConv2D padding formula:
     // left_pad = kernel_size - 1
-    // right_pad = (kernel_size - 1) // 2
+    // right_pad = stride - 1
     let left_pad = (kernel_size - 1) as i32;
-    let right_pad = ((kernel_size - 1) / 2) as i32;
+    let right_pad = (stride - 1) as i32;
 
     // Step 1: Pad time dimension (axis 1): [B, T, F, C] -> [B, T+left_pad+right_pad, F, C]
     let time_zeros_left = mlx_rs::ops::zeros::<f32>(&[batch, left_pad, freq, channels])?;
@@ -958,7 +955,7 @@ impl Subsampling {
 
         let use_bias = config.effective_use_bias();
         let out_proj = nn::LinearBuilder::new(linear_in as i32, d_model as i32)
-            .bias(use_bias)
+            .bias(true)
             .build()?;
 
         Ok(Self {

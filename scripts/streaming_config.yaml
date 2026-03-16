@@ -1,0 +1,137 @@
+# Cache-Aware RNNT Streaming Pipeline Configuration
+# Used by streaming.py for real-time ASR inference
+#
+# Based on NeMo's cache_aware_rnnt.yaml configuration
+# See: https://github.com/NVIDIA-NeMo/NeMo/blob/main/examples/asr/conf/asr_streaming_inference/cache_aware_rnnt.yaml
+
+# ================================
+# ASR Configuration
+# ================================
+asr:
+  model_name: null                    # Set via CLI: --model
+  device: cpu                         # Set via CLI: --device (cpu, cuda, mps)
+  device_id: 0                        # GPU device ID (for cuda)
+  compute_dtype: float32              # float32 for CPU/MPS compatibility, bfloat16/float16 for GPU
+  use_amp: false                      # Automatic Mixed Precision (disable for CPU/MPS)
+  decoding:
+    strategy: "greedy_batch"
+    preserve_alignments: false
+    fused_batch_size: -1
+    greedy:
+      use_cuda_graph_decoder: false
+      enable_per_stream_biasing: false
+      max_symbols: 10
+      ngram_lm_model: null
+      ngram_lm_alpha: 0.0
+      boosting_tree:
+        model_path: null
+        key_phrases_file: null
+        key_phrases_list: null
+        key_phrase_items_list: null
+        source_lang: "en"
+      boosting_tree_alpha: 0.0
+
+# ==========================================
+# Inverse Text Normalization Configuration
+# ==========================================
+itn:
+  input_case: lower_cased
+  whitelist: null
+  overwrite_cache: false
+  max_number_of_permutations_per_split: 729
+  left_padding_size: 4
+  batch_size: 32
+  n_jobs: 16
+
+# ================================
+# Neural Machine Translation (disabled)
+# ================================
+nmt:
+  model_name: null
+  source_language: null
+  target_language: null
+  waitk: -1
+  device: cpu
+  device_id: 0
+  batch_size: 1
+  llm_params:
+    dtype: "auto"
+    seed: 42
+  sampling_params:
+    max_tokens: 100
+    temperature: 0.0
+    top_p: 0.9
+    seed: 42
+
+# ========================
+# Confidence estimation
+# ========================
+confidence:
+  exclude_blank: true
+  aggregation: mean
+  method_cfg:
+    name: entropy
+    entropy_type: tsallis
+    alpha: 0.5
+    entropy_norm: exp
+
+# ========================
+# Endpointing settings
+# ========================
+endpointing:
+  stop_history_eou: 800               # Time window (ms) for evaluating End-of-Utterance
+  residue_tokens_at_end: 2            # Residual tokens for EoU detection
+
+# ========================
+# Streaming configuration
+# ========================
+streaming:
+  sample_rate: 16000                  # Audio sample rate in Hz
+  batch_size: 1                       # Single stream for real-time display
+  word_boundary_tolerance: 4          # Tolerance for word boundaries
+  att_context_size: null              # Set via CLI based on --lookahead: [70,1] for 80ms, [70,6] for 480ms, etc.
+  use_cache: true                     # Use cache for streaming (required for cache-aware)
+  use_feat_cache: true                # Cache mel-spec features
+  chunk_size_in_secs: null            # Use default (1+lookahead frames)
+  request_type: frame                 # Process audio as frames
+  num_slots: 4                        # Context manager slots (>= batch_size)
+
+# ========================
+# Pipeline settings
+# ========================
+matmul_precision: high                # Matrix multiplication precision
+log_level: 30                         # WARNING level to reduce noise
+pipeline_type: cache_aware            # Use cache-aware streaming pipeline
+asr_decoding_type: rnnt               # RNNT decoder (better accuracy for streaming)
+
+# ========================
+# Runtime settings
+# ========================
+audio_file: null                      # Set programmatically
+output_filename: null                 # Not used for streaming display
+output_dir: null                      # Not used for streaming display
+enable_pnc: false                     # Punctuation & capitalization
+enable_itn: false                     # Inverse text normalization
+enable_nmt: false                     # Neural machine translation
+asr_output_granularity: segment       # Output granularity: word or segment
+cache_dir: null                       # Cache directory for ITN
+lang: en                              # Language code
+return_tail_result: false             # Return tail labels
+
+# ========================
+# Metrics (not used for streaming)
+# ========================
+metrics:
+  asr:
+    gt_text_attr_name: text
+    clean_groundtruth_text: false
+    langid: en
+    use_cer: false
+    ignore_capitalization: true
+    ignore_punctuation: true
+    strip_punc_space: false
+  nmt:
+    gt_text_attr_name: answer
+    ignore_capitalization: false
+    ignore_punctuation: false
+    strip_punc_space: false
