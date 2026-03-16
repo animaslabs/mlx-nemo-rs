@@ -84,6 +84,10 @@ pub struct MelStream {
     last_preemph_sample: f32, // x[n-1] for preemphasis filter state
     preemph_coef: Option<f32>,
 
+    // Reusable work buffers (avoid repeated allocations)
+    audio_work_buffer: Vec<f32>,  // For combining overlap + new samples
+    preemph_buffer: Vec<f32>,     // For preemphasis output
+
     // Derived constants (computed once from config)
     hop_samples: usize,
 }
@@ -100,6 +104,10 @@ impl MelStream {
 
         let buffer = vec![0.0f32; config.capacity * config.n_mels];
 
+        // Pre-allocate work buffers with reasonable initial capacity
+        // Typical audio chunk might be ~1 second at 16kHz = 16000 samples
+        let initial_audio_capacity = 16000;
+
         Self {
             config,
             preprocessor,
@@ -110,6 +118,8 @@ impl MelStream {
             audio_overlap: Vec::new(),
             last_preemph_sample: 0.0,
             preemph_coef,
+            audio_work_buffer: Vec::with_capacity(initial_audio_capacity),
+            preemph_buffer: Vec::with_capacity(initial_audio_capacity),
             hop_samples,
         }
     }
@@ -132,13 +142,14 @@ impl MelStream {
             return Ok(total..total);
         }
 
-        // 1. Combine overlap from previous call with new samples
-        let mut audio = Vec::with_capacity(self.audio_overlap.len() + samples.len());
-        audio.extend_from_slice(&self.audio_overlap);
-        audio.extend_from_slice(samples);
+        // 1. Combine overlap from previous call with new samples into reusable buffer
+        self.audio_work_buffer.clear();
+        self.audio_work_buffer
+            .extend_from_slice(&self.audio_overlap);
+        self.audio_work_buffer.extend_from_slice(samples);
 
-        // 2. Apply preemphasis with state tracking
-        let audio = self.apply_preemphasis(&audio);
+        // 2. Apply preemphasis with state tracking (writes into preemph_buffer)
+        self.apply_preemphasis_inplace();
 
         // 3. Calculate how many complete frames we can compute
         // With center-padded STFT, n_frames = audio_len / hop + 1
@@ -150,18 +161,18 @@ impl MelStream {
         // (because frame 0 is at sample 0, frame N-1 is at sample (N-1)*hop)
         //
         // For streaming, we compute all possible frames and save the overlap.
-        let n_frames = self.compute_frame_count(audio.len());
+        let n_frames = self.compute_frame_count(self.preemph_buffer.len());
 
         if n_frames == 0 {
             // Not enough audio for a complete frame - save for next call
             // Note: We save the pre-emphasized audio to avoid re-processing
-            self.audio_overlap = audio;
+            std::mem::swap(&mut self.audio_overlap, &mut self.preemph_buffer);
             let total = self.total_frames();
             return Ok(total..total);
         }
 
         // 4. Compute MEL features
-        let mel_data = self.compute_mel(&audio, n_frames)?;
+        let mel_data = self.compute_mel(&self.preemph_buffer, n_frames)?;
 
         // 5. Store frames in circular buffer
         let start_idx = self.total_frames();
@@ -178,8 +189,11 @@ impl MelStream {
         // The "next" frame would be at n_frames * hop
         // We keep audio from that point onwards
         let samples_consumed = n_frames * self.hop_samples;
-        if samples_consumed < audio.len() {
-            self.audio_overlap = audio[samples_consumed..].to_vec();
+        let preemph_len = self.preemph_buffer.len();
+        if samples_consumed < preemph_len {
+            self.audio_overlap.clear();
+            self.audio_overlap
+                .extend_from_slice(&self.preemph_buffer[samples_consumed..]);
         } else {
             self.audio_overlap.clear();
         }
@@ -247,14 +261,31 @@ impl MelStream {
 
         let n_frames = (range.end - range.start) as usize;
         let frame_size = self.config.n_mels;
+        let capacity = self.config.capacity;
+
+        // Get buffer index for start of range
+        let start_buffer_idx = self.global_to_buffer_idx(range.start)?;
+
         let mut result = Vec::with_capacity(n_frames * frame_size);
 
-        for idx in range {
-            if let Some(frame) = self.get(idx) {
-                result.extend_from_slice(frame);
-            } else {
-                return None;
-            }
+        // Check if the range is contiguous in the circular buffer (no wrap-around)
+        if start_buffer_idx + n_frames <= capacity {
+            // Contiguous case: single slice copy
+            let start_byte = start_buffer_idx * frame_size;
+            let end_byte = start_byte + n_frames * frame_size;
+            result.extend_from_slice(&self.buffer[start_byte..end_byte]);
+        } else {
+            // Wrap-around case: two slice copies
+            // First part: from start_buffer_idx to end of buffer
+            let first_part_frames = capacity - start_buffer_idx;
+            let start_byte = start_buffer_idx * frame_size;
+            let first_end_byte = capacity * frame_size;
+            result.extend_from_slice(&self.buffer[start_byte..first_end_byte]);
+
+            // Second part: from beginning of buffer to end_buffer_idx
+            let second_part_frames = n_frames - first_part_frames;
+            let second_end_byte = second_part_frames * frame_size;
+            result.extend_from_slice(&self.buffer[0..second_end_byte]);
         }
 
         Some(result)
@@ -276,6 +307,8 @@ impl MelStream {
         let n_mels = self.config.n_mels;
 
         // Transpose from [time, n_mels] to [n_mels, time]
+        // Note: We use manual transpose here because MLX transpose creates a view
+        // that doesn't rearrange memory, which breaks as_slice() access patterns.
         let mut transposed = vec![0.0f32; n_mels * n_frames];
         for frame_idx in 0..n_frames {
             for mel_idx in 0..n_mels {
@@ -328,6 +361,9 @@ impl MelStream {
         self.first_frame = 0;
         self.audio_overlap.clear();
         self.last_preemph_sample = 0.0;
+        // Clear work buffers but keep their capacity for reuse
+        self.audio_work_buffer.clear();
+        self.preemph_buffer.clear();
     }
 
     /// Get the stream configuration.
@@ -344,30 +380,40 @@ impl MelStream {
     /// The preemphasis filter is: y[n] = x[n] - coef * x[n-1]
     ///
     /// We track `last_preemph_sample` to maintain continuity across `push()` calls.
-    fn apply_preemphasis(&mut self, samples: &[f32]) -> Vec<f32> {
+    ///
+    /// Reads from `audio_work_buffer` and writes to `preemph_buffer` (reusing allocation).
+    fn apply_preemphasis_inplace(&mut self) {
         let coef = match self.preemph_coef {
             Some(c) => c,
-            None => return samples.to_vec(),
+            None => {
+                // No preemphasis - just swap buffers to avoid copy
+                std::mem::swap(&mut self.preemph_buffer, &mut self.audio_work_buffer);
+                return;
+            }
         };
 
+        let samples = &self.audio_work_buffer;
         if samples.is_empty() {
-            return Vec::new();
+            self.preemph_buffer.clear();
+            return;
         }
 
-        let mut output = Vec::with_capacity(samples.len());
+        // Reuse preemph_buffer allocation
+        self.preemph_buffer.clear();
+        self.preemph_buffer.reserve(samples.len());
 
         // First sample uses last_preemph_sample from previous call
-        output.push(samples[0] - coef * self.last_preemph_sample);
+        self.preemph_buffer
+            .push(samples[0] - coef * self.last_preemph_sample);
 
         // Rest of the samples
         for i in 1..samples.len() {
-            output.push(samples[i] - coef * samples[i - 1]);
+            self.preemph_buffer
+                .push(samples[i] - coef * samples[i - 1]);
         }
 
         // Save last sample for next call
         self.last_preemph_sample = *samples.last().unwrap();
-
-        output
     }
 
     /// Calculate how many complete frames can be computed from audio length.
@@ -408,6 +454,8 @@ impl MelStream {
         );
 
         // Convert to [time, n_mels] layout for storage
+        // Note: We use manual transpose here because MLX transpose creates a view
+        // that doesn't rearrange memory, which breaks as_slice() access patterns.
         let mel_data: &[f32] = mel.as_slice();
         let n_mels = self.config.n_mels;
         let mut output = vec![0.0f32; actual_frames * n_mels];
