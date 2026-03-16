@@ -302,12 +302,33 @@ impl MelSpectrogram {
             self.remainder.clear();
         }
 
+        // DEBUG: Print raw audio before preemphasis
+        let debug_enabled = std::env::var("MLX_NEMO_DEBUG").is_ok();
+        if debug_enabled {
+            let raw_arr = Array::from_slice(audio_to_process, &[audio_to_process.len() as i32]);
+            tracing::info!("DEBUG process_chunk: raw_audio before preemph len={}", audio_to_process.len());
+            Self::debug_print_array("raw_audio_before_preemph", &raw_arr, 5);
+            tracing::info!("DEBUG process_chunk: preemph is stateless (matching NeMo)");
+        }
+
         // Apply preemphasis with state tracking
         let audio_to_process = self.apply_preemphasis(audio_to_process);
+
+        if debug_enabled {
+            let preemph_arr = Array::from_slice(&audio_to_process, &[audio_to_process.len() as i32]);
+            tracing::info!("DEBUG process_chunk: after preemph");
+            Self::debug_print_array("audio_after_preemph", &preemph_arr, 5);
+        }
 
         // Apply dithering (adds small noise for numerical stability)
         let mut audio_to_process = audio_to_process;
         self.apply_dither(&mut audio_to_process);
+
+        if debug_enabled {
+            let dither_arr = Array::from_slice(&audio_to_process, &[audio_to_process.len() as i32]);
+            tracing::info!("DEBUG process_chunk: after dither (dither={})", self.config.dither);
+            Self::debug_print_array("audio_after_dither", &dither_arr, 5);
+        }
 
         tracing::debug!(
             "process_chunk audio_to_process len: {} remainder len: {} samples_consumed: {}",
@@ -553,7 +574,12 @@ impl MelSpectrogram {
         Ok(Array::from_slice(&fb, &[n_mels as i32, n_freqs as i32]))
     }
 
-    /// Apply preemphasis with state tracking (streaming).
+    /// Apply preemphasis (stateless, matching NeMo's behavior).
+    ///
+    /// NeMo processes each chunk independently with x[-1] = 0:
+    /// `x = torch.cat((x[:, 0].unsqueeze(1), x[:, 1:] - self.preemph * x[:, :-1]), dim=1)`
+    ///
+    /// This means the first sample is unchanged: y[0] = x[0] - coef * 0 = x[0]
     fn apply_preemphasis(&mut self, audio: &[f32]) -> Vec<f32> {
         let coef = match self.config.preemph {
             Some(c) => c,
@@ -566,16 +592,13 @@ impl MelSpectrogram {
 
         let mut output = Vec::with_capacity(audio.len());
 
-        // First sample uses preemph_last from previous chunk
-        output.push(audio[0] - coef * self.preemph_last);
+        // First sample: y[0] = x[0] (NeMo uses x[-1] = 0, so no subtraction)
+        output.push(audio[0]);
 
-        // Rest of samples
+        // Rest of samples: y[n] = x[n] - coef * x[n-1]
         for i in 1..audio.len() {
             output.push(audio[i] - coef * audio[i - 1]);
         }
-
-        // Update state
-        self.preemph_last = *audio.last().unwrap();
 
         output
     }
@@ -648,6 +671,58 @@ impl MelSpectrogram {
         }
     }
 
+    /// Debug helper to print array statistics
+    #[allow(dead_code)]
+    fn debug_print_array(name: &str, arr: &Array, show_samples: usize) {
+        if let Err(_) = arr.eval() {
+            tracing::info!("DEBUG {}: failed to eval", name);
+            return;
+        }
+
+        let shape = arr.shape();
+        tracing::info!(
+            "DEBUG {}: shape={:?}",
+            name,
+            shape
+        );
+
+        if arr.size() == 0 {
+            tracing::info!("  {} is empty", name);
+            return;
+        }
+
+        // Get data as f32
+        let data: &[f32] = arr.as_slice();
+        let n = data.len();
+
+        // Calculate stats
+        let min = data.iter().cloned().fold(f32::INFINITY, f32::min);
+        let max = data.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        let mean: f32 = data.iter().sum::<f32>() / n as f32;
+
+        let variance: f32 = data.iter().map(|x| (x - mean).powi(2)).sum::<f32>() / n as f32;
+        let std = variance.sqrt();
+
+        tracing::info!(
+            "  min={:.6} max={:.6} mean={:.6} std={:.6}",
+            min,
+            max,
+            mean,
+            std
+        );
+
+        // First few samples
+        let samples: usize = show_samples.min(n);
+        let first: Vec<String> = data[..samples].iter().map(|x| format!("{:.6}", x)).collect();
+        tracing::info!("  first {}: [{}]", samples, first.join(", "));
+
+        // Last few samples
+        if n > samples {
+            let last: Vec<String> = data[n - samples..].iter().map(|x| format!("{:.6}", x)).collect();
+            tracing::info!("  last {}: [{}]", samples, last.join(", "));
+        }
+    }
+
     /// Compute mel spectrogram from audio samples (internal, streaming path).
     ///
     /// Uses STFT **with** center padding to match NeMo's torch.stft(center=True).
@@ -656,6 +731,20 @@ impl MelSpectrogram {
         let audio_len = audio.len();
         let n_fft = self.config.n_fft;
         let hop = self.hop_samples;
+
+        // DEBUG: Print input audio stats
+        let debug_enabled = std::env::var("MLX_NEMO_DEBUG").is_ok();
+        if debug_enabled {
+            tracing::info!(
+                "DEBUG compute_mel: audio_len={} n_fft={} hop={} win_len={}",
+                audio_len,
+                n_fft,
+                hop,
+                self.win_samples
+            );
+            let audio_arr = Array::from_slice(audio, &[audio_len as i32]);
+            Self::debug_print_array("input_audio", &audio_arr, 5);
+        }
 
         if audio_len == 0 {
             return Array::zeros::<f32>(&[self.config.features as i32, 0])
@@ -672,6 +761,15 @@ impl MelSpectrogram {
 
         // Calculate frames with center-padded formula
         let n_frames = (padded_len - n_fft) / hop + 1;
+
+        if debug_enabled {
+            tracing::info!(
+                "DEBUG compute_mel: pad_size={} padded_len={} n_frames={}",
+                pad_size,
+                padded_len,
+                n_frames
+            );
+        }
 
         if n_frames == 0 {
             return Array::zeros::<f32>(&[self.config.features as i32, 0])
@@ -690,8 +788,20 @@ impl MelSpectrogram {
 
         let frames = Array::from_slice(&frames_data, &[1, n_frames as i32, n_fft as i32]);
 
+        if debug_enabled {
+            tracing::info!("DEBUG compute_mel: frames shape {:?}", frames.shape());
+            // Print first frame
+            let first_frame = frames.index((0, 0, ..));
+            Self::debug_print_array("first_frame", &first_frame, 5);
+        }
+
         // Apply window (already zero-padded to n_fft, centered)
         let windowed = ops::multiply(&frames, &self.window)?;
+
+        if debug_enabled {
+            let first_windowed = windowed.index((0, 0, ..));
+            Self::debug_print_array("first_frame_windowed", &first_windowed, 5);
+        }
 
         // Compute FFT along last axis
         let fft_result = fft::rfft(&windowed, Some(n_fft as i32), Some(2))?;
@@ -699,11 +809,28 @@ impl MelSpectrogram {
         // Transpose to [batch, freq_bins, frames]
         let stft = ops::transpose_axes(&fft_result, &[0, 2, 1])?;
 
+        if debug_enabled {
+            tracing::info!("DEBUG compute_mel: stft shape {:?}", stft.shape());
+        }
+
         // Compute power spectrum
         let power = self.power_spectrum(&stft)?;
 
+        if debug_enabled {
+            tracing::info!("DEBUG compute_mel: power shape {:?}", power.shape());
+            // Print first frame's power spectrum (all freq bins for frame 0)
+            let first_power = power.index((0, .., 0));
+            Self::debug_print_array("first_frame_power", &first_power, 5);
+        }
+
         // Apply mel filterbank
         let mel = ops::einsum("mf,bft->bmt", &[self.filterbank.clone(), power])?;
+
+        if debug_enabled {
+            tracing::info!("DEBUG compute_mel: mel (before log) shape {:?}", mel.shape());
+            let mel_frame0 = mel.index((0, .., 0));
+            Self::debug_print_array("mel_frame0_before_log", &mel_frame0, 5);
+        }
 
         // Apply log compression
         let mel = if self.config.log {
@@ -713,8 +840,18 @@ impl MelSpectrogram {
             mel
         };
 
+        if debug_enabled {
+            let mel_frame0 = mel.index((0, .., 0));
+            Self::debug_print_array("mel_frame0_after_log", &mel_frame0, 5);
+        }
+
         // Remove batch dimension: [1, n_mels, frames] -> [n_mels, frames]
         let mel = mel.index(0);
+
+        if debug_enabled {
+            tracing::info!("DEBUG compute_mel: final mel shape {:?}", mel.shape());
+            Self::debug_print_array("final_mel", &mel, 5);
+        }
 
         Ok(mel)
     }
@@ -942,13 +1079,13 @@ mod tests {
         let chunk = vec![0.1f32; 500];
         mel.process_chunk(&chunk).unwrap();
 
-        assert!(!mel.remainder.is_empty() || mel.preemph_last != 0.0);
+        // Should have a remainder after processing
+        assert!(!mel.remainder.is_empty());
 
         // Reset
         mel.reset();
 
         assert!(mel.remainder.is_empty());
-        assert_eq!(mel.preemph_last, 0.0);
     }
 
     #[test]
@@ -1064,7 +1201,9 @@ mod tests {
     // ==================== Preemphasis Tests ====================
 
     #[test]
-    fn test_preemphasis_streaming_state() {
+    fn test_preemphasis_stateless() {
+        // Test that preemphasis is stateless (matches NeMo behavior)
+        // Each chunk is processed independently with x[-1] = 0
         let config = MelSpectrogramConfig {
             preemph: Some(0.97),
             dither: 0.0,
@@ -1072,31 +1211,41 @@ mod tests {
         };
         let mut mel = MelSpectrogram::new(config).unwrap();
 
-        // With win_samples=400, hop_samples=160:
-        // Need at least 400 samples to produce 1 frame
-        // First chunk - 500 samples produces (500-400)/160 + 1 = 1 frame
-        // samples_consumed = 1 * 160 = 160
+        // Process first chunk
         let chunk1: Vec<f32> = (0..500).map(|i| i as f32 / 500.0).collect();
         mel.process_chunk(&chunk1).unwrap();
 
-        // Preemph state should be updated (last sample of samples_needed)
-        // samples_needed = (1-1)*160 + 400 = 400, so preemph_last = chunk1[399] = 399/500 ≈ 0.798
-        assert!(
-            mel.preemph_last > 0.7,
-            "preemph_last should be updated after processing, got {}",
-            mel.preemph_last
-        );
-
-        // Second chunk - combined with remainder should produce more frames
-        let chunk2: Vec<f32> = (500..1000).map(|i| i as f32 / 1000.0).collect();
+        // Process second chunk - preemphasis should treat this as independent
+        // (first sample should be unchanged since x[-1] = 0)
+        let chunk2: Vec<f32> = vec![1.0f32; 500];
         mel.process_chunk(&chunk2).unwrap();
 
-        // State should update again
-        assert!(
-            mel.preemph_last > 0.5,
-            "preemph_last should remain updated, got {}",
-            mel.preemph_last
-        );
+        // Preemphasis is stateless - preemph_last is not used
+        // Just verify processing completes without error
+    }
+
+    #[test]
+    fn test_preemphasis_formula() {
+        // Verify preemphasis formula: y[0] = x[0], y[n] = x[n] - 0.97 * x[n-1]
+        let config = MelSpectrogramConfig {
+            preemph: Some(0.97),
+            dither: 0.0,
+            ..Default::default()
+        };
+        let mut mel = MelSpectrogram::new(config).unwrap();
+
+        // Simple test input
+        let audio = vec![1.0f32, 2.0, 3.0, 4.0, 5.0];
+        let result = mel.apply_preemphasis(&audio);
+
+        // y[0] = x[0] = 1.0 (no subtraction, x[-1] = 0)
+        assert!(approx_eq(result[0], 1.0, 1e-6), "y[0] should equal x[0]");
+
+        // y[1] = x[1] - 0.97 * x[0] = 2.0 - 0.97 * 1.0 = 1.03
+        assert!(approx_eq(result[1], 1.03, 1e-6));
+
+        // y[2] = x[2] - 0.97 * x[1] = 3.0 - 0.97 * 2.0 = 1.06
+        assert!(approx_eq(result[2], 1.06, 1e-6));
     }
 
     // ==================== Normalization Tests ====================

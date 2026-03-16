@@ -217,7 +217,9 @@ impl RequestStreamer {
         }
 
         // Extract mel chunk
-        let (mel_chunk, chunk_len) = self
+        // Returns (mel_array, total_frames, valid_frames)
+        // valid_frames matches Python's mel_len (total - 1)
+        let (mel_chunk, _total_frames, valid_frames) = self
             .mel_buffer
             .extract_chunk(chunk_size, shift_size, pre_encode_cache)
             .ok_or_else(|| Error::model("Failed to extract mel chunk"))?;
@@ -232,7 +234,7 @@ impl RequestStreamer {
         }
 
         Ok(Some(
-            FeatureBuffer::new(mel_chunk, chunk_len)
+            FeatureBuffer::new(mel_chunk, valid_frames)
                 .with_first(is_first)
                 .with_last(is_last)
                 .with_pre_encode_cache(pre_encode_cache),
@@ -249,6 +251,10 @@ impl RequestStreamer {
                 let audio_chunk = &samples[self.file_position..end];
 
                 if !audio_chunk.is_empty() {
+                    // Reset preprocessor state before each chunk to match Python's behavior.
+                    // Python NeMo processes each audio chunk independently without carrying
+                    // over any state (remainder buffer) from previous chunks.
+                    self.preprocessor.reset();
                     let mel = self.preprocessor.process_chunk(audio_chunk)?;
                     mel.eval()?;
                     let n_frames = mel.dim(1) as usize;
@@ -265,8 +271,22 @@ impl RequestStreamer {
             }
         }
 
-        // Process live audio
-        if !self.live_buffer.is_empty() {
+        // Process live audio in streaming-chunk-sized blocks
+        // This avoids MEL boundary artifacts from processing small audio chunks independently
+        let chunk_audio_size = self.audio_chunk_size();
+        while self.live_buffer.len() >= chunk_audio_size {
+            // Take exactly chunk_audio_size samples
+            let audio_chunk: Vec<f32> = self.live_buffer.drain(..chunk_audio_size).collect();
+            let mel = self.preprocessor.process_chunk(&audio_chunk)?;
+            mel.eval()?;
+            let n_frames = mel.dim(1) as usize;
+            if n_frames > 0 {
+                self.mel_buffer.append_mel(&mel)?;
+            }
+        }
+
+        // Process remaining audio only when stream has ended
+        if self.stream_ended && !self.live_buffer.is_empty() {
             let mel = self.preprocessor.process_chunk(&self.live_buffer)?;
             mel.eval()?;
             let n_frames = mel.dim(1) as usize;
@@ -306,7 +326,7 @@ impl RequestStreamer {
             self.mel_buffer.append_mel(&padding)?;
         }
 
-        let (mel_chunk, chunk_len) = self
+        let (mel_chunk, _total_frames, valid_frames) = self
             .mel_buffer
             .extract_chunk(chunk_size, shift_size, pre_encode_cache)
             .ok_or_else(|| Error::model("Failed to extract final mel chunk"))?;
@@ -316,7 +336,7 @@ impl RequestStreamer {
         self.is_done = true;
 
         Ok(Some(
-            FeatureBuffer::new(mel_chunk, chunk_len)
+            FeatureBuffer::new(mel_chunk, valid_frames)
                 .with_first(is_first)
                 .with_last(true)
                 .with_pre_encode_cache(pre_encode_cache),

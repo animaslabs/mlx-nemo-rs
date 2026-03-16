@@ -1,0 +1,74 @@
+# Multi-Speaker Streaming ASR + Diarization Configuration
+# Used by streaming_multispeaker.py for real-time multi-speaker transcription
+#
+# Based on NeMo's SpeakerTaggedASR configuration
+# Models: nvidia/multitalker-parakeet-streaming-0.6b-v1 + nvidia/diar_streaming_sortformer_4spk-v2.1
+
+# ================================
+# ASR Model Configuration
+# ================================
+asr:
+  model_name: nvidia/multitalker-parakeet-streaming-0.6b-v1
+  device: cpu                         # Set via CLI: --device (cpu, cuda, mps)
+  device_id: 0                        # GPU device ID (for cuda)
+  compute_dtype: float32              # float32 for CPU/MPS, bfloat16/float16 for GPU
+  use_amp: false                      # Automatic Mixed Precision (disable for CPU/MPS)
+
+# ================================
+# Diarization Model Configuration
+# ================================
+diarization:
+  model_name: nvidia/diar_streaming_sortformer_4spk-v2.1
+  device: cpu                         # Same as ASR device
+  device_id: 0
+
+# ================================
+# Multi-Speaker Settings
+# ================================
+multispeaker:
+  max_num_of_spks: 4                  # Maximum speakers to detect (model supports up to 4)
+  binary_diar_preds: false            # Use soft diarization predictions
+  masked_asr: true                    # Enable masked ASR for speaker separation
+  sent_break_sec: 5.0                 # Sentence break threshold in seconds
+
+# ================================
+# Streaming Configuration
+# ================================
+streaming:
+  sample_rate: 16000                  # Audio sample rate in Hz
+  batch_size: 1                       # Single stream for real-time display
+  # Attention context size: [left_context, right_context]
+  # Right context (lookahead) options:
+  #   1 frame = 80ms latency
+  #   2 frames = 160ms latency
+  #   7 frames = 560ms latency
+  #   13 frames = 1120ms latency (recommended for best accuracy)
+  att_context_size: [70, 13]          # Default: 1120ms lookahead
+  use_cache: true                     # Use cache for streaming
+  use_feat_cache: true                # Cache mel-spec features
+  chunk_size_in_secs: null            # Use default chunk size
+  request_type: frame                 # Process audio as frames
+  num_slots: 4                        # Context manager slots
+
+# ================================
+# Output Settings
+# ================================
+output:
+  format: seglst                      # Output format: seglst (SegLST JSON)
+  session_id: null                    # Set programmatically from audio filename
+
+# ================================
+# Pipeline Settings
+# ================================
+matmul_precision: high                # Matrix multiplication precision
+log_level: 30                         # WARNING level (30), ERROR (40), DEBUG (10)
+pipeline_type: speaker_tagged_asr     # Use SpeakerTaggedASR pipeline
+
+# ================================
+# Runtime Settings
+# ================================
+audio_file: null                      # Set programmatically
+output_filename: null                 # Set via CLI: -o/--output
+enable_pnc: false                     # Punctuation & capitalization
+enable_itn: false                     # Inverse text normalization
+lang: en                              # Language code

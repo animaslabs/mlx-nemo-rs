@@ -208,8 +208,9 @@ impl CacheAwareRNNTPipeline {
         let blank_id = vocab_size;
         let streaming_decoder = RnntStreamingDecoder::new(blank_id);
 
-        // Initialize state
-        let decoder_state = decoder.initialize_state(1)?;
+        // Initialize state with warmup (matches NeMo's add_sos=True behavior)
+        // For LSTM decoders, this runs the LSTM twice with blank inputs to warm up the state
+        let (_, decoder_state) = decoder.initialize_state_with_warmup(1)?;
         let state = StreamingState {
             decoder_state,
             last_token: None,
@@ -295,11 +296,12 @@ impl CacheAwareRNNTPipeline {
         )
         .expect("Failed to create encoder cache");
 
-        // Reset state
-        self.state.decoder_state = self
+        // Reset state with warmup (matches NeMo's add_sos=True behavior)
+        let (_, decoder_state) = self
             .decoder
-            .initialize_state(1)
-            .expect("Failed to initialize decoder state");
+            .initialize_state_with_warmup(1)
+            .expect("Failed to initialize decoder state with warmup");
+        self.state.decoder_state = decoder_state;
         self.state.last_token = None;
         self.state.accumulated_tokens.clear();
         self.state.is_first_chunk = true;
@@ -337,10 +339,14 @@ impl CacheAwareRNNTPipeline {
 
         // Add batch dimension: [n_mels, time] -> [1, n_mels, time]
         let chunk_len = fb.features.dim(1) as usize;
+        let valid_len = fb.valid_size;
         let features = fb
             .features
             .reshape(&[1, self.n_mels as i32, chunk_len as i32])?;
-        let lengths = Array::from_slice(&[chunk_len as i32], &[1]);
+        // Python uses mel_len (valid_size) for the lengths parameter, not tensor dimension.
+        // The tensor has chunk_len frames, but only valid_len are considered valid.
+        // The encoder uses lengths for attention masking.
+        let lengths = Array::from_slice(&[valid_len as i32], &[1]);
 
         // Run encoder with cache
         let (encoded, encoded_lengths, cache_channel_next, cache_time_next, cache_len_next) =
@@ -369,15 +375,100 @@ impl CacheAwareRNNTPipeline {
         let valid_out_len = self.streaming_config.valid_out_len;
         let enc_seq_len = raw_enc_len.min(valid_out_len).min(actual_tensor_frames);
 
-        tracing::debug!(
+        // Log mel input for comparison with Python
+        // Tensor layout is [1, n_mels, time] in row-major order
+        // To match Python's mel[0, :5, 0], we need indices at time=0 for mel bins 0-4
+        // Index formula: mel[0, i, 0] = i * time_len + 0
+        {
+            // Force evaluation to ensure we have the actual computed values
+            let features_contiguous = mlx_rs::ops::as_strided(&features, features.shape(), None, None)?;
+            features_contiguous.eval()?;
+            let mel_data = features_contiguous.as_slice::<f32>();
+            let n_mels = self.n_mels;
+            let time_len = chunk_len;
+
+            // Get first 5 mel bins at time frame 0
+            let mel_frame0_slice: Vec<f32> = (0..5.min(n_mels))
+                .map(|i| {
+                    let idx = i * time_len; // mel[0, i, 0]
+                    (mel_data[idx] * 1_000_000.0).round() / 1_000_000.0
+                })
+                .collect();
+
+            // L2 norm of all mel bins at time frame 0
+            let mel_frame0_norm: f32 = (0..n_mels)
+                .map(|i| {
+                    let v = mel_data[i * time_len]; // mel[0, i, 0]
+                    v * v
+                })
+                .sum::<f32>()
+                .sqrt();
+
+            tracing::info!(
+                ?mel_frame0_slice,
+                mel_frame0_norm = %format!("{:.6}", mel_frame0_norm),
+                "mel frame 0"
+            );
+        }
+
+        // Debug encoder output
+        self.encoder_cache.last_channel_len.eval()?;
+        let cache_len = self.encoder_cache.last_channel_len.as_slice::<i64>()[0];
+        tracing::info!(
             is_first,
             is_last,
             chunk_len,
+            valid_len,
+            drop_extra,
             raw_enc_len,
+            actual_tensor_frames,
             valid_out_len,
             enc_seq_len,
+            cache_len,
             "processing feature buffer"
         );
+
+        // Log encoder frame values for comparison with Python
+        if actual_tensor_frames > 0 {
+            let enc_data = encoded.as_slice::<f32>();
+            let d_model = encoded.shape()[2] as usize;
+
+            // Frame 0
+            let frame0_start = 0;
+            let frame0_slice: Vec<f32> = enc_data[frame0_start..frame0_start + 10.min(d_model)]
+                .iter()
+                .map(|&v| (v * 1_000_000.0).round() / 1_000_000.0)
+                .collect();
+            let frame0_norm: f32 = enc_data[frame0_start..frame0_start + d_model]
+                .iter()
+                .map(|v| v * v)
+                .sum::<f32>()
+                .sqrt();
+            tracing::info!(
+                ?frame0_slice,
+                frame0_norm = %format!("{:.6}", frame0_norm),
+                "encoder frame 0"
+            );
+
+            // Frame 1 if available
+            if actual_tensor_frames > 1 {
+                let frame1_start = d_model;
+                let frame1_slice: Vec<f32> = enc_data[frame1_start..frame1_start + 10.min(d_model)]
+                    .iter()
+                    .map(|&v| (v * 1_000_000.0).round() / 1_000_000.0)
+                    .collect();
+                let frame1_norm: f32 = enc_data[frame1_start..frame1_start + d_model]
+                    .iter()
+                    .map(|v| v * v)
+                    .sum::<f32>()
+                    .sqrt();
+                tracing::info!(
+                    ?frame1_slice,
+                    frame1_norm = %format!("{:.6}", frame1_norm),
+                    "encoder frame 1"
+                );
+            }
+        }
 
         // Decode
         let decode_output = self.streaming_decoder.decode_frames(
@@ -446,6 +537,16 @@ impl CacheAwareRNNTPipeline {
     /// Get a reference to the preprocessor.
     pub fn preprocessor(&self) -> &MelSpectrogram {
         &self.preprocessor
+    }
+
+    /// Get a reference to the prediction network (decoder).
+    pub fn prediction_network(&self) -> &PredictionNetwork {
+        &self.decoder
+    }
+
+    /// Get a reference to the joint network.
+    pub fn joint(&self) -> &RNNTJoint {
+        &self.joint
     }
 }
 

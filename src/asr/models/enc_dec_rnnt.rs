@@ -106,6 +106,29 @@ impl PredictionNetwork {
         }
     }
 
+    /// Initialize decoder state with warmup, matching NeMo's add_sos=True behavior.
+    ///
+    /// NeMo's decoder.predict(y=None, state=None, add_sos=True) runs the LSTM twice
+    /// with blank inputs to "warm up" the state before decoding. This method
+    /// replicates that behavior by:
+    /// 1. Initialize state with zeros
+    /// 2. Run predict_one(None) to get first output and updated state
+    /// 3. Run predict_one(None) again to get the warmed up state
+    ///
+    /// Returns the prediction output and state after the warmup.
+    pub fn initialize_state_with_warmup(&self, batch_size: usize) -> Result<(Array, DecoderState)> {
+        // Initialize with zeros
+        let state = self.initialize_state(batch_size)?;
+
+        // First pass: blank input with zeros state
+        let (_, state1) = self.predict_one(None, &state)?;
+
+        // Second pass: blank input with updated state (matches NeMo's add_sos=True output[-1])
+        let (output, state2) = self.predict_one(None, &state1)?;
+
+        Ok((output, state2))
+    }
+
     /// Run a single-step prediction for decoding.
     ///
     /// # Arguments
@@ -864,7 +887,8 @@ impl EncDecRNNTModel {
             );
 
             // Extract mel chunk with pre_encode_cache overlap
-            let (mel_chunk, chunk_len) = session
+            // Returns (mel_array, total_frames, valid_frames)
+            let (mel_chunk, _total_frames, chunk_len) = session
                 .mel_buffer
                 .extract_chunk(chunk_size, shift_size, pre_encode_cache)
                 .ok_or_else(|| crate::core::error::Error::model("Failed to extract mel chunk"))?;

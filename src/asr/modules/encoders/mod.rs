@@ -8,3 +8,4 @@ mod conformer;
 
 pub use conformer::reset_encoder_counter;
 pub use conformer::ConformerEncoder;
+pub use conformer::DebugEncoderOutput;

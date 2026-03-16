@@ -510,7 +510,8 @@ impl StreamingMelBuffer {
     /// Extract a chunk of mel frames for processing.
     ///
     /// This mirrors NeMo's CacheAwareStreamingAudioBuffer iteration:
-    /// - Extracts `pre_encode_cache + chunk_size` frames starting from `buffer_idx - pre_encode_cache`
+    /// - Extracts `pre_encode_cache + chunk_size + 1` frames for subsequent chunks
+    /// - The extra frame matches Python's mel computation behavior
     /// - Advances `buffer_idx` by `shift_size`
     ///
     /// # Arguments
@@ -519,14 +520,16 @@ impl StreamingMelBuffer {
     /// * `pre_encode_cache` - Number of frames to prepend from previous context
     ///
     /// # Returns
-    /// * `Some((mel_array, actual_length))` - Mel chunk Array in [n_mels, time] format for encoder input
+    /// * `Some((mel_array, total_frames, valid_frames))` - Mel chunk Array in [n_mels, time] format
+    ///   - total_frames: actual number of frames in the array
+    ///   - valid_frames: number of valid frames (total - 1, matching Python's mel_len)
     /// * `None` if not enough frames available
     pub fn extract_chunk(
         &mut self,
         chunk_size: usize,
         shift_size: usize,
         pre_encode_cache: usize,
-    ) -> Option<(Array, usize)> {
+    ) -> Option<(Array, usize, usize)> {
         // Merge pending arrays before extraction
         self.ensure_merged().ok()?;
 
@@ -553,25 +556,27 @@ impl StreamingMelBuffer {
         let mel_buffer = self.mel_buffer.as_ref()?;
 
         // Calculate extraction range
-        // For the first chunk (buffer_idx=0): extract [0, chunk_size) - no pre_encode_cache overlap
-        // For subsequent chunks: extract [buffer_idx - pre_encode_cache, buffer_idx + chunk_size)
-        let extract_start = if self.buffer_idx == 0 {
-            0
-        } else {
-            self.buffer_idx.saturating_sub(pre_encode_cache)
-        };
-
-        let extract_end = if self.buffer_idx == 0 {
-            chunk_size // First chunk: just chunk_size, no pre_encode_cache
-        } else {
-            self.buffer_idx + chunk_size
-        };
+        // Python NeMo processes each audio chunk independently through the preprocessor.
+        // Each audio chunk (4000 samples) produces 26 mel frames, passed directly to the encoder.
+        // The pre_encode_cache is handled inside the encoder's subsampling, NOT at the mel level.
+        //
+        // Therefore, we should NOT overlap mel frames between chunks.
+        // Each encoder call should receive the fresh mel frames from its corresponding audio chunk.
+        //
+        // buffer_idx tracks where the next audio chunk's mel frames START in the accumulated buffer.
+        // For chunk 0: buffer_idx=0, extract frames 0-25 (26 total)
+        // For chunk 1: buffer_idx=26, extract frames 26-51 (26 total)
+        // etc.
+        let extract_start = self.buffer_idx;
+        let extract_end = self.total_frames.min(extract_start + chunk_size + pre_encode_cache + 1);
 
         // Total frames to extract
         let total_extract = extract_end - extract_start;
 
-        tracing::debug!(
+        tracing::info!(
             self.buffer_idx,
+            self.total_frames,
+            self.mel_buffer_offset,
             extract_start,
             extract_end,
             total_extract,
@@ -582,18 +587,27 @@ impl StreamingMelBuffer {
         let local_start = extract_start.saturating_sub(self.mel_buffer_offset);
         let local_end = local_start + total_extract;
 
+        tracing::info!(
+            local_start,
+            local_end,
+            mel_buffer_shape = ?mel_buffer.shape(),
+            "Local extraction indices"
+        );
+
         // Extract slice from buffer: mel_buffer[:, local_start:local_end]
         use mlx_rs::ops::indexing::IndexOp;
         let mel_chunk = mel_buffer.index((.., local_start as i32..local_end as i32));
 
-        // Advance buffer index
-        // For first chunk: advance by total_frames_needed (since we extracted that many)
-        // Actually no - we should advance by shift_size to maintain proper overlap
-        // But for first chunk with buffer_idx=0, the next buffer_idx should be:
-        // chunk_size (not chunk_size + pre_encode_cache) so the next chunk can overlap
-        self.buffer_idx += shift_size;
+        // Advance buffer index by the number of frames extracted (not shift_size).
+        // This ensures each encoder call receives fresh mel frames from its corresponding audio chunk,
+        // matching Python's behavior where each audio chunk is processed independently.
+        self.buffer_idx += total_extract;
 
-        Some((mel_chunk, total_extract))
+        // Valid frames = total - 1 (matching Python's mel_len behavior)
+        // Python's mel computation produces N frames but only N-1 are valid
+        let valid_frames = total_extract.saturating_sub(1);
+
+        Some((mel_chunk, total_extract, valid_frames))
     }
 
     /// Reset the buffer for a new audio stream.
@@ -1029,28 +1043,34 @@ mod tests {
         assert_eq!(buffer.buffer_frames(), 50);
 
         // Extract a chunk: 20 frames, shift by 20, no pre_encode_cache
-        let (chunk, len) = buffer.extract_chunk(20, 20, 0).unwrap();
-        assert_eq!(len, 20);
-        assert_eq!(chunk.shape(), &[80, 20]);
+        // First chunk extracts all available frames (50), not just 20
+        let (chunk, total, valid) = buffer.extract_chunk(20, 20, 0).unwrap();
+        assert_eq!(total, 50); // First chunk extracts all
+        assert_eq!(valid, 49); // valid = total - 1
+        assert_eq!(chunk.shape(), &[80, 50]);
 
         // Verify buffer_idx advanced
         assert_eq!(buffer.buffer_idx, 20);
         assert_eq!(buffer.remaining_frames(), 30);
 
         // Extract another chunk with pre_encode_cache=5
-        let (chunk2, len2) = buffer.extract_chunk(20, 20, 5).unwrap();
-        // Should get 5 cache frames + 20 new frames = 25 total
-        assert_eq!(len2, 25);
-        assert_eq!(chunk2.shape(), &[80, 25]);
+        // Subsequent chunk: extracts pre_encode_cache + chunk_size + 1 = 5 + 20 + 1 = 26 frames
+        let (chunk2, total2, valid2) = buffer.extract_chunk(20, 20, 5).unwrap();
+        // Should get 5 cache frames + 20 new frames + 1 extra = 26 total
+        assert_eq!(total2, 26);
+        assert_eq!(valid2, 25); // valid = total - 1
+        assert_eq!(chunk2.shape(), &[80, 26]);
 
         // Verify we can check the extracted values
         chunk2.eval().unwrap();
         let chunk2_data: &[f32] = chunk2.as_slice();
-        // First 5 frames should be from cache (frames 15-19), then 20 new frames (20-39)
+        // First 5 frames should be from cache (frames 15-19), then 21 new frames (20-40)
         // At mel bin 0: chunk2_data[0..5] should be [15, 16, 17, 18, 19]
         assert_eq!(chunk2_data[0] as i32, 15);
         assert_eq!(chunk2_data[4] as i32, 19);
         assert_eq!(chunk2_data[5] as i32, 20);
+        // Last frame is the extra one (frame 40)
+        assert_eq!(chunk2_data[25] as i32, 40);
     }
 
     #[test]
