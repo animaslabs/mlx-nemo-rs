@@ -1,173 +1,410 @@
 #!/usr/bin/env python3
-"""Debug script to dump NeMo mel spectrogram frames for comparison."""
+"""
+Debug script to inspect mel spectrogram values from NeMo's CacheAwareRNNTPipeline.
+
+This script extracts mel values from the pipeline to compare with Rust implementation.
+"""
 
 import argparse
+import os
 import sys
 import warnings
+from pathlib import Path
 
+# Suppress noisy warnings
+os.environ["PYTHONWARNINGS"] = "ignore"
 warnings.filterwarnings("ignore")
 
-import torch
 import numpy as np
-from pathlib import Path
+import torch
+
+
+def check_dependencies():
+    """Check if required dependencies are installed."""
+    try:
+        from nemo.collections.asr.inference.factory.pipeline_builder import (
+            PipelineBuilder,
+        )
+    except ImportError:
+        print("Error: NeMo's new inference API not found.")
+        sys.exit(1)
+
+
+def load_audio(audio_path: str, target_sample_rate: int = 16000):
+    """Load audio file."""
+    import soundfile as sf
+
+    data, sample_rate = sf.read(audio_path, dtype="float32")
+
+    # Convert stereo to mono if needed
+    if len(data.shape) > 1:
+        data = np.mean(data, axis=1)
+
+    # Resample if needed
+    if sample_rate != target_sample_rate:
+        import librosa
+
+        data = librosa.resample(data, orig_sr=sample_rate, target_sr=target_sample_rate)
+
+    return data, target_sample_rate
+
+
+def build_config(model_path: str, lookahead: int):
+    """Build pipeline configuration."""
+    from omegaconf import OmegaConf
+
+    # Valid lookahead sizes
+    VALID_LOOKAHEADS = {
+        0: 0,
+        80: 1,
+        480: 6,
+        1040: 13,
+    }
+
+    right_context = VALID_LOOKAHEADS.get(lookahead, lookahead // 80)
+    att_context_size = [70, right_context]
+
+    config_path = Path(__file__).parent / "streaming_config.yaml"
+    cfg = OmegaConf.load(config_path)
+
+    cfg.asr.model_name = model_path
+    cfg.asr.device = "cpu"
+    cfg.asr.compute_dtype = "float32"
+    cfg.asr.use_amp = False
+    cfg.streaming.att_context_size = att_context_size
+    cfg.asr_decoding_type = "rnnt"
+    cfg.log_level = 40  # ERROR
+
+    return cfg
+
+
+def inspect_pipeline(pipeline):
+    """Inspect the pipeline's preprocessor settings."""
+    print("\n=== Pipeline Inspection ===")
+
+    # Get the ASR model
+    if hasattr(pipeline, "asr_model"):
+        asr_model = pipeline.asr_model
+        print(f"ASR Model type: {type(asr_model).__name__}")
+
+        # Get preprocessor
+        if hasattr(asr_model, "preprocessor"):
+            preprocessor = asr_model.preprocessor
+            print(f"\nPreprocessor type: {type(preprocessor).__name__}")
+
+            # Print preprocessor config
+            if hasattr(preprocessor, "_cfg"):
+                cfg = preprocessor._cfg
+                print("\nPreprocessor config:")
+                for key in [
+                    "sample_rate",
+                    "window_size",
+                    "window_stride",
+                    "features",
+                    "n_fft",
+                    "dither",
+                    "preemph",
+                    "log",
+                    "normalize",
+                    "window",
+                ]:
+                    if hasattr(cfg, key):
+                        print(f"  {key}: {getattr(cfg, key)}")
+
+        # Get encoder streaming config
+        if hasattr(asr_model, "encoder"):
+            encoder = asr_model.encoder
+            if hasattr(encoder, "streaming_cfg"):
+                print(f"\nEncoder streaming config: {encoder.streaming_cfg}")
+
+
+def extract_mel_from_pipeline(pipeline, audio_path: str):
+    """Extract mel spectrograms by hooking into the pipeline."""
+    print("\n=== Extracting Mel from Pipeline ===")
+
+    # Get the request generator
+    request_generator = pipeline.get_request_generator()
+
+    from nemo.collections.asr.inference.streaming.framing.request_options import (
+        ASRRequestOptions,
+    )
+
+    options = [ASRRequestOptions()]
+    request_generator.set_audio_filepaths([audio_path], options)
+
+    pipeline.open_session()
+
+    mel_chunks = []
+    chunk_idx = 0
+
+    try:
+        for requests in request_generator:
+            for req in requests:
+                # The request should contain mel features
+                print(f"\nChunk {chunk_idx}:")
+                print(f"  Request type: {type(req).__name__}")
+
+                if hasattr(req, "features"):
+                    features = req.features
+                    if isinstance(features, torch.Tensor):
+                        feat_np = features.cpu().numpy()
+                    else:
+                        feat_np = np.array(features)
+
+                    print(f"  Features shape: {feat_np.shape}")
+                    print(f"  Features min: {feat_np.min():.6f}")
+                    print(f"  Features max: {feat_np.max():.6f}")
+                    print(f"  Features mean: {feat_np.mean():.6f}")
+                    print(f"  Positive values: {np.sum(feat_np > 0)}")
+
+                    mel_chunks.append(feat_np)
+
+                if hasattr(req, "audio"):
+                    audio = req.audio
+                    if isinstance(audio, torch.Tensor):
+                        audio_np = audio.cpu().numpy()
+                    else:
+                        audio_np = np.array(audio)
+                    print(f"  Audio shape: {audio_np.shape}")
+                    print(f"  Audio min: {audio_np.min():.6f}")
+                    print(f"  Audio max: {audio_np.max():.6f}")
+
+                chunk_idx += 1
+
+            # Also run transcribe_step to get the actual processing
+            step_outputs = pipeline.transcribe_step(requests)
+
+    finally:
+        pipeline.close_session()
+
+    return mel_chunks
+
+
+def compute_mel_directly(audio_path: str, model_path: str):
+    """Compute mel spectrogram directly using NeMo's preprocessor."""
+    print("\n=== Computing Mel Directly ===")
+
+    import nemo.collections.asr as nemo_asr
+
+    # Load the model to get its preprocessor
+    print(f"Loading model: {model_path}")
+    model = nemo_asr.models.EncDecRNNTBPEModel.restore_from(
+        model_path, map_location="cpu"
+    )
+
+    # Get preprocessor
+    preprocessor = model.preprocessor
+    print(f"Preprocessor type: {type(preprocessor).__name__}")
+
+    # Print config
+    if hasattr(preprocessor, "_cfg"):
+        cfg = preprocessor._cfg
+        print("\nPreprocessor config from model:")
+        for key in [
+            "sample_rate",
+            "window_size",
+            "window_stride",
+            "features",
+            "n_fft",
+            "dither",
+            "preemph",
+            "log",
+            "normalize",
+            "window",
+            "lowfreq",
+            "highfreq",
+            "pad_to",
+            "pad_value",
+        ]:
+            if hasattr(cfg, key):
+                val = getattr(cfg, key)
+                print(f"  {key}: {val}")
+
+    # Load audio
+    audio, sr = load_audio(audio_path)
+    print(f"\nAudio: {len(audio)} samples, {sr} Hz, duration: {len(audio) / sr:.2f}s")
+    print(f"Audio min: {audio.min():.6f}, max: {audio.max():.6f}")
+
+    # Convert to tensor
+    audio_tensor = torch.tensor(audio, dtype=torch.float32).unsqueeze(0)
+    audio_length = torch.tensor([len(audio)], dtype=torch.long)
+
+    print(f"Audio tensor shape: {audio_tensor.shape}")
+
+    # Compute mel using the preprocessor
+    with torch.no_grad():
+        mel, mel_length = preprocessor(input_signal=audio_tensor, length=audio_length)
+
+    mel_np = mel.squeeze(0).cpu().numpy()
+    print(f"\nMel shape: {mel_np.shape}")
+    print(f"Mel min: {mel_np.min():.6f}")
+    print(f"Mel max: {mel_np.max():.6f}")
+    print(f"Mel mean: {mel_np.mean():.6f}")
+    print(f"Positive values: {np.sum(mel_np > 0)}")
+
+    # Save mel to file for comparison
+    np.save("python_mel_full.npy", mel_np)
+    print("\nSaved mel to python_mel_full.npy")
+
+    # Print first few frames
+    print("\nFirst 5 frames (first 10 mel bins):")
+    for i in range(min(5, mel_np.shape[1])):
+        print(f"  Frame {i}: {mel_np[:10, i]}")
+
+    return mel_np
+
+
+def compute_mel_streaming(audio_path: str, model_path: str, lookahead: int = 1040):
+    """Compute mel spectrogram in streaming mode."""
+    print("\n=== Computing Mel in Streaming Mode ===")
+
+    import nemo.collections.asr as nemo_asr
+
+    # Load the model
+    print(f"Loading model: {model_path}")
+    model = nemo_asr.models.EncDecRNNTBPEModel.restore_from(
+        model_path, map_location="cpu"
+    )
+
+    # Get preprocessor
+    preprocessor = model.preprocessor
+
+    # Load audio
+    audio, sr = load_audio(audio_path)
+    print(f"Audio: {len(audio)} samples, {sr} Hz")
+
+    # Get streaming config from encoder
+    encoder = model.encoder
+
+    # Get streaming modes
+    if hasattr(encoder, "get_streaming_cache_cfg"):
+        cache_cfg = encoder.get_streaming_cache_cfg()
+        print(f"Cache config: {cache_cfg}")
+
+    # Calculate chunk size based on streaming config
+    # This matches NeMo's CacheAwareRNNTPipeline logic
+    hop_samples = int(0.01 * sr)  # 10ms hop = 160 samples
+    win_samples = int(0.025 * sr)  # 25ms window = 400 samples
+
+    # Get the model's att_context_size for the given lookahead
+    VALID_LOOKAHEADS = {0: 0, 80: 1, 480: 6, 1040: 13}
+    right_context = VALID_LOOKAHEADS.get(lookahead, lookahead // 80)
+    att_context_size = [70, right_context]
+
+    print(f"\nAttention context size: {att_context_size}")
+
+    # Get streaming parameters from encoder
+    if hasattr(encoder, "setup_streaming_params"):
+        # This sets up the streaming configuration
+        encoder.setup_streaming_params(
+            decoding_cfg=None,
+            cache_aware_cfg={
+                "att_context_size": att_context_size,
+            },
+        )
+
+    # Simulate streaming by processing audio in chunks
+    # The chunk size calculation follows NeMo's logic:
+    # chunk_audio_samples = (chunk_mel_frames + cache_frames) * hop_samples
+
+    # Streaming mode 0 for 1040ms lookahead: chunk_size=112 mel frames
+    chunk_mel_frames = 112  # This is model_chunk_size[1]
+    cache_mel_frames = 9  # This is pre_encode_cache_size[1]
+
+    total_mel_frames = chunk_mel_frames + cache_mel_frames
+    chunk_audio_samples = total_mel_frames * hop_samples
+
+    print(f"Chunk audio samples: {chunk_audio_samples}")
+    print(f"Chunk mel frames: {chunk_mel_frames}")
+    print(f"Cache mel frames: {cache_mel_frames}")
+
+    # Process audio in chunks
+    audio_tensor = torch.tensor(audio, dtype=torch.float32).unsqueeze(0)
+
+    all_mels = []
+    pos = 0
+    chunk_idx = 0
+
+    while pos < len(audio):
+        end = min(pos + chunk_audio_samples, len(audio))
+        chunk_audio = audio[pos:end]
+
+        # Pad if needed
+        if len(chunk_audio) < chunk_audio_samples:
+            chunk_audio = np.pad(
+                chunk_audio, (0, chunk_audio_samples - len(chunk_audio))
+            )
+
+        chunk_tensor = torch.tensor(chunk_audio, dtype=torch.float32).unsqueeze(0)
+        chunk_length = torch.tensor([len(chunk_audio)], dtype=torch.long)
+
+        with torch.no_grad():
+            mel, mel_length = preprocessor(
+                input_signal=chunk_tensor, length=chunk_length
+            )
+
+        mel_np = mel.squeeze(0).cpu().numpy()
+
+        print(f"\nChunk {chunk_idx} (pos={pos}, samples={end - pos}):")
+        print(f"  Mel shape: {mel_np.shape}")
+        print(f"  Mel min: {mel_np.min():.6f}")
+        print(f"  Mel max: {mel_np.max():.6f}")
+        print(f"  Positive values: {np.sum(mel_np > 0)}")
+
+        all_mels.append(mel_np)
+
+        pos = end
+        chunk_idx += 1
+
+    return all_mels
 
 
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--model", required=True, help="Path to .nemo model")
-    parser.add_argument("audio", help="Path to audio file")
-    parser.add_argument(
-        "--chunk-ms", type=int, default=100, help="Chunk size in milliseconds"
+    parser = argparse.ArgumentParser(
+        description="Debug mel spectrogram from NeMo pipeline"
     )
+    parser.add_argument("--model", "-m", type=str, required=True, help="Model path")
+    parser.add_argument("audio", type=str, help="Audio file path")
+    parser.add_argument("--lookahead", type=int, default=1040, help="Lookahead in ms")
     parser.add_argument(
-        "--num-chunks", type=int, default=3, help="Number of chunks to process"
+        "--mode",
+        type=str,
+        default="direct",
+        choices=["direct", "streaming", "pipeline"],
+        help="Mode: direct (full audio), streaming (chunked), pipeline (via CacheAwarePipeline)",
     )
+
     args = parser.parse_args()
 
-    # Load model
-    print(f"Loading model from: {args.model}", file=sys.stderr)
-    import nemo.collections.asr as nemo_asr
+    audio_path = Path(args.audio)
+    if not audio_path.exists():
+        print(f"Error: Audio file not found: {audio_path}")
+        return 1
 
-    model = nemo_asr.models.ASRModel.restore_from(args.model, map_location="cpu")
-    model.eval()
-    print(f"Model loaded", file=sys.stderr)
+    check_dependencies()
 
-    # Setup encoder for streaming
-    model.encoder.setup_streaming_params()
-    streaming_cfg = model.encoder.streaming_cfg
+    if args.mode == "direct":
+        compute_mel_directly(str(audio_path), args.model)
+    elif args.mode == "streaming":
+        compute_mel_streaming(str(audio_path), args.model, args.lookahead)
+    elif args.mode == "pipeline":
+        from nemo.collections.asr.inference.factory.pipeline_builder import (
+            PipelineBuilder,
+        )
 
-    print(f"\nStreaming config:", file=sys.stderr)
-    print(f"  chunk_size: {streaming_cfg.chunk_size}", file=sys.stderr)
-    print(f"  shift_size: {streaming_cfg.shift_size}", file=sys.stderr)
-    print(
-        f"  pre_encode_cache_size: {streaming_cfg.pre_encode_cache_size}",
-        file=sys.stderr,
-    )
+        print(f"Model: {args.model}")
+        print(f"Lookahead: {args.lookahead}ms")
 
-    # Load audio
-    import soundfile as sf
+        cfg = build_config(args.model, args.lookahead)
 
-    print(f"\nLoading audio: {args.audio}", file=sys.stderr)
-    audio, sr = sf.read(args.audio, dtype="float32")
-    if sr != 16000:
-        import librosa
+        print("\nBuilding pipeline...")
+        pipeline = PipelineBuilder.build_pipeline(cfg)
 
-        audio = librosa.resample(audio, orig_sr=sr, target_sr=16000)
-        sr = 16000
-    print(f"Audio duration: {len(audio) / sr:.2f}s", file=sys.stderr)
+        inspect_pipeline(pipeline)
+        extract_mel_from_pipeline(pipeline, str(audio_path))
 
-    # Initialize streaming
-    chunk_samples = int(args.chunk_ms * sr / 1000)
-    print(
-        f"\nProcessing in {args.chunk_ms}ms chunks ({chunk_samples} samples)",
-        file=sys.stderr,
-    )
-
-    # Compute features for full audio and process in chunks
-    audio_tensor = torch.tensor(audio).unsqueeze(0)
-    preprocessor = model.preprocessor
-
-    # Buffer for mel frames
-    mel_buffer = None
-    mel_idx = 0
-    audio_idx = 0
-
-    # Get chunk parameters
-    chunk_size_first = (
-        streaming_cfg.chunk_size[0]
-        if isinstance(streaming_cfg.chunk_size, list)
-        else streaming_cfg.chunk_size
-    )
-    chunk_size_rest = (
-        streaming_cfg.chunk_size[1]
-        if isinstance(streaming_cfg.chunk_size, list)
-        else streaming_cfg.chunk_size
-    )
-    shift_size_first = (
-        streaming_cfg.shift_size[0]
-        if isinstance(streaming_cfg.shift_size, list)
-        else streaming_cfg.shift_size
-    )
-    shift_size_rest = (
-        streaming_cfg.shift_size[1]
-        if isinstance(streaming_cfg.shift_size, list)
-        else streaming_cfg.shift_size
-    )
-    pre_encode_first = (
-        streaming_cfg.pre_encode_cache_size[0]
-        if isinstance(streaming_cfg.pre_encode_cache_size, list)
-        else 0
-    )
-    pre_encode_rest = (
-        streaming_cfg.pre_encode_cache_size[1]
-        if isinstance(streaming_cfg.pre_encode_cache_size, list)
-        else streaming_cfg.pre_encode_cache_size
-    )
-
-    chunk_num = 0
-    while audio_idx < len(audio) and chunk_num < args.num_chunks:
-        # Add audio chunk
-        end_idx = min(audio_idx + chunk_samples, len(audio))
-        audio_chunk = audio_tensor[:, audio_idx:end_idx]
-        audio_idx = end_idx
-
-        # Compute mel for this chunk
-        length = torch.tensor([audio_chunk.shape[1]])
-        with torch.no_grad():
-            processed_signal, _ = preprocessor(input_signal=audio_chunk, length=length)
-
-        # Append to mel buffer
-        if mel_buffer is None:
-            mel_buffer = processed_signal
-        else:
-            mel_buffer = torch.cat([mel_buffer, processed_signal], dim=2)
-
-        # Check if we have enough mel frames
-        chunk_size = chunk_size_first if chunk_num == 0 else chunk_size_rest
-        pre_encode_cache = pre_encode_first if chunk_num == 0 else pre_encode_rest
-
-        total_needed = chunk_size + pre_encode_cache
-        available = mel_buffer.shape[2] - mel_idx
-
-        if available < total_needed:
-            continue
-
-        # Extract mel chunk
-        start = mel_idx - pre_encode_cache if chunk_num > 0 else mel_idx
-        end = start + total_needed
-        mel_chunk = mel_buffer[:, :, max(0, start) : end]
-
-        # Advance buffer index
-        shift_size = shift_size_first if chunk_num == 0 else shift_size_rest
-        mel_idx += shift_size
-
-        print(f"\n=== Chunk {chunk_num + 1} ===", file=sys.stderr)
-        print(f"  mel_chunk shape: {mel_chunk.shape}", file=sys.stderr)
-        print(f"  mel extract range: [{start}, {end})", file=sys.stderr)
-
-        # Print first few mel frames
-        mel_np = mel_chunk[0].numpy()  # [F, T] -> transpose to [T, F]
-        mel_np = mel_np.T  # Now [T, F]
-
-        print(f"  First 5 mel frames (first 3 freq bins each):", file=sys.stderr)
-        for t in range(min(5, mel_np.shape[0])):
-            print(
-                f"    frame {t}: [{mel_np[t, 0]:.4f}, {mel_np[t, 1]:.4f}, {mel_np[t, 2]:.4f}, ...]",
-                file=sys.stderr,
-            )
-
-        if chunk_num > 0:
-            print(f"\n  Last 5 mel frames (for overlap check):", file=sys.stderr)
-            for t in range(max(0, mel_np.shape[0] - 5), mel_np.shape[0]):
-                print(
-                    f"    frame {t}: [{mel_np[t, 0]:.4f}, {mel_np[t, 1]:.4f}, {mel_np[t, 2]:.4f}, ...]",
-                    file=sys.stderr,
-                )
-
-        chunk_num += 1
-
-    print("\nDone!", file=sys.stderr)
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

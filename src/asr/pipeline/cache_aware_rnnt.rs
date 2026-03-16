@@ -110,8 +110,12 @@ impl CacheAwareRNNTPipeline {
         let checkpoint = NemoCheckpoint::open(path)?;
         let config: AsrModelConfig = checkpoint.load_config()?;
 
-        // Create preprocessor
-        let preprocessor = MelSpectrogram::new(config.preprocessor.clone().into())?;
+        // Create preprocessor with dither disabled for inference
+        // NeMo only applies dither during training, not inference
+        let mut preproc_config: crate::asr::modules::MelSpectrogramConfig =
+            config.preprocessor.clone().into();
+        preproc_config.dither = 0.0;
+        let preprocessor = MelSpectrogram::new(preproc_config.clone())?;
 
         // Create encoder
         let mut encoder = ConformerEncoder::new(config.encoder.clone())?;
@@ -193,11 +197,10 @@ impl CacheAwareRNNTPipeline {
             encoder.d_model(),
         )?;
 
-        // Create request streamer
-        let preproc_config = preprocessor.config();
+        // Create request streamer with dither disabled (same as preprocessor)
         let n_mels = preproc_config.features;
         let streamer = RequestStreamer::new(
-            MelSpectrogram::new(config.preprocessor.clone().into())?,
+            MelSpectrogram::new(preproc_config)?,
             streaming_config.clone(),
         );
 

@@ -214,8 +214,8 @@ fn default_dither() -> f32 {
     1e-5
 }
 fn default_preemph() -> Option<f32> {
-    // Some(0.97) // JJK TEST
-    None
+    // NeMo's FilterbankFeatures has a hardcoded default of 0.97 when preemph is not in config
+    Some(0.97)
 }
 
 /// Encoder configuration.

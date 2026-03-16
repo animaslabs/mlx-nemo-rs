@@ -12,4 +12,4 @@ pub mod preprocessors;
 pub use decoders::CTCDecoder;
 pub use decoders::{LstmState, RNNTDecoder, RNNTJoint, StatelessTransducerDecoder};
 pub use encoders::ConformerEncoder;
-pub use preprocessors::MelSpectrogram;
+pub use preprocessors::{MelSpectrogram, MelSpectrogramConfig};

@@ -259,52 +259,64 @@ impl MelSpectrogram {
         raw_audio.extend_from_slice(&self.remainder);
         raw_audio.extend_from_slice(samples);
 
-        // Calculate how many full frames we can compute
-        // Frame i requires samples [i*hop, i*hop + win_samples)
-        // So for n_frames, we need: (n_frames-1)*hop + win_samples samples
+        // With center-padded STFT, we process all available audio.
+        // The compute_mel function handles padding internally.
+        // For streaming, we need to track how much audio was "consumed" for proper
+        // chunk boundary alignment.
+        //
+        // With center=True STFT: n_frames = audio_len / hop + 1
+        // Each frame is centered at sample: frame_idx * hop
+        // For proper streaming overlap, we consume: (n_frames - 1) * hop samples
+        // keeping the last (audio_len - consumed) samples for the next chunk's context.
+
         let n_frames = self.compute_frame_count(raw_audio.len());
-        tracing::trace!("process_chunk raw_audio len: {} num audio samples: {} remainder len: {} mel n_frames: {}",
-            raw_audio.len(), samples.len(), self.remainder.len(), n_frames);
+        tracing::trace!(
+            "process_chunk raw_audio len: {} num audio samples: {} remainder len: {} mel n_frames: {}",
+            raw_audio.len(), samples.len(), self.remainder.len(), n_frames
+        );
 
         if n_frames == 0 {
-            // Not enough audio, save raw samples for next call
+            // Not enough audio (shouldn't happen with center padding, but handle it)
             self.remainder = raw_audio;
-            // Return empty array with correct shape [n_mels, 0]
             return Array::zeros::<f32>(&[self.config.features as i32, 0])
                 .map_err(|e| Error::model(e.to_string()));
         }
 
-        // Calculate samples needed for n_frames and samples consumed (for remainder)
-        // Samples needed: (n_frames - 1) * hop + win_samples
-        // Samples consumed (for next chunk boundary): n_frames * hop
-        let samples_needed = (n_frames - 1) * self.hop_samples + self.win_samples;
-        let samples_consumed = n_frames * self.hop_samples;
+        // With center-padded STFT, we process all the audio we have
+        let audio_to_process = &raw_audio;
 
-        // Save remainder BEFORE processing (raw samples that weren't consumed)
+        // Calculate samples consumed for next chunk boundary
+        // For center-padded STFT, frames are centered at: 0, hop, 2*hop, ...
+        // The last frame is centered at (n_frames-1)*hop
+        // We consume all audio up to the center of the last frame
+        let samples_consumed = if n_frames > 0 {
+            (n_frames - 1) * self.hop_samples
+        } else {
+            0
+        };
+
+        // Save remainder for next chunk (samples not fully consumed)
         if samples_consumed < raw_audio.len() {
             self.remainder = raw_audio[samples_consumed..].to_vec();
         } else {
             self.remainder.clear();
         }
 
-        // Take only the samples we need for processing
-        let mut audio_to_process = raw_audio[..samples_needed].to_vec();
-
         // Apply preemphasis with state tracking
-        let audio_to_process = self.apply_preemphasis(&audio_to_process);
+        let audio_to_process = self.apply_preemphasis(audio_to_process);
 
         // Apply dithering (adds small noise for numerical stability)
         let mut audio_to_process = audio_to_process;
         self.apply_dither(&mut audio_to_process);
 
         tracing::debug!(
-            "process_chunk audio_to_process len: {} remainder len: {} samples_needed: {}",
+            "process_chunk audio_to_process len: {} remainder len: {} samples_consumed: {}",
             audio_to_process.len(),
             self.remainder.len(),
-            samples_needed
+            samples_consumed
         );
 
-        // Compute mel spectrogram
+        // Compute mel spectrogram (handles center padding internally)
         let mel = self.compute_mel(&audio_to_process)?;
 
         Ok(mel)
@@ -622,74 +634,63 @@ impl MelSpectrogram {
 
     /// Compute number of frames from audio length for streaming.
     ///
-    /// For streaming, we use a non-center-padded calculation to ensure
-    /// frame boundaries align across chunks. Each frame requires `win_samples`
-    /// of audio, and frames are spaced `hop_samples` apart.
+    /// Uses center-padded STFT formula to match NeMo's torch.stft(center=True).
+    /// Center padding adds n_fft/2 zeros on each side, so:
+    /// Frame count: `(audio_len + 2*(n_fft/2) - n_fft) / hop + 1 = audio_len / hop + 1`
     ///
-    /// Frame count: `(audio_len - win_samples) / hop + 1` when `audio_len >= win_samples`
-    ///
-    /// Returns 0 if not enough audio for even one complete frame.
+    /// Returns 0 if audio_len is 0.
     fn compute_frame_count(&self, audio_len: usize) -> usize {
-        if audio_len < self.win_samples {
+        if audio_len == 0 {
             0
         } else {
-            (audio_len - self.win_samples) / self.hop_samples + 1
+            // Center-padded formula: n_samples / hop + 1
+            audio_len / self.hop_samples + 1
         }
     }
 
     /// Compute mel spectrogram from audio samples (internal, streaming path).
     ///
-    /// For streaming, we use STFT **without** center padding to get exactly
-    /// the number of frames that `compute_frame_count` predicts. This ensures
-    /// frame boundaries align correctly across chunks.
-    ///
-    /// The batch mode `forward()` uses center padding for compatibility with
-    /// NeMo's offline processing, but streaming needs precise frame counts.
+    /// Uses STFT **with** center padding to match NeMo's torch.stft(center=True).
+    /// This pads n_fft/2 zeros on each side of the audio before computing frames.
     pub fn compute_mel(&self, audio: &[f32]) -> Result<Array> {
         let audio_len = audio.len();
         let n_fft = self.config.n_fft;
         let hop = self.hop_samples;
-        let win_len = self.win_samples;
 
-        // Calculate expected frames (same formula as compute_frame_count)
-        let n_frames = if audio_len >= win_len {
-            (audio_len - win_len) / hop + 1
-        } else {
-            0
-        };
+        if audio_len == 0 {
+            return Array::zeros::<f32>(&[self.config.features as i32, 0])
+                .map_err(|e| Error::model(e.to_string()));
+        }
+
+        // Apply center padding (matching torch.stft center=True, pad_mode='constant')
+        let pad_size = n_fft / 2;
+        let padded_len = audio_len + 2 * pad_size;
+
+        // Create padded audio: [zeros, audio, zeros]
+        let mut padded = vec![0.0f32; padded_len];
+        padded[pad_size..pad_size + audio_len].copy_from_slice(audio);
+
+        // Calculate frames with center-padded formula
+        let n_frames = (padded_len - n_fft) / hop + 1;
 
         if n_frames == 0 {
             return Array::zeros::<f32>(&[self.config.features as i32, 0])
                 .map_err(|e| Error::model(e.to_string()));
         }
 
-        // Frame the audio WITHOUT center padding
+        // Frame the padded audio
         // Each frame starts at frame_idx * hop and has length n_fft
-        // We need to handle the case where win_len < n_fft (zero-pad each frame)
         let mut frames_data = Vec::with_capacity(n_frames * n_fft);
         for frame_idx in 0..n_frames {
             let start = frame_idx * hop;
-            // The window is applied to win_len samples, but FFT needs n_fft
-            // The window array is already zero-padded to n_fft (centered)
             for i in 0..n_fft {
-                // Map FFT bin to audio sample, accounting for window centering
-                let win_offset = (n_fft - win_len) / 2;
-                if i >= win_offset && i < win_offset + win_len {
-                    let audio_idx = start + (i - win_offset);
-                    if audio_idx < audio_len {
-                        frames_data.push(audio[audio_idx]);
-                    } else {
-                        frames_data.push(0.0);
-                    }
-                } else {
-                    frames_data.push(0.0); // Zero padding for FFT
-                }
+                frames_data.push(padded[start + i]);
             }
         }
 
         let frames = Array::from_slice(&frames_data, &[1, n_frames as i32, n_fft as i32]);
 
-        // Apply window (already zero-padded to n_fft)
+        // Apply window (already zero-padded to n_fft, centered)
         let windowed = ops::multiply(&frames, &self.window)?;
 
         // Compute FFT along last axis
@@ -714,14 +715,6 @@ impl MelSpectrogram {
 
         // Remove batch dimension: [1, n_mels, frames] -> [n_mels, frames]
         let mel = mel.index(0);
-
-        // mlx_rs::transforms::eval([&mel])?;
-        // tracing::trace!(
-        //     audio_len,
-        //     n_frames,
-        //     mel_shape = ?mel.shape(),
-        //     "compute_mel: streaming STFT without center padding"
-        // );
 
         Ok(mel)
     }
@@ -904,33 +897,36 @@ mod tests {
         };
         let mut mel = MelSpectrogram::new(config).unwrap();
 
-        // With win_samples=400, hop_samples=160:
-        // n_frames = (audio_len - 400) / 160 + 1 when audio_len >= 400
+        // With center-padded STFT (hop_samples=160):
+        // n_frames = audio_len / hop + 1 when audio_len > 0
 
-        // Push small chunk (100 samples < 400 win_samples = 0 frames)
+        // Push small chunk (100 samples)
+        // n_frames = 100 / 160 + 1 = 1 frame
         let chunk1 = vec![0.1f32; 100];
         let result1 = mel.process_chunk(&chunk1).unwrap();
 
-        // Not enough for a frame, returns empty
         assert_eq!(result1.shape()[0], 128);
-        assert_eq!(result1.shape()[1], 0);
+        assert_eq!(result1.shape()[1], 1); // Center-padded gives 1 frame for any positive audio
 
-        // Push more (100 remainder + 350 new = 450 samples)
-        // n_frames = (450 - 400) / 160 + 1 = 1 frame
-        // samples_consumed = 1 * 160 = 160, remainder = 450 - 160 = 290
+        // Push more (remainder + 350 new)
+        // Remainder from first: (1-1)*160 = 0, so remainder = 100 - 0 = 100
+        // Total: 100 + 350 = 450 samples
+        // n_frames = 450 / 160 + 1 = 3 frames
         let chunk2 = vec![0.1f32; 350];
         let result2 = mel.process_chunk(&chunk2).unwrap();
 
         assert_eq!(result2.shape()[0], 128);
-        assert_eq!(result2.shape()[1], 1);
+        assert_eq!(result2.shape()[1], 3);
 
-        // Push more (290 remainder + 500 new = 790 samples)
-        // n_frames = (790 - 400) / 160 + 1 = 3 frames
+        // Push more (remainder + 500 new)
+        // Remainder from second: (3-1)*160 = 320, so remainder = 450 - 320 = 130
+        // Total: 130 + 500 = 630 samples
+        // n_frames = 630 / 160 + 1 = 4 frames
         let chunk3 = vec![0.1f32; 500];
         let result3 = mel.process_chunk(&chunk3).unwrap();
 
         assert_eq!(result3.shape()[0], 128);
-        assert_eq!(result3.shape()[1], 3);
+        assert_eq!(result3.shape()[1], 4);
     }
 
     #[test]

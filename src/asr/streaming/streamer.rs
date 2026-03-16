@@ -183,8 +183,9 @@ impl RequestStreamer {
     /// This calculates how many audio samples are needed to produce
     /// enough mel frames for a chunk.
     pub fn audio_chunk_size(&self) -> usize {
-        // Approximate: chunk_size mel frames * hop_samples
-        let chunk_mel_frames = self.config.chunk_size_for_step(self.is_first_chunk);
+        // Use subsequent chunk size consistently (like Python's CacheAwareRNNTPipeline)
+        // NeMo: buffer_size = pre_encode_cache_size + model_chunk_size
+        let chunk_mel_frames = self.config.chunk_size.1 + self.config.pre_encode_cache_size.1;
         let hop_samples = self.mel_buffer.hop_samples;
         chunk_mel_frames * hop_samples
     }
@@ -195,9 +196,14 @@ impl RequestStreamer {
         self.process_pending_audio()?;
 
         // Step 2: Try to extract a mel chunk
-        let chunk_size = self.config.chunk_size_for_step(self.is_first_chunk);
-        let shift_size = self.config.shift_size_for_step(self.is_first_chunk);
-        let pre_encode_cache = self.config.pre_encode_cache_for_step(self.is_first_chunk);
+        // NeMo's CacheAwareRNNTPipeline uses the "subsequent" values (index [1]) for ALL chunks:
+        //   model_chunk_size = model_chunk_size[1]
+        //   pre_encode_cache_size = pre_encode_cache_size[1]
+        // This differs from the encoder's setup_streaming_params which uses different
+        // values for first vs subsequent chunks.
+        let chunk_size = self.config.chunk_size.1;
+        let shift_size = self.config.shift_size.1;
+        let pre_encode_cache = self.config.pre_encode_cache_size.1;
 
         // Check if we have enough mel frames
         let remaining = self.mel_buffer.remaining_frames();
@@ -244,8 +250,24 @@ impl RequestStreamer {
 
                 if !audio_chunk.is_empty() {
                     let mel = self.preprocessor.process_chunk(audio_chunk)?;
+                    mel.eval()?;
                     let n_frames = mel.dim(1) as usize;
                     if n_frames > 0 {
+                        // Debug: check mel stats before appending
+                        let mel_flat = mel.reshape(&[-1])?;
+                        mel_flat.eval()?;
+                        let mel_slice: &[f32] = mel_flat.as_slice();
+                        let min = mel_slice.iter().cloned().fold(f32::INFINITY, f32::min);
+                        let max = mel_slice.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                        let positive = mel_slice.iter().filter(|&&v| v > 0.0).count();
+                        tracing::info!(
+                            min,
+                            max,
+                            positive,
+                            n_frames,
+                            "process_pending_audio: mel stats before append"
+                        );
+
                         self.mel_buffer.append_mel(&mel)?;
                     }
                     self.file_position = end;
@@ -260,9 +282,32 @@ impl RequestStreamer {
 
         // Process live audio
         if !self.live_buffer.is_empty() {
+            let dither_val = self.preprocessor.config().dither;
+            tracing::warn!(
+                dither = dither_val,
+                "processing live audio with preprocessor"
+            );
+
             let mel = self.preprocessor.process_chunk(&self.live_buffer)?;
+            mel.eval()?;
             let n_frames = mel.dim(1) as usize;
             if n_frames > 0 {
+                // Debug: check mel stats before appending
+                let mel_flat = mel.reshape(&[-1])?;
+                mel_flat.eval()?;
+                let mel_slice: &[f32] = mel_flat.as_slice();
+                let min = mel_slice.iter().cloned().fold(f32::INFINITY, f32::min);
+                let max = mel_slice.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                let positive = mel_slice.iter().filter(|&&v| v > 0.0).count();
+                tracing::info!(
+                    min,
+                    max,
+                    positive,
+                    n_frames,
+                    live_buffer_len = self.live_buffer.len(),
+                    "process_pending_audio (live): mel stats before append"
+                );
+
                 self.mel_buffer.append_mel(&mel)?;
             }
             self.live_buffer.clear();
@@ -286,17 +331,17 @@ impl RequestStreamer {
             return Ok(None);
         }
 
+        // Use consistent chunk parameters (always use subsequent values like Python)
+        let chunk_size = self.config.chunk_size.1;
+        let shift_size = self.config.shift_size.1;
+        let pre_encode_cache = self.config.pre_encode_cache_size.1;
+
         // Pad to make a full chunk if needed
-        let chunk_size = self.config.chunk_size_for_step(self.is_first_chunk);
         if remaining < chunk_size {
             let frames_to_pad = chunk_size - remaining;
             let padding = mlx_rs::ops::zeros::<f32>(&[self.n_mels as i32, frames_to_pad as i32])?;
             self.mel_buffer.append_mel(&padding)?;
         }
-
-        // Extract final chunk
-        let shift_size = self.config.shift_size_for_step(self.is_first_chunk);
-        let pre_encode_cache = self.config.pre_encode_cache_for_step(self.is_first_chunk);
 
         let (mel_chunk, chunk_len) = self
             .mel_buffer

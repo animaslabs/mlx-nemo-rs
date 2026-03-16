@@ -466,60 +466,73 @@ impl StreamingMelBuffer {
         shift_size: usize,
         pre_encode_cache: usize,
     ) -> Option<(Array, usize)> {
+        // Total frames needed for this chunk (including pre_encode_cache)
+        let total_frames_needed = chunk_size + pre_encode_cache;
+
         // Check if we have enough frames for this chunk
-        if self.buffer_idx + chunk_size > self.total_frames {
-            // Not enough frames - check if we have any remaining for final chunk
+        // For the first chunk (buffer_idx=0), we need chunk_size + pre_encode_cache frames
+        // For subsequent chunks, we only need chunk_size new frames (pre_encode_cache comes from overlap)
+        let frames_available = self.total_frames.saturating_sub(self.buffer_idx);
+
+        // For first chunk, require total_frames_needed; for subsequent, require chunk_size
+        let frames_required = if self.buffer_idx == 0 {
+            total_frames_needed
+        } else {
+            chunk_size
+        };
+
+        if frames_available < frames_required {
+            // Not enough frames for a full chunk
             if self.buffer_idx >= self.total_frames {
                 return None;
             }
             tracing::warn!("PARTIAL CHUNK!!");
             // Handle partial final chunk
-            let remaining = self.total_frames - self.buffer_idx;
+            let remaining = frames_available;
             return self.extract_chunk(remaining, remaining, pre_encode_cache);
         }
 
         let mel_buffer = self.mel_buffer.as_ref()?;
 
-        // Calculate start position accounting for pre_encode_cache
-        // NeMo pads with zeros if there's not enough history for the cache
-        let cache_start = self.buffer_idx.saturating_sub(pre_encode_cache);
-        let cache_frames_available = self.buffer_idx - cache_start;
-        let zeros_needed = pre_encode_cache.saturating_sub(cache_frames_available);
+        // Calculate extraction range
+        // For the first chunk (buffer_idx=0): extract [0, chunk_size + pre_encode_cache)
+        // For subsequent chunks: extract [buffer_idx - pre_encode_cache, buffer_idx + chunk_size)
+        let extract_start = if self.buffer_idx == 0 {
+            0
+        } else {
+            self.buffer_idx.saturating_sub(pre_encode_cache)
+        };
 
-        // Total frames to extract from buffer: available cache + chunk
-        let frames_from_buffer = cache_frames_available + chunk_size;
-        // Total output frames: zeros padding + frames from buffer
-        let total_extract = zeros_needed + frames_from_buffer;
+        let extract_end = if self.buffer_idx == 0 {
+            total_frames_needed
+        } else {
+            self.buffer_idx + chunk_size
+        };
+
+        // Total frames to extract
+        let total_extract = extract_end - extract_start;
 
         tracing::debug!(
             self.buffer_idx,
-            cache_start,
-            cache_frames_available,
-            zeros_needed,
-            frames_from_buffer,
+            extract_start,
+            extract_end,
             total_extract,
             "Extracting mel frames"
         );
 
         // Convert global frame indices to local buffer indices
-        let local_start = cache_start.saturating_sub(self.mel_buffer_offset);
-        let local_end = local_start + frames_from_buffer;
+        let local_start = extract_start.saturating_sub(self.mel_buffer_offset);
+        let local_end = local_start + total_extract;
 
         // Extract slice from buffer: mel_buffer[:, local_start:local_end]
         use mlx_rs::ops::indexing::IndexOp;
-        let buffer_chunk = mel_buffer.index((.., local_start as i32..local_end as i32));
-
-        // If we need zero padding, prepend it
-        let mel_chunk = if zeros_needed > 0 {
-            let zeros = mlx_rs::ops::zeros::<f32>(&[self.n_mels as i32, zeros_needed as i32])
-                .expect("Failed to create zero padding");
-            mlx_rs::ops::concatenate_axis(&[&zeros, &buffer_chunk], 1)
-                .expect("Failed to concatenate zero padding")
-        } else {
-            buffer_chunk
-        };
+        let mel_chunk = mel_buffer.index((.., local_start as i32..local_end as i32));
 
         // Advance buffer index
+        // For first chunk: advance by total_frames_needed (since we extracted that many)
+        // Actually no - we should advance by shift_size to maintain proper overlap
+        // But for first chunk with buffer_idx=0, the next buffer_idx should be:
+        // chunk_size (not chunk_size + pre_encode_cache) so the next chunk can overlap
         self.buffer_idx += shift_size;
 
         Some((mel_chunk, total_extract))
