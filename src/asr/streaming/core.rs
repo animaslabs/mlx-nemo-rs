@@ -466,20 +466,14 @@ impl StreamingMelBuffer {
         shift_size: usize,
         pre_encode_cache: usize,
     ) -> Option<(Array, usize)> {
-        // Total frames needed for this chunk (including pre_encode_cache)
-        let total_frames_needed = chunk_size + pre_encode_cache;
-
         // Check if we have enough frames for this chunk
-        // For the first chunk (buffer_idx=0), we need chunk_size + pre_encode_cache frames
-        // For subsequent chunks, we only need chunk_size new frames (pre_encode_cache comes from overlap)
+        // For the first chunk (buffer_idx=0), we just need chunk_size frames (no overlap yet)
+        // For subsequent chunks, we need chunk_size new frames (pre_encode_cache comes from overlap)
         let frames_available = self.total_frames.saturating_sub(self.buffer_idx);
 
-        // For first chunk, require total_frames_needed; for subsequent, require chunk_size
-        let frames_required = if self.buffer_idx == 0 {
-            total_frames_needed
-        } else {
-            chunk_size
-        };
+        // First chunk doesn't need pre_encode_cache (nothing to overlap with)
+        // Subsequent chunks get pre_encode_cache from overlap with previous chunk
+        let frames_required = chunk_size;
 
         if frames_available < frames_required {
             // Not enough frames for a full chunk
@@ -495,7 +489,7 @@ impl StreamingMelBuffer {
         let mel_buffer = self.mel_buffer.as_ref()?;
 
         // Calculate extraction range
-        // For the first chunk (buffer_idx=0): extract [0, chunk_size + pre_encode_cache)
+        // For the first chunk (buffer_idx=0): extract [0, chunk_size) - no pre_encode_cache overlap
         // For subsequent chunks: extract [buffer_idx - pre_encode_cache, buffer_idx + chunk_size)
         let extract_start = if self.buffer_idx == 0 {
             0
@@ -504,7 +498,7 @@ impl StreamingMelBuffer {
         };
 
         let extract_end = if self.buffer_idx == 0 {
-            total_frames_needed
+            chunk_size // First chunk: just chunk_size, no pre_encode_cache
         } else {
             self.buffer_idx + chunk_size
         };
