@@ -253,21 +253,6 @@ impl RequestStreamer {
                     mel.eval()?;
                     let n_frames = mel.dim(1) as usize;
                     if n_frames > 0 {
-                        // Debug: check mel stats before appending
-                        let mel_flat = mel.reshape(&[-1])?;
-                        mel_flat.eval()?;
-                        let mel_slice: &[f32] = mel_flat.as_slice();
-                        let min = mel_slice.iter().cloned().fold(f32::INFINITY, f32::min);
-                        let max = mel_slice.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-                        let positive = mel_slice.iter().filter(|&&v| v > 0.0).count();
-                        tracing::info!(
-                            min,
-                            max,
-                            positive,
-                            n_frames,
-                            "process_pending_audio: mel stats before append"
-                        );
-
                         self.mel_buffer.append_mel(&mel)?;
                     }
                     self.file_position = end;
@@ -282,32 +267,10 @@ impl RequestStreamer {
 
         // Process live audio
         if !self.live_buffer.is_empty() {
-            let dither_val = self.preprocessor.config().dither;
-            tracing::warn!(
-                dither = dither_val,
-                "processing live audio with preprocessor"
-            );
-
             let mel = self.preprocessor.process_chunk(&self.live_buffer)?;
             mel.eval()?;
             let n_frames = mel.dim(1) as usize;
             if n_frames > 0 {
-                // Debug: check mel stats before appending
-                let mel_flat = mel.reshape(&[-1])?;
-                mel_flat.eval()?;
-                let mel_slice: &[f32] = mel_flat.as_slice();
-                let min = mel_slice.iter().cloned().fold(f32::INFINITY, f32::min);
-                let max = mel_slice.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-                let positive = mel_slice.iter().filter(|&&v| v > 0.0).count();
-                tracing::info!(
-                    min,
-                    max,
-                    positive,
-                    n_frames,
-                    live_buffer_len = self.live_buffer.len(),
-                    "process_pending_audio (live): mel stats before append"
-                );
-
                 self.mel_buffer.append_mel(&mel)?;
             }
             self.live_buffer.clear();

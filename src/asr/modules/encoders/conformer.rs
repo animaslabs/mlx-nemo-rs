@@ -567,48 +567,11 @@ impl ConformerEncoder {
         // Track encoder calls for debugging
         let enc_call = ENCODER_CALL_COUNT.fetch_add(1, Ordering::SeqCst);
 
-        tracing::info!(
+        tracing::trace!(
             enc_call,
             features_shape = ?features.shape(),
-            "======== ENCODER STREAMING FORWARD ========"
+            "encoder streaming forward"
         );
-
-        // Log input mel spectrogram statistics
-        {
-            let f_eval = features.clone();
-            f_eval.eval()?;
-            let flat = f_eval.reshape(&[-1])?;
-            flat.eval()?;
-            let slice: &[f32] = flat.as_slice();
-            let min = slice.iter().cloned().fold(f32::INFINITY, f32::min);
-            let max = slice.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-            let mean: f32 = slice.iter().sum::<f32>() / slice.len() as f32;
-            let std: f32 = (slice.iter().map(|&v| (v - mean).powi(2)).sum::<f32>()
-                / slice.len() as f32)
-                .sqrt();
-            tracing::info!(
-                enc_call,
-                shape = ?features.shape(),
-                min = format!("{:.6}", min),
-                max = format!("{:.6}", max),
-                mean = format!("{:.6}", mean),
-                std = format!("{:.6}", std),
-                "encoder input (mel) stats"
-            );
-        }
-
-        // Log cache info
-        {
-            cache_last_channel_len.eval()?;
-            let cache_len_val = cache_last_channel_len.as_slice::<i64>()[0];
-            tracing::info!(
-                enc_call,
-                cache_last_channel_shape = ?cache_last_channel.shape(),
-                cache_last_time_shape = ?cache_last_time.shape(),
-                cache_last_channel_len = cache_len_val,
-                "encoder cache info"
-            );
-        }
 
         // Transpose from [B, F, T] to [B, T, F] for processing
         let x = mlx_rs::ops::transpose_axes(features, &[0, 2, 1])?;
@@ -623,10 +586,9 @@ impl ConformerEncoder {
         // which in streaming mode is always.
         if drop_extra_pre_encoded > 0 {
             let drop = drop_extra_pre_encoded as i32;
-            tracing::info!(
+            tracing::trace!(
                 enc_call,
                 drop_extra_pre_encoded,
-                before_shape = ?x.shape(),
                 "dropping extra pre-encoded frames"
             );
             x = x.index((.., drop.., ..));
@@ -634,41 +596,12 @@ impl ConformerEncoder {
                 &(&lengths - &Array::from_int(drop)),
                 (&Array::from_int(0), ()),
             )?;
-            tracing::info!(
-                enc_call,
-                after_shape = ?x.shape(),
-                "after dropping extra frames"
-            );
         }
 
         // Scale input by sqrt(d_model) if xscaling is enabled
         let xscale = self.pos_enc.xscale();
         if xscale != 1.0 {
-            tracing::info!(enc_call, xscale, "applying xscale transformation");
             x = &x * Array::from_f32(xscale);
-        }
-
-        // Log after subsampling and xscale
-        {
-            x.eval()?;
-            let flat = x.reshape(&[-1])?;
-            flat.eval()?;
-            let slice: &[f32] = flat.as_slice();
-            let min = slice.iter().cloned().fold(f32::INFINITY, f32::min);
-            let max = slice.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-            let mean: f32 = slice.iter().sum::<f32>() / slice.len() as f32;
-            let std: f32 = (slice.iter().map(|&v| (v - mean).powi(2)).sum::<f32>()
-                / slice.len() as f32)
-                .sqrt();
-            tracing::info!(
-                enc_call,
-                shape = ?x.shape(),
-                min = format!("{:.6}", min),
-                max = format!("{:.6}", max),
-                mean = format!("{:.6}", mean),
-                std = format!("{:.6}", std),
-                "after subsampling+xscale stats"
-            );
         }
 
         let seq_len = x.dim(1) as i32;
@@ -778,28 +711,6 @@ impl ConformerEncoder {
         }
 
         // Debug encoder output stats (before final transpose)
-        {
-            x.eval()?;
-            let flat = x.reshape(&[-1])?;
-            flat.eval()?;
-            let slice: &[f32] = flat.as_slice();
-            let min = slice.iter().cloned().fold(f32::INFINITY, f32::min);
-            let max = slice.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-            let mean: f32 = slice.iter().sum::<f32>() / slice.len() as f32;
-            let std: f32 = (slice.iter().map(|&v| (v - mean).powi(2)).sum::<f32>()
-                / slice.len() as f32)
-                .sqrt();
-            tracing::info!(
-                enc_call,
-                shape = ?x.shape(),
-                min = format!("{:.6}", min),
-                max = format!("{:.6}", max),
-                mean = format!("{:.6}", mean),
-                std = format!("{:.6}", std),
-                "encoder output stats"
-            );
-        }
-
         // Transpose back to [B, D, T]
         let x = mlx_rs::ops::transpose_axes(&x, &[0, 2, 1])?;
 
@@ -1084,29 +995,6 @@ impl Subsampling {
             "subsampling forward start"
         );
 
-        // Log input statistics for debugging comparison with Python
-        {
-            let x_eval = x.clone();
-            x_eval.eval()?;
-            let flat = x_eval.reshape(&[-1])?;
-            flat.eval()?;
-            let slice: &[f32] = flat.as_slice();
-            let min = slice.iter().cloned().fold(f32::INFINITY, f32::min);
-            let max = slice.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-            let mean: f32 = slice.iter().sum::<f32>() / slice.len() as f32;
-            let std: f32 = (slice.iter().map(|&v| (v - mean).powi(2)).sum::<f32>()
-                / slice.len() as f32)
-                .sqrt();
-            tracing::info!(
-                shape = ?x.shape(),
-                min = format!("{:.6}", min),
-                max = format!("{:.6}", max),
-                mean = format!("{:.6}", mean),
-                std = format!("{:.6}", std),
-                "subsampling input stats"
-            );
-        }
-
         // Add channel dimension: [B, T, F] -> [B, T, F, 1] for MLX Conv2d
         // MLX Conv2d expects (N, H, W, C) format
         let mut x = x.reshape(&[-1, x.dim(1) as i32, x.dim(2) as i32, 1])?;
@@ -1114,35 +1002,10 @@ impl Subsampling {
         // Apply causal padding if needed before first conv
         if self.is_causal {
             x = causal_pad_2d(&x, self.kernel_size, self.stride)?;
-            tracing::debug!(shape_after_causal_pad = ?x.shape(), "after causal_pad_2d for first conv");
         }
 
         // First conv layer with ReLU
         x = self.first_conv.forward(&x)?;
-        tracing::debug!(shape_after_first_conv = ?x.shape(), "after first_conv");
-
-        // Log after first conv
-        {
-            x.eval()?;
-            let flat = x.reshape(&[-1])?;
-            flat.eval()?;
-            let slice: &[f32] = flat.as_slice();
-            let min = slice.iter().cloned().fold(f32::INFINITY, f32::min);
-            let max = slice.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-            let mean: f32 = slice.iter().sum::<f32>() / slice.len() as f32;
-            let std: f32 = (slice.iter().map(|&v| (v - mean).powi(2)).sum::<f32>()
-                / slice.len() as f32)
-                .sqrt();
-            tracing::debug!(
-                shape = ?x.shape(),
-                min = format!("{:.6}", min),
-                max = format!("{:.6}", max),
-                mean = format!("{:.6}", mean),
-                std = format!("{:.6}", std),
-                "after first_conv stats"
-            );
-        }
-
         x = mlx_rs::nn::relu(&x)?;
 
         // Get parameters for loop since we need to avoid borrow issues
@@ -1151,7 +1014,7 @@ impl Subsampling {
         let stride = self.stride;
 
         // Apply depthwise + pointwise pairs with ReLU
-        for (i, (dw_conv, pw_conv)) in self
+        for (_i, (dw_conv, pw_conv)) in self
             .depthwise_convs
             .iter_mut()
             .zip(self.pointwise_convs.iter_mut())
@@ -1160,36 +1023,10 @@ impl Subsampling {
             // Apply causal padding before each depthwise conv
             if is_causal {
                 x = causal_pad_2d(&x, kernel_size, stride)?;
-                tracing::debug!(conv_idx = i, shape_after_causal_pad = ?x.shape(), "after causal_pad_2d for dw conv");
             }
             x = dw_conv.forward(&x)?;
-            tracing::debug!(conv_idx = i, shape_after_dw = ?x.shape(), "after depthwise conv");
             x = pw_conv.forward(&x)?;
-            tracing::debug!(conv_idx = i, shape_after_pw = ?x.shape(), "after pointwise conv");
             x = mlx_rs::nn::relu(&x)?;
-
-            // Log after each depthwise-pointwise pair
-            {
-                x.eval()?;
-                let flat = x.reshape(&[-1])?;
-                flat.eval()?;
-                let slice: &[f32] = flat.as_slice();
-                let min = slice.iter().cloned().fold(f32::INFINITY, f32::min);
-                let max = slice.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-                let mean: f32 = slice.iter().sum::<f32>() / slice.len() as f32;
-                let std: f32 = (slice.iter().map(|&v| (v - mean).powi(2)).sum::<f32>()
-                    / slice.len() as f32)
-                    .sqrt();
-                tracing::debug!(
-                    conv_idx = i,
-                    shape = ?x.shape(),
-                    min = format!("{:.6}", min),
-                    max = format!("{:.6}", max),
-                    mean = format!("{:.6}", mean),
-                    std = format!("{:.6}", std),
-                    "after dw+pw conv stats"
-                );
-            }
         }
 
         // x is now [B, T', F', C] where T' = T/subsampling_factor, F' = F/subsampling_factor
@@ -1198,45 +1035,15 @@ impl Subsampling {
         // We have: [B, T', F', C] -> transpose to [B, T', C, F'] -> flatten to [B, T', C*F']
         let batch = x.dim(0);
         let time = x.dim(1);
-        tracing::debug!(
-            batch,
-            time,
-            freq = x.dim(2),
-            channels = x.dim(3),
-            "before transpose and flatten"
-        );
 
         // Transpose to [B, T', C, F'] to match NeMo's C*F flattening order
         let x = mlx_rs::ops::transpose_axes(&x, &[0, 1, 3, 2])?;
 
         // Flatten to [B, T', C*F']
         let x = x.reshape(&[batch as i32, time as i32, -1])?;
-        tracing::debug!(shape_after_flatten = ?x.shape(), "after flatten");
 
         // Project to d_model: [B, T', d_model]
         let x = self.out_proj.forward(&x)?;
-
-        // Log output statistics
-        {
-            x.eval()?;
-            let flat = x.reshape(&[-1])?;
-            flat.eval()?;
-            let slice: &[f32] = flat.as_slice();
-            let min = slice.iter().cloned().fold(f32::INFINITY, f32::min);
-            let max = slice.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-            let mean: f32 = slice.iter().sum::<f32>() / slice.len() as f32;
-            let std: f32 = (slice.iter().map(|&v| (v - mean).powi(2)).sum::<f32>()
-                / slice.len() as f32)
-                .sqrt();
-            tracing::info!(
-                shape = ?x.shape(),
-                min = format!("{:.6}", min),
-                max = format!("{:.6}", max),
-                mean = format!("{:.6}", mean),
-                std = format!("{:.6}", std),
-                "subsampling output stats"
-            );
-        }
 
         // Update lengths based on padding mode
         let mut new_lengths = lengths.clone();
