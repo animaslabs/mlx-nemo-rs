@@ -156,7 +156,8 @@ fn create_attention_mask(
     max_audio_length: i32,
     cache_len: i32,
     filled_cache_len: i32,
-    _seq_len: i32,
+    tensor_seq_len: i32,
+    valid_seq_len: i32,
 ) -> Result<Array> {
     tracing::trace!(
         ?att_context_size,
@@ -164,7 +165,8 @@ fn create_attention_mask(
         max_audio_length,
         cache_len,
         filled_cache_len,
-        seq_len = _seq_len,
+        tensor_seq_len,
+        valid_seq_len,
         "creating streaming attention mask"
     );
 
@@ -242,18 +244,42 @@ fn create_attention_mask(
     // - Positions 0..cache_len are cache positions
     // - Positions cache_len..max_audio_length are current input positions
     // We want the mask for queries at positions cache_len..max_audio_length
-    let att_mask = att_mask.index((.., cache_len.., ..));
+    let mut att_mask = att_mask.index((.., cache_len.., ..));
 
-    // Invert: NeMo returns inverted mask at the end (True means ignore)
-    let att_mask = mlx_rs::ops::logical_not(&att_mask)?;
+    // Mask out positions beyond valid_seq_len
+    // Python NeMo uses the `length` parameter to mask extra tensor frames.
+    // Query positions >= valid_seq_len should be fully masked (can't attend to anything).
+    // This zeros out the attention output for padding frames.
+    if valid_seq_len < tensor_seq_len {
+        tracing::trace!(
+            valid_seq_len,
+            tensor_seq_len,
+            "masking query positions beyond valid length"
+        );
+
+        // Create row mask: [tensor_seq_len] where True for rows 0..valid_seq_len
+        let row_indices: Vec<i32> = (0..tensor_seq_len).collect();
+        let row_indices = Array::from_slice(&row_indices, &[tensor_seq_len]);
+        let valid_len_arr = Array::from_int(valid_seq_len);
+        let row_valid = row_indices.lt(&valid_len_arr)?;
+
+        // Reshape to [1, tensor_seq_len, 1] for broadcasting
+        let row_valid = row_valid.reshape(&[1, tensor_seq_len, 1])?;
+
+        // AND with attention mask: rows >= valid_seq_len become all False
+        att_mask = att_mask.logical_and(&row_valid)?;
+    }
+
+    // No inversion needed: mask is True where attention is ALLOWED
+    // The attention layer will use: where(mask, scores, -inf) to keep scores where mask=True
 
     {
         att_mask.eval()?;
-        // Count how many positions are visible (False = visible after inversion)
+        // Count how many positions are visible (True = visible)
         let flat = att_mask.reshape(&[-1])?;
         flat.eval()?;
         let flat_slice: &[bool] = flat.as_slice();
-        let visible_count = flat_slice.iter().filter(|&&x| !x).count();
+        let visible_count = flat_slice.iter().filter(|&&x| x).count();
         let total = flat_slice.len();
         tracing::trace!(
             shape = ?att_mask.shape(),
@@ -438,6 +464,27 @@ impl ConformerEncoder {
             att_context_size,
             att_context_style,
         })
+    }
+
+    /// Set the streaming mode's attention context size.
+    ///
+    /// This should be called after loading the model and before streaming inference
+    /// to select the appropriate context size for the desired latency mode.
+    pub fn set_streaming_mode(&mut self, mode_idx: usize) {
+        if let Some(ctx_size) = self.config.att_context_size.as_ref().and_then(|cs| cs.get_mode(mode_idx)) {
+            tracing::debug!(
+                mode_idx,
+                left = ctx_size.0,
+                right = ctx_size.1,
+                "Setting encoder streaming mode"
+            );
+            self.att_context_size = Some(ctx_size);
+        } else {
+            tracing::warn!(
+                mode_idx,
+                "Invalid streaming mode index, keeping current context"
+            );
+        }
     }
 
     /// Forward pass through the encoder.
@@ -799,8 +846,24 @@ impl ConformerEncoder {
                 total_len,        // Full buffer: cache_size + tensor_seq_len
                 cache_size,       // Full cache buffer size (for slicing)
                 filled_cache_len, // How much is filled (for offset masking)
-                tensor_seq_len,   // Use tensor dimension for mask size
+                tensor_seq_len,   // Tensor dimension for mask row count
+                valid_seq_len,    // Valid frames for query row masking
             )?)
+        } else {
+            None
+        };
+
+        // Create padding mask for conv module: True where position >= valid_seq_len
+        // This zeros out padding frames after GLU, matching Python NeMo behavior
+        let pad_mask = if tensor_seq_len > valid_seq_len {
+            // Create indices [0, 1, 2, ..., tensor_seq_len - 1]
+            let indices = mlx_rs::ops::arange::<_, i32>(0, tensor_seq_len, 1)?;
+            // mask[i] = (i >= valid_seq_len) => True for padding positions
+            let valid_len_arr = Array::from_int(valid_seq_len);
+            let mask = mlx_rs::ops::ge(&indices, &valid_len_arr)?;
+            // Expand to [1, tensor_seq_len] for batch broadcasting
+            let mask = mask.reshape(&[1, tensor_seq_len])?;
+            Some(mask)
         } else {
             None
         };
@@ -827,11 +890,28 @@ impl ConformerEncoder {
                 filled_cache_len,
                 Some(&layer_cache_time), // Always pass conv cache
                 att_mask.as_ref(),
-                layer_idx,
-                enc_call,
+                pad_mask.as_ref(),
             )?;
 
             x = x_out;
+
+            // Trace layer 0 output for chunk 0 debugging
+            if enc_call == 0 && layer_idx == 0 {
+                x.eval()?;
+                let seq = x.dim(1);
+                if seq > 4 {
+                    let x_frame4 = x.index((0, 4, ..));
+                    x_frame4.eval()?;
+                    let x4_slice: Vec<f32> = x_frame4.as_slice::<f32>()[..10].to_vec();
+                    let x4_norm = {
+                        let sq = mlx_rs::ops::square(&x_frame4)?;
+                        let sum = mlx_rs::ops::sum(&sq, None)?;
+                        sum.eval()?;
+                        sum.as_slice::<f32>()[0].sqrt()
+                    };
+                    tracing::info!(layer_idx, x4_norm, ?x4_slice, "chunk0 layer0 OUTPUT [0,4]");
+                }
+            }
 
             // Update cache: the attention layer returns new_cache from sliding window
             // We need to store it properly in the full cache buffer
@@ -882,15 +962,19 @@ impl ConformerEncoder {
 
         // Debug: track cache length
         tracing::trace!(
-            seq_len,
+            tensor_seq_len,
+            valid_seq_len = seq_len,
             cache_size,
             filled_before = filled_cache_len,
             "cache length tracking"
         );
 
-        // Update cache length: clamp(old_len + seq_len, max=cache_size)
+        // Update cache length: clamp(old_len + tensor_seq_len, max=cache_size)
+        // IMPORTANT: Use tensor_seq_len, not valid_seq_len!
+        // The attention layer caches ALL tensor frames (x.dim(1)), not just valid frames.
+        // Python NeMo: cache_last_channel_len grows by the actual tensor dimension.
         let cache_channel_len_next = mlx_rs::ops::clip(
-            &(cache_last_channel_len + &Array::from_int(seq_len)),
+            &(cache_last_channel_len + &Array::from_int(tensor_seq_len)),
             ((), &Array::from_int(cache_size)),
         )?;
 
@@ -922,29 +1006,6 @@ impl ConformerEncoder {
         } else {
             cache_channel_len_next
         };
-
-        // Debug: check cache statistics
-        {
-            // Check first layer's new cache
-            let first_cache = cache_channel_next.index((0, .., .., ..));
-            first_cache.eval()?;
-            let fc_flat = first_cache.reshape(&[-1])?;
-            fc_flat.eval()?;
-            let fc_slice: &[f32] = fc_flat.as_slice();
-            let fc_min = fc_slice.iter().cloned().fold(f32::INFINITY, f32::min);
-            let fc_max = fc_slice.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-            let fc_mean: f32 = fc_slice.iter().sum::<f32>() / fc_slice.len() as f32;
-            let fc_var: f32 = fc_slice.iter().map(|&x| (x - fc_mean).powi(2)).sum::<f32>()
-                / fc_slice.len() as f32;
-            tracing::trace!(
-                layer = 0,
-                min = fc_min,
-                max = fc_max,
-                mean = fc_mean,
-                var = fc_var,
-                "layer0 cache stats"
-            );
-        }
 
         Ok((
             x,
@@ -1712,8 +1773,7 @@ impl ConformerBlock {
     /// * `cache_filled_len` - How many frames of MHA cache are valid
     /// * `cache_last_time` - Optional conv cache [batch, d_model, time_cache]
     /// * `att_mask` - Optional attention mask [batch, seq_len, total_len] where True=masked
-    /// * `layer_idx` - Layer index for debugging
-    /// * `enc_call` - Encoder call count for debugging
+    /// * `pad_mask` - Optional padding mask [batch, seq_len] where True=padding (for conv module)
     ///
     /// # Returns
     /// * Output tensor [batch, seq_len, d_model]
@@ -1727,55 +1787,21 @@ impl ConformerBlock {
         cache_filled_len: i32,
         cache_last_time: Option<&Array>,
         att_mask: Option<&Array>,
-        layer_idx: usize,
-        enc_call: u64,
+        pad_mask: Option<&Array>,
     ) -> Result<(Array, Option<Array>, Option<Array>)> {
-        // // Helper to compute tensor stats using tracing
-        // let compute_stats = |arr: &Array, name: &str| -> Result<()> {
-        //     arr.eval()?;
-        //     let flat = arr.reshape(&[-1])?;
-        //     flat.eval()?;
-        //     let slice: &[f32] = flat.as_slice();
-        //     let min = slice.iter().cloned().fold(f32::INFINITY, f32::min);
-        //     let max = slice.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-        //     let mean: f32 = slice.iter().sum::<f32>() / slice.len() as f32;
-        //     let var: f32 =
-        //         slice.iter().map(|&v| (v - mean).powi(2)).sum::<f32>() / slice.len() as f32;
-        //     let std = var.sqrt();
-        //     tracing::trace!(
-        //         enc_call,
-        //         layer_idx,
-        //         stage = name,
-        //         min,
-        //         max,
-        //         mean,
-        //         std,
-        //         "layer tensor stats"
-        //     );
-        //     Ok(())
-        // };
-
-        // // Only debug specific encoder calls and layers to avoid too much output
-        // let should_debug = (layer_idx == 0 || layer_idx == 11 || layer_idx == 23)
-        //     && (enc_call < 5 || enc_call == 135 || enc_call == 200 || enc_call == 270);
-
-        // if should_debug {
-        //     compute_stats(x, "input")?;
-        // }
-
         // Feed-forward 1 (half-step residual)
         let residual = x.clone();
-        let ff1_out = self.ff1_norm.forward(x)?;
-        let ff1_out = self.ff1.forward(&ff1_out)?;
+        let ff1_norm_out = self.ff1_norm.forward(x)?;
+        let ff1_out = self.ff1.forward(&ff1_norm_out)?;
         let half = Array::from_f32(0.5);
         let scaled_ff1 = &half * &ff1_out;
         let x = &residual + &scaled_ff1;
 
         // Self-attention with cache
         let residual = x.clone();
-        let attn_out = self.self_attn_norm.forward(&x)?;
+        let mha_norm_out = self.self_attn_norm.forward(&x)?;
         let (attn_out, new_cache_channel) = self.self_attn.forward_with_cache(
-            &attn_out,
+            &mha_norm_out,
             pos_emb,
             cache_last_channel,
             cache_filled_len,
@@ -1785,16 +1811,15 @@ impl ConformerBlock {
 
         // Convolution with cache
         let residual = x.clone();
-        let conv_out = self.conv_norm.forward(&x)?;
+        let conv_norm_out = self.conv_norm.forward(&x)?;
         let (conv_out, new_cache_time) =
-            self.conv.forward_with_cache(&conv_out, cache_last_time)?;
-
+            self.conv.forward_with_cache(&conv_norm_out, cache_last_time, pad_mask)?;
         let x = &residual + &conv_out;
 
         // Feed-forward 2 (half-step residual)
         let residual = x.clone();
-        let ff2_out = self.ff2_norm.forward(&x)?;
-        let ff2_out = self.ff2.forward(&ff2_out)?;
+        let ff2_norm_out = self.ff2_norm.forward(&x)?;
+        let ff2_out = self.ff2.forward(&ff2_norm_out)?;
         let scaled_ff2 = &half * &ff2_out;
         let x = &residual + &scaled_ff2;
 
@@ -2083,6 +2108,7 @@ impl ConvolutionModule {
     /// # Arguments
     /// * `x` - Input tensor [batch, seq_len, d_model]
     /// * `cache` - Optional cache tensor [batch, d_model, cache_len] for left context
+    /// * `pad_mask` - Optional padding mask [batch, seq_len] where True = padding (to be zeroed)
     ///
     /// # Returns
     /// * Output tensor [batch, seq_len, d_model]
@@ -2091,6 +2117,7 @@ impl ConvolutionModule {
         &mut self,
         x: &Array,
         cache: Option<&Array>,
+        pad_mask: Option<&Array>,
     ) -> Result<(Array, Option<Array>)> {
         // Pointwise conv 1 with GLU activation
         let x = self.pointwise_conv1.forward(x)?;
@@ -2100,7 +2127,18 @@ impl ConvolutionModule {
         let x1 = x.index((.., .., ..d_model));
         let x2 = x.index((.., .., d_model..));
         let sigmoid_x2 = mlx_rs::ops::sigmoid(&x2)?;
-        let x = &x1 * &sigmoid_x2;
+        let mut x = &x1 * &sigmoid_x2;
+
+        // Apply padding mask after GLU - this matches Python NeMo's behavior
+        // where padding frames are zeroed out before depthwise conv and cache update
+        if let Some(mask) = pad_mask {
+            // pad_mask: [batch, seq_len] where True = padding
+            // x: [batch, seq_len, d_model]
+            // Expand mask to [batch, seq_len, 1] for broadcasting
+            let mask_expanded = mask.reshape(&[mask.dim(0) as i32, mask.dim(1) as i32, 1])?;
+            // Where mask is True (padding), set to 0.0
+            x = mlx_rs::ops::r#where(&mask_expanded, &Array::from_f32(0.0), &x)?;
+        }
 
         // For streaming: use cache instead of padding
         let (x, new_cache) = if let Some(cache_tensor) = cache {

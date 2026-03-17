@@ -1,0 +1,153 @@
+#!/usr/bin/env python3
+"""Trace sublayer outputs for layer 0, chunks 0-2."""
+
+import os
+import warnings
+os.environ['PYTHONWARNINGS'] = 'ignore'
+warnings.filterwarnings('ignore')
+
+import logging
+for n in ['nemo', 'nemo_logger', 'pytorch_lightning', 'lightning']:
+    logging.getLogger(n).setLevel(logging.ERROR)
+os.environ['NEMO_LOG_LEVEL'] = 'ERROR'
+
+import torch
+import numpy as np
+import soundfile as sf
+from pathlib import Path
+from omegaconf import OmegaConf
+
+
+def main():
+    audio_path = '../samples/2086-149220-0033.wav'
+
+    config_path = Path('streaming_config.yaml')
+    cfg = OmegaConf.load(config_path)
+    cfg.asr.model_name = '../models/nvidia/nemotron-speech-streaming-en-0.6b/nemotron-speech-streaming-en-0.6b.nemo'
+    cfg.asr.device = 'cpu'
+    cfg.asr.compute_dtype = 'float32'
+    cfg.asr.use_amp = False
+    cfg.streaming.att_context_size = [70, 1]
+    cfg.asr_decoding_type = 'rnnt'
+    cfg.log_level = 40
+
+    from nemo.collections.asr.inference.factory.pipeline_builder import PipelineBuilder
+    pipeline = PipelineBuilder.build_pipeline(cfg)
+
+    asr_model = pipeline.asr_model.asr_model
+    preprocessor = asr_model.preprocessor
+    encoder = asr_model.encoder
+
+    streaming_cfg = encoder.streaming_cfg
+    if streaming_cfg is None:
+        encoder.setup_streaming_params()
+        streaming_cfg = encoder.streaming_cfg
+
+    audio, sr = sf.read(audio_path, dtype='float32')
+
+    batch_size = 1
+    dtype = torch.float32
+    device = torch.device('cpu')
+    cache_last_channel, cache_last_time, cache_last_channel_len = encoder.get_initial_cache_state(
+        batch_size, dtype, device, max_dim=0
+    )
+
+    pre_encode_cache_size = streaming_cfg.pre_encode_cache_size[1]
+    model_chunk_size = streaming_cfg.chunk_size[1]
+
+    if hasattr(preprocessor, 'featurizer'):
+        fb = preprocessor.featurizer
+        hop_length = int(getattr(fb, 'hop_length', getattr(fb, 'hop_size', 160)))
+    else:
+        hop_length = int(16000 * 0.01)
+
+    buffer_mel_frames = model_chunk_size + pre_encode_cache_size
+    audio_chunk_samples = buffer_mel_frames * hop_length
+
+    # Patch layer 0 to trace sublayer outputs
+    layer0 = encoder.layers[0]
+    original_forward = layer0.forward
+    chunk_idx_ref = [0]
+
+    def traced_forward(x, att_mask=None, pos_emb=None, pad_mask=None, cache_last_channel=None, cache_last_time=None):
+        ci = chunk_idx_ref[0]
+        if ci <= 2:  # Only trace first 3 chunks
+            print(f"\n=== Chunk {ci} Layer 0 ===")
+            print(f"  Input x shape: {list(x.shape)}")  # [B, T, D]
+            print(f"  Input frame 0 [:10]: {x[0, 0, :10].tolist()}")
+            print(f"  Input frame 0 norm: {torch.norm(x[0, 0]).item():.6f}")
+
+        result = original_forward(x, att_mask=att_mask, pos_emb=pos_emb, pad_mask=pad_mask,
+                                  cache_last_channel=cache_last_channel, cache_last_time=cache_last_time)
+
+        if ci <= 2:
+            out, new_cache_channel, new_cache_time = result
+            print(f"  Output frame 0 [:10]: {out[0, 0, :10].tolist()}")
+            print(f"  Output frame 0 norm: {torch.norm(out[0, 0]).item():.6f}")
+            if out.shape[1] > 1:
+                print(f"  Output frame 1 [:10]: {out[0, 1, :10].tolist()}")
+                print(f"  Output frame 1 norm: {torch.norm(out[0, 1]).item():.6f}")
+
+        return result
+
+    layer0.forward = traced_forward
+
+    audio_pos = 0
+    max_chunks = 5
+
+    with torch.no_grad():
+        for ci in range(max_chunks):
+            chunk_idx_ref[0] = ci
+            if audio_pos >= len(audio):
+                break
+
+            end_pos = min(audio_pos + audio_chunk_samples, len(audio))
+            audio_chunk = audio[audio_pos:end_pos]
+            if len(audio_chunk) < audio_chunk_samples:
+                audio_chunk = np.pad(audio_chunk, (0, audio_chunk_samples - len(audio_chunk)))
+
+            chunk_tensor = torch.from_numpy(audio_chunk).float().unsqueeze(0)
+            chunk_len = torch.tensor([len(audio_chunk)])
+
+            mel, mel_len = preprocessor(input_signal=chunk_tensor, length=chunk_len)
+
+            is_first = (ci == 0)
+            drop_extra = 0 if is_first else streaming_cfg.drop_extra_pre_encoded
+
+            print(f"\n{'='*60}")
+            print(f"CHUNK {ci}")
+            print(f"{'='*60}")
+
+            (encoded, encoded_len,
+             cache_last_channel, cache_last_time,
+             cache_last_channel_len) = encoder.cache_aware_stream_step(
+                processed_signal=mel,
+                processed_signal_length=mel_len,
+                cache_last_channel=cache_last_channel,
+                cache_last_time=cache_last_time,
+                cache_last_channel_len=cache_last_channel_len,
+                keep_all_outputs=True,
+                drop_extra_pre_encoded=drop_extra,
+            )
+
+            # Print encoder output
+            enc_np = encoded.numpy()
+            if enc_np.shape[1] == 1024:  # [B, D, T]
+                frame0 = enc_np[0, :, 0]
+                frame1 = enc_np[0, :, 1] if enc_np.shape[2] > 1 else None
+            else:  # [B, T, D]
+                frame0 = enc_np[0, 0, :]
+                frame1 = enc_np[0, 1, :] if enc_np.shape[1] > 1 else None
+
+            print(f"\n=== Chunk {ci} Encoder Output ===")
+            print(f"  Frame 0 [:10]: [{', '.join(f'{v:.6f}' for v in frame0[:10])}]")
+            print(f"  Frame 0 norm: {np.linalg.norm(frame0):.6f}")
+            if frame1 is not None:
+                print(f"  Frame 1 [:10]: [{', '.join(f'{v:.6f}' for v in frame1[:10])}]")
+                print(f"  Frame 1 norm: {np.linalg.norm(frame1):.6f}")
+
+            audio_pos = end_pos
+
+
+if __name__ == '__main__':
+    main()

@@ -713,10 +713,6 @@ impl EncDecRNNTModel {
             ));
         }
 
-        // Reset attention and encoder debug counters for fresh streaming session
-        crate::asr::modules::encoders::attention::reset_attention_counter();
-        crate::asr::modules::encoders::reset_encoder_counter();
-
         // Compute streaming configuration
         let config = compute_streaming_config(self.encoder.config(), mode_idx, 10000)?;
 

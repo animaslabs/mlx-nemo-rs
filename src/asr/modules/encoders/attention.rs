@@ -704,16 +704,28 @@ impl RelPositionMultiHeadAttention {
         let mut scores = (&matrix_ac + &matrix_bd) / Array::from_f32(scale);
 
         // Apply attention mask if provided
-        if let Some(mask) = att_mask {
+        let mask_expanded = if let Some(mask) = att_mask {
             // mask: [batch, seq_len, total_len] -> [batch, 1, seq_len, total_len]
             let mask = mask.reshape(&[batch_size, 1, seq_len, total_len])?;
-            // Where mask is True (masked/padding), set score to -inf
+            // NeMo convention: mask=True means VALID (can attend), False means MASKED
+            // where(mask, scores, -inf) keeps scores where mask=True, sets -inf where mask=False
             let neg_inf = Array::from_f32(f32::NEG_INFINITY);
-            scores = ops::r#where(&mask, &neg_inf, &scores)?;
-        }
+            scores = ops::r#where(&mask, &scores, &neg_inf)?;
+            Some(mask)
+        } else {
+            None
+        };
 
         // Softmax
-        let attn_weights = ops::softmax_axis(&scores, -1, None)?;
+        let mut attn_weights = ops::softmax_axis(&scores, -1, None)?;
+
+        // Zero out attention weights for masked positions (Python: .masked_fill(mask, 0.0))
+        // This handles the case where all positions are masked (softmax produces NaN)
+        // and ensures masked positions don't contribute to the output
+        if let Some(mask) = mask_expanded {
+            let zero = Array::from_f32(0.0);
+            attn_weights = ops::r#where(&mask, &attn_weights, &zero)?;
+        }
 
         // Debug: print attention stats periodically (only layer 0, every ~100 encoder calls)
         // Each encoder call has 24 layers, so call_count/24 gives encoder call number

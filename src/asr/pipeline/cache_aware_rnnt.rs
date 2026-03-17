@@ -182,6 +182,10 @@ impl CacheAwareRNNTPipeline {
         decoder.load_weights(&weights, "decoder")?;
         joint.load_weights(&weights, "joint")?;
 
+        // Set encoder's attention context for the selected streaming mode
+        // This ensures the encoder uses the correct left/right context for attention masking
+        encoder.set_streaming_mode(mode_idx);
+
         // Compute streaming configuration
         let streaming_config = compute_streaming_config(encoder.config(), mode_idx, 10000)?;
 
@@ -306,9 +310,6 @@ impl CacheAwareRNNTPipeline {
         self.state.accumulated_tokens.clear();
         self.state.is_first_chunk = true;
 
-        // Reset attention and encoder counters
-        crate::asr::modules::encoders::attention::reset_attention_counter();
-        crate::asr::modules::encoders::reset_encoder_counter();
     }
 
     /// Process the next available request and return transcription output.
