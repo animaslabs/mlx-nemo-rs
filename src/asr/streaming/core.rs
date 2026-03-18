@@ -573,7 +573,7 @@ impl StreamingMelBuffer {
         // Total frames to extract
         let total_extract = extract_end - extract_start;
 
-        tracing::info!(
+        tracing::trace!(
             self.buffer_idx,
             self.total_frames,
             self.mel_buffer_offset,
@@ -587,7 +587,7 @@ impl StreamingMelBuffer {
         let local_start = extract_start.saturating_sub(self.mel_buffer_offset);
         let local_end = local_start + total_extract;
 
-        tracing::info!(
+        tracing::trace!(
             local_start,
             local_end,
             mel_buffer_shape = ?mel_buffer.shape(),

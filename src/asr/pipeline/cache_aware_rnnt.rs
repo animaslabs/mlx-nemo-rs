@@ -413,7 +413,7 @@ impl CacheAwareRNNTPipeline {
                 .sum::<f32>()
                 .sqrt();
 
-            tracing::info!(
+            tracing::trace!(
                 ?mel_frame0_slice,
                 mel_frame0_norm = %format!("{:.6}", mel_frame0_norm),
                 "mel frame 0"
@@ -423,7 +423,7 @@ impl CacheAwareRNNTPipeline {
         // Debug encoder output
         self.encoder_cache.last_channel_len.eval()?;
         let cache_len = self.encoder_cache.last_channel_len.as_slice::<i64>()[0];
-        tracing::info!(
+        tracing::trace!(
             is_first,
             is_last,
             chunk_len,
@@ -453,7 +453,7 @@ impl CacheAwareRNNTPipeline {
                 .map(|v| v * v)
                 .sum::<f32>()
                 .sqrt();
-            tracing::info!(
+            tracing::trace!(
                 ?frame0_slice,
                 frame0_norm = %format!("{:.6}", frame0_norm),
                 "encoder frame 0"
@@ -471,7 +471,7 @@ impl CacheAwareRNNTPipeline {
                     .map(|v| v * v)
                     .sum::<f32>()
                     .sqrt();
-                tracing::info!(
+                tracing::trace!(
                     ?frame1_slice,
                     frame1_norm = %format!("{:.6}", frame1_norm),
                     "encoder frame 1"

@@ -17,6 +17,11 @@ use crate::core::error::{Error, Result};
 /// - Incremental mel spectrogram computation
 /// - Chunk extraction with proper overlap (pre_encode_cache)
 ///
+/// The streamer mirrors NeMo's `AudioBufferer` approach:
+/// - Maintains a rolling audio buffer of size `pre_encode_cache + chunk`
+/// - First chunk is padded with zeros (silence) for pre_encode_cache
+/// - Subsequent chunks get overlap from the previous chunk
+///
 /// # Example
 ///
 /// ```rust,ignore
@@ -62,6 +67,10 @@ pub struct RequestStreamer {
     is_done: bool,
     /// Number of mel features
     n_mels: usize,
+
+    // Audio overlap buffer for pre_encode_cache
+    /// Audio samples to prepend to the next chunk (for overlap/pre_encode_cache)
+    audio_overlap: Vec<f32>,
 }
 
 impl RequestStreamer {
@@ -91,6 +100,7 @@ impl RequestStreamer {
             stream_ended: false,
             is_done: false,
             n_mels,
+            audio_overlap: Vec::new(),
         }
     }
 
@@ -169,6 +179,7 @@ impl RequestStreamer {
         self.live_buffer.clear();
         self.mel_buffer.reset();
         self.preprocessor.reset();
+        self.audio_overlap.clear();
         self.reset_stream_state();
     }
 
@@ -176,18 +187,42 @@ impl RequestStreamer {
         self.is_first_chunk = true;
         self.stream_ended = false;
         self.is_done = false;
+        self.audio_overlap.clear();
     }
 
     /// Get audio chunk size in samples for the current streaming config.
     ///
-    /// This calculates how many audio samples are needed to produce
-    /// enough mel frames for a chunk.
+    /// This calculates how many NEW audio samples are consumed per chunk.
+    /// This matches Python's MonoStream frame_size = chunk_size_in_secs * sample_rate.
+    ///
+    /// Note: The mel buffer receives more samples per chunk (chunk + pre_encode_cache)
+    /// because we prepend overlap/silence. But this method returns just the NEW audio
+    /// consumed from the source per iteration.
     pub fn audio_chunk_size(&self) -> usize {
-        // Use subsequent chunk size consistently (like Python's CacheAwareRNNTPipeline)
-        // NeMo: buffer_size = pre_encode_cache_size + model_chunk_size
-        let chunk_mel_frames = self.config.chunk_size.1 + self.config.pre_encode_cache_size.1;
+        // Just the chunk size, NOT including pre_encode_cache
+        // This matches Python's MonoStream frame_size
+        let chunk_mel_frames = self.config.chunk_size.1;
         let hop_samples = self.mel_buffer.hop_samples;
         chunk_mel_frames * hop_samples
+    }
+
+    /// Get the full audio buffer size in samples (chunk + pre_encode_cache).
+    ///
+    /// This is the size of the buffer passed to mel computation.
+    fn audio_buffer_size(&self) -> usize {
+        let buffer_mel_frames = self.config.chunk_size.1 + self.config.pre_encode_cache_size.1;
+        let hop_samples = self.mel_buffer.hop_samples;
+        buffer_mel_frames * hop_samples
+    }
+
+    /// Get the pre-encode cache size in audio samples.
+    ///
+    /// This is the number of silence/overlap samples to prepend to each audio chunk
+    /// to match Python NeMo's AudioBufferer behavior.
+    fn pre_encode_cache_samples(&self) -> usize {
+        let pre_encode_cache_frames = self.config.pre_encode_cache_size.1;
+        let hop_samples = self.mel_buffer.hop_samples;
+        pre_encode_cache_frames * hop_samples
     }
 
     /// Process available audio and try to extract the next request.
@@ -241,43 +276,126 @@ impl RequestStreamer {
         ))
     }
 
+    /// Build the audio buffer for mel computation.
+    ///
+    /// This mirrors Python's AudioBufferer behavior:
+    /// - First chunk: buffer = [zeros (pre_encode) | audio (chunk)]
+    /// - Subsequent: buffer = [overlap from prev | audio (chunk)]
+    ///
+    /// The overlap (pre_encode_cache samples from the end of each chunk)
+    /// is saved for the next chunk.
+    fn build_audio_buffer(&mut self, audio_chunk: &[f32]) -> Vec<f32> {
+        let pre_encode_samples = self.pre_encode_cache_samples();
+        let buffer_size = self.audio_buffer_size();
+
+        let mut buffer = Vec::with_capacity(buffer_size);
+
+        if self.is_first_chunk {
+            // First chunk: prepend silence (zeros) for pre_encode_cache
+            tracing::debug!(
+                pre_encode_samples,
+                audio_chunk_len = audio_chunk.len(),
+                "First chunk: prepending silence"
+            );
+            buffer.resize(pre_encode_samples, 0.0f32);
+            buffer.extend_from_slice(audio_chunk);
+        } else {
+            // Subsequent chunks: prepend overlap from previous chunk
+            if self.audio_overlap.len() >= pre_encode_samples {
+                buffer.extend_from_slice(&self.audio_overlap[..pre_encode_samples]);
+            } else {
+                // Pad with zeros if overlap is too short (shouldn't happen normally)
+                let zeros_needed = pre_encode_samples - self.audio_overlap.len();
+                buffer.resize(zeros_needed, 0.0f32);
+                buffer.extend_from_slice(&self.audio_overlap);
+            }
+            buffer.extend_from_slice(audio_chunk);
+        }
+
+        // Pad to full buffer size if needed (for final short chunk)
+        if buffer.len() < buffer_size {
+            buffer.resize(buffer_size, 0.0f32);
+        }
+
+        // Save the end of this chunk as overlap for the next chunk.
+        // We need pre_encode_cache samples from the end of the NEW audio
+        // (not from the buffer which includes previous overlap).
+        self.audio_overlap.clear();
+        if audio_chunk.len() >= pre_encode_samples {
+            // Take last pre_encode_samples from the audio chunk
+            self.audio_overlap
+                .extend_from_slice(&audio_chunk[audio_chunk.len() - pre_encode_samples..]);
+        } else {
+            // Audio chunk is shorter than pre_encode_samples
+            // This can happen for final chunks - include what we have
+            // and pad the rest from the beginning of the chunk
+            if !self.audio_overlap.is_empty() && buffer.len() >= pre_encode_samples {
+                // Take from the end of the buffer we just built
+                self.audio_overlap
+                    .extend_from_slice(&buffer[buffer.len() - pre_encode_samples..]);
+            } else {
+                self.audio_overlap.extend_from_slice(audio_chunk);
+            }
+        }
+
+        buffer
+    }
+
     fn process_pending_audio(&mut self) -> Result<()> {
+        let chunk_audio_size = self.audio_chunk_size();
+
         // Process file audio
-        if let Some(ref samples) = self.file_samples {
+        // First, check if we have file samples and extract the chunk to avoid borrow issues
+        let (audio_chunk, new_position, reached_end) = if let Some(ref samples) = self.file_samples
+        {
             if self.file_position < samples.len() {
-                // Process remaining file audio
-                let chunk_audio_size = self.audio_chunk_size();
                 let end = (self.file_position + chunk_audio_size).min(samples.len());
-                let audio_chunk = &samples[self.file_position..end];
+                let chunk = samples[self.file_position..end].to_vec();
+                let reached = end >= samples.len();
+                (Some(chunk), end, reached)
+            } else {
+                (None, self.file_position, false)
+            }
+        } else {
+            (None, self.file_position, false)
+        };
 
-                if !audio_chunk.is_empty() {
-                    // Reset preprocessor state before each chunk to match Python's behavior.
-                    // Python NeMo processes each audio chunk independently without carrying
-                    // over any state (remainder buffer) from previous chunks.
-                    self.preprocessor.reset();
-                    let mel = self.preprocessor.process_chunk(audio_chunk)?;
-                    mel.eval()?;
-                    let n_frames = mel.dim(1) as usize;
-                    if n_frames > 0 {
-                        self.mel_buffer.append_mel(&mel)?;
-                    }
-                    self.file_position = end;
-                }
+        // Now process the chunk if we have one
+        if let Some(audio_chunk) = audio_chunk {
+            if !audio_chunk.is_empty() {
+                // Reset preprocessor state before each chunk
+                self.preprocessor.reset();
 
-                // If we've reached the end of file, signal stream end
-                if self.file_position >= samples.len() && !self.stream_ended {
-                    self.stream_ended = true;
+                // Build the full audio buffer with overlap/silence prefix
+                let audio_buffer = self.build_audio_buffer(&audio_chunk);
+
+                let mel = self.preprocessor.process_chunk(&audio_buffer)?;
+                mel.eval()?;
+                let n_frames = mel.dim(1) as usize;
+                if n_frames > 0 {
+                    self.mel_buffer.append_mel(&mel)?;
                 }
+                self.file_position = new_position;
+            }
+
+            // If we've reached the end of file, signal stream end
+            if reached_end && !self.stream_ended {
+                self.stream_ended = true;
             }
         }
 
         // Process live audio in streaming-chunk-sized blocks
-        // This avoids MEL boundary artifacts from processing small audio chunks independently
-        let chunk_audio_size = self.audio_chunk_size();
         while self.live_buffer.len() >= chunk_audio_size {
             // Take exactly chunk_audio_size samples
             let audio_chunk: Vec<f32> = self.live_buffer.drain(..chunk_audio_size).collect();
-            let mel = self.preprocessor.process_chunk(&audio_chunk)?;
+
+            // Reset preprocessor state before each chunk
+            self.preprocessor.reset();
+
+            // Build the full audio buffer with overlap/silence prefix
+            let audio_buffer = self.build_audio_buffer(&audio_chunk);
+
+            let mel = self.preprocessor.process_chunk(&audio_buffer)?;
             mel.eval()?;
             let n_frames = mel.dim(1) as usize;
             if n_frames > 0 {
@@ -287,7 +405,14 @@ impl RequestStreamer {
 
         // Process remaining audio only when stream has ended
         if self.stream_ended && !self.live_buffer.is_empty() {
-            let mel = self.preprocessor.process_chunk(&self.live_buffer)?;
+            // Reset preprocessor state
+            self.preprocessor.reset();
+
+            // Build the full audio buffer with overlap/silence prefix
+            let remaining = self.live_buffer.clone();
+            let audio_buffer = self.build_audio_buffer(&remaining);
+
+            let mel = self.preprocessor.process_chunk(&audio_buffer)?;
             mel.eval()?;
             let n_frames = mel.dim(1) as usize;
             if n_frames > 0 {
