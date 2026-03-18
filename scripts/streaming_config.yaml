@@ -17,6 +17,7 @@ asr:
     strategy: "greedy_batch"
     preserve_alignments: false
     fused_batch_size: -1
+    word_seperator: " "              # Note: spelling is intentional (legacy API)
     greedy:
       use_cuda_graph_decoder: false
       enable_per_stream_biasing: false
