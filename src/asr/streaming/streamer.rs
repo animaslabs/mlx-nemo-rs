@@ -80,13 +80,22 @@ impl RequestStreamer {
         let n_mels = preproc_config.features;
         let sample_rate = preproc_config.sample_rate;
 
-        let mel_buffer = StreamingMelBuffer::new(
+        let mut mel_buffer = StreamingMelBuffer::new(
             sample_rate,
             preproc_config.window_size,
             preproc_config.window_stride,
             n_mels,
             preproc_config.n_fft,
         );
+
+        // Initialize mel buffer with pre_encode_cache silence frames.
+        // This matches Python's BatchedCacheFeatureBufferer which initializes
+        // feature_buffer to LOG_MEL_ZERO. The first pre_encode_cache frames
+        // provide context for the encoder's subsampling layer.
+        let pre_encode_cache = config.pre_encode_cache_size.1;
+        if let Err(e) = mel_buffer.initialize_with_silence(pre_encode_cache) {
+            tracing::warn!("Failed to initialize mel buffer with silence: {}", e);
+        }
 
         Self {
             preprocessor,
@@ -181,6 +190,12 @@ impl RequestStreamer {
         self.preprocessor.reset();
         self.audio_overlap.clear();
         self.reset_stream_state();
+
+        // Re-initialize mel buffer with pre_encode_cache silence frames
+        let pre_encode_cache = self.config.pre_encode_cache_size.1;
+        if let Err(e) = self.mel_buffer.initialize_with_silence(pre_encode_cache) {
+            tracing::warn!("Failed to initialize mel buffer with silence: {}", e);
+        }
     }
 
     fn reset_stream_state(&mut self) {
@@ -373,7 +388,25 @@ impl RequestStreamer {
                 mel.eval()?;
                 let n_frames = mel.dim(1) as usize;
                 if n_frames > 0 {
-                    self.mel_buffer.append_mel(&mel)?;
+                    // Take only the LAST chunk_size mel frames, matching Python's
+                    // BatchedCacheFeatureBufferer which does:
+                    //   feat_chunk=features[:, :, -self.feature_chunk_len:]
+                    // This discards the overlap/zeros portion at the start and keeps
+                    // only the frames corresponding to the new audio.
+                    let chunk_size = self.config.chunk_size.1;
+                    let fresh_mel = if n_frames > chunk_size {
+                        // Take only the LAST chunk_size frames
+                        use mlx_rs::ops::indexing::IndexOp;
+                        let start = (n_frames - chunk_size) as i32;
+                        mel.index((.., start..))
+                    } else {
+                        // Not enough frames: keep all
+                        mel
+                    };
+                    let fresh_n_frames = fresh_mel.dim(1) as usize;
+                    if fresh_n_frames > 0 {
+                        self.mel_buffer.append_mel(&fresh_mel)?;
+                    }
                 }
                 self.file_position = new_position;
             }
@@ -399,7 +432,19 @@ impl RequestStreamer {
             mel.eval()?;
             let n_frames = mel.dim(1) as usize;
             if n_frames > 0 {
-                self.mel_buffer.append_mel(&mel)?;
+                // Take only the LAST chunk_size mel frames (see comment above)
+                let chunk_size = self.config.chunk_size.1;
+                let fresh_mel = if n_frames > chunk_size {
+                    use mlx_rs::ops::indexing::IndexOp;
+                    let start = (n_frames - chunk_size) as i32;
+                    mel.index((.., start..))
+                } else {
+                    mel
+                };
+                let fresh_n_frames = fresh_mel.dim(1) as usize;
+                if fresh_n_frames > 0 {
+                    self.mel_buffer.append_mel(&fresh_mel)?;
+                }
             }
         }
 
@@ -416,7 +461,19 @@ impl RequestStreamer {
             mel.eval()?;
             let n_frames = mel.dim(1) as usize;
             if n_frames > 0 {
-                self.mel_buffer.append_mel(&mel)?;
+                // Take only the LAST chunk_size mel frames (see comment above)
+                let chunk_size = self.config.chunk_size.1;
+                let fresh_mel = if n_frames > chunk_size {
+                    use mlx_rs::ops::indexing::IndexOp;
+                    let start = (n_frames - chunk_size) as i32;
+                    mel.index((.., start..))
+                } else {
+                    mel
+                };
+                let fresh_n_frames = fresh_mel.dim(1) as usize;
+                if fresh_n_frames > 0 {
+                    self.mel_buffer.append_mel(&fresh_mel)?;
+                }
             }
             self.live_buffer.clear();
         }

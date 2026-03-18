@@ -556,19 +556,17 @@ impl StreamingMelBuffer {
         let mel_buffer = self.mel_buffer.as_ref()?;
 
         // Calculate extraction range
-        // Python NeMo processes each audio chunk independently through the preprocessor.
-        // Each audio chunk (4000 samples) produces 26 mel frames, passed directly to the encoder.
-        // The pre_encode_cache is handled inside the encoder's subsampling, NOT at the mel level.
+        // We extract exactly chunk_size + pre_encode_cache frames starting from buffer_idx.
+        // This matches Python's expected_feature_buffer_len = buffer_size_in_secs / window_stride
+        // where buffer_size_in_secs = pre_encode_cache_size_in_secs + model_chunk_size_in_secs.
         //
-        // Therefore, we should NOT overlap mel frames between chunks.
-        // Each encoder call should receive the fresh mel frames from its corresponding audio chunk.
+        // The pre_encode_cache frames provide context for the encoder's subsampling layer,
+        // while chunk_size frames are the new content.
         //
-        // buffer_idx tracks where the next audio chunk's mel frames START in the accumulated buffer.
-        // For chunk 0: buffer_idx=0, extract frames 0-25 (26 total)
-        // For chunk 1: buffer_idx=26, extract frames 26-51 (26 total)
-        // etc.
+        // buffer_idx tracks the start position for extraction. By advancing by shift_size
+        // (not the full extraction size), we maintain proper overlap between chunks.
         let extract_start = self.buffer_idx;
-        let extract_end = self.total_frames.min(extract_start + chunk_size + pre_encode_cache + 1);
+        let extract_end = self.total_frames.min(extract_start + chunk_size + pre_encode_cache);
 
         // Total frames to extract
         let total_extract = extract_end - extract_start;
@@ -580,6 +578,8 @@ impl StreamingMelBuffer {
             extract_start,
             extract_end,
             total_extract,
+            chunk_size,
+            pre_encode_cache,
             "Extracting mel frames"
         );
 
@@ -598,14 +598,14 @@ impl StreamingMelBuffer {
         use mlx_rs::ops::indexing::IndexOp;
         let mel_chunk = mel_buffer.index((.., local_start as i32..local_end as i32));
 
-        // Advance buffer index by the number of frames extracted (not shift_size).
-        // This ensures each encoder call receives fresh mel frames from its corresponding audio chunk,
-        // matching Python's behavior where each audio chunk is processed independently.
-        self.buffer_idx += total_extract;
+        // Advance buffer index by shift_size, NOT total_extract.
+        // This matches NeMo's streaming behavior where the buffer advances by shift_size
+        // each step, creating overlap between consecutive chunks.
+        // The overlap is essential for proper streaming recognition.
+        self.buffer_idx += shift_size;
 
-        // Valid frames = total - 1 (matching Python's mel_len behavior)
-        // Python's mel computation produces N frames but only N-1 are valid
-        let valid_frames = total_extract.saturating_sub(1);
+        // All extracted frames are valid (matching Python's expected_feature_buffer_len)
+        let valid_frames = total_extract;
 
         Some((mel_chunk, total_extract, valid_frames))
     }
@@ -620,6 +620,37 @@ impl StreamingMelBuffer {
         self.buffer_idx = 0;
         self.total_audio_samples = 0;
         self.mel_buffer_offset = 0;
+    }
+
+    /// Initialize the buffer with silence frames.
+    ///
+    /// This matches Python's BatchedCacheFeatureBufferer which initializes
+    /// the feature_buffer to LOG_MEL_ZERO. The silence value is computed as
+    /// ln(2^-24) ≈ -16.6355 to match NeMo's log_zero_guard_value.
+    ///
+    /// # Arguments
+    /// * `n_frames` - Number of silence frames to initialize
+    pub fn initialize_with_silence(&mut self, n_frames: usize) -> Result<()> {
+        if n_frames == 0 {
+            return Ok(());
+        }
+
+        // LOG_MEL_ZERO = ln(2^-24) ≈ -16.6355 (matches NeMo's log_zero_guard)
+        const LOG_MEL_ZERO: f32 = -16.635532;
+
+        let silence_mel = mlx_rs::ops::full::<f32>(
+            &[self.n_mels as i32, n_frames as i32],
+            &mlx_rs::Array::from_f32(LOG_MEL_ZERO),
+        )?;
+        self.append_mel(&silence_mel)?;
+
+        tracing::debug!(
+            n_frames,
+            LOG_MEL_ZERO,
+            "Initialized mel buffer with silence frames"
+        );
+
+        Ok(())
     }
 
     /// Get memory statistics for the buffer.
