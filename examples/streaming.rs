@@ -164,6 +164,14 @@ fn main() -> mlx_nemo::Result<()> {
 
         // Process any available transcription steps
         while let Some(output) = pipeline.transcribe_step()? {
+            // Display step info for debugging
+            let new_tokens_str: Vec<String> = output.new_tokens.iter().map(|t| t.to_string()).collect();
+            eprintln!(
+                "STEP {} new_tokens=[{}] total_tokens={}",
+                transcribe_steps,
+                new_tokens_str.join(", "),
+                output.tokens.len()
+            );
             transcribe_steps += 1;
 
             // Display partial result if text changed

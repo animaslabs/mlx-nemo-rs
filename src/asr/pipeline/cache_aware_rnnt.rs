@@ -331,12 +331,11 @@ impl CacheAwareRNNTPipeline {
         let is_first = fb.is_first || self.state.is_first_chunk;
         let is_last = fb.is_last;
 
-        // Determine drop_extra based on whether this is the first chunk
-        let drop_extra = if is_first {
-            0
-        } else {
-            self.streaming_config.drop_extra_pre_encoded
-        };
+        // Always apply drop_extra_pre_encoded in streaming mode.
+        // NeMo applies this whenever cache_last_channel is not None, which in
+        // streaming mode is always true (cache is pre-initialized to zeros).
+        // This corrects for extra frames produced by strided subsampling at chunk boundaries.
+        let drop_extra = self.streaming_config.drop_extra_pre_encoded;
 
         // Add batch dimension: [n_mels, time] -> [1, n_mels, time]
         let chunk_len = fb.features.dim(1) as usize;

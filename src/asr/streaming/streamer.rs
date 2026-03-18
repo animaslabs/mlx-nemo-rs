@@ -88,14 +88,10 @@ impl RequestStreamer {
             preproc_config.n_fft,
         );
 
-        // Initialize mel buffer with pre_encode_cache silence frames.
-        // This matches Python's BatchedCacheFeatureBufferer which initializes
-        // feature_buffer to LOG_MEL_ZERO. The first pre_encode_cache frames
-        // provide context for the encoder's subsampling layer.
-        let pre_encode_cache = config.pre_encode_cache_size.1;
-        if let Err(e) = mel_buffer.initialize_with_silence(pre_encode_cache) {
-            tracing::warn!("Failed to initialize mel buffer with silence: {}", e);
-        }
+        // Note: We don't initialize mel buffer with silence here.
+        // Python takes (chunk_size + pre_encode_cache) audio samples per chunk
+        // and computes mel from all of it. The encoder's internal caching
+        // handles the context between chunks.
 
         Self {
             preprocessor,
@@ -190,12 +186,6 @@ impl RequestStreamer {
         self.preprocessor.reset();
         self.audio_overlap.clear();
         self.reset_stream_state();
-
-        // Re-initialize mel buffer with pre_encode_cache silence frames
-        let pre_encode_cache = self.config.pre_encode_cache_size.1;
-        if let Err(e) = self.mel_buffer.initialize_with_silence(pre_encode_cache) {
-            tracing::warn!("Failed to initialize mel buffer with silence: {}", e);
-        }
     }
 
     fn reset_stream_state(&mut self) {
@@ -207,16 +197,17 @@ impl RequestStreamer {
 
     /// Get audio chunk size in samples for the current streaming config.
     ///
-    /// This calculates how many NEW audio samples are consumed per chunk.
-    /// This matches Python's MonoStream frame_size = chunk_size_in_secs * sample_rate.
+    /// This calculates how many audio samples are consumed per chunk.
+    /// This matches Python NeMo's approach:
+    ///   buffer_mel_frames = model_chunk_size + pre_encode_cache_size
+    ///   audio_chunk_samples = buffer_mel_frames * hop_length
     ///
-    /// Note: The mel buffer receives more samples per chunk (chunk + pre_encode_cache)
-    /// because we prepend overlap/silence. But this method returns just the NEW audio
-    /// consumed from the source per iteration.
+    /// The audio advances by this full amount each step - overlap is handled
+    /// by the encoder's internal caching, not by audio-level overlap.
     pub fn audio_chunk_size(&self) -> usize {
-        // Just the chunk size, NOT including pre_encode_cache
-        // This matches Python's MonoStream frame_size
-        let chunk_mel_frames = self.config.chunk_size.1;
+        // Include pre_encode_cache to match Python's audio chunk calculation
+        // Python: buffer_mel_frames = model_chunk_size + pre_encode_cache_size
+        let chunk_mel_frames = self.config.chunk_size.1 + self.config.pre_encode_cache_size.1;
         let hop_samples = self.mel_buffer.hop_samples;
         chunk_mel_frames * hop_samples
     }
@@ -246,14 +237,17 @@ impl RequestStreamer {
         self.process_pending_audio()?;
 
         // Step 2: Try to extract a mel chunk
-        // NeMo's CacheAwareRNNTPipeline uses the "subsequent" values (index [1]) for ALL chunks:
-        //   model_chunk_size = model_chunk_size[1]
-        //   pre_encode_cache_size = pre_encode_cache_size[1]
-        // This differs from the encoder's setup_streaming_params which uses different
-        // values for first vs subsequent chunks.
+        // NeMo uses subsequent values ([1]) for chunk/shift sizes for all chunks.
+        // For pre_encode_cache:
+        // - First chunk: pre_encode_cache = 0 (no previous context)
+        // - Subsequent: pre_encode_cache = 9 (context from previous chunk)
         let chunk_size = self.config.chunk_size.1;
         let shift_size = self.config.shift_size.1;
-        let pre_encode_cache = self.config.pre_encode_cache_size.1;
+        let pre_encode_cache = if self.is_first_chunk {
+            self.config.pre_encode_cache_size.0 // 0 for first chunk
+        } else {
+            self.config.pre_encode_cache_size.1 // 9 for subsequent
+        };
 
         // Check if we have enough mel frames
         let remaining = self.mel_buffer.remaining_frames();
@@ -293,67 +287,24 @@ impl RequestStreamer {
 
     /// Build the audio buffer for mel computation.
     ///
-    /// This mirrors Python's AudioBufferer behavior:
-    /// - First chunk: buffer = [zeros (pre_encode) | audio (chunk)]
-    /// - Subsequent: buffer = [overlap from prev | audio (chunk)]
+    /// This matches Python NeMo's approach:
+    /// - Each chunk takes (chunk_size + pre_encode_cache) * hop audio samples
+    /// - No audio-level overlap or padding is needed
+    /// - The encoder's internal caching handles context between chunks
     ///
-    /// The overlap (pre_encode_cache samples from the end of each chunk)
-    /// is saved for the next chunk.
+    /// For short final chunks, pad with zeros.
     fn build_audio_buffer(&mut self, audio_chunk: &[f32]) -> Vec<f32> {
-        let pre_encode_samples = self.pre_encode_cache_samples();
         let buffer_size = self.audio_buffer_size();
 
-        let mut buffer = Vec::with_capacity(buffer_size);
-
-        if self.is_first_chunk {
-            // First chunk: prepend silence (zeros) for pre_encode_cache
-            tracing::debug!(
-                pre_encode_samples,
-                audio_chunk_len = audio_chunk.len(),
-                "First chunk: prepending silence"
-            );
-            buffer.resize(pre_encode_samples, 0.0f32);
-            buffer.extend_from_slice(audio_chunk);
+        // Just use the audio chunk directly, pad if needed for final short chunk
+        if audio_chunk.len() >= buffer_size {
+            audio_chunk[..buffer_size].to_vec()
         } else {
-            // Subsequent chunks: prepend overlap from previous chunk
-            if self.audio_overlap.len() >= pre_encode_samples {
-                buffer.extend_from_slice(&self.audio_overlap[..pre_encode_samples]);
-            } else {
-                // Pad with zeros if overlap is too short (shouldn't happen normally)
-                let zeros_needed = pre_encode_samples - self.audio_overlap.len();
-                buffer.resize(zeros_needed, 0.0f32);
-                buffer.extend_from_slice(&self.audio_overlap);
-            }
-            buffer.extend_from_slice(audio_chunk);
-        }
-
-        // Pad to full buffer size if needed (for final short chunk)
-        if buffer.len() < buffer_size {
+            // Pad short final chunk with zeros
+            let mut buffer = audio_chunk.to_vec();
             buffer.resize(buffer_size, 0.0f32);
+            buffer
         }
-
-        // Save the end of this chunk as overlap for the next chunk.
-        // We need pre_encode_cache samples from the end of the NEW audio
-        // (not from the buffer which includes previous overlap).
-        self.audio_overlap.clear();
-        if audio_chunk.len() >= pre_encode_samples {
-            // Take last pre_encode_samples from the audio chunk
-            self.audio_overlap
-                .extend_from_slice(&audio_chunk[audio_chunk.len() - pre_encode_samples..]);
-        } else {
-            // Audio chunk is shorter than pre_encode_samples
-            // This can happen for final chunks - include what we have
-            // and pad the rest from the beginning of the chunk
-            if !self.audio_overlap.is_empty() && buffer.len() >= pre_encode_samples {
-                // Take from the end of the buffer we just built
-                self.audio_overlap
-                    .extend_from_slice(&buffer[buffer.len() - pre_encode_samples..]);
-            } else {
-                self.audio_overlap.extend_from_slice(audio_chunk);
-            }
-        }
-
-        buffer
     }
 
     fn process_pending_audio(&mut self) -> Result<()> {
@@ -388,25 +339,10 @@ impl RequestStreamer {
                 mel.eval()?;
                 let n_frames = mel.dim(1) as usize;
                 if n_frames > 0 {
-                    // Take only the LAST chunk_size mel frames, matching Python's
-                    // BatchedCacheFeatureBufferer which does:
-                    //   feat_chunk=features[:, :, -self.feature_chunk_len:]
-                    // This discards the overlap/zeros portion at the start and keeps
-                    // only the frames corresponding to the new audio.
-                    let chunk_size = self.config.chunk_size.1;
-                    let fresh_mel = if n_frames > chunk_size {
-                        // Take only the LAST chunk_size frames
-                        use mlx_rs::ops::indexing::IndexOp;
-                        let start = (n_frames - chunk_size) as i32;
-                        mel.index((.., start..))
-                    } else {
-                        // Not enough frames: keep all
-                        mel
-                    };
-                    let fresh_n_frames = fresh_mel.dim(1) as usize;
-                    if fresh_n_frames > 0 {
-                        self.mel_buffer.append_mel(&fresh_mel)?;
-                    }
+                    // Keep all mel frames - the encoder cache handles context.
+                    // Python NeMo takes (chunk + pre_encode) audio samples and
+                    // keeps all resulting mel frames.
+                    self.mel_buffer.append_mel(&mel)?;
                 }
                 self.file_position = new_position;
             }
@@ -432,19 +368,8 @@ impl RequestStreamer {
             mel.eval()?;
             let n_frames = mel.dim(1) as usize;
             if n_frames > 0 {
-                // Take only the LAST chunk_size mel frames (see comment above)
-                let chunk_size = self.config.chunk_size.1;
-                let fresh_mel = if n_frames > chunk_size {
-                    use mlx_rs::ops::indexing::IndexOp;
-                    let start = (n_frames - chunk_size) as i32;
-                    mel.index((.., start..))
-                } else {
-                    mel
-                };
-                let fresh_n_frames = fresh_mel.dim(1) as usize;
-                if fresh_n_frames > 0 {
-                    self.mel_buffer.append_mel(&fresh_mel)?;
-                }
+                // Keep all mel frames
+                self.mel_buffer.append_mel(&mel)?;
             }
         }
 
@@ -453,7 +378,7 @@ impl RequestStreamer {
             // Reset preprocessor state
             self.preprocessor.reset();
 
-            // Build the full audio buffer with overlap/silence prefix
+            // Build the audio buffer
             let remaining = self.live_buffer.clone();
             let audio_buffer = self.build_audio_buffer(&remaining);
 
@@ -461,19 +386,8 @@ impl RequestStreamer {
             mel.eval()?;
             let n_frames = mel.dim(1) as usize;
             if n_frames > 0 {
-                // Take only the LAST chunk_size mel frames (see comment above)
-                let chunk_size = self.config.chunk_size.1;
-                let fresh_mel = if n_frames > chunk_size {
-                    use mlx_rs::ops::indexing::IndexOp;
-                    let start = (n_frames - chunk_size) as i32;
-                    mel.index((.., start..))
-                } else {
-                    mel
-                };
-                let fresh_n_frames = fresh_mel.dim(1) as usize;
-                if fresh_n_frames > 0 {
-                    self.mel_buffer.append_mel(&fresh_mel)?;
-                }
+                // Keep all mel frames
+                self.mel_buffer.append_mel(&mel)?;
             }
             self.live_buffer.clear();
         }
