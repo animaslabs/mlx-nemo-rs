@@ -623,6 +623,16 @@ impl ConformerEncoder {
         self.config.d_model
     }
 
+    /// Get the attention context style.
+    pub fn att_context_style(&self) -> &str {
+        &self.att_context_style
+    }
+
+    /// Check if this is a chunked_limited style encoder.
+    pub fn is_chunked_limited(&self) -> bool {
+        self.att_context_style == "chunked_limited"
+    }
+
     /// Forward pass through subsampling layer only.
     ///
     /// This is useful for debugging to compare subsampling outputs with Python.

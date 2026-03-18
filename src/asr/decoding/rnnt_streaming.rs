@@ -10,11 +10,45 @@
 
 use mlx_rs::ops::indexing::{argmax_axis, IndexOp};
 use mlx_rs::Array;
-use tracing::{debug, trace};
+use tracing::{debug, info, trace};
 
 use crate::asr::models::{DecoderState, PredictionNetwork};
-use crate::asr::modules::RNNTJoint;
+use crate::asr::modules::{LstmState, RNNTJoint};
 use crate::core::error::Result;
+
+/// Compute L2 norm of a 1D slice
+fn l2_norm(slice: &[f32]) -> f32 {
+    slice.iter().map(|v| v * v).sum::<f32>().sqrt()
+}
+
+/// Log LSTM decoder state for debugging
+fn log_lstm_state(state: &LstmState, label: &str, step: usize, frame: usize, symbols: usize) {
+    if let (Ok(h_flat), Ok(c_flat)) = (
+        state.hidden.reshape(&[-1]),
+        state.cell.reshape(&[-1]),
+    ) {
+        h_flat.eval().ok();
+        c_flat.eval().ok();
+        let h_slice: &[f32] = h_flat.as_slice();
+        let c_slice: &[f32] = c_flat.as_slice();
+        let h_norm = l2_norm(h_slice);
+        let c_norm = l2_norm(c_slice);
+        let h_first5: Vec<f32> = h_slice.iter().take(5).copied().collect();
+        let c_first5: Vec<f32> = c_slice.iter().take(5).copied().collect();
+
+        info!(
+            step,
+            frame,
+            symbols,
+            label,
+            h_norm = format!("{:.6}", h_norm),
+            c_norm = format!("{:.6}", c_norm),
+            h_first5 = ?h_first5.iter().map(|v| format!("{:.6}", v)).collect::<Vec<_>>(),
+            c_first5 = ?c_first5.iter().map(|v| format!("{:.6}", v)).collect::<Vec<_>>(),
+            "decoder state"
+        );
+    }
+}
 
 /// Maximum number of symbols that can be emitted per encoder frame.
 /// This is a safety limit to prevent infinite loops.
@@ -112,9 +146,27 @@ impl RnntStreamingDecoder {
             "decode_frames start"
         );
 
+        // Track global step for detailed logging
+        let mut global_step: usize = 0;
+
         for t in 0..valid_frames {
             // Get encoder frame: [1, 1, d_model]
             let enc_frame = encoder_output.index((0i32..1, t as i32..t as i32 + 1, ..));
+            enc_frame.eval()?;
+
+            // Log encoder frame values for comparison
+            let enc_flat = enc_frame.reshape(&[-1])?;
+            enc_flat.eval()?;
+            let enc_slice: &[f32] = enc_flat.as_slice();
+            let enc_norm = l2_norm(enc_slice);
+            let enc_first10: Vec<f32> = enc_slice.iter().take(10).copied().collect();
+
+            info!(
+                frame = t,
+                enc_norm = format!("{:.6}", enc_norm),
+                enc_first10 = ?enc_first10.iter().map(|v| format!("{:.6}", v)).collect::<Vec<_>>(),
+                "decoder input encoder frame"
+            );
 
             let mut symbols_emitted = 0;
 
@@ -123,9 +175,38 @@ impl RnntStreamingDecoder {
                 let last_token_arr =
                     last_token.map(|tok| Array::from_slice(&[tok as i32], &[1, 1]));
 
+                info!(
+                    frame = t,
+                    step = global_step,
+                    symbols_emitted,
+                    last_token = ?*last_token,
+                    "prediction network input"
+                );
+
+                // Log decoder state before prediction
+                if let DecoderState::Lstm(ref lstm_state) = decoder_state {
+                    log_lstm_state(lstm_state, "before", global_step, t, symbols_emitted);
+                }
+
                 // Get prediction output
                 let (pred_output, new_state) =
                     decoder.predict_one(last_token_arr.as_ref(), decoder_state)?;
+                pred_output.eval()?;
+
+                // Log prediction output
+                let pred_flat = pred_output.reshape(&[-1])?;
+                pred_flat.eval()?;
+                let pred_slice: &[f32] = pred_flat.as_slice();
+                let pred_norm = l2_norm(pred_slice);
+                let pred_first10: Vec<f32> = pred_slice.iter().take(10).copied().collect();
+
+                info!(
+                    frame = t,
+                    step = global_step,
+                    pred_norm = format!("{:.6}", pred_norm),
+                    pred_first10 = ?pred_first10.iter().map(|v| format!("{:.6}", v)).collect::<Vec<_>>(),
+                    "prediction network output"
+                );
 
                 // Compute joint output: [1, vocab_size+1]
                 let log_probs = joint.forward_one(&enc_frame, &pred_output)?;
@@ -136,25 +217,38 @@ impl RnntStreamingDecoder {
                 prediction.eval()?;
                 let pred_token = prediction.as_slice::<u32>()[0] as usize;
 
-                // Debug: log top predictions for first frame
-                if t == 0 && symbols_emitted == 0 {
-                    let lp_slice: &[f32] = log_probs.as_slice();
-                    let blank_prob = lp_slice
-                        .get(self.blank_id)
-                        .copied()
-                        .unwrap_or(f32::NEG_INFINITY);
-                    trace!(
-                        pred_token,
-                        blank_prob,
-                        is_blank = pred_token == self.blank_id,
-                        "first frame prediction"
-                    );
-                }
+                // Log joint output and prediction
+                let lp_slice: &[f32] = log_probs.as_slice();
+                let blank_prob = lp_slice
+                    .get(self.blank_id)
+                    .copied()
+                    .unwrap_or(f32::NEG_INFINITY);
+                let pred_prob = lp_slice
+                    .get(pred_token)
+                    .copied()
+                    .unwrap_or(f32::NEG_INFINITY);
+
+                // Get top-5 predictions
+                let mut indexed: Vec<(usize, f32)> = lp_slice.iter().copied().enumerate().collect();
+                indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+                let top5: Vec<(usize, f32)> = indexed.into_iter().take(5).collect();
+
+                info!(
+                    frame = t,
+                    step = global_step,
+                    pred_token,
+                    pred_prob = format!("{:.6}", pred_prob),
+                    blank_prob = format!("{:.6}", blank_prob),
+                    is_blank = pred_token == self.blank_id,
+                    top5 = ?top5.iter().map(|(i, p)| format!("{}:{:.4}", i, p)).collect::<Vec<_>>(),
+                    "joint output"
+                );
 
                 if pred_token == self.blank_id {
                     // Blank: advance to next encoder frame
                     output.blank_count += 1;
                     output.labels[t] = self.blank_id;
+                    global_step += 1;
                     break;
                 }
 
@@ -167,9 +261,16 @@ impl RnntStreamingDecoder {
                 *last_token = Some(pred_token);
                 *decoder_state = new_state;
                 symbols_emitted += 1;
+                global_step += 1;
 
-                trace!(
+                // Log decoder state after token emission
+                if let DecoderState::Lstm(ref lstm_state) = decoder_state {
+                    log_lstm_state(lstm_state, "after", global_step, t, symbols_emitted);
+                }
+
+                info!(
                     frame = t,
+                    step = global_step,
                     token = pred_token,
                     symbols_emitted,
                     "token emitted"

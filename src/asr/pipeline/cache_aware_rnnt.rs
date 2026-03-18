@@ -212,9 +212,9 @@ impl CacheAwareRNNTPipeline {
         let blank_id = vocab_size;
         let streaming_decoder = RnntStreamingDecoder::new(blank_id);
 
-        // Initialize state with warmup (matches NeMo's add_sos=True behavior)
-        // For LSTM decoders, this runs the LSTM twice with blank inputs to warm up the state
-        let (_, decoder_state) = decoder.initialize_state_with_warmup(1)?;
+        // Initialize decoder state with zeros (matches NeMo's add_sos=False behavior)
+        // NeMo's greedy decoder passes state=None on first step, which initializes to zeros
+        let decoder_state = decoder.initialize_state(1)?;
         let state = StreamingState {
             decoder_state,
             last_token: None,
@@ -300,11 +300,11 @@ impl CacheAwareRNNTPipeline {
         )
         .expect("Failed to create encoder cache");
 
-        // Reset state with warmup (matches NeMo's add_sos=True behavior)
-        let (_, decoder_state) = self
+        // Reset decoder state with zeros (matches NeMo's add_sos=False behavior)
+        let decoder_state = self
             .decoder
-            .initialize_state_with_warmup(1)
-            .expect("Failed to initialize decoder state with warmup");
+            .initialize_state(1)
+            .expect("Failed to initialize decoder state");
         self.state.decoder_state = decoder_state;
         self.state.last_token = None;
         self.state.accumulated_tokens.clear();
@@ -371,10 +371,18 @@ impl CacheAwareRNNTPipeline {
         encoded_lengths.eval()?;
 
         // Get valid output length
+        // For chunked_limited style, keep all outputs (matches NeMo's keep_all_outputs=True)
+        // For regular style, clip to valid_out_len
         let raw_enc_len = encoded_lengths.as_slice::<i32>()[0] as usize;
         let actual_tensor_frames = encoded.shape()[1] as usize;
         let valid_out_len = self.streaming_config.valid_out_len;
-        let enc_seq_len = raw_enc_len.min(valid_out_len).min(actual_tensor_frames);
+        let enc_seq_len = if self.encoder.is_chunked_limited() {
+            // chunked_limited with keep_all_outputs=True: use all encoder outputs
+            raw_enc_len.min(actual_tensor_frames)
+        } else {
+            // regular style: clip to valid_out_len
+            raw_enc_len.min(valid_out_len).min(actual_tensor_frames)
+        };
 
         // Log mel input for comparison with Python
         // Tensor layout is [1, n_mels, time] in row-major order
