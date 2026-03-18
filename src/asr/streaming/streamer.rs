@@ -268,6 +268,14 @@ impl RequestStreamer {
             .extract_chunk(chunk_size, shift_size, pre_encode_cache)
             .ok_or_else(|| Error::model("Failed to extract mel chunk"))?;
 
+        // Reset mel buffer after extraction.
+        // This matches Python's approach where each audio chunk of size
+        // (chunk_size + pre_encode_cache) * hop produces its own mel that goes
+        // directly to the encoder. Without this reset, mel frames accumulate
+        // across chunks (adding 25 but advancing by shift_size=16 leaves 9 leftover),
+        // causing the "pre_encode_cache" frames to come from the wrong audio segment.
+        self.mel_buffer.reset();
+
         let is_first = self.is_first_chunk;
         self.is_first_chunk = false;
 
