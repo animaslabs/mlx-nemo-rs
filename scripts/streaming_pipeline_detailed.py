@@ -29,15 +29,25 @@ from pathlib import Path
 os.environ["PYTHONWARNINGS"] = "ignore"
 warnings.filterwarnings("ignore")
 
-import logging
-for name in ["nemo", "nemo_logger", "pytorch_lightning", "lightning"]:
-    logging.getLogger(name).setLevel(logging.ERROR)
-os.environ["NEMO_LOG_LEVEL"] = "ERROR"
-
 import torch
 import numpy as np
 import soundfile as sf
 from omegaconf import OmegaConf
+
+from nemo.collections.asr.inference.model_wrappers.cache_aware_rnnt_inference_wrapper import (
+    CacheAwareRNNTInferenceWrapper,
+)
+from nemo.collections.asr.inference.pipelines.cache_aware_rnnt_pipeline import (
+    CacheAwareRNNTPipeline,
+)
+from nemo.collections.asr.inference.streaming.framing.request_options import (
+    ASRRequestOptions,
+)
+from nemo.collections.asr.inference.streaming.framing.request import Frame
+
+import logging
+for name in ["nemo", "nemo_logger", "pytorch_lightning", "lightning"]:
+    logging.getLogger(name).setLevel(logging.ERROR)
 
 
 SAMPLE_RATE = 16000
@@ -65,12 +75,6 @@ def build_config(model_path: str, device: str, lookahead_ms: int):
 
 def load_model_and_pipeline(cfg):
     """Load model and create pipeline."""
-    from nemo.collections.asr.inference.model_wrappers.cache_aware_rnnt_inference_wrapper import (
-        CacheAwareRNNTInferenceWrapper,
-    )
-    from nemo.collections.asr.inference.pipelines.cache_aware_rnnt_pipeline import (
-        CacheAwareRNNTPipeline,
-    )
 
     # The wrapper handles model loading internally
     wrapper = CacheAwareRNNTInferenceWrapper(
@@ -153,10 +157,6 @@ def run_detailed_streaming(pipeline, wrapper, asr_model, audio_path: str, max_ch
     - Decoder tokens emitted
     - Cache state
     """
-    from nemo.collections.asr.inference.streaming.framing.request_options import (
-        ASRRequestOptions,
-    )
-    from nemo.collections.asr.inference.streaming.framing.request import Frame
 
     # Load audio info
     info = sf.info(audio_path)
