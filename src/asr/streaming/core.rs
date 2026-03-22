@@ -381,12 +381,12 @@ impl StreamingMelBuffer {
         }
     }
 
-    /// Append zero frames to prime the buffer for subsampling and keep them as cache
-    pub fn prime(&mut self, mel: &Array) -> Result<()> {
-        self.append_mel(mel)?;
-        self.buffer_idx = self.total_frames;
-        Ok(())
-    }
+    // /// Append zero frames to prime the buffer for subsampling and keep them as cache
+    // pub fn prime(&mut self, mel: &Array) -> Result<()> {
+    //     self.append_mel(mel)?;
+    //     self.buffer_idx = self.total_frames;
+    //     Ok(())
+    // }
 
     /// Append pre-computed mel frames to the buffer.
     ///
@@ -882,13 +882,13 @@ pub fn compute_streaming_config(
     // NeMo: chunk_size = [sampling_frames[0] + subsampling_factor * lookahead_steps,
     //                     sampling_frames[1] + subsampling_factor * lookahead_steps]
     let chunk_size = (
-        sampling_frames.0 + subsampling_factor * lookahead_steps,
+        sampling_frames.1 + subsampling_factor * lookahead_steps,
         sampling_frames.1 + subsampling_factor * lookahead_steps,
     );
 
     // Shift size - how many pre-subsampled frames to advance each step
     let shift_size = (
-        sampling_frames.0 + sampling_frames.1 * lookahead_steps.saturating_sub(cache_drop_size),
+        sampling_frames.1 + sampling_frames.1 * lookahead_steps.saturating_sub(cache_drop_size),
         sampling_frames.1 + sampling_frames.1 * lookahead_steps.saturating_sub(cache_drop_size),
     );
 

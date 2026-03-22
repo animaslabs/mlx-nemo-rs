@@ -93,6 +93,14 @@ impl RequestStreamer {
         // and computes mel from all of it. The encoder's internal caching
         // handles the context between chunks.
 
+        tracing::info!(
+            sample_rate,
+            n_mels,
+            chunk_size = config.chunk_size.1,
+            pre_encode_cache = config.pre_encode_cache_size.1,
+            "Created RequestStreamer"
+        );
+
         Self {
             preprocessor,
             config,
@@ -137,14 +145,33 @@ impl RequestStreamer {
             samples
         };
 
+        let num_samples = samples.len();
+        let duration_secs = num_samples as f32 / self.sample_rate as f32;
         self.file_samples = Some(samples);
         self.file_position = 0;
         self.reset_stream_state();
+
+        tracing::info!(
+            num_samples,
+            duration_secs,
+            sample_rate = self.sample_rate,
+            "Loaded audio file"
+        );
         Ok(())
     }
 
     /// Set audio samples directly (for pre-loaded audio).
     pub fn set_audio_samples(&mut self, samples: Vec<f32>) {
+        let num_samples = samples.len();
+        let duration_secs = num_samples as f32 / self.sample_rate as f32;
+
+        tracing::info!(
+            num_samples,
+            duration_secs,
+            sample_rate = self.sample_rate,
+            "Set audio samples directly"
+        );
+
         self.file_samples = Some(samples);
         self.file_position = 0;
         self.reset_stream_state();
@@ -154,6 +181,13 @@ impl RequestStreamer {
     ///
     /// Use this for real-time streaming where audio arrives incrementally.
     pub fn add_audio(&mut self, samples: &[f32]) {
+        tracing::trace!(
+            added_samples = samples.len(),
+            buffer_before = self.live_buffer.len(),
+            buffer_after = self.live_buffer.len() + samples.len(),
+            first_five = ?samples.iter().take(5).collect::<Vec<_>>(),
+            "Adding live audio samples"
+        );
         self.live_buffer.extend_from_slice(samples);
     }
 
@@ -164,6 +198,11 @@ impl RequestStreamer {
     /// 2. Process any remaining mel frames
     /// 3. Mark the final request with `is_last = true`
     pub fn end_stream(&mut self) {
+        tracing::debug!(
+            live_buffer_remaining = self.live_buffer.len(),
+            mel_frames_remaining = self.mel_buffer.remaining_frames(),
+            "Stream ended"
+        );
         self.stream_ended = true;
     }
 
@@ -179,6 +218,7 @@ impl RequestStreamer {
 
     /// Reset the stream state for a new audio stream.
     pub fn reset(&mut self) {
+        tracing::debug!("Resetting RequestStreamer for new audio stream");
         self.file_samples = None;
         self.file_position = 0;
         self.live_buffer.clear();
@@ -207,7 +247,8 @@ impl RequestStreamer {
     pub fn audio_chunk_size(&self) -> usize {
         // Include pre_encode_cache to match Python's audio chunk calculation
         // Python: buffer_mel_frames = model_chunk_size + pre_encode_cache_size
-        let chunk_mel_frames = self.config.chunk_size.1 + self.config.pre_encode_cache_size.1;
+        // let chunk_mel_frames = self.config.chunk_size.1 + self.config.pre_encode_cache_size.1;
+        let chunk_mel_frames = self.config.chunk_size.1;
         let hop_samples = self.mel_buffer.hop_samples;
         chunk_mel_frames * hop_samples
     }
@@ -233,6 +274,13 @@ impl RequestStreamer {
 
     /// Process available audio and try to extract the next request.
     fn try_extract_next(&mut self) -> Result<Option<FeatureBuffer>> {
+        tracing::trace!(
+            is_first_chunk = self.is_first_chunk,
+            stream_ended = self.stream_ended,
+            mel_frames_available = self.mel_buffer.remaining_frames(),
+            "try_extract_next called"
+        );
+
         // Step 1: Process any pending audio into mel frames
         self.process_pending_audio()?;
 
@@ -241,10 +289,10 @@ impl RequestStreamer {
         // For pre_encode_cache:
         // - First chunk: pre_encode_cache = 0 (no previous context)
         // - Subsequent: pre_encode_cache = 9 (context from previous chunk)
-        let chunk_size = self.config.chunk_size.1;
-        let shift_size = self.config.shift_size.1;
+        let chunk_size = self.config.chunk_size.0;
+        let shift_size = self.config.shift_size.0;
         let pre_encode_cache = if self.is_first_chunk {
-            self.config.pre_encode_cache_size.0 // 0 for first chunk
+            self.config.pre_encode_cache_size.1 // 0 for first chunk
         } else {
             self.config.pre_encode_cache_size.1 // 9 for subsequent
         };
@@ -265,8 +313,17 @@ impl RequestStreamer {
         // valid_frames matches Python's mel_len (total - 1)
         let (mel_chunk, _total_frames, valid_frames) = self
             .mel_buffer
-            .extract_chunk(chunk_size, shift_size, pre_encode_cache)
+            .extract_chunk(chunk_size + pre_encode_cache, shift_size + pre_encode_cache, 0)
             .ok_or_else(|| Error::model("Failed to extract mel chunk"))?;
+
+        tracing::debug!(
+            chunk_size,
+            shift_size,
+            pre_encode_cache,
+            valid_frames,
+            is_first = self.is_first_chunk,
+            "Extracted mel chunk"
+        );
 
         // Reset mel buffer after extraction.
         // This matches Python's approach where each audio chunk of size
@@ -274,7 +331,7 @@ impl RequestStreamer {
         // directly to the encoder. Without this reset, mel frames accumulate
         // across chunks (adding 25 but advancing by shift_size=16 leaves 9 leftover),
         // causing the "pre_encode_cache" frames to come from the wrong audio segment.
-        self.mel_buffer.reset();
+        // self.mel_buffer.reset();
 
         let is_first = self.is_first_chunk;
         self.is_first_chunk = false;
@@ -282,8 +339,17 @@ impl RequestStreamer {
         // Check if this is the last chunk
         let is_last = self.stream_ended && self.mel_buffer.is_empty();
         if is_last {
+            tracing::debug!("This is the final chunk");
             self.is_done = true;
         }
+
+        tracing::trace!(
+            is_first,
+            is_last,
+            valid_frames,
+            pre_encode_cache,
+            "Returning FeatureBuffer"
+        );
 
         Ok(Some(
             FeatureBuffer::new(mel_chunk, valid_frames)
@@ -318,6 +384,13 @@ impl RequestStreamer {
     fn process_pending_audio(&mut self) -> Result<()> {
         let chunk_audio_size = self.audio_chunk_size();
 
+        tracing::trace!(
+            chunk_audio_size,
+            file_position = self.file_position,
+            live_buffer_len = self.live_buffer.len(),
+            "Processing pending audio"
+        );
+
         // Process file audio
         // First, check if we have file samples and extract the chunk to avoid borrow issues
         let (audio_chunk, new_position, reached_end) = if let Some(ref samples) = self.file_samples
@@ -341,9 +414,20 @@ impl RequestStreamer {
                 self.preprocessor.reset();
 
                 // Build the full audio buffer with overlap/silence prefix
-                let audio_buffer = self.build_audio_buffer(&audio_chunk);
+                // let audio_buffer = self.build_audio_buffer(&audio_chunk);
 
-                let mel = self.preprocessor.process_chunk(&audio_buffer)?;
+                let audio_array = mlx_rs::Array::from_slice(&audio_chunk, &[audio_chunk.len() as i32]);
+                let (mel, _lengths) = self.preprocessor.forward(&audio_array, None)?;
+                // Remove batch dim: [batch, n_mels, frames] -> [n_mels, frames]
+                use mlx_rs::ops::indexing::IndexOp;
+                let mel = mel.index(0);
+                // Remove last frame (extra frame from center padding)
+                let n_frames = mel.dim(1) as usize;
+                let mel = if n_frames > 1 {
+                    mel.index((.., ..(n_frames as i32 - 1)))
+                } else {
+                    mel
+                };
                 mel.eval()?;
                 let n_frames = mel.dim(1) as usize;
                 if n_frames > 0 {
@@ -353,6 +437,14 @@ impl RequestStreamer {
                     self.mel_buffer.append_mel(&mel)?;
                 }
                 self.file_position = new_position;
+
+                tracing::trace!(
+                    audio_chunk_len = audio_chunk.len(),
+                    // audio_buffer_len = audio_buffer.len(),
+                    mel_frames = n_frames,
+                    new_position,
+                    "Processed file audio chunk"
+                );
             }
 
             // If we've reached the end of file, signal stream end
@@ -367,22 +459,46 @@ impl RequestStreamer {
             let audio_chunk: Vec<f32> = self.live_buffer.drain(..chunk_audio_size).collect();
 
             // Reset preprocessor state before each chunk
-            self.preprocessor.reset();
+            // self.preprocessor.reset();
 
             // Build the full audio buffer with overlap/silence prefix
             let audio_buffer = self.build_audio_buffer(&audio_chunk);
 
-            let mel = self.preprocessor.process_chunk(&audio_buffer)?;
+            let audio_array = mlx_rs::Array::from_slice(&audio_buffer, &[audio_buffer.len() as i32]);
+            // let mel = self.preprocessor.forward(&audio_array, None)?;
+            let (mel, _lengths) = self.preprocessor.forward(&audio_array, None)?;
+            // Remove batch dim: [batch, n_mels, frames] -> [n_mels, frames]
+            use mlx_rs::ops::indexing::IndexOp;
+            let mel = mel.index(0);
+            // Remove last frame (extra frame from center padding)
+            let n_frames = mel.dim(1) as usize;
+            let mel = if n_frames > 1 {
+                mel.index((.., ..(n_frames as i32 - 1)))
+            } else {
+                mel
+            };
             mel.eval()?;
             let n_frames = mel.dim(1) as usize;
             if n_frames > 0 {
                 // Keep all mel frames
                 self.mel_buffer.append_mel(&mel)?;
             }
+
+            tracing::trace!(
+                audio_chunk_len = audio_chunk.len(),
+                mel_frames = n_frames,
+                live_buffer_remaining = self.live_buffer.len(),
+                "Processed live audio chunk"
+            );
         }
 
         // Process remaining audio only when stream has ended
         if self.stream_ended && !self.live_buffer.is_empty() {
+            tracing::debug!(
+                remaining_samples = self.live_buffer.len(),
+                "Processing remaining audio at stream end"
+            );
+
             // Reset preprocessor state
             self.preprocessor.reset();
 
@@ -398,17 +514,28 @@ impl RequestStreamer {
                 self.mel_buffer.append_mel(&mel)?;
             }
             self.live_buffer.clear();
+
+            tracing::trace!(
+                mel_frames = n_frames,
+                "Processed final remaining audio"
+            );
         }
 
         Ok(())
     }
 
     fn handle_final_chunk(&mut self) -> Result<Option<FeatureBuffer>> {
+        tracing::debug!(
+            mel_frames_before_flush = self.mel_buffer.remaining_frames(),
+            "Handling final chunk"
+        );
+
         // Flush any remaining audio in preprocessor
         let final_mel = self.preprocessor.flush()?;
         final_mel.eval()?;
         let n_frames = final_mel.dim(1) as usize;
         if n_frames > 0 {
+            tracing::trace!(flushed_frames = n_frames, "Flushed preprocessor");
             self.mel_buffer.append_mel(&final_mel)?;
         }
 
@@ -426,18 +553,31 @@ impl RequestStreamer {
         // Pad to make a full chunk if needed
         if remaining < chunk_size {
             let frames_to_pad = chunk_size - remaining;
+            tracing::trace!(
+                remaining,
+                chunk_size,
+                frames_to_pad,
+                "Padding final chunk"
+            );
             let padding = mlx_rs::ops::zeros::<f32>(&[self.n_mels as i32, frames_to_pad as i32])?;
             self.mel_buffer.append_mel(&padding)?;
         }
 
         let (mel_chunk, _total_frames, valid_frames) = self
             .mel_buffer
-            .extract_chunk(chunk_size, shift_size, pre_encode_cache)
+            .extract_chunk(chunk_size + pre_encode_cache, shift_size + pre_encode_cache, 0)
             .ok_or_else(|| Error::model("Failed to extract final mel chunk"))?;
 
         let is_first = self.is_first_chunk;
         self.is_first_chunk = false;
         self.is_done = true;
+
+        tracing::debug!(
+            is_first,
+            valid_frames,
+            pre_encode_cache,
+            "Returning final FeatureBuffer"
+        );
 
         Ok(Some(
             FeatureBuffer::new(mel_chunk, valid_frames)
@@ -469,12 +609,22 @@ impl Iterator for RequestStreamer {
 fn load_wav(path: &Path) -> Result<(Vec<f32>, u32)> {
     use hound::WavReader;
 
+    tracing::debug!(path = %path.display(), "Loading WAV file");
+
     let reader = WavReader::open(path)
         .map_err(|e| Error::audio(format!("Failed to open WAV file: {}", e)))?;
 
     let spec = reader.spec();
     let sample_rate = spec.sample_rate;
     let channels = spec.channels as usize;
+
+    tracing::trace!(
+        sample_rate,
+        channels,
+        bits_per_sample = spec.bits_per_sample,
+        sample_format = ?spec.sample_format,
+        "WAV file spec"
+    );
 
     let samples: Vec<f32> = match spec.sample_format {
         hound::SampleFormat::Float => {
@@ -514,6 +664,13 @@ fn load_wav(path: &Path) -> Result<(Vec<f32>, u32)> {
         }
     };
 
+    tracing::debug!(
+        num_samples = samples.len(),
+        sample_rate,
+        duration_secs = samples.len() as f32 / sample_rate as f32,
+        "WAV file loaded"
+    );
+
     Ok((samples, sample_rate))
 }
 
@@ -532,8 +689,16 @@ fn resample_audio(samples: &[f32], from_rate: u32, to_rate: u32) -> Result<Vec<f
     };
 
     if from_rate == to_rate {
+        tracing::trace!("No resampling needed (rates match)");
         return Ok(samples.to_vec());
     }
+
+    tracing::debug!(
+        from_rate,
+        to_rate,
+        input_samples = samples.len(),
+        "Resampling audio"
+    );
 
     let params = SincInterpolationParameters {
         sinc_len: 256,
@@ -557,7 +722,13 @@ fn resample_audio(samples: &[f32], from_rate: u32, to_rate: u32) -> Result<Vec<f
         .process(&waves_in, None)
         .map_err(|e| Error::audio(format!("Resampling failed: {}", e)))?;
 
-    Ok(waves_out.into_iter().next().unwrap_or_default())
+    let output = waves_out.into_iter().next().unwrap_or_default();
+    tracing::trace!(
+        input_samples = samples.len(),
+        output_samples = output.len(),
+        "Resampling complete"
+    );
+    Ok(output)
 }
 
 #[cfg(not(feature = "asr"))]

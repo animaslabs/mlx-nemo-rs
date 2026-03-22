@@ -138,7 +138,10 @@ fn main() -> mlx_nemo::Result<()> {
     };
 
     // Calculate chunk size in samples
+    // Each chunk includes the lookahead and current 80ms frames (8x downsampled mel frames)
+    // mode 0: 1120ms chunk (112 mel frames), 1040ms lookahead
     let chunk_samples = (sample_rate as f32 * chunk_ms as f32 / 1000.0) as usize;
+    // let chunk_samples = config.shift_size.0 * 160;
     println!(
         "\nProcessing in {} ms chunks ({} samples)",
         chunk_ms, chunk_samples

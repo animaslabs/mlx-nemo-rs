@@ -101,7 +101,7 @@ impl CacheAwareRNNTPipeline {
     ///
     /// # Arguments
     /// * `path` - Path to the .nemo checkpoint file
-    /// * `mode_idx` - Streaming mode index (0 = lowest latency)
+    /// * `mode_idx` - Streaming mode index (0 = highest latency)
     pub fn restore(path: impl AsRef<Path>, mode_idx: usize) -> Result<Self> {
         let path = path.as_ref();
         tracing::info!("Loading pipeline from: {}", path.display());
