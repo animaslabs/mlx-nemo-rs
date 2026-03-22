@@ -167,8 +167,33 @@ impl MelSpectrogram {
         let hop_samples = config.hop_samples();
         let n_freqs = config.n_fft / 2 + 1;
 
+        tracing::info!(
+            "[RS-MEL] Creating MelSpectrogram processor: sample_rate={} n_fft={} hop={} win={} n_mels={} fmin={} fmax={}",
+            config.sample_rate,
+            config.n_fft,
+            hop_samples,
+            win_samples,
+            config.features,
+            config.fmin,
+            config.effective_fmax()
+        );
+        tracing::info!(
+            "[RS-MEL] Options: window={} log={} normalize={} preemph={:?} dither={}",
+            config.window,
+            config.log,
+            config.normalize,
+            config.preemph,
+            config.dither
+        );
+
         // Create window function (zero-padded to n_fft)
         let window = Self::create_window(&config.window, win_samples, config.n_fft)?;
+        tracing::debug!(
+            "[RS-MEL] Created {} window: len={} (zero-padded to {})",
+            config.window,
+            win_samples,
+            config.n_fft
+        );
 
         // Create mel filterbank
         let filterbank = Self::create_filterbank(
@@ -178,6 +203,10 @@ impl MelSpectrogram {
             config.fmin,
             config.effective_fmax(),
         )?;
+        tracing::debug!(
+            "[RS-MEL] Created mel filterbank: shape={:?}",
+            filterbank.shape()
+        );
 
         // NeMo uses 2^-24 as log guard
         let log_guard = Array::from_f32(2.0_f32.powi(-24));
@@ -237,8 +266,13 @@ impl MelSpectrogram {
 
     /// Reset streaming state (remainder buffer and preemphasis state).
     pub fn reset(&mut self) {
+        let had_remainder = !self.remainder.is_empty();
         self.remainder.clear();
         self.preemph_last = 0.0;
+        tracing::debug!(
+            "[RS-MEL] reset: cleared remainder (had {} samples)",
+            if had_remainder { "some" } else { "0" }
+        );
     }
 
     /// Process a chunk of audio samples (streaming API).
@@ -254,10 +288,43 @@ impl MelSpectrogram {
     /// Mel spectrogram features [n_mels, num_frames]. May be empty if not
     /// enough samples for a complete frame.
     pub fn process_chunk(&mut self, samples: &[f32]) -> Result<Array> {
+        static STEP: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let step = STEP.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+        tracing::debug!(
+            "[RS-MEL step={}] ===== MelSpectrogram.process_chunk() =====",
+            step
+        );
+        tracing::debug!(
+            "[RS-MEL step={}] CONFIG: n_fft={} hop={} win={} n_mels={} preemph={:?} dither={}",
+            step,
+            self.config.n_fft,
+            self.hop_samples,
+            self.win_samples,
+            self.config.features,
+            self.config.preemph,
+            self.config.dither
+        );
+
         // Combine remainder with new samples (raw, unprocessed)
         let mut raw_audio = Vec::with_capacity(self.remainder.len() + samples.len());
         raw_audio.extend_from_slice(&self.remainder);
         raw_audio.extend_from_slice(samples);
+
+        tracing::debug!(
+            "[RS-MEL step={}] INPUT: new_samples={} remainder={} combined={}",
+            step,
+            samples.len(),
+            self.remainder.len(),
+            raw_audio.len()
+        );
+        if !samples.is_empty() {
+            tracing::trace!(
+                "[RS-MEL step={}] INPUT samples[:5]: {:?}",
+                step,
+                &samples[..samples.len().min(5)]
+            );
+        }
 
         // With center-padded STFT, we process all available audio.
         // The compute_mel function handles padding internally.
@@ -270,14 +337,21 @@ impl MelSpectrogram {
         // keeping the last (audio_len - consumed) samples for the next chunk's context.
 
         let n_frames = self.compute_frame_count(raw_audio.len());
-        tracing::trace!(
-            "process_chunk raw_audio len: {} num audio samples: {} remainder len: {} mel n_frames: {}",
-            raw_audio.len(), samples.len(), self.remainder.len(), n_frames
+        tracing::debug!(
+            "[RS-MEL step={}] FRAMES: n_frames={} (from {} samples)",
+            step,
+            n_frames,
+            raw_audio.len()
         );
 
         if n_frames == 0 {
             // Not enough audio (shouldn't happen with center padding, but handle it)
             self.remainder = raw_audio;
+            tracing::debug!(
+                "[RS-MEL step={}] Not enough samples, buffering {} for next chunk",
+                step,
+                self.remainder.len()
+            );
             return Array::zeros::<f32>(&[self.config.features as i32, 0])
                 .map_err(|e| Error::model(e.to_string()));
         }
@@ -302,43 +376,45 @@ impl MelSpectrogram {
             self.remainder.clear();
         }
 
-        // DEBUG: Print raw audio before preemphasis
-        let debug_enabled = std::env::var("MLX_NEMO_DEBUG").is_ok();
-        if debug_enabled {
-            let raw_arr = Array::from_slice(audio_to_process, &[audio_to_process.len() as i32]);
-            tracing::info!("DEBUG process_chunk: raw_audio before preemph len={}", audio_to_process.len());
-            Self::debug_print_array("raw_audio_before_preemph", &raw_arr, 5);
-            tracing::info!("DEBUG process_chunk: preemph is stateless (matching NeMo)");
-        }
+        tracing::debug!(
+            "[RS-MEL step={}] CONSUMED: {} samples, remainder={} for next chunk",
+            step,
+            samples_consumed,
+            self.remainder.len()
+        );
 
         // Apply preemphasis with state tracking
+        tracing::trace!(
+            "[RS-MEL step={}] PREEMPH: before[:5]={:?}",
+            step,
+            &audio_to_process[..audio_to_process.len().min(5)]
+        );
         let audio_to_process = self.apply_preemphasis(audio_to_process);
-
-        if debug_enabled {
-            let preemph_arr = Array::from_slice(&audio_to_process, &[audio_to_process.len() as i32]);
-            tracing::info!("DEBUG process_chunk: after preemph");
-            Self::debug_print_array("audio_after_preemph", &preemph_arr, 5);
-        }
+        tracing::trace!(
+            "[RS-MEL step={}] PREEMPH: after[:5]={:?}",
+            step,
+            &audio_to_process[..audio_to_process.len().min(5)]
+        );
 
         // Apply dithering (adds small noise for numerical stability)
         let mut audio_to_process = audio_to_process;
         self.apply_dither(&mut audio_to_process);
 
-        if debug_enabled {
-            let dither_arr = Array::from_slice(&audio_to_process, &[audio_to_process.len() as i32]);
-            tracing::info!("DEBUG process_chunk: after dither (dither={})", self.config.dither);
-            Self::debug_print_array("audio_after_dither", &dither_arr, 5);
-        }
-
         tracing::debug!(
-            "process_chunk audio_to_process len: {} remainder len: {} samples_consumed: {}",
+            "[RS-MEL step={}] Processing {} samples -> {} mel frames",
+            step,
             audio_to_process.len(),
-            self.remainder.len(),
-            samples_consumed
+            n_frames
         );
 
         // Compute mel spectrogram (handles center padding internally)
-        let mel = self.compute_mel(&audio_to_process)?;
+        let mel = self.compute_mel_with_step(&audio_to_process, step)?;
+
+        tracing::debug!(
+            "[RS-MEL step={}] OUTPUT: mel shape={:?}",
+            step,
+            mel.shape()
+        );
 
         Ok(mel)
     }
@@ -371,8 +447,14 @@ impl MelSpectrogram {
     /// - mel_features: [batch, n_mels, frames]
     /// - lengths: [batch] output frame counts
     pub fn forward(&self, audio: &Array, lengths: Option<&Array>) -> Result<(Array, Array)> {
+        tracing::debug!(
+            "[RS-MEL batch] forward: input shape={:?}",
+            audio.shape()
+        );
+
         // Ensure audio is 2D [batch, time]
         let audio = if audio.ndim() == 1 {
+            tracing::debug!("[RS-MEL batch] Reshaping 1D audio to [1, time]");
             audio.reshape(&[1, -1])?
         } else {
             audio.clone()
@@ -381,11 +463,19 @@ impl MelSpectrogram {
         let batch_size = audio.shape()[0];
         let audio_len = audio.shape()[1];
 
+        tracing::debug!(
+            "[RS-MEL batch] Processing batch_size={} audio_len={}",
+            batch_size,
+            audio_len
+        );
+
         // Apply dithering if configured (adds small noise for numerical stability)
         let audio = self.apply_dither_batch(&audio)?;
+        tracing::trace!("[RS-MEL batch] Applied dither={}", self.config.dither);
 
         // Apply preemphasis if configured
         let audio = if let Some(coef) = self.config.preemph {
+            tracing::trace!("[RS-MEL batch] Applying preemphasis coef={}", coef);
             self.apply_preemphasis_batch(&audio, coef)?
         } else {
             audio
@@ -393,15 +483,28 @@ impl MelSpectrogram {
 
         // Compute STFT
         let stft = self.stft_batch(&audio)?;
+        tracing::debug!(
+            "[RS-MEL batch] STFT: shape={:?}",
+            stft.shape()
+        );
 
         // Compute power spectrum
         let power = self.power_spectrum(&stft)?;
+        tracing::debug!(
+            "[RS-MEL batch] POWER: shape={:?}",
+            power.shape()
+        );
 
         // Apply mel filterbank: power [batch, freqs, frames] -> mel [batch, n_mels, frames]
         let mel = ops::einsum("mf,bft->bmt", &[self.filterbank.clone(), power])?;
+        tracing::debug!(
+            "[RS-MEL batch] MEL FILTERBANK: shape={:?}",
+            mel.shape()
+        );
 
         // Apply log compression
         let mel = if self.config.log {
+            tracing::trace!("[RS-MEL batch] Applying log compression");
             let mel_safe = ops::add(&mel, &self.log_guard)?;
             ops::log(&mel_safe)?
         } else {
@@ -410,18 +513,27 @@ impl MelSpectrogram {
 
         // Apply normalization if requested
         let mel = match self.config.normalize.as_str() {
-            "per_feature" => self.normalize_per_feature(&mel)?,
+            "per_feature" => {
+                tracing::trace!("[RS-MEL batch] Applying per_feature normalization");
+                self.normalize_per_feature(&mel)?
+            }
             _ => mel,
         };
 
         // Compute output lengths
+        let n_frames = audio_len as usize / self.hop_samples + 1;
         let out_lengths = if let Some(lens) = lengths {
             self.compute_output_lengths(lens)?
         } else {
             // All same length based on audio_len
-            let n_frames = audio_len as usize / self.hop_samples + 1;
             ops::full::<i32>(&[batch_size], &Array::from_int(n_frames as i32))?
         };
+
+        tracing::debug!(
+            "[RS-MEL batch] OUTPUT: mel shape={:?} n_frames={}",
+            mel.shape(),
+            n_frames
+        );
 
         Ok((mel, out_lengths))
     }
@@ -728,25 +840,37 @@ impl MelSpectrogram {
     /// Uses STFT **with** center padding to match NeMo's torch.stft(center=True).
     /// This pads n_fft/2 zeros on each side of the audio before computing frames.
     pub fn compute_mel(&self, audio: &[f32]) -> Result<Array> {
+        self.compute_mel_with_step(audio, usize::MAX)
+    }
+
+    /// Internal mel computation with step counter for logging.
+    fn compute_mel_with_step(&self, audio: &[f32], step: usize) -> Result<Array> {
         let audio_len = audio.len();
         let n_fft = self.config.n_fft;
         let hop = self.hop_samples;
 
-        // DEBUG: Print input audio stats
-        let debug_enabled = std::env::var("MLX_NEMO_DEBUG").is_ok();
-        if debug_enabled {
-            tracing::info!(
-                "DEBUG compute_mel: audio_len={} n_fft={} hop={} win_len={}",
-                audio_len,
-                n_fft,
-                hop,
-                self.win_samples
-            );
-            let audio_arr = Array::from_slice(audio, &[audio_len as i32]);
-            Self::debug_print_array("input_audio", &audio_arr, 5);
-        }
+        let step_str = if step == usize::MAX {
+            "batch".to_string()
+        } else {
+            step.to_string()
+        };
+
+        tracing::debug!(
+            "[RS-MEL step={}] compute_mel: audio_len={} n_fft={} hop={} win_len={}",
+            step_str,
+            audio_len,
+            n_fft,
+            hop,
+            self.win_samples
+        );
+        tracing::trace!(
+            "[RS-MEL step={}] INPUT audio[:10]: {:?}",
+            step_str,
+            &audio[..audio_len.min(10)]
+        );
 
         if audio_len == 0 {
+            tracing::debug!("[RS-MEL step={}] Empty audio, returning empty mel", step_str);
             return Array::zeros::<f32>(&[self.config.features as i32, 0])
                 .map_err(|e| Error::model(e.to_string()));
         }
@@ -762,16 +886,16 @@ impl MelSpectrogram {
         // Calculate frames with center-padded formula
         let n_frames = (padded_len - n_fft) / hop + 1;
 
-        if debug_enabled {
-            tracing::info!(
-                "DEBUG compute_mel: pad_size={} padded_len={} n_frames={}",
-                pad_size,
-                padded_len,
-                n_frames
-            );
-        }
+        tracing::debug!(
+            "[RS-MEL step={}] PADDING: pad_size={} padded_len={} n_frames={}",
+            step_str,
+            pad_size,
+            padded_len,
+            n_frames
+        );
 
         if n_frames == 0 {
+            tracing::debug!("[RS-MEL step={}] No frames, returning empty mel", step_str);
             return Array::zeros::<f32>(&[self.config.features as i32, 0])
                 .map_err(|e| Error::model(e.to_string()));
         }
@@ -788,20 +912,26 @@ impl MelSpectrogram {
 
         let frames = Array::from_slice(&frames_data, &[1, n_frames as i32, n_fft as i32]);
 
-        if debug_enabled {
-            tracing::info!("DEBUG compute_mel: frames shape {:?}", frames.shape());
-            // Print first frame
-            let first_frame = frames.index((0, 0, ..));
-            Self::debug_print_array("first_frame", &first_frame, 5);
-        }
+        tracing::debug!(
+            "[RS-MEL step={}] FRAMED: shape={:?}",
+            step_str,
+            frames.shape()
+        );
+        // Log first frame's first few samples
+        tracing::trace!(
+            "[RS-MEL step={}] FRAME[0][:5]: {:?}",
+            step_str,
+            &frames_data[..frames_data.len().min(5)]
+        );
 
         // Apply window (already zero-padded to n_fft, centered)
         let windowed = ops::multiply(&frames, &self.window)?;
 
-        if debug_enabled {
-            let first_windowed = windowed.index((0, 0, ..));
-            Self::debug_print_array("first_frame_windowed", &first_windowed, 5);
-        }
+        tracing::trace!(
+            "[RS-MEL step={}] WINDOWED: applied {} window",
+            step_str,
+            self.config.window
+        );
 
         // Compute FFT along last axis
         let fft_result = fft::rfft(&windowed, Some(n_fft as i32), Some(2))?;
@@ -809,48 +939,111 @@ impl MelSpectrogram {
         // Transpose to [batch, freq_bins, frames]
         let stft = ops::transpose_axes(&fft_result, &[0, 2, 1])?;
 
-        if debug_enabled {
-            tracing::info!("DEBUG compute_mel: stft shape {:?}", stft.shape());
-        }
+        tracing::debug!(
+            "[RS-MEL step={}] STFT: shape={:?} (complex)",
+            step_str,
+            stft.shape()
+        );
 
         // Compute power spectrum
         let power = self.power_spectrum(&stft)?;
 
-        if debug_enabled {
-            tracing::info!("DEBUG compute_mel: power shape {:?}", power.shape());
-            // Print first frame's power spectrum (all freq bins for frame 0)
-            let first_power = power.index((0, .., 0));
-            Self::debug_print_array("first_frame_power", &first_power, 5);
+        tracing::debug!(
+            "[RS-MEL step={}] POWER: shape={:?}",
+            step_str,
+            power.shape()
+        );
+
+        // Log first frame's power spectrum stats
+        if tracing::enabled!(tracing::Level::TRACE) {
+            let _ = power.eval();
+            if let Ok(power_slice) = power.try_as_slice::<f32>() {
+                let n_freqs = self.config.n_fft / 2 + 1;
+                // First frame's power values (first n_freqs values)
+                let frame0_power: Vec<f32> = power_slice[..n_freqs.min(power_slice.len())].to_vec();
+                tracing::trace!(
+                    "[RS-MEL step={}] POWER[0,:5,0]: {:?}",
+                    step_str,
+                    &frame0_power[..frame0_power.len().min(5)]
+                );
+            }
         }
 
         // Apply mel filterbank
         let mel = ops::einsum("mf,bft->bmt", &[self.filterbank.clone(), power])?;
 
-        if debug_enabled {
-            tracing::info!("DEBUG compute_mel: mel (before log) shape {:?}", mel.shape());
-            let mel_frame0 = mel.index((0, .., 0));
-            Self::debug_print_array("mel_frame0_before_log", &mel_frame0, 5);
+        tracing::debug!(
+            "[RS-MEL step={}] MEL FILTERBANK: shape={:?}",
+            step_str,
+            mel.shape()
+        );
+
+        // Log mel values before log
+        if tracing::enabled!(tracing::Level::TRACE) {
+            let _ = mel.eval();
+            if let Ok(mel_slice) = mel.try_as_slice::<f32>() {
+                tracing::trace!(
+                    "[RS-MEL step={}] MEL[0,:5,0] (before log): {:?}",
+                    step_str,
+                    &mel_slice[..mel_slice.len().min(5)]
+                );
+            }
         }
 
         // Apply log compression
         let mel = if self.config.log {
+            tracing::trace!(
+                "[RS-MEL step={}] LOG: applying log(mel + 2^-24)",
+                step_str
+            );
             let mel_safe = ops::add(&mel, &self.log_guard)?;
             ops::log(&mel_safe)?
         } else {
             mel
         };
 
-        if debug_enabled {
-            let mel_frame0 = mel.index((0, .., 0));
-            Self::debug_print_array("mel_frame0_after_log", &mel_frame0, 5);
+        // Log mel values after log
+        if tracing::enabled!(tracing::Level::TRACE) {
+            let _ = mel.eval();
+            if let Ok(mel_slice) = mel.try_as_slice::<f32>() {
+                tracing::trace!(
+                    "[RS-MEL step={}] LOG-MEL[0,:5,0]: {:?}",
+                    step_str,
+                    &mel_slice[..mel_slice.len().min(5)]
+                );
+            }
         }
 
         // Remove batch dimension: [1, n_mels, frames] -> [n_mels, frames]
         let mel = mel.index(0);
 
-        if debug_enabled {
-            tracing::info!("DEBUG compute_mel: final mel shape {:?}", mel.shape());
-            Self::debug_print_array("final_mel", &mel, 5);
+        tracing::debug!(
+            "[RS-MEL step={}] FINAL: shape={:?}",
+            step_str,
+            mel.shape()
+        );
+
+        // Log final mel stats
+        if tracing::enabled!(tracing::Level::TRACE) {
+            let _ = mel.eval();
+            if let Ok(mel_slice) = mel.try_as_slice::<f32>() {
+                let n_mels = self.config.features;
+                // First frame (first n_mels values in column-major or row 0 in row-major)
+                tracing::trace!(
+                    "[RS-MEL step={}] FINAL[:5,0]: {:?}",
+                    step_str,
+                    &mel_slice[..mel_slice.len().min(5)]
+                );
+                // Last frame
+                if mel_slice.len() >= n_mels {
+                    let last_frame_start = mel_slice.len() - n_mels;
+                    tracing::trace!(
+                        "[RS-MEL step={}] FINAL[:5,-1]: {:?}",
+                        step_str,
+                        &mel_slice[last_frame_start..last_frame_start + 5.min(n_mels)]
+                    );
+                }
+            }
         }
 
         Ok(mel)

@@ -49,6 +49,8 @@ struct StreamingState {
     accumulated_tokens: Vec<usize>,
     /// Whether first chunk has been processed
     is_first_chunk: bool,
+    /// Step counter for logging
+    step_count: usize,
 }
 
 /// Cache-aware RNN-T streaming pipeline.
@@ -220,6 +222,7 @@ impl CacheAwareRNNTPipeline {
             last_token: None,
             accumulated_tokens: Vec::new(),
             is_first_chunk: true,
+            step_count: 0,
         };
 
         Ok(Self {
@@ -309,7 +312,7 @@ impl CacheAwareRNNTPipeline {
         self.state.last_token = None;
         self.state.accumulated_tokens.clear();
         self.state.is_first_chunk = true;
-
+        self.state.step_count = 0;
     }
 
     /// Process the next available request and return transcription output.
@@ -322,6 +325,10 @@ impl CacheAwareRNNTPipeline {
             Some(Err(e)) => return Err(e),
             None => return Ok(None),
         };
+
+        // Increment and log step counter
+        self.state.step_count += 1;
+        tracing::info!(step = self.state.step_count, "transcribe_step");
 
         self.process_feature_buffer(feature_buffer)
     }

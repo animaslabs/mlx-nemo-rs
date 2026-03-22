@@ -6,6 +6,8 @@
 
 use std::path::Path;
 
+use mlx_rs::ops::indexing::IndexOp;
+
 use crate::asr::modules::MelSpectrogram;
 use crate::asr::streaming::{FeatureBuffer, StreamingConfig, StreamingMelBuffer};
 use crate::core::error::{Error, Result};
@@ -281,23 +283,33 @@ impl RequestStreamer {
             "try_extract_next called"
         );
 
-        // Step 1: Process any pending audio into mel frames
+        // Step 1: Initialize mel buffer with silence for pre_encode_cache (first time only)
+        // This matches Python's BatchedCacheFeatureBufferer which initializes
+        // the feature_buffer to LOG_MEL_ZERO for the first pre_encode_cache frames.
+        if self.is_first_chunk && self.mel_buffer.total_frames == 0 {
+            let pre_encode_cache = self.config.pre_encode_cache_size.1;
+            if pre_encode_cache > 0 {
+                self.mel_buffer.initialize_with_silence(pre_encode_cache)?;
+                tracing::debug!(
+                    pre_encode_cache,
+                    "Initialized mel buffer with silence for pre_encode_cache"
+                );
+            }
+        }
+
+        // Step 2: Process any pending audio into mel frames
         self.process_pending_audio()?;
 
-        // Step 2: Try to extract a mel chunk
-        // NeMo uses subsequent values ([1]) for chunk/shift sizes for all chunks.
-        // For pre_encode_cache:
-        // - First chunk: pre_encode_cache = 0 (no previous context)
-        // - Subsequent: pre_encode_cache = 9 (context from previous chunk)
-        let chunk_size = self.config.chunk_size.0;
-        let shift_size = self.config.shift_size.0;
-        let pre_encode_cache = if self.is_first_chunk {
-            self.config.pre_encode_cache_size.1 // 0 for first chunk
-        } else {
-            self.config.pre_encode_cache_size.1 // 9 for subsequent
-        };
+        // Step 3: Try to extract a mel chunk
+        // Python's feature buffer works like this:
+        // - Buffer has 121 frames: [9 pre_encode_cache] + [112 chunk]
+        // - Each step: shift left by 112, keep 9 old frames, append 112 new
+        // - The 9 old frames are PRESERVED from previous step (not recomputed)
+        let chunk_size = self.config.chunk_size.1; // 112
+        let shift_size = self.config.shift_size.1; // 112
+        let pre_encode_cache = self.config.pre_encode_cache_size.1; // 9
 
-        // Check if we have enough mel frames
+        // We need chunk_size frames of NEW mel data (pre_encode_cache comes from buffer overlap)
         let remaining = self.mel_buffer.remaining_frames();
         if remaining < chunk_size {
             // Not enough frames yet
@@ -308,12 +320,11 @@ impl RequestStreamer {
             return Ok(None);
         }
 
-        // Extract mel chunk
-        // Returns (mel_array, total_frames, valid_frames)
-        // valid_frames matches Python's mel_len (total - 1)
+        // Extract mel chunk: pre_encode_cache + chunk_size frames, shift by shift_size
+        // This leaves pre_encode_cache frames of overlap for the next chunk
         let (mel_chunk, _total_frames, valid_frames) = self
             .mel_buffer
-            .extract_chunk(chunk_size + pre_encode_cache, shift_size + pre_encode_cache, 0)
+            .extract_chunk(chunk_size, shift_size, pre_encode_cache)
             .ok_or_else(|| Error::model("Failed to extract mel chunk"))?;
 
         tracing::debug!(
@@ -321,23 +332,22 @@ impl RequestStreamer {
             shift_size,
             pre_encode_cache,
             valid_frames,
+            buffer_idx = self.mel_buffer.buffer_idx,
+            total_frames = self.mel_buffer.total_frames,
+            remaining_after = self.mel_buffer.remaining_frames(),
             is_first = self.is_first_chunk,
             "Extracted mel chunk"
         );
 
-        // Reset mel buffer after extraction.
-        // This matches Python's approach where each audio chunk of size
-        // (chunk_size + pre_encode_cache) * hop produces its own mel that goes
-        // directly to the encoder. Without this reset, mel frames accumulate
-        // across chunks (adding 25 but advancing by shift_size=16 leaves 9 leftover),
-        // causing the "pre_encode_cache" frames to come from the wrong audio segment.
-        // self.mel_buffer.reset();
+        // DO NOT reset mel buffer - we need to preserve overlap frames for pre_encode_cache!
+        // Python's BatchedCacheFeatureBufferer keeps the last pre_encode_cache frames
+        // by shifting the buffer left, not by resetting it.
 
         let is_first = self.is_first_chunk;
         self.is_first_chunk = false;
 
         // Check if this is the last chunk
-        let is_last = self.stream_ended && self.mel_buffer.is_empty();
+        let is_last = self.stream_ended && self.mel_buffer.remaining_frames() < chunk_size;
         if is_last {
             tracing::debug!("This is the final chunk");
             self.is_done = true;
@@ -359,26 +369,53 @@ impl RequestStreamer {
         ))
     }
 
+    /// Get the number of lookback samples for mel computation continuity.
+    ///
+    /// Python uses 1 hop (160 samples) of lookback for mel continuity.
+    /// This ensures proper windowing at chunk boundaries.
+    fn mel_lookback_samples(&self) -> usize {
+        // Python: n_chunk_look_back = int(timestep_duration * sample_rate) = 160
+        self.mel_buffer.hop_samples
+    }
+
     /// Build the audio buffer for mel computation.
     ///
-    /// This matches Python NeMo's approach:
-    /// - Each chunk takes (chunk_size + pre_encode_cache) * hop audio samples
-    /// - No audio-level overlap or padding is needed
-    /// - The encoder's internal caching handles context between chunks
-    ///
-    /// For short final chunks, pad with zeros.
+    /// This matches Python NeMo's BatchedCacheFeatureBufferer approach:
+    /// - Takes chunk_size + 1 hop of lookback for mel continuity
+    /// - Feature-level caching is handled by the mel buffer, not audio overlap
     fn build_audio_buffer(&mut self, audio_chunk: &[f32]) -> Vec<f32> {
-        let buffer_size = self.audio_buffer_size();
+        let lookback_samples = self.mel_lookback_samples();
 
-        // Just use the audio chunk directly, pad if needed for final short chunk
-        if audio_chunk.len() >= buffer_size {
-            audio_chunk[..buffer_size].to_vec()
-        } else {
-            // Pad short final chunk with zeros
-            let mut buffer = audio_chunk.to_vec();
-            buffer.resize(buffer_size, 0.0f32);
-            buffer
+        // For first chunk, prepend zeros for lookback
+        // For subsequent chunks, prepend last lookback_samples from previous chunk
+        if self.audio_overlap.is_empty() {
+            self.audio_overlap = vec![0.0f32; lookback_samples];
         }
+
+        // Prepend lookback, then append current chunk
+        let mut buffer = Vec::with_capacity(lookback_samples + audio_chunk.len());
+        buffer.extend_from_slice(&self.audio_overlap);
+        buffer.extend_from_slice(audio_chunk);
+
+        // Save last lookback_samples from audio_chunk for next iteration
+        if audio_chunk.len() >= lookback_samples {
+            let start_idx = audio_chunk.len() - lookback_samples;
+            self.audio_overlap = audio_chunk[start_idx..].to_vec();
+        } else {
+            // Chunk is shorter than lookback_samples (final chunk case)
+            let shift = audio_chunk.len();
+            self.audio_overlap.drain(..shift);
+            self.audio_overlap.extend_from_slice(audio_chunk);
+        }
+
+        tracing::trace!(
+            lookback_samples,
+            audio_chunk_len = audio_chunk.len(),
+            buffer_len = buffer.len(),
+            "Built audio buffer with lookback"
+        );
+
+        buffer
     }
 
     fn process_pending_audio(&mut self) -> Result<()> {
@@ -407,44 +444,64 @@ impl RequestStreamer {
             (None, self.file_position, false)
         };
 
+        // Python's BatchedCacheFeatureBufferer approach:
+        // 1. Take audio chunk + small lookback for mel continuity
+        // 2. Compute mel, trim to expected_feat_len, then take last feature_chunk_len frames
+        // 3. Append to feature buffer (which maintains pre_encode_cache overlap)
+        let feature_chunk_len = self.config.chunk_size.1; // 112 frames
+        // Python: expected_feat_len = feature_chunk_len + plus_one, where plus_one = 1
+        // This matches Python's trimming before taking the last chunk
+        let expected_feat_len = feature_chunk_len + 1; // 113 frames
+
         // Now process the chunk if we have one
         if let Some(audio_chunk) = audio_chunk {
             if !audio_chunk.is_empty() {
                 // Reset preprocessor state before each chunk
                 self.preprocessor.reset();
 
-                // Build the full audio buffer with overlap/silence prefix
-                // let audio_buffer = self.build_audio_buffer(&audio_chunk);
+                // Build the audio buffer with small lookback for mel continuity
+                let audio_buffer = self.build_audio_buffer(&audio_chunk);
 
-                let audio_array = mlx_rs::Array::from_slice(&audio_chunk, &[audio_chunk.len() as i32]);
+                let audio_array =
+                    mlx_rs::Array::from_slice(&audio_buffer, &[audio_buffer.len() as i32]);
                 let (mel, _lengths) = self.preprocessor.forward(&audio_array, None)?;
                 // Remove batch dim: [batch, n_mels, frames] -> [n_mels, frames]
                 use mlx_rs::ops::indexing::IndexOp;
                 let mel = mel.index(0);
-                // Remove last frame (extra frame from center padding)
-                let n_frames = mel.dim(1) as usize;
-                let mel = if n_frames > 1 {
-                    mel.index((.., ..(n_frames as i32 - 1)))
-                } else {
-                    mel
-                };
                 mel.eval()?;
                 let n_frames = mel.dim(1) as usize;
+
                 if n_frames > 0 {
-                    // Keep all mel frames - the encoder cache handles context.
-                    // Python NeMo takes (chunk + pre_encode) audio samples and
-                    // keeps all resulting mel frames.
-                    self.mel_buffer.append_mel(&mel)?;
+                    // Python's approach:
+                    // 1. First trim to expected_feat_len (113)
+                    // 2. Then take last feature_chunk_len (112) frames
+                    // This ensures we take frames 1-112, not frames 2-113
+                    let mel_trimmed = if n_frames > expected_feat_len {
+                        mel.index((.., ..expected_feat_len as i32))
+                    } else {
+                        mel
+                    };
+                    let trimmed_frames = mel_trimmed.dim(1) as usize;
+
+                    let mel_to_append = if trimmed_frames > feature_chunk_len {
+                        let start = (trimmed_frames - feature_chunk_len) as i32;
+                        mel_trimmed.index((.., start..))
+                    } else {
+                        mel_trimmed
+                    };
+                    let appended_frames = mel_to_append.dim(1) as usize;
+                    self.mel_buffer.append_mel(&mel_to_append)?;
+
+                    tracing::trace!(
+                        audio_chunk_len = audio_chunk.len(),
+                        audio_buffer_len = audio_buffer.len(),
+                        mel_computed = n_frames,
+                        mel_trimmed = trimmed_frames,
+                        mel_appended = appended_frames,
+                        "Processed file audio chunk"
+                    );
                 }
                 self.file_position = new_position;
-
-                tracing::trace!(
-                    audio_chunk_len = audio_chunk.len(),
-                    // audio_buffer_len = audio_buffer.len(),
-                    mel_frames = n_frames,
-                    new_position,
-                    "Processed file audio chunk"
-                );
             }
 
             // If we've reached the end of file, signal stream end
@@ -454,42 +511,58 @@ impl RequestStreamer {
         }
 
         // Process live audio in streaming-chunk-sized blocks
+        // Python's BatchedCacheFeatureBufferer approach:
+        // 1. Take audio chunk + small lookback for mel continuity
+        // 2. Compute mel, trim to expected_feat_len, then take last feature_chunk_len frames
+        // 3. Append to feature buffer (which maintains pre_encode_cache overlap)
+
         while self.live_buffer.len() >= chunk_audio_size {
             // Take exactly chunk_audio_size samples
             let audio_chunk: Vec<f32> = self.live_buffer.drain(..chunk_audio_size).collect();
 
-            // Reset preprocessor state before each chunk
-            // self.preprocessor.reset();
-
-            // Build the full audio buffer with overlap/silence prefix
+            // Build the audio buffer with small lookback for mel continuity
             let audio_buffer = self.build_audio_buffer(&audio_chunk);
 
-            let audio_array = mlx_rs::Array::from_slice(&audio_buffer, &[audio_buffer.len() as i32]);
-            // let mel = self.preprocessor.forward(&audio_array, None)?;
+            let audio_array =
+                mlx_rs::Array::from_slice(&audio_buffer, &[audio_buffer.len() as i32]);
             let (mel, _lengths) = self.preprocessor.forward(&audio_array, None)?;
             // Remove batch dim: [batch, n_mels, frames] -> [n_mels, frames]
-            use mlx_rs::ops::indexing::IndexOp;
             let mel = mel.index(0);
-            // Remove last frame (extra frame from center padding)
-            let n_frames = mel.dim(1) as usize;
-            let mel = if n_frames > 1 {
-                mel.index((.., ..(n_frames as i32 - 1)))
-            } else {
-                mel
-            };
             mel.eval()?;
             let n_frames = mel.dim(1) as usize;
-            if n_frames > 0 {
-                // Keep all mel frames
-                self.mel_buffer.append_mel(&mel)?;
-            }
 
-            tracing::trace!(
-                audio_chunk_len = audio_chunk.len(),
-                mel_frames = n_frames,
-                live_buffer_remaining = self.live_buffer.len(),
-                "Processed live audio chunk"
-            );
+            if n_frames > 0 {
+                // Python's approach:
+                // 1. First trim to expected_feat_len (113)
+                // 2. Then take last feature_chunk_len (112) frames
+                // This ensures we take frames 1-112, not frames 2-113
+                let mel_trimmed = if n_frames > expected_feat_len {
+                    mel.index((.., ..expected_feat_len as i32))
+                } else {
+                    mel
+                };
+                let trimmed_frames = mel_trimmed.dim(1) as usize;
+
+                let mel_to_append = if trimmed_frames > feature_chunk_len {
+                    let start = (trimmed_frames - feature_chunk_len) as i32;
+                    mel_trimmed.index((.., start..))
+                } else {
+                    mel_trimmed
+                };
+                let appended_frames = mel_to_append.dim(1) as usize;
+                self.mel_buffer.append_mel(&mel_to_append)?;
+
+                tracing::trace!(
+                    audio_chunk_len = audio_chunk.len(),
+                    audio_buffer_len = audio_buffer.len(),
+                    mel_computed = n_frames,
+                    mel_trimmed = trimmed_frames,
+                    mel_appended = appended_frames,
+                    buffer_total = self.mel_buffer.total_frames,
+                    live_buffer_remaining = self.live_buffer.len(),
+                    "Processed live audio chunk"
+                );
+            }
         }
 
         // Process remaining audio only when stream has ended
@@ -563,9 +636,11 @@ impl RequestStreamer {
             self.mel_buffer.append_mel(&padding)?;
         }
 
+        // Extract with proper parameters: chunk_size new frames, shift by shift_size,
+        // pre_encode_cache frames from overlap
         let (mel_chunk, _total_frames, valid_frames) = self
             .mel_buffer
-            .extract_chunk(chunk_size + pre_encode_cache, shift_size + pre_encode_cache, 0)
+            .extract_chunk(chunk_size, shift_size, pre_encode_cache)
             .ok_or_else(|| Error::model("Failed to extract final mel chunk"))?;
 
         let is_first = self.is_first_chunk;
