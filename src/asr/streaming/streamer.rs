@@ -73,6 +73,12 @@ pub struct RequestStreamer {
     // Audio overlap buffer for pre_encode_cache
     /// Audio samples to prepend to the next chunk (for overlap/pre_encode_cache)
     audio_overlap: Vec<f32>,
+
+    // Progress tracking
+    /// Counter for live audio chunks processed
+    live_chunk_counter: usize,
+    /// Total audio samples processed from live buffer
+    live_samples_processed: usize,
 }
 
 impl RequestStreamer {
@@ -116,6 +122,8 @@ impl RequestStreamer {
             is_done: false,
             n_mels,
             audio_overlap: Vec::new(),
+            live_chunk_counter: 0,
+            live_samples_processed: 0,
         }
     }
 
@@ -235,6 +243,8 @@ impl RequestStreamer {
         self.stream_ended = false;
         self.is_done = false;
         self.audio_overlap.clear();
+        self.live_chunk_counter = 0;
+        self.live_samples_processed = 0;
     }
 
     /// Get audio chunk size in samples for the current streaming config.
@@ -375,7 +385,8 @@ impl RequestStreamer {
     /// This ensures proper windowing at chunk boundaries.
     fn mel_lookback_samples(&self) -> usize {
         // Python: n_chunk_look_back = int(timestep_duration * sample_rate) = 160
-        self.mel_buffer.hop_samples
+        // JJK save multiple hops because if the window size is 512, hop is 160, lookback is 352
+        self.mel_buffer.window_samples - self.mel_buffer.hop_samples
     }
 
     /// Build the audio buffer for mel computation.
@@ -457,7 +468,7 @@ impl RequestStreamer {
         if let Some(audio_chunk) = audio_chunk {
             if !audio_chunk.is_empty() {
                 // Reset preprocessor state before each chunk
-                self.preprocessor.reset();
+                // self.preprocessor.reset();
 
                 // Build the audio buffer with small lookback for mel continuity
                 let audio_buffer = self.build_audio_buffer(&audio_chunk);
@@ -520,6 +531,10 @@ impl RequestStreamer {
             // Take exactly chunk_audio_size samples
             let audio_chunk: Vec<f32> = self.live_buffer.drain(..chunk_audio_size).collect();
 
+            // Update progress counters
+            self.live_chunk_counter += 1;
+            self.live_samples_processed += audio_chunk.len();
+
             // Build the audio buffer with small lookback for mel continuity
             let audio_buffer = self.build_audio_buffer(&audio_chunk);
 
@@ -553,6 +568,8 @@ impl RequestStreamer {
                 self.mel_buffer.append_mel(&mel_to_append)?;
 
                 tracing::trace!(
+                    chunk_num = self.live_chunk_counter,
+                    samples_processed = self.live_samples_processed,
                     audio_chunk_len = audio_chunk.len(),
                     audio_buffer_len = audio_buffer.len(),
                     mel_computed = n_frames,
@@ -573,15 +590,20 @@ impl RequestStreamer {
             );
 
             // Reset preprocessor state
-            self.preprocessor.reset();
+            // self.preprocessor.reset();
 
             // Build the audio buffer
             let remaining = self.live_buffer.clone();
             let audio_buffer = self.build_audio_buffer(&remaining);
 
-            let mel = self.preprocessor.process_chunk(&audio_buffer)?;
+            let audio_array =
+                mlx_rs::Array::from_slice(&audio_buffer, &[audio_buffer.len() as i32]);
+            let (mel, _lengths) = self.preprocessor.forward(&audio_array, None)?;
+            // Remove batch dim: [batch, n_mels, frames] -> [n_mels, frames]
+            let mel = mel.index(0);
             mel.eval()?;
             let n_frames = mel.dim(1) as usize;
+
             if n_frames > 0 {
                 // Keep all mel frames
                 self.mel_buffer.append_mel(&mel)?;
