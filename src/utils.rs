@@ -128,7 +128,7 @@ pub mod collections {
     /// remove_duplicates(&mut vec);
     /// assert_eq!(vec, vec![1, 2, 3, 4]);
     /// ```
-    pub fn remove_duplicates<T: Eq + std::hash::Hash>(vec: &mut Vec<T>) {
+    pub fn remove_duplicates<T: Eq + std::hash::Hash + Clone>(vec: &mut Vec<T>) {
         let mut seen = std::collections::HashSet::new();
         vec.retain(|item| seen.insert(item.clone()));
     }
