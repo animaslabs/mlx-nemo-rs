@@ -495,6 +495,17 @@ impl CacheAwareRNNTPipeline {
             &mut self.state.last_token,
         )?;
 
+        // Log when all frames produce blank (potential stuck state)
+        if decode_output.new_tokens.is_empty() && decode_output.blank_count > 0 {
+            tracing::trace!(
+                step = self.state.step_count,
+                last_token = ?self.state.last_token,
+                blank_count = decode_output.blank_count,
+                total_tokens = self.state.accumulated_tokens.len(),
+                "all frames produced blank"
+            );
+        }
+
         // Accumulate tokens
         self.state
             .accumulated_tokens

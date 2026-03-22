@@ -138,6 +138,47 @@ impl RnntStreamingDecoder {
                 prediction.eval()?;
                 let pred_token = prediction.as_slice::<u32>()[0] as usize;
 
+                // Debug: log encoder and prediction norms for frame 0
+                if t == 0 && symbols_emitted == 0 {
+                    let enc_data = enc_frame.as_slice::<f32>();
+                    let enc_norm: f32 = enc_data.iter().map(|v| v * v).sum::<f32>().sqrt();
+                    let pred_data = pred_output.as_slice::<f32>();
+                    let pred_norm: f32 = pred_data.iter().map(|v| v * v).sum::<f32>().sqrt();
+                    trace!(
+                        frame = t,
+                        enc_norm = %format!("{:.4}", enc_norm),
+                        pred_norm = %format!("{:.4}", pred_norm),
+                        last_token = ?last_token,
+                        pred_token,
+                        "frame 0 debug"
+                    );
+                }
+
+                // Debug: log probabilities for first frame when blank is predicted
+                if pred_token == self.blank_id && t == 0 && symbols_emitted == 0 {
+                    let probs_data = log_probs.as_slice::<f32>();
+                    let blank_prob = probs_data[self.blank_id];
+
+                    // Find top non-blank token
+                    let mut best_non_blank_prob = f32::NEG_INFINITY;
+                    let mut best_non_blank_token = 0;
+                    for (i, &prob) in probs_data.iter().enumerate() {
+                        if i != self.blank_id && prob > best_non_blank_prob {
+                            best_non_blank_prob = prob;
+                            best_non_blank_token = i;
+                        }
+                    }
+
+                    trace!(
+                        frame = t,
+                        blank_log_prob = %format!("{:.4}", blank_prob),
+                        best_non_blank_token,
+                        best_non_blank_log_prob = %format!("{:.4}", best_non_blank_prob),
+                        prob_diff = %format!("{:.4}", blank_prob - best_non_blank_prob),
+                        "blank predicted on frame 0"
+                    );
+                }
+
                 if pred_token == self.blank_id {
                     // Blank: advance to next encoder frame
                     output.blank_count += 1;

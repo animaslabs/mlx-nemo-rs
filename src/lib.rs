@@ -26,6 +26,8 @@ pub mod core;
 pub mod asr;
 
 pub mod audio;
+pub mod math;
+pub mod utils;
 
 // Re-export commonly used types
 pub use core::error::{Error, Result};

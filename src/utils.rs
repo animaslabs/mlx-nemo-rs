@@ -49,7 +49,7 @@ pub mod strings {
         let cleaned: String = s
             .chars()
             .filter(|c| c.is_alphanumeric())
-            .map(|c| c.to_lowercase())
+            .flat_map(|c| c.to_lowercase())
             .collect();
 
         cleaned == cleaned.chars().rev().collect::<String>()
