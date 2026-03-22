@@ -36,7 +36,7 @@ uv pip install torch numpy soundfile numba
 # Install NeMo without deps to avoid numba version conflicts
 echo ""
 echo "Installing NeMo toolkit..."
-uv pip install nemo_toolkit --no-deps
+uv pip install --no-deps git+https://github.com/NVIDIA-NeMo/NeMo.git@main
 
 # Install remaining dependencies
 echo ""
