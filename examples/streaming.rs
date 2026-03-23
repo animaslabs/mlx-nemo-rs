@@ -187,7 +187,7 @@ fn main() -> mlx_nemo::Result<()> {
                 "STEP {} new_tokens=[{}] total_tokens={}",
                 transcribe_steps,
                 new_tokens_str.join(", "),
-                output.tokens.len()
+                output.token_count
             );
             transcribe_steps += 1;
 

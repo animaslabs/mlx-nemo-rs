@@ -26,8 +26,10 @@ pub struct TranscribeOutput {
     pub text: String,
     /// New tokens emitted in this step
     pub new_tokens: Vec<usize>,
-    /// All accumulated token IDs
+    /// All accumulated token IDs (only populated when `is_final` is true to avoid O(N²) memory)
     pub tokens: Vec<usize>,
+    /// Total number of accumulated tokens (available on every step)
+    pub token_count: usize,
     /// Whether this is the final output
     pub is_final: bool,
 }
@@ -525,10 +527,19 @@ impl CacheAwareRNNTPipeline {
             String::new()
         };
 
+        // Only clone accumulated_tokens on final output to avoid O(N²) memory usage
+        let token_count = self.state.accumulated_tokens.len();
+        let tokens = if is_last {
+            self.state.accumulated_tokens.clone()
+        } else {
+            Vec::new()
+        };
+
         Ok(Some(TranscribeOutput {
             text,
             new_tokens: decode_output.new_tokens,
-            tokens: self.state.accumulated_tokens.clone(),
+            tokens,
+            token_count,
             is_final: is_last,
         }))
     }

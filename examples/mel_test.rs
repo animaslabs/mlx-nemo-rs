@@ -104,7 +104,7 @@ fn main() -> mlx_nemo::Result<()> {
         chunk_size, pre_encode_cache, total_needed
     );
 
-    if let Some((extracted, len)) = buffer.extract_chunk(chunk_size, shift_size, pre_encode_cache) {
+    if let Some((extracted, len, _valid_frames)) = buffer.extract_chunk(chunk_size, shift_size, pre_encode_cache) {
         extracted.eval()?;
         println!(
             "Extracted chunk shape: {:?}, len: {}",

@@ -337,6 +337,10 @@ impl RequestStreamer {
             .extract_chunk(chunk_size, shift_size, pre_encode_cache)
             .ok_or_else(|| Error::model("Failed to extract mel chunk"))?;
 
+        // Trim old mel frames to bound memory usage.
+        // Keep enough frames for the pre_encode_cache overlap needed for next chunk.
+        self.mel_buffer.trim_old_frames(pre_encode_cache)?;
+
         tracing::debug!(
             chunk_size,
             shift_size,
@@ -352,6 +356,7 @@ impl RequestStreamer {
         // DO NOT reset mel buffer - we need to preserve overlap frames for pre_encode_cache!
         // Python's BatchedCacheFeatureBufferer keeps the last pre_encode_cache frames
         // by shifting the buffer left, not by resetting it.
+        // NOTE: trim_old_frames above handles memory cleanup while preserving the overlap.
 
         let is_first = self.is_first_chunk;
         self.is_first_chunk = false;
