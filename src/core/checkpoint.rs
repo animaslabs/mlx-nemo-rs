@@ -576,7 +576,20 @@ impl SafetensorsLoader {
         // Find tokenizer (optional)
         let tokenizer_path = Self::find_tokenizer_in_dir(dir);
 
-        Self::new(weights_path, config_path, tokenizer_path)
+        let mut loader = Self::new(weights_path, config_path, tokenizer_path)?;
+
+        // If quantization wasn't found in the main config (e.g., model_config.yaml),
+        // also check config.json which is where MLX stores quantization info
+        if loader.quantization.is_none() {
+            let config_json = dir.join("config.json");
+            if config_json.exists() {
+                if let Ok(content) = std::fs::read_to_string(&config_json) {
+                    loader.quantization = Self::parse_quantization_config(&content);
+                }
+            }
+        }
+
+        Ok(loader)
     }
 
     /// Load weights from the safetensors file.

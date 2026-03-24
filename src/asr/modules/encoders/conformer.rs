@@ -584,9 +584,9 @@ impl ConformerEncoder {
         quant: Option<&QuantizationConfig>,
     ) -> Result<()> {
         // Load subsampling weights (NeMo uses encoder.pre_encode prefix)
-        // Subsampling uses Conv layers, not quantized
+        // Conv layers are not quantized, but output projection may be
         self.subsampling
-            .load_weights(weights, "encoder.pre_encode")?;
+            .load_weights(weights, "encoder.pre_encode", quant)?;
 
         // Load conformer block weights (NeMo uses encoder.layers.N prefix)
         // Position biases are per-layer (not shared), loaded in ConformerBlock
@@ -1064,7 +1064,7 @@ struct Subsampling {
     pointwise_convs: Vec<nn::Conv2d>,
 
     /// Output projection: Linear(conv_channels * reduced_feat, d_model)
-    out_proj: nn::Linear,
+    out_proj: LinearLayer,
 
     /// Whether to use causal (left-only) padding for streaming
     is_causal: bool,
@@ -1146,10 +1146,11 @@ impl Subsampling {
         );
         let linear_in = conv_channels * feat_out;
 
-        let use_bias = config.effective_use_bias();
-        let out_proj = nn::LinearBuilder::new(linear_in as i32, d_model as i32)
-            .bias(true)
-            .build()?;
+        // Create placeholder LinearLayer - weights will be loaded later
+        let out_proj = LinearLayer::standard(
+            mlx_rs::ops::zeros::<f32>(&[d_model as i32, linear_in as i32])?,
+            Some(mlx_rs::ops::zeros::<f32>(&[d_model as i32])?),
+        );
 
         Ok(Self {
             subsampling_factor,
@@ -1507,7 +1508,12 @@ impl Subsampling {
         Ok((x, new_lengths))
     }
 
-    fn load_weights(&mut self, weights: &HashMap<String, Array>, prefix: &str) -> Result<()> {
+    fn load_weights(
+        &mut self,
+        weights: &HashMap<String, Array>,
+        prefix: &str,
+        quant: Option<&QuantizationConfig>,
+    ) -> Result<()> {
         // Load first conv: encoder.pre_encode.conv.0
         load_conv2d(&mut self.first_conv, weights, &format!("{}.conv.0", prefix));
 
@@ -1526,13 +1532,10 @@ impl Subsampling {
             load_conv2d(pw_conv, weights, &format!("{}.conv.{}", prefix, pw_idx));
         }
 
-        // Load output projection
+        // Load output projection (may be quantized)
         let proj_prefix = format!("{}.out", prefix);
-        if let Some(weight) = weights.get(&format!("{}.weight", proj_prefix)) {
-            self.out_proj.weight.value = weight.clone();
-        }
-        if let Some(bias) = weights.get(&format!("{}.bias", proj_prefix)) {
-            self.out_proj.bias.value = Some(bias.clone());
+        if let Some(layer) = load_linear_layer(weights, &proj_prefix, quant) {
+            self.out_proj = layer;
         }
 
         Ok(())
