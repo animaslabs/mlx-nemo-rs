@@ -6,9 +6,10 @@
 //!
 //! Usage:
 //!   cargo run --example live_pipeline -- --model path/to/streaming-model.nemo
+//!   cargo run --example live_pipeline -- --model path/to/mlx-model-directory
 //!
 //! Options:
-//!   --model <path>      Path to NeMo streaming model (.nemo file)
+//!   --model <path>      Path to NeMo streaming model (.nemo file or MLX directory)
 //!   --mode <idx>        Streaming mode index (default: 0)
 //!   --device <name>     Audio input device name (default: system default)
 //!   --list-devices      List available audio input devices and exit
@@ -21,6 +22,7 @@
 //! Press Ctrl+C to stop and see the final transcription.
 
 use std::io::{self, Write};
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
@@ -107,10 +109,10 @@ fn main() -> mlx_nemo::Result<()> {
 
     // Check for model path
     let model_path = model_path.unwrap_or_else(|| {
-        eprintln!("Usage: {} --model <model.nemo> [options]", args[0]);
+        eprintln!("Usage: {} --model <model> [options]", args[0]);
         eprintln!();
         eprintln!("Options:");
-        eprintln!("  --model <path>      Path to NeMo streaming model (.nemo file)");
+        eprintln!("  --model <path>      Path to NeMo streaming model (.nemo file or MLX directory)");
         eprintln!("  --mode <idx>        Streaming mode index (default: 0)");
         eprintln!("  --device <name>     Audio input device name (default: system default)");
         eprintln!("  --list-devices      List available audio input devices and exit");
@@ -118,10 +120,15 @@ fn main() -> mlx_nemo::Result<()> {
         std::process::exit(1);
     });
 
-    // Load pipeline
+    // Load pipeline (detect directory vs .nemo file)
     println!("Loading pipeline from: {}", model_path);
     let start = Instant::now();
-    let mut pipeline = CacheAwareRNNTPipeline::restore(model_path, mode_idx)?;
+    let model_path_ref = Path::new(model_path);
+    let mut pipeline = if model_path_ref.is_dir() {
+        CacheAwareRNNTPipeline::restore_from_directory(model_path_ref, mode_idx)?
+    } else {
+        CacheAwareRNNTPipeline::restore(model_path_ref, mode_idx)?
+    };
     println!("Pipeline loaded in {:.2}s", start.elapsed().as_secs_f32());
 
     let target_rate = pipeline.sample_rate();
