@@ -16,6 +16,7 @@
 //!   --list-modes       List available streaming modes and exit
 
 use std::io::{self, Write};
+use std::path::Path;
 use std::time::Instant;
 
 use mlx_nemo::asr::{CacheAwareRNNTPipeline, StreamingModeInfo};
@@ -78,10 +79,15 @@ fn main() -> mlx_nemo::Result<()> {
         std::process::exit(1);
     });
 
-    // Load pipeline
+    // Load pipeline (detect directory vs .nemo file)
     println!("Loading pipeline from: {}", model_path);
     let start = Instant::now();
-    let mut pipeline = CacheAwareRNNTPipeline::restore(model_path, mode_idx)?;
+    let model_path_ref = Path::new(model_path);
+    let mut pipeline = if model_path_ref.is_dir() {
+        CacheAwareRNNTPipeline::restore_from_directory(model_path_ref, mode_idx)?
+    } else {
+        CacheAwareRNNTPipeline::restore(model_path_ref, mode_idx)?
+    };
     println!("Pipeline loaded in {:.2}s", start.elapsed().as_secs_f32());
 
     let sample_rate = pipeline.sample_rate();
