@@ -644,13 +644,19 @@ impl RNNTDecoder {
 
     /// Load weights from a checkpoint.
     pub fn load_weights(&mut self, weights: &HashMap<String, Array>, prefix: &str) -> Result<()> {
-        // NeMo keys:
+        // NeMo/PyTorch keys:
         // decoder.prediction.embed.weight: [vocab_size + 1, pred_hidden]
         // decoder.prediction.dec_rnn.lstm.weight_ih_l0: [4 * hidden, input_size]
         // decoder.prediction.dec_rnn.lstm.weight_hh_l0: [4 * hidden, hidden_size]
         // decoder.prediction.dec_rnn.lstm.bias_ih_l0: [4 * hidden]
         // decoder.prediction.dec_rnn.lstm.bias_hh_l0: [4 * hidden]
         // (and l1 for second layer, etc.)
+        //
+        // MLX keys (alternative naming):
+        // decoder.prediction.dec_rnn.lstm.0.Wx: [4 * hidden, input_size] (= weight_ih)
+        // decoder.prediction.dec_rnn.lstm.0.Wh: [4 * hidden, hidden_size] (= weight_hh)
+        // decoder.prediction.dec_rnn.lstm.0.bias: [4 * hidden] (combined bias)
+        // (and .1 for second layer, etc.)
 
         // Load embedding
         let embed_key = format!("{}.prediction.embed.weight", prefix);
@@ -661,8 +667,9 @@ impl RNNTDecoder {
             tracing::warn!("Prediction embedding not found at {}", embed_key);
         }
 
-        // Load LSTM layers
+        // Load LSTM layers - try both PyTorch and MLX naming conventions
         for layer_idx in 0..self.num_layers {
+            // PyTorch naming
             let weight_ih_key = format!(
                 "{}.prediction.dec_rnn.lstm.weight_ih_l{}",
                 prefix, layer_idx
@@ -674,32 +681,62 @@ impl RNNTDecoder {
             let bias_ih_key = format!("{}.prediction.dec_rnn.lstm.bias_ih_l{}", prefix, layer_idx);
             let bias_hh_key = format!("{}.prediction.dec_rnn.lstm.bias_hh_l{}", prefix, layer_idx);
 
-            if let Some(w) = weights.get(&weight_ih_key) {
+            // MLX naming
+            let mlx_wx_key = format!("{}.prediction.dec_rnn.lstm.{}.Wx", prefix, layer_idx);
+            let mlx_wh_key = format!("{}.prediction.dec_rnn.lstm.{}.Wh", prefix, layer_idx);
+            let mlx_bias_key = format!("{}.prediction.dec_rnn.lstm.{}.bias", prefix, layer_idx);
+
+            // Try PyTorch naming first, then MLX naming
+            let weight_ih_loaded = if let Some(w) = weights.get(&weight_ih_key) {
                 self.lstm_layers[layer_idx].weight_ih = w.clone();
-                tracing::debug!("Loaded LSTM layer {} weight_ih: {:?}", layer_idx, w.shape());
+                tracing::debug!("Loaded LSTM layer {} weight_ih (PyTorch): {:?}", layer_idx, w.shape());
+                true
+            } else if let Some(w) = weights.get(&mlx_wx_key) {
+                self.lstm_layers[layer_idx].weight_ih = w.clone();
+                tracing::debug!("Loaded LSTM layer {} weight_ih (MLX Wx): {:?}", layer_idx, w.shape());
+                true
             } else {
-                tracing::warn!("LSTM weight_ih not found at {}", weight_ih_key);
-            }
+                tracing::warn!("LSTM weight_ih not found at {} or {}", weight_ih_key, mlx_wx_key);
+                false
+            };
 
-            if let Some(w) = weights.get(&weight_hh_key) {
+            let weight_hh_loaded = if let Some(w) = weights.get(&weight_hh_key) {
                 self.lstm_layers[layer_idx].weight_hh = w.clone();
-                tracing::debug!("Loaded LSTM layer {} weight_hh: {:?}", layer_idx, w.shape());
+                tracing::debug!("Loaded LSTM layer {} weight_hh (PyTorch): {:?}", layer_idx, w.shape());
+                true
+            } else if let Some(w) = weights.get(&mlx_wh_key) {
+                self.lstm_layers[layer_idx].weight_hh = w.clone();
+                tracing::debug!("Loaded LSTM layer {} weight_hh (MLX Wh): {:?}", layer_idx, w.shape());
+                true
             } else {
-                tracing::warn!("LSTM weight_hh not found at {}", weight_hh_key);
-            }
+                tracing::warn!("LSTM weight_hh not found at {} or {}", weight_hh_key, mlx_wh_key);
+                false
+            };
 
-            if let Some(b) = weights.get(&bias_ih_key) {
+            // For bias, try PyTorch naming first (separate biases)
+            let bias_loaded = if let Some(b) = weights.get(&bias_ih_key) {
                 self.lstm_layers[layer_idx].bias_ih = b.clone();
-                tracing::debug!("Loaded LSTM layer {} bias_ih: {:?}", layer_idx, b.shape());
+                tracing::debug!("Loaded LSTM layer {} bias_ih (PyTorch): {:?}", layer_idx, b.shape());
+                if let Some(b2) = weights.get(&bias_hh_key) {
+                    self.lstm_layers[layer_idx].bias_hh = b2.clone();
+                    tracing::debug!("Loaded LSTM layer {} bias_hh (PyTorch): {:?}", layer_idx, b2.shape());
+                }
+                true
+            } else if let Some(b) = weights.get(&mlx_bias_key) {
+                // MLX has a single combined bias - set it as bias_ih and zero out bias_hh
+                // The LSTM cell computes: gates = x @ W_ih^T + b_ih + h @ W_hh^T + b_hh
+                // With combined bias: b = b_ih + b_hh, so we set b_ih = b and b_hh = 0
+                self.lstm_layers[layer_idx].bias_ih = b.clone();
+                self.lstm_layers[layer_idx].bias_hh = Array::zeros::<f32>(&[b.dim(0) as i32])?;
+                tracing::debug!("Loaded LSTM layer {} combined bias (MLX): {:?}", layer_idx, b.shape());
+                true
             } else {
-                tracing::warn!("LSTM bias_ih not found at {}", bias_ih_key);
-            }
+                tracing::warn!("LSTM bias not found at {}/{} or {}", bias_ih_key, bias_hh_key, mlx_bias_key);
+                false
+            };
 
-            if let Some(b) = weights.get(&bias_hh_key) {
-                self.lstm_layers[layer_idx].bias_hh = b.clone();
-                tracing::debug!("Loaded LSTM layer {} bias_hh: {:?}", layer_idx, b.shape());
-            } else {
-                tracing::warn!("LSTM bias_hh not found at {}", bias_hh_key);
+            if weight_ih_loaded && weight_hh_loaded && bias_loaded {
+                tracing::info!("Successfully loaded LSTM layer {}", layer_idx);
             }
         }
 
