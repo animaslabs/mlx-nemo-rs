@@ -49,9 +49,9 @@ fn main() -> mlx_nemo::Result<()> {
     // Create encoder (has subsampling layer)
     let mut encoder = ConformerEncoder::new(config.encoder.clone())?;
 
-    // Load encoder weights
+    // Load encoder weights (.nemo files are not quantized)
     let weights = checkpoint.load_weights()?;
-    encoder.load_weights(&weights)?;
+    encoder.load_weights(&weights, None)?;
 
     // Streaming parameters (matching Python debug script)
     let hop_samples = 160;  // 10ms at 16kHz

@@ -196,12 +196,12 @@ impl CacheAwareRNNTPipeline {
             vocab_size + 1,
         )?;
 
-        // Load weights
+        // Load weights (.nemo files are not quantized)
         let weights = checkpoint.load_weights()?;
         // Note: MelSpectrogram doesn't need weight loading (uses fixed mel filterbanks)
-        encoder.load_weights(&weights)?;
-        decoder.load_weights(&weights, "decoder")?;
-        joint.load_weights(&weights, "joint")?;
+        encoder.load_weights(&weights, None)?;
+        decoder.load_weights(&weights, "decoder", None)?;
+        joint.load_weights(&weights, "joint", None)?;
 
         // Set encoder's attention context for the selected streaming mode
         // This ensures the encoder uses the correct left/right context for attention masking
@@ -416,12 +416,18 @@ impl CacheAwareRNNTPipeline {
             vocab_size + 1,
         )?;
 
-        // Load weights
+        // Load weights (may be quantized)
         let weights = loader.load_weights()?;
-        tracing::debug!("Loading {} weight tensors (format: {:?})", weights.len(), loader.weight_format);
-        encoder.load_weights(&weights)?;
-        decoder.load_weights(&weights, "decoder")?;
-        joint.load_weights(&weights, "joint")?;
+        let quant = loader.quantization();
+        tracing::debug!(
+            "Loading {} weight tensors (format: {:?}, quantized: {})",
+            weights.len(),
+            loader.weight_format,
+            quant.is_some()
+        );
+        encoder.load_weights(&weights, quant)?;
+        decoder.load_weights(&weights, "decoder", quant)?;
+        joint.load_weights(&weights, "joint", quant)?;
 
         // Set encoder's attention context for the selected streaming mode
         encoder.set_streaming_mode(mode_idx);

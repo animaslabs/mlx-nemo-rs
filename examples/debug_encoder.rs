@@ -49,9 +49,9 @@ fn main() -> mlx_nemo::Result<()> {
     // Create encoder
     let mut encoder = ConformerEncoder::new(config.encoder.clone())?;
 
-    // Load weights
+    // Load weights (.nemo files are not quantized)
     let weights = checkpoint.load_weights()?;
-    encoder.load_weights(&weights)?;
+    encoder.load_weights(&weights, None)?;
 
     println!("\nEncoder config:");
     println!("  d_model: {}", encoder.d_model());

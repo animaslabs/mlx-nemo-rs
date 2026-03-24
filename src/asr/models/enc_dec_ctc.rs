@@ -47,6 +47,7 @@ use crate::asr::streaming::{
 use crate::core::checkpoint::NemoCheckpoint;
 use crate::core::config::from_yaml_str;
 use crate::core::error::{Error, Result};
+use crate::core::quantization::QuantizationConfig;
 
 /// Debug output containing all intermediate tensors from forward pass.
 pub struct DebugOutput {
@@ -151,14 +152,14 @@ impl EncDecCTCModel {
             model.load_tokenizer(&tokenizer_path)?;
         }
 
-        // Load weights
+        // Load weights (.nemo files are not quantized)
         // Note: For now, we support safetensors format
         // PyTorch .ckpt support requires additional work
         if checkpoint.weights_path.is_some() {
             match checkpoint.load_weights() {
                 Ok(weights) => {
                     tracing::debug!("Loading {} weight tensors", weights.len());
-                    model.load_weights(&weights)?;
+                    model.load_weights(&weights, None)?;
                 }
                 Err(e) => {
                     tracing::warn!("Could not load weights: {}", e);
@@ -250,10 +251,16 @@ impl EncDecCTCModel {
             model.load_tokenizer(tok_path)?;
         }
 
-        // Load weights
+        // Load weights (may be quantized)
         let weights = loader.load_weights()?;
-        tracing::debug!("Loading {} weight tensors (format: {:?})", weights.len(), loader.weight_format);
-        model.load_weights(&weights)?;
+        let quant = loader.quantization();
+        tracing::debug!(
+            "Loading {} weight tensors (format: {:?}, quantized: {})",
+            weights.len(),
+            loader.weight_format,
+            quant.is_some()
+        );
+        model.load_weights(&weights, quant)?;
 
         Ok(model)
     }
@@ -299,10 +306,16 @@ impl EncDecCTCModel {
             model.load_tokenizer(tok_path)?;
         }
 
-        // Load weights
+        // Load weights (may be quantized)
         let weights = loader.load_weights()?;
-        tracing::debug!("Loading {} weight tensors (format: {:?})", weights.len(), loader.weight_format);
-        model.load_weights(&weights)?;
+        let quant = loader.quantization();
+        tracing::debug!(
+            "Loading {} weight tensors (format: {:?}, quantized: {})",
+            weights.len(),
+            loader.weight_format,
+            quant.is_some()
+        );
+        model.load_weights(&weights, quant)?;
 
         Ok(model)
     }
@@ -322,12 +335,17 @@ impl EncDecCTCModel {
     }
 
     /// Load weights from a HashMap.
+    ///
+    /// # Arguments
+    /// * `weights` - Weight dictionary
+    /// * `quant` - Optional quantization config for quantized models
     pub fn load_weights(
         &mut self,
         weights: &std::collections::HashMap<String, Array>,
+        quant: Option<&QuantizationConfig>,
     ) -> Result<()> {
-        self.encoder.load_weights(weights)?;
-        self.decoder.load_weights(weights, "decoder")?;
+        self.encoder.load_weights(weights, quant)?;
+        self.decoder.load_weights(weights, "decoder", quant)?;
         Ok(())
     }
 

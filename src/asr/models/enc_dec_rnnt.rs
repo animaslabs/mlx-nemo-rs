@@ -41,6 +41,7 @@ use crate::asr::streaming::{
 use crate::core::checkpoint::NemoCheckpoint;
 use crate::core::config::from_yaml_str;
 use crate::core::error::{Error, Result};
+use crate::core::quantization::QuantizationConfig;
 
 /// Decoding strategy for RNNT models.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -156,10 +157,20 @@ impl PredictionNetwork {
     }
 
     /// Load weights from a checkpoint.
-    pub fn load_weights(&mut self, weights: &HashMap<String, Array>, prefix: &str) -> Result<()> {
+    ///
+    /// # Arguments
+    /// * `weights` - Weight dictionary
+    /// * `prefix` - Key prefix for this layer
+    /// * `quant` - Optional quantization config for quantized models
+    pub fn load_weights(
+        &mut self,
+        weights: &HashMap<String, Array>,
+        prefix: &str,
+        quant: Option<&QuantizationConfig>,
+    ) -> Result<()> {
         match self {
-            Self::Stateless(d) => d.load_weights(weights, prefix),
-            Self::Lstm(d) => d.load_weights(weights, prefix),
+            Self::Stateless(d) => d.load_weights(weights, prefix, quant),
+            Self::Lstm(d) => d.load_weights(weights, prefix, quant),
         }
     }
 
@@ -323,12 +334,12 @@ impl EncDecRNNTModel {
             model.load_tokenizer(&tokenizer_path)?;
         }
 
-        // Load weights
+        // Load weights (.nemo files are not quantized)
         if checkpoint.weights_path.is_some() {
             match checkpoint.load_weights() {
                 Ok(weights) => {
                     tracing::debug!("Loading {} weight tensors", weights.len());
-                    model.load_weights(&weights)?;
+                    model.load_weights(&weights, None)?;
                 }
                 Err(e) => {
                     tracing::warn!("Could not load weights: {}", e);
@@ -428,10 +439,16 @@ impl EncDecRNNTModel {
             model.load_tokenizer(tok_path)?;
         }
 
-        // Load weights
+        // Load weights (may be quantized)
         let weights = loader.load_weights()?;
-        tracing::debug!("Loading {} weight tensors (format: {:?})", weights.len(), loader.weight_format);
-        model.load_weights(&weights)?;
+        let quant = loader.quantization();
+        tracing::debug!(
+            "Loading {} weight tensors (format: {:?}, quantized: {})",
+            weights.len(),
+            loader.weight_format,
+            quant.is_some()
+        );
+        model.load_weights(&weights, quant)?;
 
         Ok(model)
     }
@@ -486,10 +503,16 @@ impl EncDecRNNTModel {
             model.load_tokenizer(tok_path)?;
         }
 
-        // Load weights
+        // Load weights (may be quantized)
         let weights = loader.load_weights()?;
-        tracing::debug!("Loading {} weight tensors (format: {:?})", weights.len(), loader.weight_format);
-        model.load_weights(&weights)?;
+        let quant = loader.quantization();
+        tracing::debug!(
+            "Loading {} weight tensors (format: {:?}, quantized: {})",
+            weights.len(),
+            loader.weight_format,
+            quant.is_some()
+        );
+        model.load_weights(&weights, quant)?;
 
         Ok(model)
     }
@@ -540,15 +563,23 @@ impl EncDecRNNTModel {
     }
 
     /// Load weights from a HashMap.
-    pub fn load_weights(&mut self, weights: &HashMap<String, Array>) -> Result<()> {
-        // Load encoder weights
-        self.encoder.load_weights(weights)?;
+    ///
+    /// # Arguments
+    /// * `weights` - Weight dictionary
+    /// * `quant` - Optional quantization config for quantized models
+    pub fn load_weights(
+        &mut self,
+        weights: &HashMap<String, Array>,
+        quant: Option<&QuantizationConfig>,
+    ) -> Result<()> {
+        // Load encoder weights (linear layers may be quantized)
+        self.encoder.load_weights(weights, quant)?;
 
-        // Load decoder (prediction network) weights
-        self.decoder.load_weights(weights, "decoder")?;
+        // Load decoder (prediction network) weights (embeddings may be quantized)
+        self.decoder.load_weights(weights, "decoder", quant)?;
 
-        // Load joint network weights
-        self.joint.load_weights(weights, "joint")?;
+        // Load joint network weights (linear layers may be quantized)
+        self.joint.load_weights(weights, "joint", quant)?;
 
         Ok(())
     }

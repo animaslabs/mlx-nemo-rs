@@ -445,6 +445,9 @@ pub struct SafetensorsLoader {
     /// Detected or specified weight format.
     /// If None, format will be auto-detected from weight shapes during loading.
     pub weight_format: Option<crate::core::weights::WeightFormat>,
+
+    /// Quantization configuration, if the model is quantized.
+    pub quantization: Option<crate::core::quantization::QuantizationConfig>,
 }
 
 impl SafetensorsLoader {
@@ -495,12 +498,45 @@ impl SafetensorsLoader {
 
         let tokenizer_path = tokenizer_path.map(|p| p.as_ref().to_path_buf());
 
+        // Try to parse quantization config from JSON config
+        let quantization = Self::parse_quantization_config(&config_content);
+
         Ok(Self {
             weights_path,
             config_content,
             tokenizer_path,
             weight_format,
+            quantization,
         })
+    }
+
+    /// Parse quantization configuration from config content.
+    ///
+    /// Looks for `"quantization": { "bits": N, "group_size": M }` in JSON config.
+    fn parse_quantization_config(config_content: &str) -> Option<crate::core::quantization::QuantizationConfig> {
+        // Try parsing as JSON first
+        if let Ok(json) = serde_json::from_str::<serde_json::Value>(config_content) {
+            if let Some(quant) = json.get("quantization") {
+                let bits = quant.get("bits").and_then(|v| v.as_i64()).unwrap_or(8) as i32;
+                let group_size = quant.get("group_size").and_then(|v| v.as_i64()).unwrap_or(64) as i32;
+
+                tracing::info!(bits, group_size, "detected quantized model");
+                return Some(crate::core::quantization::QuantizationConfig::new(bits, group_size));
+            }
+        }
+
+        // Try parsing as YAML
+        if let Ok(yaml) = serde_yaml::from_str::<serde_yaml::Value>(config_content) {
+            if let Some(quant) = yaml.get("quantization") {
+                let bits = quant.get("bits").and_then(|v| v.as_i64()).unwrap_or(8) as i32;
+                let group_size = quant.get("group_size").and_then(|v| v.as_i64()).unwrap_or(64) as i32;
+
+                tracing::info!(bits, group_size, "detected quantized model");
+                return Some(crate::core::quantization::QuantizationConfig::new(bits, group_size));
+            }
+        }
+
+        None
     }
 
     /// Create a loader from explicit paths with a specific weight format.
@@ -584,6 +620,16 @@ impl SafetensorsLoader {
     /// Set the weight format explicitly.
     pub fn set_weight_format(&mut self, format: crate::core::weights::WeightFormat) {
         self.weight_format = Some(format);
+    }
+
+    /// Get the quantization config if the model is quantized.
+    pub fn quantization(&self) -> Option<&crate::core::quantization::QuantizationConfig> {
+        self.quantization.as_ref()
+    }
+
+    /// Check if this model is quantized.
+    pub fn is_quantized(&self) -> bool {
+        self.quantization.is_some()
     }
 
     // Helper: Find weights file in directory

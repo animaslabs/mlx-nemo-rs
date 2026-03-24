@@ -7,9 +7,10 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use mlx_rs::ops::indexing::IndexOp;
-use mlx_rs::{builder::Builder, module::Module, nn, ops, Array};
+use mlx_rs::{ops, Array};
 
 use crate::core::error::{Error, Result};
+use crate::core::quantization::{LinearLayer, QuantizationConfig, load_linear_layer};
 
 /// Global counter for attention forward calls (for debugging)
 static ATTENTION_CALL_COUNT: AtomicU64 = AtomicU64::new(0);
@@ -190,16 +191,16 @@ pub struct RelPositionMultiHeadAttention {
     n_heads: usize,
     head_dim: usize,
 
-    /// Query projection
-    linear_q: nn::Linear,
-    /// Key projection
-    linear_k: nn::Linear,
-    /// Value projection
-    linear_v: nn::Linear,
-    /// Output projection
-    linear_out: nn::Linear,
-    /// Position embedding projection (no bias)
-    linear_pos: nn::Linear,
+    /// Query projection (supports quantized weights)
+    linear_q: LinearLayer,
+    /// Key projection (supports quantized weights)
+    linear_k: LinearLayer,
+    /// Value projection (supports quantized weights)
+    linear_v: LinearLayer,
+    /// Output projection (supports quantized weights)
+    linear_out: LinearLayer,
+    /// Position embedding projection (no bias, supports quantized weights)
+    linear_pos: LinearLayer,
 
     /// Position bias for content attention [n_heads, head_dim]
     pos_bias_u: Array,
@@ -224,24 +225,22 @@ impl RelPositionMultiHeadAttention {
     pub fn new(d_model: usize, n_heads: usize, use_bias: bool) -> Result<Self> {
         let head_dim = d_model / n_heads;
 
-        // Create linear projections with configurable bias
-        let linear_q = nn::LinearBuilder::new(d_model as i32, d_model as i32)
-            .bias(use_bias)
-            .build()?;
-        let linear_k = nn::LinearBuilder::new(d_model as i32, d_model as i32)
-            .bias(use_bias)
-            .build()?;
-        let linear_v = nn::LinearBuilder::new(d_model as i32, d_model as i32)
-            .bias(use_bias)
-            .build()?;
-        let linear_out = nn::LinearBuilder::new(d_model as i32, d_model as i32)
-            .bias(use_bias)
-            .build()?;
+        // Create zero-initialized linear projections (will be loaded from weights)
+        let create_linear = |with_bias: bool| -> Result<LinearLayer> {
+            let weight = ops::zeros::<f32>(&[d_model as i32, d_model as i32])?;
+            let bias = if with_bias {
+                Some(ops::zeros::<f32>(&[d_model as i32])?)
+            } else {
+                None
+            };
+            Ok(LinearLayer::standard(weight, bias))
+        };
 
-        // Position projection always without bias (per NeMo spec)
-        let linear_pos = nn::LinearBuilder::new(d_model as i32, d_model as i32)
-            .bias(false)
-            .build()?;
+        let linear_q = create_linear(use_bias)?;
+        let linear_k = create_linear(use_bias)?;
+        let linear_v = create_linear(use_bias)?;
+        let linear_out = create_linear(use_bias)?;
+        let linear_pos = create_linear(false)?; // Position projection always without bias
 
         // Initialize position biases (will be loaded from weights)
         let pos_bias_u = ops::zeros::<f32>(&[n_heads as i32, head_dim as i32])?;
@@ -831,22 +830,35 @@ impl RelPositionMultiHeadAttention {
     }
 
     /// Load weights from a state dict.
-    pub fn load_weights(&mut self, weights: &HashMap<String, Array>, prefix: &str) -> Result<()> {
-        load_linear(&mut self.linear_q, weights, &format!("{}.linear_q", prefix));
-        load_linear(&mut self.linear_k, weights, &format!("{}.linear_k", prefix));
-        load_linear(&mut self.linear_v, weights, &format!("{}.linear_v", prefix));
-        load_linear(
-            &mut self.linear_out,
-            weights,
-            &format!("{}.linear_out", prefix),
-        );
-
-        // linear_pos has no bias
-        if let Some(weight) = weights.get(&format!("{}.linear_pos.weight", prefix)) {
-            self.linear_pos.weight.value = weight.clone();
+    ///
+    /// # Arguments
+    /// * `weights` - Weight dictionary
+    /// * `prefix` - Key prefix for this layer
+    /// * `quant` - Optional quantization config for quantized models
+    pub fn load_weights(
+        &mut self,
+        weights: &HashMap<String, Array>,
+        prefix: &str,
+        quant: Option<&QuantizationConfig>,
+    ) -> Result<()> {
+        // Load linear projections (supports both standard and quantized)
+        if let Some(layer) = load_linear_layer(weights, &format!("{}.linear_q", prefix), quant) {
+            self.linear_q = layer;
+        }
+        if let Some(layer) = load_linear_layer(weights, &format!("{}.linear_k", prefix), quant) {
+            self.linear_k = layer;
+        }
+        if let Some(layer) = load_linear_layer(weights, &format!("{}.linear_v", prefix), quant) {
+            self.linear_v = layer;
+        }
+        if let Some(layer) = load_linear_layer(weights, &format!("{}.linear_out", prefix), quant) {
+            self.linear_out = layer;
+        }
+        if let Some(layer) = load_linear_layer(weights, &format!("{}.linear_pos", prefix), quant) {
+            self.linear_pos = layer;
         }
 
-        // Load position biases (per-layer, not shared)
+        // Load position biases (per-layer, not shared, not quantized)
         if let Some(bias_u) = weights.get(&format!("{}.pos_bias_u", prefix)) {
             self.pos_bias_u = bias_u.clone();
         }
@@ -855,16 +867,6 @@ impl RelPositionMultiHeadAttention {
         }
 
         Ok(())
-    }
-}
-
-/// Helper to load Linear weights
-fn load_linear(layer: &mut nn::Linear, weights: &HashMap<String, Array>, prefix: &str) {
-    if let Some(weight) = weights.get(&format!("{}.weight", prefix)) {
-        layer.weight.value = weight.clone();
-    }
-    if let Some(bias) = weights.get(&format!("{}.bias", prefix)) {
-        layer.bias.value = Some(bias.clone());
     }
 }
 

@@ -6,12 +6,15 @@
 
 use std::collections::HashMap;
 
-use mlx_rs::ops::{self, indexing, indexing::IndexOp};
+use mlx_rs::ops::{self, indexing::IndexOp};
 use mlx_rs::Array;
 use tracing::{debug, instrument, trace, trace_span};
 
 use crate::asr::config::{DecoderConfig, JointConfig};
 use crate::core::error::{Error, Result};
+use crate::core::quantization::{
+    EmbeddingLayer, LinearLayer, QuantizationConfig, load_embedding_layer, load_linear_layer,
+};
 
 /// Stateless Transducer Decoder (Prediction Network).
 ///
@@ -21,8 +24,8 @@ use crate::core::error::{Error, Result};
 ///
 /// This is the decoder used by Parakeet RNNT models.
 pub struct StatelessTransducerDecoder {
-    /// Embedding layer: vocab_size + 1 (blank) -> pred_hidden
-    embedding_weight: Array,
+    /// Embedding layer: vocab_size + 1 (blank) -> pred_hidden (supports quantized weights)
+    embedding: EmbeddingLayer,
     /// Hidden dimension of prediction network
     pred_hidden: usize,
     /// Context size (number of previous tokens to consider)
@@ -52,9 +55,10 @@ impl StatelessTransducerDecoder {
         // Initialize embedding with zeros (will be loaded from weights)
         // Shape: [vocab_size + 1, pred_hidden] (includes blank token)
         let embedding_weight = Array::zeros::<f32>(&[(vocab_size + 1) as i32, pred_hidden as i32])?;
+        let embedding = EmbeddingLayer::standard(embedding_weight);
 
         Ok(Self {
-            embedding_weight,
+            embedding,
             pred_hidden,
             context_size,
             vocab_size,
@@ -288,38 +292,35 @@ impl StatelessTransducerDecoder {
     /// Get embeddings for token indices.
     fn embed(&self, indices: &Array) -> Result<Array> {
         // indices: [batch, seq_len] -> [batch, seq_len, pred_hidden]
-        let batch = indices.shape()[0];
-        let seq_len = indices.shape()[1];
-
-        // Flatten indices to [batch * seq_len]
-        let flat_indices = ops::reshape(indices, &[-1])?;
-
-        // Do embedding lookup using take_axis on axis 0
-        // embedding_weight: [vocab_size, pred_hidden]
-        // flat_indices: [batch * seq_len]
-        // result: [batch * seq_len, pred_hidden]
-        let flat_emb = indexing::take_axis(&self.embedding_weight, &flat_indices, 0)?;
-
-        // Reshape back to [batch, seq_len, pred_hidden]
-        let emb = ops::reshape(&flat_emb, &[batch, seq_len, self.pred_hidden as i32])?;
-
-        Ok(emb)
+        // Use EmbeddingLayer::lookup which handles both standard and quantized embeddings
+        self.embedding.lookup(indices)
     }
 
     /// Load weights from a checkpoint.
-    pub fn load_weights(&mut self, weights: &HashMap<String, Array>, prefix: &str) -> Result<()> {
-        // NeMo key: decoder.prediction.embed.weight
-        let embed_key = format!("{}.prediction.embed.weight", prefix);
+    ///
+    /// # Arguments
+    /// * `weights` - Weight dictionary
+    /// * `prefix` - Key prefix for this layer
+    /// * `quant` - Optional quantization config for quantized models
+    pub fn load_weights(
+        &mut self,
+        weights: &HashMap<String, Array>,
+        prefix: &str,
+        quant: Option<&QuantizationConfig>,
+    ) -> Result<()> {
+        // Try to load embedding using the quantization-aware loader
+        // NeMo key: decoder.prediction.embed
+        let embed_key = format!("{}.prediction.embed", prefix);
 
-        if let Some(weight) = weights.get(&embed_key) {
-            self.embedding_weight = weight.clone();
-            tracing::debug!("Loaded prediction embedding: {:?}", weight.shape());
+        if let Some(layer) = load_embedding_layer(weights, &embed_key, quant) {
+            self.embedding = layer;
+            tracing::debug!("Loaded prediction embedding from {}", embed_key);
         } else {
             // Try alternative key patterns
-            let alt_key = format!("{}.embed.weight", prefix);
-            if let Some(weight) = weights.get(&alt_key) {
-                self.embedding_weight = weight.clone();
-                tracing::debug!("Loaded prediction embedding (alt): {:?}", weight.shape());
+            let alt_key = format!("{}.embed", prefix);
+            if let Some(layer) = load_embedding_layer(weights, &alt_key, quant) {
+                self.embedding = layer;
+                tracing::debug!("Loaded prediction embedding from {}", alt_key);
             } else {
                 tracing::warn!(
                     "Prediction embedding not found at {} or {}",
@@ -344,9 +345,9 @@ impl StatelessTransducerDecoder {
 ///
 /// State consists of (hidden, cell) tensors for each LSTM layer.
 pub struct RNNTDecoder {
-    /// Embedding layer: vocab_size + 1 (blank) -> pred_hidden
-    embedding_weight: Array,
-    /// LSTM layers - list of (weight_ih, weight_hh, bias_ih, bias_hh)
+    /// Embedding layer: vocab_size + 1 (blank) -> pred_hidden (supports quantized weights)
+    embedding: EmbeddingLayer,
+    /// LSTM layers - list of (weight_ih, weight_hh, bias_ih, bias_hh) (not quantized)
     lstm_layers: Vec<LstmLayer>,
     /// Hidden dimension of prediction network
     pred_hidden: usize,
@@ -404,8 +405,9 @@ impl RNNTDecoder {
         // Initialize embedding with zeros (will be loaded from weights)
         // Shape: [vocab_size + 1, pred_hidden] (includes blank token)
         let embedding_weight = Array::zeros::<f32>(&[(vocab_size + 1) as i32, pred_hidden as i32])?;
+        let embedding = EmbeddingLayer::standard(embedding_weight);
 
-        // Initialize LSTM layers
+        // Initialize LSTM layers (not quantized)
         let mut lstm_layers = Vec::with_capacity(num_layers);
         for _ in 0..num_layers {
             // All layers have the same input/hidden size for NeMo models
@@ -419,7 +421,7 @@ impl RNNTDecoder {
         }
 
         Ok(Self {
-            embedding_weight,
+            embedding,
             lstm_layers,
             pred_hidden,
             num_layers,
@@ -624,26 +626,22 @@ impl RNNTDecoder {
     /// Get embeddings for token indices.
     fn embed(&self, indices: &Array) -> Result<Array> {
         // indices: [batch, seq_len] -> [batch, seq_len, pred_hidden]
-        let batch = indices.shape()[0];
-        let seq_len = indices.shape()[1];
-
-        // Flatten indices to [batch * seq_len]
-        let flat_indices = ops::reshape(indices, &[-1])?;
-
-        // Do embedding lookup using take_axis on axis 0
-        // embedding_weight: [vocab_size, pred_hidden]
-        // flat_indices: [batch * seq_len]
-        // result: [batch * seq_len, pred_hidden]
-        let flat_emb = indexing::take_axis(&self.embedding_weight, &flat_indices, 0)?;
-
-        // Reshape back to [batch, seq_len, pred_hidden]
-        let emb = ops::reshape(&flat_emb, &[batch, seq_len, self.pred_hidden as i32])?;
-
-        Ok(emb)
+        // Use EmbeddingLayer::lookup which handles both standard and quantized embeddings
+        self.embedding.lookup(indices)
     }
 
     /// Load weights from a checkpoint.
-    pub fn load_weights(&mut self, weights: &HashMap<String, Array>, prefix: &str) -> Result<()> {
+    ///
+    /// # Arguments
+    /// * `weights` - Weight dictionary
+    /// * `prefix` - Key prefix for this layer
+    /// * `quant` - Optional quantization config for quantized models
+    pub fn load_weights(
+        &mut self,
+        weights: &HashMap<String, Array>,
+        prefix: &str,
+        quant: Option<&QuantizationConfig>,
+    ) -> Result<()> {
         // NeMo/PyTorch keys:
         // decoder.prediction.embed.weight: [vocab_size + 1, pred_hidden]
         // decoder.prediction.dec_rnn.lstm.weight_ih_l0: [4 * hidden, input_size]
@@ -658,11 +656,11 @@ impl RNNTDecoder {
         // decoder.prediction.dec_rnn.lstm.0.bias: [4 * hidden] (combined bias)
         // (and .1 for second layer, etc.)
 
-        // Load embedding
-        let embed_key = format!("{}.prediction.embed.weight", prefix);
-        if let Some(weight) = weights.get(&embed_key) {
-            self.embedding_weight = weight.clone();
-            tracing::debug!("Loaded prediction embedding: {:?}", weight.shape());
+        // Load embedding (may be quantized)
+        let embed_key = format!("{}.prediction.embed", prefix);
+        if let Some(layer) = load_embedding_layer(weights, &embed_key, quant) {
+            self.embedding = layer;
+            tracing::debug!("Loaded prediction embedding from {}", embed_key);
         } else {
             tracing::warn!("Prediction embedding not found at {}", embed_key);
         }
@@ -790,15 +788,12 @@ impl JointActivation {
 ///
 /// where h is encoder output and g is prediction network output.
 pub struct RNNTJoint {
-    /// Projection from encoder hidden to joint hidden
-    encoder_proj_weight: Array,
-    encoder_proj_bias: Option<Array>,
-    /// Projection from prediction hidden to joint hidden
-    pred_proj_weight: Array,
-    pred_proj_bias: Option<Array>,
-    /// Output projection from joint hidden to vocabulary
-    joint_proj_weight: Array,
-    joint_proj_bias: Option<Array>,
+    /// Projection from encoder hidden to joint hidden (supports quantized weights)
+    encoder_proj: LinearLayer,
+    /// Projection from prediction hidden to joint hidden (supports quantized weights)
+    pred_proj: LinearLayer,
+    /// Output projection from joint hidden to vocabulary (supports quantized weights)
+    joint_proj: LinearLayer,
     /// Activation function
     activation: JointActivation,
     /// Joint hidden dimension
@@ -831,24 +826,21 @@ impl RNNTJoint {
             activation
         );
 
-        // Initialize weights with zeros (will be loaded from checkpoint)
-        let encoder_proj_weight =
-            Array::zeros::<f32>(&[joint_hidden as i32, encoder_hidden as i32])?;
-        let encoder_proj_bias = Some(Array::zeros::<f32>(&[joint_hidden as i32])?);
+        // Create zero-initialized linear layers (will be loaded from checkpoint)
+        let create_linear = |out_dim: usize, in_dim: usize| -> Result<LinearLayer> {
+            let weight = Array::zeros::<f32>(&[out_dim as i32, in_dim as i32])?;
+            let bias = Some(Array::zeros::<f32>(&[out_dim as i32])?);
+            Ok(LinearLayer::standard(weight, bias))
+        };
 
-        let pred_proj_weight = Array::zeros::<f32>(&[joint_hidden as i32, pred_hidden as i32])?;
-        let pred_proj_bias = Some(Array::zeros::<f32>(&[joint_hidden as i32])?);
-
-        let joint_proj_weight = Array::zeros::<f32>(&[vocab_size as i32, joint_hidden as i32])?;
-        let joint_proj_bias = Some(Array::zeros::<f32>(&[vocab_size as i32])?);
+        let encoder_proj = create_linear(joint_hidden, encoder_hidden)?;
+        let pred_proj = create_linear(joint_hidden, pred_hidden)?;
+        let joint_proj = create_linear(vocab_size, joint_hidden)?;
 
         Ok(Self {
-            encoder_proj_weight,
-            encoder_proj_bias,
-            pred_proj_weight,
-            pred_proj_bias,
-            joint_proj_weight,
-            joint_proj_bias,
+            encoder_proj,
+            pred_proj,
+            joint_proj,
             activation,
             joint_hidden,
             vocab_size,
@@ -895,20 +887,12 @@ impl RNNTJoint {
 
         // Project encoder: [B, T, joint_hidden]
         trace!("Projecting encoder output");
-        let enc_proj = self.linear(
-            encoder_output,
-            &self.encoder_proj_weight,
-            self.encoder_proj_bias.as_ref(),
-        )?;
+        let enc_proj = self.encoder_proj.forward(encoder_output)?;
         trace!(enc_proj_shape = ?enc_proj.shape(), "Encoder projection complete");
 
         // Project prediction: [B, U, joint_hidden]
         trace!("Projecting prediction output");
-        let pred_proj = self.linear(
-            pred_output,
-            &self.pred_proj_weight,
-            self.pred_proj_bias.as_ref(),
-        )?;
+        let pred_proj = self.pred_proj.forward(pred_output)?;
         trace!(pred_proj_shape = ?pred_proj.shape(), "Prediction projection complete");
 
         // Broadcast add: [B, T, 1, H] + [B, 1, U, H] -> [B, T, U, H]
@@ -933,11 +917,7 @@ impl RNNTJoint {
             &[batch * time * labels, self.joint_hidden as i32],
         )?;
 
-        let logits_flat = self.linear(
-            &joint_flat,
-            &self.joint_proj_weight,
-            self.joint_proj_bias.as_ref(),
-        )?;
+        let logits_flat = self.joint_proj.forward(&joint_flat)?;
 
         let logits = ops::reshape(&logits_flat, &[batch, time, labels, self.vocab_size as i32])?;
         trace!(logits_shape = ?logits.shape(), "Logits computed");
@@ -993,14 +973,10 @@ impl RNNTJoint {
         trace!(enc_shape = ?enc.shape(), pred_shape = ?pred.shape(), "Inputs prepared");
 
         // Project encoder: [B, joint_hidden]
-        let enc_proj = self.linear(
-            &enc,
-            &self.encoder_proj_weight,
-            self.encoder_proj_bias.as_ref(),
-        )?;
+        let enc_proj = self.encoder_proj.forward(&enc)?;
 
         // Project prediction: [B, joint_hidden]
-        let pred_proj = self.linear(&pred, &self.pred_proj_weight, self.pred_proj_bias.as_ref())?;
+        let pred_proj = self.pred_proj.forward(&pred)?;
 
         // Debug: compare encoder vs prediction projection magnitudes
         {
@@ -1046,11 +1022,7 @@ impl RNNTJoint {
 
         // Output projection: [B, vocab_size]
         trace!("Computing output logits");
-        let logits = self.linear(
-            &activated,
-            &self.joint_proj_weight,
-            self.joint_proj_bias.as_ref(),
-        )?;
+        let logits = self.joint_proj.forward(&activated)?;
 
         // Log softmax
         trace!("Applying log softmax");
@@ -1061,108 +1033,65 @@ impl RNNTJoint {
         Ok(log_probs)
     }
 
-    /// Linear transformation: y = xW^T + b
-    fn linear(&self, x: &Array, weight: &Array, bias: Option<&Array>) -> Result<Array> {
-        // x: [..., in_features], weight: [out_features, in_features]
-        // result: [..., out_features]
-        // Transpose weight: [out, in] -> [in, out]
-        let weight_t = weight.transpose()?;
-        let mut result = ops::matmul(x, &weight_t)?;
-
-        if let Some(b) = bias {
-            result = ops::add(&result, b)?;
-        }
-
-        Ok(result)
-    }
-
     /// Load weights from a checkpoint.
-    pub fn load_weights(&mut self, weights: &HashMap<String, Array>, prefix: &str) -> Result<()> {
+    ///
+    /// # Arguments
+    /// * `weights` - Weight dictionary
+    /// * `prefix` - Key prefix for this layer
+    /// * `quant` - Optional quantization config for quantized models
+    pub fn load_weights(
+        &mut self,
+        weights: &HashMap<String, Array>,
+        prefix: &str,
+        quant: Option<&QuantizationConfig>,
+    ) -> Result<()> {
         // NeMo keys:
         // joint.enc.weight, joint.enc.bias (or joint.encoder.weight)
         // joint.pred.weight, joint.pred.bias (or joint.prediction.weight)
         // joint.joint_net.0.weight, joint.joint_net.0.bias (linear)
         // joint.joint_net.2.weight, joint.joint_net.2.bias (output)
 
-        // Try different key patterns
-        let enc_weight_keys = [
-            format!("{}.enc.weight", prefix),
-            format!("{}.encoder.weight", prefix),
-            format!("{}.joint_net.0.weight", prefix),
-        ];
-        let enc_bias_keys = [
-            format!("{}.enc.bias", prefix),
-            format!("{}.encoder.bias", prefix),
-            format!("{}.joint_net.0.bias", prefix),
+        // Try different key patterns for encoder projection
+        let enc_prefixes = [
+            format!("{}.enc", prefix),
+            format!("{}.encoder", prefix),
+            format!("{}.joint_net.0", prefix),
         ];
 
-        for key in &enc_weight_keys {
-            if let Some(w) = weights.get(key) {
-                self.encoder_proj_weight = w.clone();
-                tracing::debug!("Loaded joint encoder weight from {}: {:?}", key, w.shape());
+        for enc_prefix in &enc_prefixes {
+            if let Some(layer) = load_linear_layer(weights, enc_prefix, quant) {
+                self.encoder_proj = layer;
+                tracing::debug!("Loaded joint encoder projection from {}", enc_prefix);
                 break;
             }
         }
 
-        for key in &enc_bias_keys {
-            if let Some(b) = weights.get(key) {
-                self.encoder_proj_bias = Some(b.clone());
-                tracing::debug!("Loaded joint encoder bias from {}", key);
-                break;
-            }
-        }
-
-        let pred_weight_keys = [
-            format!("{}.pred.weight", prefix),
-            format!("{}.prediction.weight", prefix),
-            format!("{}.joint_net.1.weight", prefix),
-        ];
-        let pred_bias_keys = [
-            format!("{}.pred.bias", prefix),
-            format!("{}.prediction.bias", prefix),
-            format!("{}.joint_net.1.bias", prefix),
+        // Try different key patterns for prediction projection
+        let pred_prefixes = [
+            format!("{}.pred", prefix),
+            format!("{}.prediction", prefix),
+            format!("{}.joint_net.1", prefix),
         ];
 
-        for key in &pred_weight_keys {
-            if let Some(w) = weights.get(key) {
-                self.pred_proj_weight = w.clone();
-                tracing::debug!("Loaded joint pred weight from {}: {:?}", key, w.shape());
-                break;
-            }
-        }
-
-        for key in &pred_bias_keys {
-            if let Some(b) = weights.get(key) {
-                self.pred_proj_bias = Some(b.clone());
-                tracing::debug!("Loaded joint pred bias from {}", key);
+        for pred_prefix in &pred_prefixes {
+            if let Some(layer) = load_linear_layer(weights, pred_prefix, quant) {
+                self.pred_proj = layer;
+                tracing::debug!("Loaded joint prediction projection from {}", pred_prefix);
                 break;
             }
         }
 
         // Output projection - try multiple patterns
-        let out_weight_keys = [
-            format!("{}.joint_net.2.weight", prefix),
-            format!("{}.joint_net.output.weight", prefix),
-            format!("{}.out.weight", prefix),
-        ];
-        let out_bias_keys = [
-            format!("{}.joint_net.2.bias", prefix),
-            format!("{}.joint_net.output.bias", prefix),
-            format!("{}.out.bias", prefix),
+        let out_prefixes = [
+            format!("{}.joint_net.2", prefix),
+            format!("{}.joint_net.output", prefix),
+            format!("{}.out", prefix),
         ];
 
-        for key in &out_weight_keys {
-            if let Some(w) = weights.get(key) {
-                self.joint_proj_weight = w.clone();
-                tracing::debug!("Loaded joint output weight from {}: {:?}", key, w.shape());
-                break;
-            }
-        }
-
-        for key in &out_bias_keys {
-            if let Some(b) = weights.get(key) {
-                self.joint_proj_bias = Some(b.clone());
-                tracing::debug!("Loaded joint output bias from {}", key);
+        for out_prefix in &out_prefixes {
+            if let Some(layer) = load_linear_layer(weights, out_prefix, quant) {
+                self.joint_proj = layer;
+                tracing::debug!("Loaded joint output projection from {}", out_prefix);
                 break;
             }
         }

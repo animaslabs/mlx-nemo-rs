@@ -15,6 +15,7 @@ use mlx_rs::Array;
 use super::attention::{RelPositionMultiHeadAttention, RelPositionalEncoding};
 use crate::asr::config::EncoderConfig;
 use crate::core::error::Result;
+use crate::core::quantization::{LinearLayer, QuantizationConfig, load_linear_layer};
 
 /// Global counter for encoder forward calls (for debugging)
 static ENCODER_CALL_COUNT: AtomicU64 = AtomicU64::new(0);
@@ -45,16 +46,6 @@ pub fn reset_encoder_counter() {
 fn load_layer_norm(layer: &mut nn::LayerNorm, weights: &HashMap<String, Array>, prefix: &str) {
     if let Some(weight) = weights.get(&format!("{}.weight", prefix)) {
         layer.weight.value = Some(weight.clone());
-    }
-    if let Some(bias) = weights.get(&format!("{}.bias", prefix)) {
-        layer.bias.value = Some(bias.clone());
-    }
-}
-
-/// Helper to load Linear weights
-fn load_linear(layer: &mut nn::Linear, weights: &HashMap<String, Array>, prefix: &str) {
-    if let Some(weight) = weights.get(&format!("{}.weight", prefix)) {
-        layer.weight.value = weight.clone();
     }
     if let Some(bias) = weights.get(&format!("{}.bias", prefix)) {
         layer.bias.value = Some(bias.clone());
@@ -583,18 +574,27 @@ impl ConformerEncoder {
     }
 
     /// Load weights from a state dict.
-    pub fn load_weights(&mut self, weights: &HashMap<String, Array>) -> Result<()> {
+    ///
+    /// # Arguments
+    /// * `weights` - Weight dictionary
+    /// * `quant` - Optional quantization config for quantized models
+    pub fn load_weights(
+        &mut self,
+        weights: &HashMap<String, Array>,
+        quant: Option<&QuantizationConfig>,
+    ) -> Result<()> {
         // Load subsampling weights (NeMo uses encoder.pre_encode prefix)
+        // Subsampling uses Conv layers, not quantized
         self.subsampling
             .load_weights(weights, "encoder.pre_encode")?;
 
         // Load conformer block weights (NeMo uses encoder.layers.N prefix)
         // Position biases are per-layer (not shared), loaded in ConformerBlock
         for (i, layer) in self.layers.iter_mut().enumerate() {
-            layer.load_weights(weights, &format!("encoder.layers.{}", i))?;
+            layer.load_weights(weights, &format!("encoder.layers.{}", i), quant)?;
         }
 
-        // Load final norm weights
+        // Load final norm weights (not quantized)
         load_layer_norm(&mut self.final_norm, weights, "encoder.final_norm");
 
         Ok(())
@@ -1842,26 +1842,31 @@ impl ConformerBlock {
         self.conv.cache_size()
     }
 
-    fn load_weights(&mut self, weights: &HashMap<String, Array>, prefix: &str) -> Result<()> {
+    fn load_weights(
+        &mut self,
+        weights: &HashMap<String, Array>,
+        prefix: &str,
+        quant: Option<&QuantizationConfig>,
+    ) -> Result<()> {
         // Load feed-forward 1 (NeMo uses "feed_forward1" not "ff1")
         self.ff1
-            .load_weights(weights, &format!("{}.feed_forward1", prefix))?;
+            .load_weights(weights, &format!("{}.feed_forward1", prefix), quant)?;
         load_layer_norm(
             &mut self.ff1_norm,
             weights,
             &format!("{}.norm_feed_forward1", prefix),
         );
 
-        // Load self-attention
+        // Load self-attention (linear projections may be quantized)
         self.self_attn
-            .load_weights(weights, &format!("{}.self_attn", prefix))?;
+            .load_weights(weights, &format!("{}.self_attn", prefix), quant)?;
         load_layer_norm(
             &mut self.self_attn_norm,
             weights,
             &format!("{}.norm_self_att", prefix),
         );
 
-        // Load convolution module
+        // Load convolution module (convolutions are not quantized)
         self.conv
             .load_weights(weights, &format!("{}.conv", prefix))?;
         load_layer_norm(
@@ -1872,7 +1877,7 @@ impl ConformerBlock {
 
         // Load feed-forward 2 (NeMo uses "feed_forward2" not "ff2")
         self.ff2
-            .load_weights(weights, &format!("{}.feed_forward2", prefix))?;
+            .load_weights(weights, &format!("{}.feed_forward2", prefix), quant)?;
         load_layer_norm(
             &mut self.ff2_norm,
             weights,
@@ -1892,26 +1897,33 @@ impl ConformerBlock {
 
 /// Feed-forward module with expansion.
 struct FeedForward {
-    linear1: nn::Linear,
-    linear2: nn::Linear,
+    linear1: LinearLayer,
+    linear2: LinearLayer,
     #[allow(dead_code)]
     dropout: f32,
 }
 
 impl FeedForward {
     fn new(d_model: usize, ff_dim: usize, dropout: f32, use_bias: bool) -> Result<Self> {
+        // Create zero-initialized linear layers (will be loaded from weights)
+        let create_linear = |in_dim: usize, out_dim: usize, with_bias: bool| -> Result<LinearLayer> {
+            let weight = mlx_rs::ops::zeros::<f32>(&[out_dim as i32, in_dim as i32])?;
+            let bias = if with_bias {
+                Some(mlx_rs::ops::zeros::<f32>(&[out_dim as i32])?)
+            } else {
+                None
+            };
+            Ok(LinearLayer::standard(weight, bias))
+        };
+
         Ok(Self {
-            linear1: nn::LinearBuilder::new(d_model as i32, ff_dim as i32)
-                .bias(use_bias)
-                .build()?,
-            linear2: nn::LinearBuilder::new(ff_dim as i32, d_model as i32)
-                .bias(use_bias)
-                .build()?,
+            linear1: create_linear(d_model, ff_dim, use_bias)?,
+            linear2: create_linear(ff_dim, d_model, use_bias)?,
             dropout,
         })
     }
 
-    fn forward(&mut self, x: &Array) -> Result<Array> {
+    fn forward(&self, x: &Array) -> Result<Array> {
         let x = self.linear1.forward(x)?;
         let x = mlx_rs::nn::silu(&x)?; // silu is the same as swish
                                        // Skip dropout during inference
@@ -1919,9 +1931,18 @@ impl FeedForward {
         Ok(x)
     }
 
-    fn load_weights(&mut self, weights: &HashMap<String, Array>, prefix: &str) -> Result<()> {
-        load_linear(&mut self.linear1, weights, &format!("{}.linear1", prefix));
-        load_linear(&mut self.linear2, weights, &format!("{}.linear2", prefix));
+    fn load_weights(
+        &mut self,
+        weights: &HashMap<String, Array>,
+        prefix: &str,
+        quant: Option<&QuantizationConfig>,
+    ) -> Result<()> {
+        if let Some(layer) = load_linear_layer(weights, &format!("{}.linear1", prefix), quant) {
+            self.linear1 = layer;
+        }
+        if let Some(layer) = load_linear_layer(weights, &format!("{}.linear2", prefix), quant) {
+            self.linear2 = layer;
+        }
         Ok(())
     }
 }
