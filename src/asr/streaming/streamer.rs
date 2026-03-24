@@ -286,10 +286,20 @@ impl RequestStreamer {
 
     /// Process available audio and try to extract the next request.
     fn try_extract_next(&mut self) -> Result<Option<FeatureBuffer>> {
+        // Calculate audio position info for debugging
+        let audio_position_samples = if self.file_samples.is_some() {
+            self.file_position
+        } else {
+            self.live_samples_processed
+        };
+        let audio_position_secs = audio_position_samples as f32 / self.sample_rate as f32;
+
         tracing::trace!(
             is_first_chunk = self.is_first_chunk,
             stream_ended = self.stream_ended,
             mel_frames_available = self.mel_buffer.remaining_frames(),
+            audio_position_samples,
+            audio_position_secs = %format!("{:.3}s", audio_position_secs),
             "try_extract_next called"
         );
 
@@ -319,15 +329,33 @@ impl RequestStreamer {
         let shift_size = self.config.shift_size.1; // 112
         let pre_encode_cache = self.config.pre_encode_cache_size.1; // 9
 
-        // We need chunk_size frames of NEW mel data (pre_encode_cache comes from buffer overlap)
+        // Check if we have enough frames to extract a full chunk.
+        // We need chunk_size + pre_encode_cache total frames for proper extraction.
         let remaining = self.mel_buffer.remaining_frames();
-        if remaining < chunk_size {
-            // Not enough frames yet
-            if self.stream_ended {
+        let required_frames = chunk_size + pre_encode_cache;
+
+        if remaining < required_frames {
+            if self.is_first_chunk {
+                // For the first chunk, pad with zeros to reach required_frames.
+                // The silence initialization provides pre_encode_cache frames,
+                // but we may not have enough audio frames yet.
+                let frames_to_pad = required_frames - remaining;
+                tracing::debug!(
+                    remaining,
+                    required_frames,
+                    frames_to_pad,
+                    "Padding first chunk with zeros"
+                );
+                let padding =
+                    mlx_rs::ops::zeros::<f32>(&[self.n_mels as i32, frames_to_pad as i32])?;
+                self.mel_buffer.append_mel(&padding)?;
+            } else if self.stream_ended {
                 // Handle final partial chunk
                 return self.handle_final_chunk();
+            } else {
+                // Not enough frames yet, wait for more audio
+                return Ok(None);
             }
-            return Ok(None);
         }
 
         // Extract mel chunk: pre_encode_cache + chunk_size frames, shift by shift_size
@@ -341,16 +369,22 @@ impl RequestStreamer {
         // Keep enough frames for the pre_encode_cache overlap needed for next chunk.
         self.mel_buffer.trim_old_frames(pre_encode_cache)?;
 
+        // Calculate expected encoder output frames
+        // subsampling_factor = 8, so encoder_frames = ceil(mel_frames / 8)
+        let subsampling_factor = 8;
+        let expected_encoder_frames = (valid_frames + subsampling_factor - 1) / subsampling_factor;
+
         tracing::debug!(
             chunk_size,
             shift_size,
             pre_encode_cache,
-            valid_frames,
+            mel_valid_frames = valid_frames,
+            expected_encoder_frames,
             buffer_idx = self.mel_buffer.buffer_idx,
             total_frames = self.mel_buffer.total_frames,
             remaining_after = self.mel_buffer.remaining_frames(),
             is_first = self.is_first_chunk,
-            "Extracted mel chunk"
+            "STREAMER: extracted mel chunk"
         );
 
         // DO NOT reset mel buffer - we need to preserve overlap frames for pre_encode_cache!
@@ -391,7 +425,8 @@ impl RequestStreamer {
     fn mel_lookback_samples(&self) -> usize {
         // Python: n_chunk_look_back = int(timestep_duration * sample_rate) = 160
         // JJK save multiple hops because if the window size is 512, hop is 160, lookback is 352
-        self.mel_buffer.window_samples - self.mel_buffer.hop_samples
+        // self.mel_buffer.window_samples - self.mel_buffer.hop_samples
+        self.mel_buffer.hop_samples
     }
 
     /// Build the audio buffer for mel computation.
@@ -508,13 +543,16 @@ impl RequestStreamer {
                     let appended_frames = mel_to_append.dim(1) as usize;
                     self.mel_buffer.append_mel(&mel_to_append)?;
 
-                    tracing::trace!(
-                        audio_chunk_len = audio_chunk.len(),
-                        audio_buffer_len = audio_buffer.len(),
+                    let audio_position_secs = self.file_position as f32 / self.sample_rate as f32;
+                    tracing::debug!(
+                        audio_chunk_samples = audio_chunk.len(),
+                        audio_buffer_samples = audio_buffer.len(),
+                        audio_position_secs = %format!("{:.3}s", audio_position_secs),
                         mel_computed = n_frames,
                         mel_trimmed = trimmed_frames,
                         mel_appended = appended_frames,
-                        "Processed file audio chunk"
+                        mel_buffer_total = self.mel_buffer.total_frames,
+                        "STREAMER: processed audio -> mel"
                     );
                 }
                 self.file_position = new_position;
@@ -650,12 +688,16 @@ impl RequestStreamer {
         let shift_size = self.config.shift_size.1;
         let pre_encode_cache = self.config.pre_encode_cache_size.1;
 
-        // Pad to make a full chunk if needed
-        if remaining < chunk_size {
-            let frames_to_pad = chunk_size - remaining;
+        // Pad to make a full chunk if needed.
+        // We need chunk_size + pre_encode_cache frames total for extraction:
+        // - pre_encode_cache frames from overlap (context from previous chunk)
+        // - chunk_size frames of new content
+        let required_frames = chunk_size + pre_encode_cache;
+        if remaining < required_frames {
+            let frames_to_pad = required_frames - remaining;
             tracing::trace!(
                 remaining,
-                chunk_size,
+                required_frames,
                 frames_to_pad,
                 "Padding final chunk"
             );

@@ -53,6 +53,23 @@ struct StreamingState {
     is_first_chunk: bool,
     /// Step counter for logging
     step_count: usize,
+    /// Cumulative statistics
+    cumulative_stats: CumulativeStats,
+}
+
+/// Cumulative statistics for debugging alignment.
+#[derive(Debug, Clone, Default)]
+struct CumulativeStats {
+    /// Total audio samples processed
+    total_audio_samples: usize,
+    /// Total mel frames processed
+    total_mel_frames: usize,
+    /// Total encoder frames produced
+    total_encoder_frames: usize,
+    /// Total blank predictions
+    total_blanks: usize,
+    /// Total non-blank tokens emitted
+    total_tokens: usize,
 }
 
 /// Cache-aware RNN-T streaming pipeline.
@@ -225,6 +242,225 @@ impl CacheAwareRNNTPipeline {
             accumulated_tokens: Vec::new(),
             is_first_chunk: true,
             step_count: 0,
+            cumulative_stats: CumulativeStats::default(),
+        };
+
+        Ok(Self {
+            config,
+            preprocessor,
+            encoder,
+            decoder,
+            joint,
+            tokenizer,
+            streaming_decoder,
+            streaming_config,
+            encoder_cache,
+            streamer,
+            state,
+            blank_id,
+            n_mels,
+        })
+    }
+
+    /// Restore a pipeline from standalone safetensors files.
+    ///
+    /// This method loads a pipeline from separate files (weights, config, tokenizer)
+    /// rather than a bundled .nemo archive.
+    ///
+    /// # Arguments
+    /// * `weights_path` - Path to the safetensors weights file
+    /// * `config_path` - Path to the config file (YAML or JSON with NeMo AsrModelConfig schema)
+    /// * `tokenizer_path` - Optional path to the SentencePiece tokenizer file
+    /// * `mode_idx` - Streaming mode index (0 = highest latency)
+    /// * `format` - Optional weight format. If None, auto-detects from safetensors metadata
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// let pipeline = CacheAwareRNNTPipeline::restore_safetensors(
+    ///     "weights.safetensors",
+    ///     "config.yaml",
+    ///     Some("tokenizer.model"),
+    ///     0,
+    ///     Some(WeightFormat::Mlx),
+    /// )?;
+    /// ```
+    pub fn restore_safetensors(
+        weights_path: impl AsRef<Path>,
+        config_path: impl AsRef<Path>,
+        tokenizer_path: Option<impl AsRef<Path>>,
+        mode_idx: usize,
+        format: Option<crate::core::WeightFormat>,
+    ) -> Result<Self> {
+        use crate::core::checkpoint::SafetensorsLoader;
+
+        let weights_path = weights_path.as_ref();
+        let config_path = config_path.as_ref();
+        tracing::info!(
+            "Loading pipeline from safetensors: weights={}, config={}",
+            weights_path.display(),
+            config_path.display()
+        );
+
+        // Create loader
+        let mut loader = SafetensorsLoader::new(
+            weights_path,
+            config_path,
+            tokenizer_path.as_ref().map(|p| p.as_ref()),
+        )?;
+
+        // Override format if specified
+        if let Some(fmt) = format {
+            loader.set_weight_format(fmt);
+        }
+
+        // Load config
+        let config: AsrModelConfig = loader.load_config()?;
+
+        // Build the pipeline from components
+        Self::build_from_config_and_weights(config, loader, mode_idx)
+    }
+
+    /// Restore a pipeline from a directory containing safetensors files.
+    ///
+    /// Auto-detects file locations within the directory.
+    ///
+    /// # Arguments
+    /// * `dir` - Path to the directory containing model files
+    /// * `mode_idx` - Streaming mode index (0 = highest latency)
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// let pipeline = CacheAwareRNNTPipeline::restore_from_directory("my_model/", 0)?;
+    /// ```
+    pub fn restore_from_directory(dir: impl AsRef<Path>, mode_idx: usize) -> Result<Self> {
+        use crate::core::checkpoint::SafetensorsLoader;
+
+        let dir = dir.as_ref();
+        tracing::info!("Loading pipeline from directory: {}", dir.display());
+
+        let loader = SafetensorsLoader::from_directory(dir)?;
+        let config: AsrModelConfig = loader.load_config()?;
+
+        Self::build_from_config_and_weights(config, loader, mode_idx)
+    }
+
+    /// Internal helper to build pipeline from config and a SafetensorsLoader.
+    fn build_from_config_and_weights(
+        config: AsrModelConfig,
+        loader: crate::core::checkpoint::SafetensorsLoader,
+        mode_idx: usize,
+    ) -> Result<Self> {
+        // Create preprocessor with dither disabled for inference
+        let mut preproc_config: crate::asr::modules::MelSpectrogramConfig =
+            config.preprocessor.clone().into();
+        preproc_config.dither = 0.0;
+        let preprocessor = MelSpectrogram::new(preproc_config.clone())?;
+
+        // Create encoder
+        let mut encoder = ConformerEncoder::new(config.encoder.clone())?;
+
+        // Load tokenizer
+        let tokenizer = loader.tokenizer_path().and_then(|path| {
+            SentencePieceProcessor::open(path)
+                .map_err(|e| tracing::warn!("Failed to load tokenizer: {}", e))
+                .ok()
+        });
+
+        // Determine vocabulary size
+        let vocab_size = tokenizer
+            .as_ref()
+            .map(|t| t.len())
+            .unwrap_or(config.decoder.num_classes as usize);
+
+        // Create decoder (prediction network)
+        let is_lstm_decoder = config
+            .decoder
+            .prednet
+            .as_ref()
+            .map(|p| p.is_lstm_based())
+            .unwrap_or(false);
+
+        let mut decoder = if is_lstm_decoder {
+            tracing::info!("Using LSTM-based prediction network");
+            PredictionNetwork::Lstm(crate::asr::modules::RNNTDecoder::new(
+                &config.decoder,
+                vocab_size,
+            )?)
+        } else {
+            tracing::info!("Using stateless prediction network");
+            PredictionNetwork::Stateless(crate::asr::modules::StatelessTransducerDecoder::new(
+                &config.decoder,
+                vocab_size,
+            )?)
+        };
+
+        // Create joint network
+        let joint_config = config.joint.clone().unwrap_or_default();
+        let encoder_hidden = encoder.output_dim();
+        let pred_hidden = decoder.pred_hidden();
+        let joint_hidden = joint_config.effective_joint_hidden();
+        let activation = joint_config.effective_activation().to_string();
+
+        let effective_joint_config = crate::asr::config::JointConfig {
+            joint_hidden,
+            activation,
+            ..joint_config
+        };
+
+        let mut joint = RNNTJoint::new(
+            &effective_joint_config,
+            encoder_hidden,
+            pred_hidden,
+            vocab_size + 1,
+        )?;
+
+        // Load weights
+        let weights = loader.load_weights()?;
+        tracing::debug!("Loading {} weight tensors (format: {:?})", weights.len(), loader.weight_format);
+        encoder.load_weights(&weights)?;
+        decoder.load_weights(&weights, "decoder")?;
+        joint.load_weights(&weights, "joint")?;
+
+        // Set encoder's attention context for the selected streaming mode
+        encoder.set_streaming_mode(mode_idx);
+
+        // Compute streaming configuration
+        let streaming_config = compute_streaming_config(encoder.config(), mode_idx, 10000)?;
+
+        // Setup encoder for streaming
+        encoder.setup_streaming(streaming_config.cache_drop_size);
+
+        // Create encoder cache
+        let encoder_cache = EncoderCache::new(
+            encoder.num_layers(),
+            1, // batch_size = 1 for single-stream
+            streaming_config.last_channel_cache_size,
+            streaming_config.last_time_cache_size,
+            encoder.d_model(),
+        )?;
+
+        // Create request streamer with dither disabled (same as preprocessor)
+        let n_mels = preproc_config.features;
+        let streamer = RequestStreamer::new(
+            MelSpectrogram::new(preproc_config)?,
+            streaming_config.clone(),
+        );
+
+        // Create streaming decoder
+        let blank_id = vocab_size;
+        let streaming_decoder = RnntStreamingDecoder::new(blank_id);
+
+        // Initialize decoder state
+        let decoder_state = decoder.initialize_state(1)?;
+        let state = StreamingState {
+            decoder_state,
+            last_token: None,
+            accumulated_tokens: Vec::new(),
+            is_first_chunk: true,
+            step_count: 0,
+            cumulative_stats: CumulativeStats::default(),
         };
 
         Ok(Self {
@@ -315,6 +551,7 @@ impl CacheAwareRNNTPipeline {
         self.state.accumulated_tokens.clear();
         self.state.is_first_chunk = true;
         self.state.step_count = 0;
+        self.state.cumulative_stats = CumulativeStats::default();
     }
 
     /// Process the next available request and return transcription output.
@@ -356,6 +593,27 @@ impl CacheAwareRNNTPipeline {
         // The tensor has chunk_len frames, but only valid_len are considered valid.
         // The encoder uses lengths for attention masking.
         let lengths = Array::from_slice(&[valid_len as i32], &[1]);
+
+        // Calculate audio time position based on mel frames processed
+        // Each mel frame = hop_length samples = 160 samples at 16kHz = 10ms
+        let hop_length = 160; // TODO: get from config
+        let sample_rate = self.sample_rate() as f32;
+        let audio_samples_this_chunk = chunk_len * hop_length;
+        let audio_time_start = self.state.cumulative_stats.total_audio_samples as f32 / sample_rate;
+        let audio_time_end = (self.state.cumulative_stats.total_audio_samples + audio_samples_this_chunk) as f32 / sample_rate;
+
+        // Debug: Log feature buffer details with audio position
+        tracing::debug!(
+            step = self.state.step_count,
+            is_first,
+            is_last,
+            pre_encode_cache = fb.pre_encode_cache,
+            chunk_len,
+            valid_len,
+            audio_time_start = %format!("{:.3}s", audio_time_start),
+            audio_time_end = %format!("{:.3}s", audio_time_end),
+            "PIPELINE: received feature buffer"
+        );
 
         // Run encoder with cache
         let (encoded, encoded_lengths, cache_channel_next, cache_time_next, cache_len_next) =
@@ -431,6 +689,21 @@ impl CacheAwareRNNTPipeline {
         // Debug encoder output
         self.encoder_cache.last_channel_len.eval()?;
         let cache_len = self.encoder_cache.last_channel_len.as_slice::<i64>()[0];
+
+        // Detailed debug for alignment diagnosis
+        tracing::debug!(
+            step = self.state.step_count,
+            mel_chunk_len = chunk_len,
+            mel_valid_len = valid_len,
+            drop_extra,
+            enc_raw_len = raw_enc_len,
+            enc_tensor_frames = actual_tensor_frames,
+            enc_valid_out_config = valid_out_len,
+            enc_seq_len_to_decode = enc_seq_len,
+            enc_cache_len = cache_len,
+            "PIPELINE: encoder output"
+        );
+
         tracing::trace!(
             is_first,
             is_last,
@@ -496,6 +769,36 @@ impl CacheAwareRNNTPipeline {
             &self.joint,
             &mut self.state.last_token,
         )?;
+
+        // Update cumulative statistics
+        self.state.cumulative_stats.total_audio_samples += audio_samples_this_chunk;
+        self.state.cumulative_stats.total_mel_frames += valid_len;
+        self.state.cumulative_stats.total_encoder_frames += enc_seq_len;
+        self.state.cumulative_stats.total_blanks += decode_output.blank_count;
+        self.state.cumulative_stats.total_tokens += decode_output.new_tokens.len();
+
+        // Detailed decode summary
+        tracing::debug!(
+            step = self.state.step_count,
+            frames_decoded = enc_seq_len,
+            blanks = decode_output.blank_count,
+            new_tokens = decode_output.new_tokens.len(),
+            total_tokens = self.state.accumulated_tokens.len() + decode_output.new_tokens.len(),
+            last_token = ?self.state.last_token,
+            "PIPELINE: decode complete"
+        );
+
+        // Cumulative statistics
+        tracing::debug!(
+            step = self.state.step_count,
+            cum_audio_samples = self.state.cumulative_stats.total_audio_samples,
+            cum_audio_time = %format!("{:.3}s", self.state.cumulative_stats.total_audio_samples as f32 / sample_rate),
+            cum_mel_frames = self.state.cumulative_stats.total_mel_frames,
+            cum_encoder_frames = self.state.cumulative_stats.total_encoder_frames,
+            cum_blanks = self.state.cumulative_stats.total_blanks,
+            cum_tokens = self.state.cumulative_stats.total_tokens,
+            "PIPELINE: cumulative stats"
+        );
 
         // Log when all frames produce blank (potential stuck state)
         if decode_output.new_tokens.is_empty() && decode_output.blank_count > 0 {

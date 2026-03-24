@@ -7,5 +7,7 @@ pub mod checkpoint;
 pub mod config;
 pub mod error;
 pub mod pytorch;
+pub mod weights;
 
 pub use error::{Error, Result};
+pub use weights::WeightFormat;

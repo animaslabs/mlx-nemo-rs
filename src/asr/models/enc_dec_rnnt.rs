@@ -339,6 +339,161 @@ impl EncDecRNNTModel {
         Ok(model)
     }
 
+    /// Restore a model from standalone safetensors files.
+    ///
+    /// This method loads a model from separate files (weights, config, tokenizer)
+    /// rather than a bundled .nemo archive. This is useful for:
+    /// - Models exported to safetensors format
+    /// - HuggingFace/mlx-community model directories
+    /// - Custom model deployments
+    ///
+    /// # Arguments
+    /// * `weights_path` - Path to the safetensors weights file
+    /// * `config_path` - Path to the config file (YAML or JSON with NeMo AsrModelConfig schema)
+    /// * `tokenizer_path` - Optional path to the SentencePiece tokenizer file
+    /// * `format` - Optional weight format. If None, auto-detects from safetensors metadata
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// // Load with explicit format
+    /// let model = EncDecRNNTModel::restore_safetensors(
+    ///     "weights.safetensors",
+    ///     "config.yaml",
+    ///     Some("tokenizer.model"),
+    ///     Some(WeightFormat::Mlx),
+    /// )?;
+    ///
+    /// // Load with auto-detected format
+    /// let model = EncDecRNNTModel::restore_safetensors(
+    ///     "weights.safetensors",
+    ///     "config.yaml",
+    ///     Some("tokenizer.model"),
+    ///     None,
+    /// )?;
+    /// ```
+    pub fn restore_safetensors(
+        weights_path: impl AsRef<Path>,
+        config_path: impl AsRef<Path>,
+        tokenizer_path: Option<impl AsRef<Path>>,
+        format: Option<crate::core::WeightFormat>,
+    ) -> Result<Self> {
+        use crate::core::checkpoint::SafetensorsLoader;
+
+        let weights_path = weights_path.as_ref();
+        let config_path = config_path.as_ref();
+        tracing::info!(
+            "Loading RNNT model from safetensors: weights={}, config={}",
+            weights_path.display(),
+            config_path.display()
+        );
+
+        // Create loader
+        let mut loader = SafetensorsLoader::new(
+            weights_path,
+            config_path,
+            tokenizer_path.as_ref().map(|p| p.as_ref()),
+        )?;
+
+        // Override format if specified
+        if let Some(fmt) = format {
+            loader.set_weight_format(fmt);
+        }
+
+        // Load config
+        let config: AsrModelConfig = loader.load_config()?;
+
+        // Verify this is an RNNT model
+        if !config.is_rnnt() {
+            tracing::warn!(
+                "Config does not appear to be an RNNT model. Target: {:?}",
+                config.target
+            );
+        }
+
+        tracing::debug!(
+            "Model config loaded, encoder layers: {}",
+            config.encoder.n_layers
+        );
+
+        // Create model
+        let mut model = Self::new(config)?;
+
+        // Load tokenizer if available
+        if let Some(tok_path) = loader.tokenizer_path() {
+            tracing::debug!("Loading tokenizer from: {}", tok_path.display());
+            model.load_tokenizer(tok_path)?;
+        } else if let Some(tok_path) = tokenizer_path {
+            tracing::debug!("Loading tokenizer from: {}", tok_path.as_ref().display());
+            model.load_tokenizer(tok_path)?;
+        }
+
+        // Load weights
+        let weights = loader.load_weights()?;
+        tracing::debug!("Loading {} weight tensors (format: {:?})", weights.len(), loader.weight_format);
+        model.load_weights(&weights)?;
+
+        Ok(model)
+    }
+
+    /// Restore a model from a directory containing safetensors files.
+    ///
+    /// Auto-detects file locations within the directory:
+    /// - Weights: model.safetensors, weights.safetensors, model_weights.safetensors
+    /// - Config: config.yaml, config.json, model_config.yaml
+    /// - Tokenizer: tokenizer.model, *.spm, sentencepiece.bpe.model
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// // Load from directory structure:
+    /// // my_model/
+    /// // ├── model.safetensors
+    /// // ├── config.yaml
+    /// // └── tokenizer.model
+    /// let model = EncDecRNNTModel::restore_from_directory("my_model/")?;
+    /// ```
+    pub fn restore_from_directory(dir: impl AsRef<Path>) -> Result<Self> {
+        use crate::core::checkpoint::SafetensorsLoader;
+
+        let dir = dir.as_ref();
+        tracing::info!("Loading RNNT model from directory: {}", dir.display());
+
+        let loader = SafetensorsLoader::from_directory(dir)?;
+
+        // Load config
+        let config: AsrModelConfig = loader.load_config()?;
+
+        // Verify this is an RNNT model
+        if !config.is_rnnt() {
+            tracing::warn!(
+                "Config does not appear to be an RNNT model. Target: {:?}",
+                config.target
+            );
+        }
+
+        tracing::debug!(
+            "Model config loaded, encoder layers: {}",
+            config.encoder.n_layers
+        );
+
+        // Create model
+        let mut model = Self::new(config)?;
+
+        // Load tokenizer if found
+        if let Some(tok_path) = loader.tokenizer_path() {
+            tracing::debug!("Loading tokenizer from: {}", tok_path.display());
+            model.load_tokenizer(tok_path)?;
+        }
+
+        // Load weights
+        let weights = loader.load_weights()?;
+        tracing::debug!("Loading {} weight tensors (format: {:?})", weights.len(), loader.weight_format);
+        model.load_weights(&weights)?;
+
+        Ok(model)
+    }
+
     /// Load a tokenizer from a SentencePiece model file.
     pub fn load_tokenizer(&mut self, path: impl AsRef<Path>) -> Result<()> {
         let path = path.as_ref();

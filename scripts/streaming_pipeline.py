@@ -231,12 +231,43 @@ def run_streaming_transcription(pipeline, audio_path: str, verbose: bool = False
         # Process audio through the request generator
         # Each iteration yields a batch of Frame/FeatureBuffer requests
         for requests in request_generator:
+            # Debug: Print request details
+            print(f"\n{'─'*40}")
+            print(f"[Chunk {chunks_processed}] Processing {len(requests)} request(s)")
+            for i, req in enumerate(requests):
+                req_type = type(req).__name__
+                print(f"  Request[{i}]: type={req_type}")
+                if hasattr(req, 'features') and req.features is not None:
+                    feat = req.features
+                    print(f"    features: shape={feat.shape}, dtype={feat.dtype}")
+                    print(f"    features min/max: {feat.min():.4f} / {feat.max():.4f}")
+                if hasattr(req, 'audio') and req.audio is not None:
+                    audio = req.audio
+                    print(f"    audio: shape={audio.shape}, dtype={audio.dtype}")
+                if hasattr(req, 'is_final'):
+                    print(f"    is_final: {req.is_final}")
+                if hasattr(req, 'stream_id'):
+                    print(f"    stream_id: {req.stream_id}")
+
             # transcribe_step processes the requests and updates internal state
             step_outputs = pipeline.transcribe_step(requests)
             chunks_processed += 1
 
+            # Debug: Print step output details
+            print(f"  Step outputs: {len(step_outputs)} output(s)")
+
             # Process outputs for each stream (we have a single stream)
-            for step_output in step_outputs:
+            for idx, step_output in enumerate(step_outputs):
+                print(f"  Output[{idx}]:")
+                print(f"    partial_transcript: '{step_output.partial_transcript}'")
+                print(f"    final_transcript: '{step_output.final_transcript}'")
+                if hasattr(step_output, 'tokens') and step_output.tokens:
+                    print(f"    tokens: {step_output.tokens}")
+                if hasattr(step_output, 'timestamps') and step_output.timestamps:
+                    print(f"    timestamps: {step_output.timestamps}")
+                if hasattr(step_output, 'confidence') and step_output.confidence is not None:
+                    print(f"    confidence: {step_output.confidence}")
+
                 # Final transcript - complete segments after EOU detection
                 if step_output.final_transcript:
                     final = step_output.final_transcript.strip()
@@ -366,8 +397,8 @@ Lookahead options:
     pipeline = create_pipeline(cfg, asr_model)
 
     # Print pipeline info if requested
-    if args.info:
-        print_pipeline_info(pipeline, cfg)
+    # if args.info:
+    print_pipeline_info(pipeline, cfg)
 
     # Run streaming transcription
     final_text, elapsed, chunks, audio_duration = run_streaming_transcription(

@@ -105,6 +105,18 @@ impl RnntStreamingDecoder {
             ..Default::default()
         };
 
+        // Log encoder tensor shape for alignment debugging
+        let enc_shape = encoder_output.shape();
+        debug!(
+            enc_batch = enc_shape[0],
+            enc_time = enc_shape[1],
+            enc_dim = enc_shape[2],
+            valid_frames,
+            blank_id = self.blank_id,
+            max_symbols = self.max_symbols_per_step,
+            "DECODER: starting decode"
+        );
+
         trace!(
             valid_frames,
             blank_id = self.blank_id,
@@ -182,7 +194,17 @@ impl RnntStreamingDecoder {
                 if pred_token == self.blank_id {
                     // Blank: advance to next encoder frame
                     output.blank_count += 1;
-                    output.labels[t] = self.blank_id;
+                    // Only set to blank if no tokens were emitted for this frame
+                    if symbols_emitted == 0 {
+                        output.labels[t] = self.blank_id;
+                    }
+                    debug!(
+                        frame = t,
+                        of = valid_frames,
+                        symbols_emitted,
+                        result = "BLANK",
+                        "DECODER: frame result"
+                    );
                     break;
                 }
 
@@ -190,13 +212,23 @@ impl RnntStreamingDecoder {
                 output.new_tokens.push(pred_token);
                 output.timesteps.push(t);
                 output.non_blank_count += 1;
-                output.labels[t] = pred_token;
+                // Record first token emitted for this frame (for summary display)
+                if symbols_emitted == 0 {
+                    output.labels[t] = pred_token;
+                }
 
                 *last_token = Some(pred_token);
                 *decoder_state = new_state;
                 symbols_emitted += 1;
 
-                trace!(frame = t, token = pred_token, symbols_emitted, "token emitted");
+                debug!(
+                    frame = t,
+                    of = valid_frames,
+                    token = pred_token,
+                    symbols_emitted,
+                    result = "TOKEN",
+                    "DECODER: frame result"
+                );
 
                 if symbols_emitted >= self.max_symbols_per_step {
                     debug!(frame = t, symbols_emitted, "max symbols per step reached");
@@ -205,11 +237,22 @@ impl RnntStreamingDecoder {
             }
         }
 
+        // Build a compact representation of what happened at each frame
+        // B = blank, T<id> = token with id
+        let frame_summary: String = output.labels.iter().enumerate().map(|(i, &label)| {
+            if label == self.blank_id {
+                "B".to_string()
+            } else {
+                format!("T{}", label)
+            }
+        }).collect::<Vec<_>>().join(" ");
+
         debug!(
             new_tokens = output.new_tokens.len(),
             blank_count = output.blank_count,
             non_blank_count = output.non_blank_count,
-            "decode_frames complete"
+            frame_summary = %frame_summary,
+            "DECODER: decode_frames complete"
         );
 
         Ok(output)

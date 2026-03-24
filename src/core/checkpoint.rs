@@ -176,6 +176,7 @@ impl NemoCheckpoint {
     /// Load weights from the checkpoint.
     ///
     /// This loads the weights from either a safetensors or PyTorch checkpoint file.
+    /// Weights are transformed from PyTorch format to MLX format (Conv1d/Conv2d transposition).
     pub fn load_weights(&self) -> Result<HashMap<String, Array>> {
         let weights_path = self
             .weights_path
@@ -187,21 +188,26 @@ impl NemoCheckpoint {
             .and_then(|e| e.to_str())
             .unwrap_or("");
 
-        match extension {
+        let raw_weights = match extension {
             "safetensors" => {
                 // Load using mlx-rs safetensors support
-                let tensors = Array::load_safetensors(weights_path)?;
-                Ok(tensors)
+                Array::load_safetensors(weights_path)?
             }
             "ckpt" => {
                 // Load using PyTorch checkpoint loader
-                crate::core::pytorch::load(weights_path)
+                crate::core::pytorch::load(weights_path)?
             }
-            _ => Err(Error::checkpoint(format!(
-                "Unknown weights format: '{}'. Supported: .safetensors, .ckpt",
-                extension
-            ))),
-        }
+            _ => {
+                return Err(Error::checkpoint(format!(
+                    "Unknown weights format: '{}'. Supported: .safetensors, .ckpt",
+                    extension
+                )));
+            }
+        };
+
+        // Transform weights from PyTorch format to MLX format
+        // .nemo files always contain PyTorch-format weights
+        crate::core::weights::transform_weights_to_mlx(raw_weights)
     }
 
     // Helper functions
@@ -393,5 +399,284 @@ impl NemoCheckpointWriter {
 impl Default for NemoCheckpointWriter {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Loader for standalone safetensors files (not within .nemo archives).
+///
+/// This loader supports loading models from directory structures commonly
+/// used by HuggingFace and mlx-community:
+///
+/// ```text
+/// my_model/
+/// ├── model.safetensors          (or weights.safetensors, model_weights.safetensors)
+/// ├── config.yaml                (or config.json, model_config.yaml)
+/// └── tokenizer.model            (or *.spm, sentencepiece.bpe.model)
+/// ```
+///
+/// # Example
+///
+/// ```rust,ignore
+/// // Load from explicit paths
+/// let loader = SafetensorsLoader::new(
+///     "weights.safetensors",
+///     "config.yaml",
+///     Some("tokenizer.model"),
+/// )?;
+///
+/// // Load from directory (auto-detect files)
+/// let loader = SafetensorsLoader::from_directory("my_model/")?;
+///
+/// // Access components
+/// let weights = loader.load_weights()?;
+/// let config: AsrModelConfig = loader.load_config()?;
+/// ```
+#[derive(Debug)]
+pub struct SafetensorsLoader {
+    /// Path to the safetensors weights file.
+    pub weights_path: PathBuf,
+
+    /// Raw config content (YAML or JSON).
+    pub config_content: String,
+
+    /// Path to tokenizer file, if found.
+    pub tokenizer_path: Option<PathBuf>,
+
+    /// Detected or specified weight format.
+    /// If None, format will be auto-detected from weight shapes during loading.
+    pub weight_format: Option<crate::core::weights::WeightFormat>,
+}
+
+impl SafetensorsLoader {
+    /// Create a loader from explicit file paths.
+    ///
+    /// # Arguments
+    /// * `weights_path` - Path to the safetensors file
+    /// * `config_path` - Path to the config file (YAML or JSON)
+    /// * `tokenizer_path` - Optional path to tokenizer file
+    pub fn new(
+        weights_path: impl AsRef<Path>,
+        config_path: impl AsRef<Path>,
+        tokenizer_path: Option<impl AsRef<Path>>,
+    ) -> Result<Self> {
+        let weights_path = weights_path.as_ref().to_path_buf();
+        let config_path = config_path.as_ref();
+
+        if !weights_path.exists() {
+            return Err(Error::checkpoint_at(
+                format!("Weights file not found: {}", weights_path.display()),
+                &weights_path,
+            ));
+        }
+
+        if !config_path.exists() {
+            return Err(Error::checkpoint_at(
+                format!("Config file not found: {}", config_path.display()),
+                config_path,
+            ));
+        }
+
+        // Read config content
+        let config_content = std::fs::read_to_string(config_path)?;
+
+        // Try to detect weight format from safetensors metadata
+        // If metadata indicates MLX, use that. Otherwise, leave as None for shape-based detection.
+        let weight_format = crate::core::weights::read_safetensors_metadata(&weights_path)
+            .ok()
+            .and_then(|m| {
+                let fmt = crate::core::weights::WeightFormat::from_safetensors_metadata(&m);
+                if fmt == crate::core::weights::WeightFormat::Mlx {
+                    Some(fmt)
+                } else {
+                    // Don't default to PyTorch; let shape-based detection decide
+                    None
+                }
+            });
+
+        let tokenizer_path = tokenizer_path.map(|p| p.as_ref().to_path_buf());
+
+        Ok(Self {
+            weights_path,
+            config_content,
+            tokenizer_path,
+            weight_format,
+        })
+    }
+
+    /// Create a loader from explicit paths with a specific weight format.
+    pub fn with_format(
+        weights_path: impl AsRef<Path>,
+        config_path: impl AsRef<Path>,
+        tokenizer_path: Option<impl AsRef<Path>>,
+        format: crate::core::weights::WeightFormat,
+    ) -> Result<Self> {
+        let mut loader = Self::new(weights_path, config_path, tokenizer_path)?;
+        loader.weight_format = Some(format);
+        Ok(loader)
+    }
+
+    /// Load from a directory, auto-detecting file locations.
+    ///
+    /// Searches for:
+    /// - Weights: model.safetensors, weights.safetensors, model_weights.safetensors
+    /// - Config: config.yaml, config.json, model_config.yaml, model_config.json
+    /// - Tokenizer: *.model, *.spm, tokenizer.model, sentencepiece.bpe.model
+    pub fn from_directory(dir: impl AsRef<Path>) -> Result<Self> {
+        let dir = dir.as_ref();
+
+        if !dir.is_dir() {
+            return Err(Error::checkpoint_at(
+                format!("Not a directory: {}", dir.display()),
+                dir,
+            ));
+        }
+
+        // Find weights file
+        let weights_path = Self::find_weights_in_dir(dir)?;
+
+        // Find config file
+        let config_path = Self::find_config_in_dir(dir)?;
+
+        // Find tokenizer (optional)
+        let tokenizer_path = Self::find_tokenizer_in_dir(dir);
+
+        Self::new(weights_path, config_path, tokenizer_path)
+    }
+
+    /// Load weights from the safetensors file.
+    ///
+    /// Applies weight transformations based on the detected/specified format.
+    /// If format is None, uses shape-based detection to determine the format.
+    pub fn load_weights(&self) -> Result<HashMap<String, Array>> {
+        crate::core::weights::load_safetensors_weights(&self.weights_path, self.weight_format)
+    }
+
+    /// Load weights without any transformation.
+    ///
+    /// Use this if you want to handle format conversion yourself.
+    pub fn load_weights_raw(&self) -> Result<HashMap<String, Array>> {
+        Array::load_safetensors(&self.weights_path).map_err(|e| e.into())
+    }
+
+    /// Load and parse the model configuration.
+    ///
+    /// Automatically detects YAML vs JSON format.
+    pub fn load_config<T: serde::de::DeserializeOwned>(&self) -> Result<T> {
+        // Try YAML first, then JSON
+        if let Ok(config) = serde_yaml::from_str(&self.config_content) {
+            return Ok(config);
+        }
+
+        serde_json::from_str(&self.config_content)
+            .map_err(|e| Error::config(format!("Failed to parse config (tried YAML and JSON): {}", e)))
+    }
+
+    /// Get the raw config content.
+    pub fn config_content(&self) -> &str {
+        &self.config_content
+    }
+
+    /// Get the tokenizer path if found.
+    pub fn tokenizer_path(&self) -> Option<&Path> {
+        self.tokenizer_path.as_deref()
+    }
+
+    /// Set the weight format explicitly.
+    pub fn set_weight_format(&mut self, format: crate::core::weights::WeightFormat) {
+        self.weight_format = Some(format);
+    }
+
+    // Helper: Find weights file in directory
+    fn find_weights_in_dir(dir: &Path) -> Result<PathBuf> {
+        // Priority order for weights files
+        let candidates = [
+            "model.safetensors",
+            "weights.safetensors",
+            "model_weights.safetensors",
+        ];
+
+        for name in candidates {
+            let path = dir.join(name);
+            if path.exists() {
+                return Ok(path);
+            }
+        }
+
+        // Try subdirectory patterns (e.g., weights/model.safetensors)
+        let subdir_path = dir.join("weights").join("model.safetensors");
+        if subdir_path.exists() {
+            return Ok(subdir_path);
+        }
+
+        // Search for any .safetensors file
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if let Some(ext) = path.extension() {
+                    if ext == "safetensors" {
+                        return Ok(path);
+                    }
+                }
+            }
+        }
+
+        Err(Error::checkpoint_at(
+            "No safetensors file found in directory",
+            dir,
+        ))
+    }
+
+    // Helper: Find config file in directory
+    fn find_config_in_dir(dir: &Path) -> Result<PathBuf> {
+        // Priority order for config files
+        let candidates = [
+            "config.yaml",
+            "model_config.yaml",
+            "config.json",
+            "model_config.json",
+        ];
+
+        for name in candidates {
+            let path = dir.join(name);
+            if path.exists() {
+                return Ok(path);
+            }
+        }
+
+        Err(Error::checkpoint_at(
+            "No config file found in directory",
+            dir,
+        ))
+    }
+
+    // Helper: Find tokenizer file in directory
+    fn find_tokenizer_in_dir(dir: &Path) -> Option<PathBuf> {
+        // Priority order for tokenizer files
+        let candidates = [
+            "tokenizer.model",
+            "tokenizer.spm",
+            "sentencepiece.bpe.model",
+        ];
+
+        for name in candidates {
+            let path = dir.join(name);
+            if path.exists() {
+                return Some(path);
+            }
+        }
+
+        // Search for any .model or .spm file
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                    if name.ends_with(".model") || name.ends_with(".spm") {
+                        return Some(path);
+                    }
+                }
+            }
+        }
+
+        None
     }
 }

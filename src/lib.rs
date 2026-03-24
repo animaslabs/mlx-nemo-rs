@@ -31,6 +31,8 @@ pub mod utils;
 
 // Re-export commonly used types
 pub use core::error::{Error, Result};
+pub use core::weights::WeightFormat;
+pub use core::checkpoint::SafetensorsLoader;
 
 /// Prelude module for convenient imports
 pub mod prelude {

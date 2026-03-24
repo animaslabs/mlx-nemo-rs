@@ -68,10 +68,9 @@ fn load_linear(layer: &mut nn::Linear, weights: &HashMap<String, Array>, prefix:
 /// So we need to transpose axes 1 and 2.
 fn load_conv1d(layer: &mut nn::Conv1d, weights: &HashMap<String, Array>, prefix: &str) {
     if let Some(weight) = weights.get(&format!("{}.weight", prefix)) {
-        // Transpose from PyTorch (O, I, K) to MLX (O, K, I)
-        if let Ok(transposed) = weight.transpose_axes(&[0, 2, 1]) {
-            layer.weight.value = transposed;
-        }
+        // Weights are already in MLX format (O, K, I) after loading
+        // The transformation from PyTorch (O, I, K) is done in weights.rs
+        layer.weight.value = weight.clone();
     }
     if let Some(bias) = weights.get(&format!("{}.bias", prefix)) {
         layer.bias.value = Some(bias.clone());
@@ -1034,10 +1033,9 @@ impl ConformerEncoder {
 /// So we need to transpose axes 1,2,3 -> 2,3,1
 fn load_conv2d(layer: &mut nn::Conv2d, weights: &HashMap<String, Array>, prefix: &str) {
     if let Some(weight) = weights.get(&format!("{}.weight", prefix)) {
-        // Transpose from PyTorch (O, I, H, W) to MLX (O, H, W, I)
-        if let Ok(transposed) = weight.transpose_axes(&[0, 2, 3, 1]) {
-            layer.weight.value = transposed;
-        }
+        // Weights are already in MLX format (O, H, W, I) after loading
+        // The transformation from PyTorch (O, I, H, W) is done in weights.rs
+        layer.weight.value = weight.clone();
     }
     if let Some(bias) = weights.get(&format!("{}.bias", prefix)) {
         layer.bias.value = Some(bias.clone());
