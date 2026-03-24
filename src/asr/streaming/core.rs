@@ -543,10 +543,10 @@ impl StreamingMelBuffer {
         let frames_required = chunk_size;
 
         if frames_available < frames_required {
-            // Not enough frames for a full chunk
-            if self.buffer_idx >= self.total_frames {
-                return None;
-            }
+            // // Not enough frames for a full chunk
+            // if self.buffer_idx >= self.total_frames {
+            //     return None;
+            // }
             tracing::warn!("PARTIAL CHUNK!!");
             // Handle partial final chunk
             let remaining = frames_available;
@@ -575,6 +575,8 @@ impl StreamingMelBuffer {
             self.buffer_idx,
             self.total_frames,
             self.mel_buffer_offset,
+            frames_available,
+            frames_required,
             extract_start,
             extract_end,
             total_extract,

@@ -16,6 +16,30 @@ use crate::asr::models::{DecoderState, PredictionNetwork};
 use crate::asr::modules::RNNTJoint;
 use crate::core::error::Result;
 
+/// Apply a mask to log probabilities, setting specified token indices to -inf.
+///
+/// This prevents certain tokens from being selected during greedy decoding.
+fn apply_token_mask(log_probs: &Array, masked_ids: &[usize]) -> Result<Array> {
+    if masked_ids.is_empty() {
+        return Ok(log_probs.clone());
+    }
+
+    // Get the log probs data
+    let mut probs_data: Vec<f32> = log_probs.as_slice::<f32>().to_vec();
+    let vocab_size = log_probs.dim(-1) as usize;
+
+    // Set masked token probabilities to -inf
+    for &id in masked_ids {
+        if id < vocab_size {
+            probs_data[id] = f32::NEG_INFINITY;
+        }
+    }
+
+    // Reconstruct array with same shape
+    let shape: Vec<i32> = log_probs.shape().iter().map(|&x| x as i32).collect();
+    Ok(Array::from_slice(&probs_data, &shape))
+}
+
 /// Maximum number of symbols that can be emitted per encoder frame.
 /// This is a safety limit to prevent infinite loops.
 const DEFAULT_MAX_SYMBOLS_PER_STEP: usize = 10;
@@ -86,6 +110,7 @@ impl RnntStreamingDecoder {
     /// * `decoder_state` - Mutable decoder state (updated in place)
     /// * `joint` - Joint network
     /// * `last_token` - Mutable last token (updated in place)
+    /// * `masked_token_ids` - Optional token IDs to mask (set to -inf before argmax)
     ///
     /// # Returns
     /// * `DecodeStepOutput` containing new tokens and labels
@@ -97,6 +122,7 @@ impl RnntStreamingDecoder {
         decoder_state: &mut DecoderState,
         joint: &RNNTJoint,
         last_token: &mut Option<usize>,
+        masked_token_ids: Option<&[usize]>,
     ) -> Result<DecodeStepOutput> {
         encoder_output.eval()?;
 
@@ -144,6 +170,13 @@ impl RnntStreamingDecoder {
                 // Compute joint output: [1, vocab_size+1]
                 let log_probs = joint.forward_one(&enc_frame, &pred_output)?;
                 log_probs.eval()?;
+
+                // Apply token mask if provided (set masked tokens to -inf)
+                let log_probs = if let Some(mask_ids) = masked_token_ids {
+                    apply_token_mask(&log_probs, mask_ids)?
+                } else {
+                    log_probs
+                };
 
                 // Get argmax prediction
                 let prediction = argmax_axis(&log_probs, -1, false)?;
@@ -268,6 +301,7 @@ impl RnntStreamingDecoder {
         decoder_state: &mut DecoderState,
         joint: &RNNTJoint,
         last_token: &mut Option<usize>,
+        masked_token_ids: Option<&[usize]>,
     ) -> Result<DecodeStepOutput> {
         // Ensure frame has batch dimension: [1, 1, d_model]
         let frame = if encoder_frame.ndim() == 2 {
@@ -276,7 +310,15 @@ impl RnntStreamingDecoder {
             encoder_frame.clone()
         };
 
-        self.decode_frames(&frame, 1, decoder, decoder_state, joint, last_token)
+        self.decode_frames(
+            &frame,
+            1,
+            decoder,
+            decoder_state,
+            joint,
+            last_token,
+            masked_token_ids,
+        )
     }
 }
 

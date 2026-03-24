@@ -9,6 +9,21 @@ use mlx_rs::Array;
 use sentencepiece::SentencePieceProcessor;
 
 use crate::asr::config::AsrModelConfig;
+
+/// Find token IDs that represent punctuation in the tokenizer vocabulary.
+///
+/// Returns IDs of tokens where the decoded piece consists entirely of
+/// punctuation and/or whitespace, with at least one punctuation character.
+fn find_punctuation_tokens(tokenizer: &SentencePieceProcessor) -> Vec<usize> {
+    (0..tokenizer.len())
+        .filter(|&id| {
+            let piece = tokenizer.decode_piece_ids(&[id as u32]).unwrap_or_default();
+            // Must have at least one punctuation char and only contain punctuation/whitespace
+            piece.chars().all(|c| c.is_ascii_punctuation() || c.is_whitespace())
+                && piece.chars().any(|c| c.is_ascii_punctuation())
+        })
+        .collect()
+}
 use crate::asr::decoding::RnntStreamingDecoder;
 use crate::asr::models::{DecoderState, PredictionNetwork};
 use crate::asr::modules::{ConformerEncoder, MelSpectrogram, RNNTJoint};
@@ -115,6 +130,12 @@ pub struct CacheAwareRNNTPipeline {
     state: StreamingState,
     blank_id: usize,
     n_mels: usize,
+
+    // Punctuation suppression
+    /// Whether to suppress punctuation during decoding
+    suppress_punctuation: bool,
+    /// Token IDs identified as punctuation (computed at load time)
+    punctuation_token_ids: Vec<usize>,
 }
 
 impl CacheAwareRNNTPipeline {
@@ -233,6 +254,16 @@ impl CacheAwareRNNTPipeline {
         let blank_id = vocab_size;
         let streaming_decoder = RnntStreamingDecoder::new(blank_id);
 
+        // Find punctuation tokens from tokenizer
+        let punctuation_token_ids = tokenizer
+            .as_ref()
+            .map(|t| find_punctuation_tokens(t))
+            .unwrap_or_default();
+        tracing::debug!(
+            num_punctuation_tokens = punctuation_token_ids.len(),
+            "identified punctuation tokens"
+        );
+
         // Initialize decoder state with zeros (matches NeMo's add_sos=False behavior)
         // NeMo's greedy decoder passes state=None on first step, which initializes to zeros
         let decoder_state = decoder.initialize_state(1)?;
@@ -259,6 +290,8 @@ impl CacheAwareRNNTPipeline {
             state,
             blank_id,
             n_mels,
+            suppress_punctuation: false,
+            punctuation_token_ids,
         })
     }
 
@@ -458,6 +491,16 @@ impl CacheAwareRNNTPipeline {
         let blank_id = vocab_size;
         let streaming_decoder = RnntStreamingDecoder::new(blank_id);
 
+        // Find punctuation tokens from tokenizer
+        let punctuation_token_ids = tokenizer
+            .as_ref()
+            .map(|t| find_punctuation_tokens(t))
+            .unwrap_or_default();
+        tracing::debug!(
+            num_punctuation_tokens = punctuation_token_ids.len(),
+            "identified punctuation tokens"
+        );
+
         // Initialize decoder state
         let decoder_state = decoder.initialize_state(1)?;
         let state = StreamingState {
@@ -483,6 +526,8 @@ impl CacheAwareRNNTPipeline {
             state,
             blank_id,
             n_mels,
+            suppress_punctuation: false,
+            punctuation_token_ids,
         })
     }
 
@@ -502,6 +547,30 @@ impl CacheAwareRNNTPipeline {
     /// Get the current streaming configuration.
     pub fn streaming_config(&self) -> &StreamingConfig {
         &self.streaming_config
+    }
+
+    /// Enable or disable punctuation suppression during decoding.
+    ///
+    /// When enabled, punctuation tokens are masked out (set to -inf) before
+    /// argmax selection, preventing them from being generated.
+    pub fn set_suppress_punctuation(&mut self, suppress: bool) {
+        self.suppress_punctuation = suppress;
+        if suppress {
+            tracing::info!(
+                num_masked_tokens = self.punctuation_token_ids.len(),
+                "punctuation suppression enabled"
+            );
+        }
+    }
+
+    /// Check if punctuation suppression is enabled.
+    pub fn suppress_punctuation(&self) -> bool {
+        self.suppress_punctuation
+    }
+
+    /// Get the list of punctuation token IDs.
+    pub fn punctuation_token_ids(&self) -> &[usize] {
+        &self.punctuation_token_ids
     }
 
     /// Set audio from a file path.
@@ -766,7 +835,12 @@ impl CacheAwareRNNTPipeline {
             }
         }
 
-        // Decode
+        // Decode with optional punctuation masking
+        let masked_ids = if self.suppress_punctuation {
+            Some(self.punctuation_token_ids.as_slice())
+        } else {
+            None
+        };
         let decode_output = self.streaming_decoder.decode_frames(
             &encoded,
             enc_seq_len,
@@ -774,6 +848,7 @@ impl CacheAwareRNNTPipeline {
             &mut self.state.decoder_state,
             &self.joint,
             &mut self.state.last_token,
+            masked_ids,
         )?;
 
         // Update cumulative statistics

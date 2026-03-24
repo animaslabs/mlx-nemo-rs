@@ -13,6 +13,7 @@
 //!   --model <path>     Path to NeMo model (.nemo file)
 //!   --mode <idx>       Streaming mode index (0 = lowest latency, default: 0)
 //!   --chunk-ms <ms>    Audio chunk size in milliseconds (default: 100)
+//!   --no-punctuation   Strip punctuation from output
 //!   --list-modes       List available streaming modes and exit
 
 use std::io::{self, Write};
@@ -38,6 +39,7 @@ fn main() -> mlx_nemo::Result<()> {
     let mut mode_idx: usize = 0;
     let mut chunk_ms: u32 = 100;
     let mut list_modes = false;
+    let mut no_punctuation = false;
 
     let mut i = 1;
     while i < args.len() {
@@ -57,6 +59,9 @@ fn main() -> mlx_nemo::Result<()> {
             "--list-modes" => {
                 list_modes = true;
             }
+            "--no-punctuation" => {
+                no_punctuation = true;
+            }
             arg if !arg.starts_with('-') => {
                 audio_path = Some(arg);
             }
@@ -75,6 +80,7 @@ fn main() -> mlx_nemo::Result<()> {
         eprintln!("  --model <path>     Path to NeMo model (.nemo file)");
         eprintln!("  --mode <idx>       Streaming mode index (default: 0)");
         eprintln!("  --chunk-ms <ms>    Audio chunk size in milliseconds (default: 100)");
+        eprintln!("  --no-punctuation   Strip punctuation from output");
         eprintln!("  --list-modes       List available streaming modes and exit");
         std::process::exit(1);
     });
@@ -89,6 +95,11 @@ fn main() -> mlx_nemo::Result<()> {
         CacheAwareRNNTPipeline::restore(model_path_ref, mode_idx)?
     };
     println!("Pipeline loaded in {:.2}s", start.elapsed().as_secs_f32());
+
+    // Enable punctuation suppression if requested
+    if no_punctuation {
+        pipeline.set_suppress_punctuation(true);
+    }
 
     let sample_rate = pipeline.sample_rate();
     println!("Sample rate: {} Hz", sample_rate);
