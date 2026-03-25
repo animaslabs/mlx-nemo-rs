@@ -136,6 +136,10 @@ pub struct CacheAwareRNNTPipeline {
     suppress_punctuation: bool,
     /// Token IDs identified as punctuation (computed at load time)
     punctuation_token_ids: Vec<usize>,
+
+    // Blank threshold
+    /// Blank threshold for decoder (0.0 = disabled)
+    blank_threshold: f32,
 }
 
 impl CacheAwareRNNTPipeline {
@@ -292,6 +296,7 @@ impl CacheAwareRNNTPipeline {
             n_mels,
             suppress_punctuation: false,
             punctuation_token_ids,
+            blank_threshold: 0.0,
         })
     }
 
@@ -528,6 +533,7 @@ impl CacheAwareRNNTPipeline {
             n_mels,
             suppress_punctuation: false,
             punctuation_token_ids,
+            blank_threshold: 0.0,
         })
     }
 
@@ -571,6 +577,35 @@ impl CacheAwareRNNTPipeline {
     /// Get the list of punctuation token IDs.
     pub fn punctuation_token_ids(&self) -> &[usize] {
         &self.punctuation_token_ids
+    }
+
+    /// Set the blank threshold for decoding.
+    ///
+    /// When > 0, blank is only emitted if blank_log_prob - best_non_blank_log_prob > threshold.
+    /// This helps prevent the model from over-predicting blanks during streaming,
+    /// which can cause sentences to be missed.
+    ///
+    /// Recommended values:
+    /// - 0.0 = disabled (default argmax behavior)
+    /// - 0.5 = blank must be ~1.6x more probable than best non-blank (mild)
+    /// - 1.0 = blank must be ~2.7x more probable (moderate)
+    /// - 2.0 = blank must be ~7.4x more probable (aggressive)
+    pub fn set_blank_threshold(&mut self, threshold: f32) {
+        self.blank_threshold = threshold;
+        // Rebuild streaming decoder with new threshold
+        self.streaming_decoder = RnntStreamingDecoder::new(self.blank_id)
+            .with_blank_threshold(threshold);
+        if threshold > 0.0 {
+            tracing::info!(
+                threshold = %format!("{:.2}", threshold),
+                "blank threshold enabled"
+            );
+        }
+    }
+
+    /// Get the current blank threshold.
+    pub fn blank_threshold(&self) -> f32 {
+        self.blank_threshold
     }
 
     /// Set audio from a file path.

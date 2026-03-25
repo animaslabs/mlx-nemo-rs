@@ -44,6 +44,11 @@ fn apply_token_mask(log_probs: &Array, masked_ids: &[usize]) -> Result<Array> {
 /// This is a safety limit to prevent infinite loops.
 const DEFAULT_MAX_SYMBOLS_PER_STEP: usize = 10;
 
+/// Default blank threshold (disabled).
+/// When > 0, requires blank log-probability to exceed best non-blank by this margin.
+/// This helps prevent the model from over-predicting blanks during streaming.
+const DEFAULT_BLANK_THRESHOLD: f32 = 0.0;
+
 /// Output from a streaming decode step.
 #[derive(Debug, Clone, Default)]
 pub struct DecodeStepOutput {
@@ -76,6 +81,14 @@ pub struct RnntStreamingDecoder {
     blank_id: usize,
     /// Maximum symbols per encoder frame
     max_symbols_per_step: usize,
+    /// Blank threshold: log-probability margin required for blank to be emitted.
+    /// When > 0, blank is only emitted if blank_log_prob - best_non_blank_log_prob > threshold.
+    /// This helps prevent over-predicting blanks during streaming.
+    /// - 0.0 = disabled (default argmax behavior)
+    /// - 0.5 = blank must be ~1.6x more probable than best non-blank
+    /// - 1.0 = blank must be ~2.7x more probable
+    /// - 2.0 = blank must be ~7.4x more probable
+    blank_threshold: f32,
 }
 
 impl RnntStreamingDecoder {
@@ -84,6 +97,7 @@ impl RnntStreamingDecoder {
         Self {
             blank_id,
             max_symbols_per_step: DEFAULT_MAX_SYMBOLS_PER_STEP,
+            blank_threshold: DEFAULT_BLANK_THRESHOLD,
         }
     }
 
@@ -93,9 +107,29 @@ impl RnntStreamingDecoder {
         self
     }
 
+    /// Set the blank threshold.
+    ///
+    /// When > 0, blank is only emitted if blank_log_prob - best_non_blank_log_prob > threshold.
+    /// This helps prevent the model from over-predicting blanks during streaming.
+    ///
+    /// Recommended values:
+    /// - 0.0 = disabled (default argmax behavior)
+    /// - 0.5 = blank must be ~1.6x more probable than best non-blank (mild)
+    /// - 1.0 = blank must be ~2.7x more probable (moderate)
+    /// - 2.0 = blank must be ~7.4x more probable (aggressive)
+    pub fn with_blank_threshold(mut self, threshold: f32) -> Self {
+        self.blank_threshold = threshold;
+        self
+    }
+
     /// Get the blank token ID.
     pub fn blank_id(&self) -> usize {
         self.blank_id
+    }
+
+    /// Get the current blank threshold.
+    pub fn blank_threshold(&self) -> f32 {
+        self.blank_threshold
     }
 
     /// Decode encoder frames and update state.
@@ -199,30 +233,78 @@ impl RnntStreamingDecoder {
                     );
                 }
 
-                // Debug: log probabilities for first frame when blank is predicted
-                if pred_token == self.blank_id && t == 0 && symbols_emitted == 0 {
+                // Apply blank threshold override if configured
+                // When blank is argmax but margin is insufficient, select best non-blank instead
+                let pred_token = if pred_token == self.blank_id && self.blank_threshold > 0.0 {
                     let probs_data = log_probs.as_slice::<f32>();
                     let blank_prob = probs_data[self.blank_id];
 
-                    // Find top non-blank token
-                    let mut best_non_blank_prob = f32::NEG_INFINITY;
-                    let mut best_non_blank_token = 0;
-                    for (i, &prob) in probs_data.iter().enumerate() {
-                        if i != self.blank_id && prob > best_non_blank_prob {
-                            best_non_blank_prob = prob;
-                            best_non_blank_token = i;
-                        }
+                    // Find best non-blank token
+                    let (best_non_blank_token, best_non_blank_prob) = probs_data
+                        .iter()
+                        .enumerate()
+                        .filter(|(i, _)| *i != self.blank_id)
+                        .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
+                        .map(|(i, &p)| (i, p))
+                        .unwrap_or((self.blank_id, f32::NEG_INFINITY));
+
+                    let margin = blank_prob - best_non_blank_prob;
+
+                    // Debug logging for first frame
+                    if t == 0 && symbols_emitted == 0 {
+                        trace!(
+                            frame = t,
+                            blank_log_prob = %format!("{:.4}", blank_prob),
+                            best_non_blank_token,
+                            best_non_blank_log_prob = %format!("{:.4}", best_non_blank_prob),
+                            margin = %format!("{:.4}", margin),
+                            threshold = %format!("{:.4}", self.blank_threshold),
+                            "blank threshold check on frame 0"
+                        );
                     }
 
-                    trace!(
-                        frame = t,
-                        blank_log_prob = %format!("{:.4}", blank_prob),
-                        best_non_blank_token,
-                        best_non_blank_log_prob = %format!("{:.4}", best_non_blank_prob),
-                        prob_diff = %format!("{:.4}", blank_prob - best_non_blank_prob),
-                        "blank predicted on frame 0"
-                    );
-                }
+                    if margin > self.blank_threshold {
+                        // Blank wins, keep it
+                        self.blank_id
+                    } else {
+                        // Override: emit best non-blank instead
+                        trace!(
+                            frame = t,
+                            original = "blank",
+                            override_token = best_non_blank_token,
+                            margin = %format!("{:.4}", margin),
+                            threshold = %format!("{:.4}", self.blank_threshold),
+                            "blank overridden by threshold"
+                        );
+                        best_non_blank_token
+                    }
+                } else {
+                    // Debug: log probabilities for first frame when blank is predicted (no threshold)
+                    if pred_token == self.blank_id && t == 0 && symbols_emitted == 0 {
+                        let probs_data = log_probs.as_slice::<f32>();
+                        let blank_prob = probs_data[self.blank_id];
+
+                        // Find top non-blank token
+                        let mut best_non_blank_prob = f32::NEG_INFINITY;
+                        let mut best_non_blank_token = 0;
+                        for (i, &prob) in probs_data.iter().enumerate() {
+                            if i != self.blank_id && prob > best_non_blank_prob {
+                                best_non_blank_prob = prob;
+                                best_non_blank_token = i;
+                            }
+                        }
+
+                        trace!(
+                            frame = t,
+                            blank_log_prob = %format!("{:.4}", blank_prob),
+                            best_non_blank_token,
+                            best_non_blank_log_prob = %format!("{:.4}", best_non_blank_prob),
+                            prob_diff = %format!("{:.4}", blank_prob - best_non_blank_prob),
+                            "blank predicted on frame 0"
+                        );
+                    }
+                    pred_token
+                };
 
                 if pred_token == self.blank_id {
                     // Blank: advance to next encoder frame
@@ -339,8 +421,25 @@ mod tests {
         let decoder = RnntStreamingDecoder::new(1024);
         assert_eq!(decoder.blank_id(), 1024);
         assert_eq!(decoder.max_symbols_per_step, DEFAULT_MAX_SYMBOLS_PER_STEP);
+        assert_eq!(decoder.blank_threshold(), DEFAULT_BLANK_THRESHOLD);
 
         let decoder = decoder.with_max_symbols(5);
         assert_eq!(decoder.max_symbols_per_step, 5);
+    }
+
+    #[test]
+    fn test_decoder_blank_threshold() {
+        let decoder = RnntStreamingDecoder::new(1024)
+            .with_blank_threshold(1.5);
+        assert_eq!(decoder.blank_id(), 1024);
+        assert_eq!(decoder.blank_threshold(), 1.5);
+
+        // Can chain with other builder methods
+        let decoder = RnntStreamingDecoder::new(512)
+            .with_max_symbols(3)
+            .with_blank_threshold(2.0);
+        assert_eq!(decoder.blank_id(), 512);
+        assert_eq!(decoder.max_symbols_per_step, 3);
+        assert_eq!(decoder.blank_threshold(), 2.0);
     }
 }
