@@ -12,6 +12,26 @@ use crate::asr::modules::MelSpectrogram;
 use crate::asr::streaming::{FeatureBuffer, StreamingConfig, StreamingMelBuffer};
 use crate::core::error::{Error, Result};
 
+/// Check if audio chunk is silent based on RMS energy.
+///
+/// Returns `true` if the RMS energy is below the threshold.
+/// Returns `false` if threshold is <= 0 (disabled) or audio is empty.
+fn is_silent(audio: &[f32], threshold: f32) -> bool {
+    if threshold <= 0.0 || audio.is_empty() {
+        return false; // Disabled or no audio
+    }
+    let rms = (audio.iter().map(|s| s * s).sum::<f32>() / audio.len() as f32).sqrt();
+    rms < threshold
+}
+
+/// Compute RMS energy of audio samples.
+fn compute_rms(audio: &[f32]) -> f32 {
+    if audio.is_empty() {
+        return 0.0;
+    }
+    (audio.iter().map(|s| s * s).sum::<f32>() / audio.len() as f32).sqrt()
+}
+
 /// Request streamer for streaming ASR inference.
 ///
 /// This streamer handles:
@@ -79,6 +99,11 @@ pub struct RequestStreamer {
     live_chunk_counter: usize,
     /// Total audio samples processed from live buffer
     live_samples_processed: usize,
+
+    // Silence detection
+    /// RMS energy threshold below which audio is considered silent.
+    /// 0.0 = disabled (default), typical values: 0.005-0.02
+    silence_threshold: f32,
 }
 
 impl RequestStreamer {
@@ -124,6 +149,7 @@ impl RequestStreamer {
             audio_overlap: Vec::new(),
             live_chunk_counter: 0,
             live_samples_processed: 0,
+            silence_threshold: 0.0,
         }
     }
 
@@ -245,6 +271,29 @@ impl RequestStreamer {
         self.audio_overlap.clear();
         self.live_chunk_counter = 0;
         self.live_samples_processed = 0;
+    }
+
+    /// Set silence detection threshold.
+    ///
+    /// When > 0, audio chunks with RMS energy below threshold are skipped.
+    /// This prevents the model from processing silent frames that could
+    /// trigger stuck behavior in the decoder.
+    ///
+    /// # Arguments
+    /// * `threshold` - RMS energy threshold. 0.0 = disabled (default).
+    ///
+    /// # Recommended values
+    /// - 0.0 = disabled (default)
+    /// - 0.005-0.01 = quiet environments
+    /// - 0.01-0.02 = typical environments
+    /// - 0.02-0.05 = noisy environments
+    pub fn set_silence_threshold(&mut self, threshold: f32) {
+        self.silence_threshold = threshold;
+    }
+
+    /// Get the current silence detection threshold.
+    pub fn silence_threshold(&self) -> f32 {
+        self.silence_threshold
     }
 
     /// Get audio chunk size in samples for the current streaming config.
@@ -469,6 +518,30 @@ impl RequestStreamer {
         buffer
     }
 
+    /// Update the audio overlap buffer without building the full audio buffer.
+    ///
+    /// This is used when skipping silent chunks to maintain continuity
+    /// in the overlap buffer for when speech returns.
+    fn update_audio_overlap(&mut self, audio_chunk: &[f32]) {
+        let lookback_samples = self.mel_lookback_samples();
+
+        // Initialize overlap if empty
+        if self.audio_overlap.is_empty() {
+            self.audio_overlap = vec![0.0f32; lookback_samples];
+        }
+
+        // Save last lookback_samples from audio_chunk for next iteration
+        if audio_chunk.len() >= lookback_samples {
+            let start_idx = audio_chunk.len() - lookback_samples;
+            self.audio_overlap = audio_chunk[start_idx..].to_vec();
+        } else {
+            // Chunk is shorter than lookback_samples
+            let shift = audio_chunk.len();
+            self.audio_overlap.drain(..shift);
+            self.audio_overlap.extend_from_slice(audio_chunk);
+        }
+    }
+
     fn process_pending_audio(&mut self) -> Result<()> {
         let chunk_audio_size = self.audio_chunk_size();
 
@@ -507,8 +580,25 @@ impl RequestStreamer {
         // Now process the chunk if we have one
         if let Some(audio_chunk) = audio_chunk {
             if !audio_chunk.is_empty() {
-                // Reset preprocessor state before each chunk
-                // self.preprocessor.reset();
+                // Skip silent chunks - don't process through mel/encoder
+                if is_silent(&audio_chunk, self.silence_threshold) {
+                    tracing::trace!(
+                        rms = %format!("{:.6}", compute_rms(&audio_chunk)),
+                        threshold = self.silence_threshold,
+                        chunk_samples = audio_chunk.len(),
+                        "Skipping silent audio chunk (file)"
+                    );
+                    // Update position but don't produce mel frames
+                    self.file_position = new_position;
+                    // Still update overlap buffer for continuity when speech returns
+                    self.update_audio_overlap(&audio_chunk);
+
+                    // If we've reached the end of file, signal stream end
+                    if reached_end && !self.stream_ended {
+                        self.stream_ended = true;
+                    }
+                    return Ok(());
+                }
 
                 // Build the audio buffer with small lookback for mel continuity
                 let audio_buffer = self.build_audio_buffer(&audio_chunk);
@@ -577,6 +667,19 @@ impl RequestStreamer {
             // Update progress counters
             self.live_chunk_counter += 1;
             self.live_samples_processed += audio_chunk.len();
+
+            // Skip silent chunks - don't process through mel/encoder
+            if is_silent(&audio_chunk, self.silence_threshold) {
+                tracing::trace!(
+                    rms = %format!("{:.6}", compute_rms(&audio_chunk)),
+                    threshold = self.silence_threshold,
+                    chunk_num = self.live_chunk_counter,
+                    "Skipping silent audio chunk (live)"
+                );
+                // Still update overlap buffer for continuity when speech returns
+                self.update_audio_overlap(&audio_chunk);
+                continue;
+            }
 
             // Build the audio buffer with small lookback for mel continuity
             let audio_buffer = self.build_audio_buffer(&audio_chunk);
@@ -893,5 +996,56 @@ mod tests {
     fn test_request_streamer_state() {
         // Can't fully test without preprocessor, but can test state logic
         assert!(true); // Placeholder
+    }
+
+    #[test]
+    fn test_compute_rms() {
+        // Silence
+        let silence = vec![0.0f32; 100];
+        assert_eq!(compute_rms(&silence), 0.0);
+
+        // Constant signal: RMS of [1.0, 1.0, ...] = 1.0
+        let constant = vec![1.0f32; 100];
+        assert!((compute_rms(&constant) - 1.0).abs() < 1e-6);
+
+        // Alternating signal: RMS of [-1.0, 1.0, ...] = 1.0
+        let alternating: Vec<f32> = (0..100).map(|i| if i % 2 == 0 { 1.0 } else { -1.0 }).collect();
+        assert!((compute_rms(&alternating) - 1.0).abs() < 1e-6);
+
+        // Small signal
+        let small = vec![0.01f32; 100];
+        assert!((compute_rms(&small) - 0.01).abs() < 1e-6);
+
+        // Empty
+        assert_eq!(compute_rms(&[]), 0.0);
+    }
+
+    #[test]
+    fn test_is_silent() {
+        // Threshold disabled (0.0)
+        let audio = vec![0.0f32; 100];
+        assert!(!is_silent(&audio, 0.0));
+
+        // Silent audio with threshold enabled
+        let silence = vec![0.0f32; 100];
+        assert!(is_silent(&silence, 0.01));
+
+        // Loud audio above threshold
+        let loud = vec![0.1f32; 100];
+        assert!(!is_silent(&loud, 0.01));
+
+        // Quiet audio below threshold
+        let quiet = vec![0.005f32; 100];
+        assert!(is_silent(&quiet, 0.01));
+
+        // Audio just above threshold
+        let borderline = vec![0.015f32; 100];
+        assert!(!is_silent(&borderline, 0.01));
+
+        // Empty audio
+        assert!(!is_silent(&[], 0.01));
+
+        // Negative threshold (disabled)
+        assert!(!is_silent(&silence, -1.0));
     }
 }

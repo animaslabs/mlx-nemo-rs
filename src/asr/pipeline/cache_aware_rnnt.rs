@@ -608,6 +608,35 @@ impl CacheAwareRNNTPipeline {
         self.blank_threshold
     }
 
+    /// Set silence detection threshold.
+    ///
+    /// When > 0, audio chunks with RMS energy below threshold are skipped.
+    /// This prevents the model from processing silent frames that could
+    /// trigger stuck behavior in the decoder.
+    ///
+    /// # Arguments
+    /// * `threshold` - RMS energy threshold. 0.0 = disabled (default).
+    ///
+    /// # Recommended values
+    /// - 0.0 = disabled (default)
+    /// - 0.005-0.01 = quiet environments
+    /// - 0.01-0.02 = typical environments
+    /// - 0.02-0.05 = noisy environments
+    pub fn set_silence_threshold(&mut self, threshold: f32) {
+        self.streamer.set_silence_threshold(threshold);
+        if threshold > 0.0 {
+            tracing::info!(
+                threshold = %format!("{:.4}", threshold),
+                "silence detection enabled"
+            );
+        }
+    }
+
+    /// Get the current silence detection threshold.
+    pub fn silence_threshold(&self) -> f32 {
+        self.streamer.silence_threshold()
+    }
+
     /// Set audio from a file path.
     pub fn set_audio_file(&mut self, path: impl AsRef<Path>) -> Result<()> {
         self.reset();
