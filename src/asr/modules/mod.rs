@@ -14,10 +14,12 @@ pub use decoders::{LstmState, RNNTDecoder, RNNTJoint, StatelessTransducerDecoder
 pub use encoders::ConformerEncoder;
 
 // Primary exports (new names)
-pub use preprocessors::{MelConfig, MelProcessor};
+pub use preprocessors::{MelConfig, MelProcessor, StreamingMel};
 
-// Streaming exports
-pub use preprocessors::{StreamingMelConfig, StreamingMelProcessor};
+// Stateless streaming exports
+pub use preprocessors::{
+    frames_available, process_audio_streaming, MelStreamState, StreamingMelConfig,
+};
 
 // Backwards-compatible aliases
 pub use preprocessors::{MelSpectrogram, MelSpectrogramConfig};

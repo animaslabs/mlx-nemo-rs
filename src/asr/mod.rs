@@ -31,6 +31,7 @@
 
 pub mod config;
 pub mod decoding;
+pub mod dsp;
 pub mod models;
 pub mod modules;
 pub mod pipeline;
@@ -43,7 +44,7 @@ pub use models::{
     RnntStreamingSession,
 };
 // Primary exports (new names)
-pub use modules::{MelConfig, MelProcessor};
+pub use modules::{MelConfig, MelProcessor, StreamingMel};
 // Backwards-compatible alias
 pub use modules::MelSpectrogram;
 pub use pipeline::{CacheAwareRNNTPipeline, TranscribeOutput};

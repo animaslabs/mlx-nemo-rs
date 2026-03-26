@@ -74,6 +74,36 @@ pub enum DecoderState {
     Lstm(LstmState),
 }
 
+impl DecoderState {
+    /// Compute a summary norm of the decoder state for debugging.
+    pub fn compute_norm(&self) -> f32 {
+        match self {
+            DecoderState::Stateless(arr) => {
+                arr.eval().ok();
+                let data = arr.as_slice::<f32>();
+                if !data.is_empty() {
+                    // Sample first 100 values for efficiency
+                    let sample_len = data.len().min(100);
+                    data[..sample_len].iter().map(|v| v * v).sum::<f32>().sqrt()
+                } else {
+                    0.0
+                }
+            }
+            DecoderState::Lstm(lstm_state) => {
+                // Compute norm of hidden state
+                lstm_state.hidden.eval().ok();
+                let data = lstm_state.hidden.as_slice::<f32>();
+                if !data.is_empty() {
+                    let sample_len = data.len().min(100);
+                    data[..sample_len].iter().map(|v| v * v).sum::<f32>().sqrt()
+                } else {
+                    0.0
+                }
+            }
+        }
+    }
+}
+
 impl PredictionNetwork {
     /// Get the prediction network hidden dimension.
     pub fn pred_hidden(&self) -> usize {
