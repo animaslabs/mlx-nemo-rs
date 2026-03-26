@@ -1686,31 +1686,31 @@ impl CacheAwareRNNTPipeline {
             "PIPELINE: received feature buffer"
         );
 
-        // Log encoder cache state BEFORE processing
-        {
-            self.encoder_cache.last_channel_len.eval().ok();
-            let cache_len_before = self.encoder_cache.last_channel_len.as_slice::<i64>()[0];
+        // // Log encoder cache state BEFORE processing
+        // {
+        //     self.encoder_cache.last_channel_len.eval().ok();
+        //     let cache_len_before = self.encoder_cache.last_channel_len.as_slice::<i64>()[0];
 
-            // Compute cache channel norm (sample first layer)
-            let cache_channel_norm: f32 = {
-                self.encoder_cache.last_channel.eval().ok();
-                let data = self.encoder_cache.last_channel.as_slice::<f32>();
-                if !data.is_empty() {
-                    // Just sample first 100 values for efficiency
-                    let sample_len = data.len().min(100);
-                    data[..sample_len].iter().map(|v| v * v).sum::<f32>().sqrt()
-                } else {
-                    0.0
-                }
-            };
+        //     // Compute cache channel norm (sample first layer)
+        //     let cache_channel_norm: f32 = {
+        //         self.encoder_cache.last_channel.eval().ok();
+        //         let data = self.encoder_cache.last_channel.as_slice::<f32>();
+        //         if !data.is_empty() {
+        //             // Just sample first 100 values for efficiency
+        //             let sample_len = data.len().min(100);
+        //             data[..sample_len].iter().map(|v| v * v).sum::<f32>().sqrt()
+        //         } else {
+        //             0.0
+        //         }
+        //     };
 
-            tracing::debug!(
-                step = self.state.step_count,
-                cache_len_before,
-                cache_channel_norm = %format!("{:.6}", cache_channel_norm),
-                "ENCODER CACHE: state before forward"
-            );
-        }
+        //     tracing::debug!(
+        //         step = self.state.step_count,
+        //         cache_len_before,
+        //         cache_channel_norm = %format!("{:.6}", cache_channel_norm),
+        //         "ENCODER CACHE: state before forward"
+        //     );
+        // }
 
         // Run encoder with cache
         let (encoded, encoded_lengths, cache_channel_next, cache_time_next, cache_len_next) =

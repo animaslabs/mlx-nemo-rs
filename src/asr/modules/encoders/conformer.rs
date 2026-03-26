@@ -115,16 +115,16 @@ fn causal_pad_2d(x: &Array, kernel_size: usize, stride: usize) -> Result<Array> 
 
     // Step 1: Pad time dimension (axis 1): [B, T, F, C] -> [B, T+left_pad+right_pad, F, C]
     let left_pad_time = (kernel_size - 1) as i32;
-    // let right_pad_time = (kernel_size / 2) as i32;
+    let right_pad_time = 0 as i32; // (stride - 1) as i32; // ((kernel_size - 1) / 2) as i32;
     let time_zeros_left = mlx_rs::ops::zeros::<f32>(&[batch, left_pad_time, freq, channels])?;
-    // let time_zeros_right = mlx_rs::ops::zeros::<f32>(&[batch, right_pad_time, freq, channels])?;
-    // let x = mlx_rs::ops::concatenate_axis(&[&time_zeros_left, x, &time_zeros_right], 1)?;
+    let time_zeros_right = mlx_rs::ops::zeros::<f32>(&[batch, right_pad_time, freq, channels])?;
+    let x = mlx_rs::ops::concatenate_axis(&[&time_zeros_left, x, &time_zeros_right], 1)?;
     // JJK test
-    let x = mlx_rs::ops::concatenate_axis(&[&time_zeros_left, x], 1)?;
+    // let x = mlx_rs::ops::concatenate_axis(&[&time_zeros_left, x], 1)?;
 
     // Step 2: Pad frequency dimension (axis 2)
     // let new_time = time + left_pad_time + right_pad_time;
-    let new_time = time + left_pad_time;
+    let new_time = time + left_pad_time + right_pad_time;
     let freq_zeros_left = mlx_rs::ops::zeros::<f32>(&[batch, new_time, left_pad, channels])?;
     let freq_zeros_right = mlx_rs::ops::zeros::<f32>(&[batch, new_time, right_pad, channels])?;
     let x = mlx_rs::ops::concatenate_axis(&[&freq_zeros_left, &x, &freq_zeros_right], 2)?;
