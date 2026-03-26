@@ -1,16 +1,20 @@
 //! Common DSP primitives for audio processing.
 //!
-//! Pure functions for signal processing - no MLX dependencies.
-//! These functions are used by the mel spectrogram processor and can be
-//! reused for other audio processing tasks.
+//! MLX-based functions for signal processing used throughout the ASR pipeline.
+//! Data stays on GPU to avoid CPU/GPU copies.
 
 use std::f32::consts::PI;
+
+use mlx_rs::ops::indexing::IndexOp;
+use mlx_rs::{ops, Array};
+
+use crate::core::error::{Error, Result};
 
 // ============================================================================
 // Window Functions
 // ============================================================================
 
-/// Create Hann window of given length.
+/// Create Hann window of given length as MLX array.
 ///
 /// The Hann window is defined as:
 /// w[n] = 0.5 * (1 - cos(2πn / (N-1)))
@@ -19,21 +23,30 @@ use std::f32::consts::PI;
 /// * `length` - Window length in samples
 ///
 /// # Returns
-/// Vector of window coefficients
-pub fn hann_window(length: usize) -> Vec<f32> {
+/// MLX Array of shape [length] with window coefficients
+pub fn hann_window(length: usize) -> Result<Array> {
     if length == 0 {
-        return Vec::new();
+        return Ok(Array::zeros::<f32>(&[0])?);
     }
     if length == 1 {
-        return vec![1.0];
+        return Ok(Array::from_f32(1.0).reshape(&[1])?);
     }
+
     let n = length as f32;
-    (0..length)
-        .map(|i| 0.5 * (1.0 - (2.0 * PI * i as f32 / (n - 1.0)).cos()))
-        .collect()
+    // Create indices [0, 1, 2, ..., length-1]
+    let indices = ops::arange::<_, f32>(0, length as i32, None)?;
+    // 2 * PI * i / (n - 1)
+    let scale = Array::from_f32(2.0 * PI / (n - 1.0));
+    let angles = ops::multiply(&indices, &scale)?;
+    // 0.5 * (1 - cos(angles))
+    let cos_vals = ops::cos(&angles)?;
+    let one = Array::from_f32(1.0);
+    let half = Array::from_f32(0.5);
+    let one_minus_cos = ops::subtract(&one, &cos_vals)?;
+    ops::multiply(&half, &one_minus_cos).map_err(|e| Error::model(e.to_string()))
 }
 
-/// Create Hamming window of given length.
+/// Create Hamming window of given length as MLX array.
 ///
 /// The Hamming window is defined as:
 /// w[n] = 0.54 - 0.46 * cos(2πn / (N-1))
@@ -42,37 +55,49 @@ pub fn hann_window(length: usize) -> Vec<f32> {
 /// * `length` - Window length in samples
 ///
 /// # Returns
-/// Vector of window coefficients
-pub fn hamming_window(length: usize) -> Vec<f32> {
+/// MLX Array of shape [length] with window coefficients
+pub fn hamming_window(length: usize) -> Result<Array> {
     if length == 0 {
-        return Vec::new();
+        return Ok(Array::zeros::<f32>(&[0])?);
     }
     if length == 1 {
-        return vec![1.0];
+        return Ok(Array::from_f32(1.0).reshape(&[1])?);
     }
+
     let n = length as f32;
-    (0..length)
-        .map(|i| 0.54 - 0.46 * (2.0 * PI * i as f32 / (n - 1.0)).cos())
-        .collect()
+    // Create indices [0, 1, 2, ..., length-1]
+    let indices = ops::arange::<_, f32>(0, length as i32, None)?;
+    // 2 * PI * i / (n - 1)
+    let scale = Array::from_f32(2.0 * PI / (n - 1.0));
+    let angles = ops::multiply(&indices, &scale)?;
+    // 0.54 - 0.46 * cos(angles)
+    let cos_vals = ops::cos(&angles)?;
+    let a = Array::from_f32(0.54);
+    let b = Array::from_f32(0.46);
+    let b_cos = ops::multiply(&b, &cos_vals)?;
+    ops::subtract(&a, &b_cos).map_err(|e| Error::model(e.to_string()))
 }
 
-/// Create window by type name.
+/// Create window by type name as MLX array.
 ///
 /// # Arguments
 /// * `window_type` - Window type: "hann" or "hamming"
 /// * `length` - Window length in samples
 ///
 /// # Returns
-/// `Some(Vec<f32>)` with window coefficients, or `None` for unknown window type
-pub fn create_window(window_type: &str, length: usize) -> Option<Vec<f32>> {
+/// MLX Array with window coefficients, or error for unknown window type
+pub fn create_window(window_type: &str, length: usize) -> Result<Array> {
     match window_type {
-        "hann" => Some(hann_window(length)),
-        "hamming" => Some(hamming_window(length)),
-        _ => None,
+        "hann" => hann_window(length),
+        "hamming" => hamming_window(length),
+        _ => Err(Error::config(format!("Unknown window type: {}", window_type))),
     }
 }
 
-/// Create a window function with centered zero-padding to n_fft.
+/// Create a window function with zero-padding to n_fft as MLX array.
+///
+/// The window is always center-padded: zeros are added symmetrically on both sides.
+/// This ensures proper STFT alignment since audio frames are also center-padded.
 ///
 /// # Arguments
 /// * `window_type` - Window type: "hann" or "hamming"
@@ -80,20 +105,23 @@ pub fn create_window(window_type: &str, length: usize) -> Option<Vec<f32>> {
 /// * `n_fft` - FFT size (window will be zero-padded to this length)
 ///
 /// # Returns
-/// `Some(Vec<f32>)` with zero-padded window, or `None` for unknown window type
-pub fn create_window_padded(window_type: &str, win_length: usize, n_fft: usize) -> Option<Vec<f32>> {
-    let win_values = create_window(window_type, win_length)?;
+/// MLX Array of shape [n_fft] with center-padded window
+pub fn create_window_padded(window_type: &str, win_length: usize, n_fft: usize) -> Result<Array> {
+    let window = create_window(window_type, win_length)?;
 
     if win_length >= n_fft {
-        return Some(win_values);
+        return Ok(window);
     }
 
-    // Center the window with zero-padding
+    // Always center-pad the window
     let left_pad = (n_fft - win_length) / 2;
-    let mut padded = vec![0.0f32; n_fft];
-    padded[left_pad..left_pad + win_length].copy_from_slice(&win_values);
+    let right_pad = n_fft - win_length - left_pad;
 
-    Some(padded)
+    let left_zeros = Array::zeros::<f32>(&[left_pad as i32])?;
+    let right_zeros = Array::zeros::<f32>(&[right_pad as i32])?;
+
+    ops::concatenate(&[&left_zeros, &window, &right_zeros])
+        .map_err(|e| Error::model(e.to_string()))
 }
 
 // ============================================================================
@@ -131,10 +159,9 @@ pub fn mel_to_hz(mel: f32) -> f32 {
     }
 }
 
-/// Create Slaney-normalized mel filterbank.
+/// Create Slaney-normalized mel filterbank as MLX array.
 ///
-/// Returns a flattened [n_mels × n_freqs] matrix in row-major order,
-/// where n_freqs = n_fft / 2 + 1.
+/// Returns a matrix of shape [n_mels, n_freqs] where n_freqs = n_fft / 2 + 1.
 ///
 /// # Arguments
 /// * `n_mels` - Number of mel filterbank channels
@@ -144,15 +171,19 @@ pub fn mel_to_hz(mel: f32) -> f32 {
 /// * `f_max` - Maximum frequency in Hz
 ///
 /// # Returns
-/// Flattened filterbank matrix of size [n_mels * n_freqs]
+/// MLX Array of shape [n_mels, n_freqs]
 pub fn mel_filterbank(
     n_mels: usize,
     n_fft: usize,
     sample_rate: f32,
     f_min: f32,
     f_max: f32,
-) -> Vec<f32> {
+) -> Result<Array> {
     let n_freqs = n_fft / 2 + 1;
+
+    // Build filterbank on CPU then convert to MLX
+    // (Filterbank is computed once at init, so CPU is fine)
+    let mut filterbank = vec![0.0f32; n_mels * n_freqs];
 
     // FFT frequencies: i * sample_rate / n_fft
     let fft_freqs: Vec<f32> = (0..n_freqs)
@@ -173,8 +204,6 @@ pub fn mel_filterbank(
     let fdiff: Vec<f32> = hz_points.windows(2).map(|w| w[1] - w[0]).collect();
 
     // Build filterbank with Slaney normalization
-    let mut filterbank = vec![0.0f32; n_mels * n_freqs];
-
     for m in 0..n_mels {
         let f_left = hz_points[m];
         let f_right = hz_points[m + 2];
@@ -191,83 +220,119 @@ pub fn mel_filterbank(
         }
     }
 
-    filterbank
+    Ok(Array::from_slice(
+        &filterbank,
+        &[n_mels as i32, n_freqs as i32],
+    ))
 }
 
 // ============================================================================
 // Audio Processing Filters
 // ============================================================================
 
-/// Apply preemphasis filter: y[n] = x[n] - coef * x[n-1]
+/// Apply preemphasis filter to audio: y[n] = x[n] - coef * x[n-1]
 ///
 /// # Arguments
-/// * `audio` - Input audio samples
+/// * `audio` - Input audio array [batch, time] or [time]
 /// * `coef` - Preemphasis coefficient (typically 0.97)
-/// * `last_sample` - Last sample from previous chunk (for continuity)
 ///
 /// # Returns
-/// Filtered audio samples
-pub fn preemphasis(audio: &[f32], coef: f32, last_sample: f32) -> Vec<f32> {
-    let mut out = Vec::with_capacity(audio.len());
-    let mut prev = last_sample;
-    for &sample in audio {
-        out.push(sample - coef * prev);
-        prev = sample;
+/// Filtered audio with same shape as input
+pub fn preemphasis(audio: &Array, coef: f32) -> Result<Array> {
+    let ndim = audio.ndim();
+
+    if ndim == 1 {
+        // [time] case
+        let audio_len = audio.shape()[0];
+        if audio_len <= 1 {
+            return Ok(audio.clone());
+        }
+
+        // Shift audio by 1: [0, x[0], x[1], ..., x[n-2]]
+        let zero = Array::zeros::<f32>(&[1])?;
+        let shifted = ops::concatenate(&[&zero, &audio.index(..(audio_len - 1))])?;
+
+        // y = x - coef * shifted
+        let coef_arr = Array::from_f32(coef);
+        let scaled = ops::multiply(&shifted, &coef_arr)?;
+        ops::subtract(audio, &scaled).map_err(|e| Error::model(e.to_string()))
+    } else if ndim == 2 {
+        // [batch, time] case
+        let batch_size = audio.shape()[0];
+        let audio_len = audio.shape()[1];
+
+        if audio_len <= 1 {
+            return Ok(audio.clone());
+        }
+
+        // Shift audio by 1: [zeros, x[:, :-1]]
+        let zeros = Array::zeros::<f32>(&[batch_size, 1])?;
+        let shifted = ops::concatenate_axis(&[&zeros, &audio.index((.., ..(audio_len - 1)))], 1)?;
+
+        // y = x - coef * shifted
+        let coef_arr = Array::from_f32(coef);
+        let scaled = ops::multiply(&shifted, &coef_arr)?;
+        ops::subtract(audio, &scaled).map_err(|e| Error::model(e.to_string()))
+    } else {
+        Err(Error::config(format!(
+            "preemphasis expects 1D or 2D input, got {}D",
+            ndim
+        )))
     }
-    out
 }
 
-/// Apply dithering (deterministic noise for reproducibility).
-///
-/// Uses a deterministic hash-based noise generator for reproducibility
-/// in tests. In production, you might want true random noise.
+/// Apply dithering (random noise) to audio.
 ///
 /// # Arguments
-/// * `audio` - Input audio samples
+/// * `audio` - Input audio array
 /// * `amount` - Dither amount (noise amplitude)
 ///
 /// # Returns
-/// Audio samples with added dither noise
-pub fn dither(audio: &[f32], amount: f32) -> Vec<f32> {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
+/// Audio with added dither noise
+pub fn dither(audio: &Array, amount: f32) -> Result<Array> {
+    if amount <= 0.0 {
+        return Ok(audio.clone());
+    }
 
-    audio
-        .iter()
-        .enumerate()
-        .map(|(i, &sample)| {
-            let mut hasher = DefaultHasher::new();
-            i.hash(&mut hasher);
-            let hash = hasher.finish();
-            let noise = ((hash as f64 / u64::MAX as f64) * 2.0 - 1.0) as f32 * amount;
-            sample + noise
-        })
-        .collect()
+    let noise = mlx_rs::random::uniform::<_, f32>(-amount, amount, audio.shape(), None)?;
+    ops::add(audio, &noise).map_err(|e| Error::model(e.to_string()))
 }
 
 // ============================================================================
 // STFT Helpers
 // ============================================================================
 
-/// Frame audio into overlapping windows, zero-padded to n_fft.
+/// Frame audio into overlapping windows as MLX array.
 ///
-/// Returns flattened [n_frames × n_fft] data in row-major order.
+/// Returns array of shape [n_frames, n_fft] with center-padded frames.
+/// Each frame has the audio centered within the FFT frame size.
 ///
 /// # Arguments
-/// * `audio` - Input audio samples
+/// * `audio` - Input audio [time]
 /// * `window_len` - Window length in samples
 /// * `hop_len` - Hop length in samples
 /// * `n_fft` - FFT size (frames will be zero-padded to this length)
 ///
 /// # Returns
-/// Flattened framed data of size [n_frames * n_fft]
-pub fn frame_audio(audio: &[f32], window_len: usize, hop_len: usize, n_fft: usize) -> Vec<f32> {
-    let n_frames = num_frames(audio.len(), window_len, hop_len);
+/// MLX Array of shape [n_frames, n_fft]
+pub fn frame_audio(
+    audio: &Array,
+    window_len: usize,
+    hop_len: usize,
+    n_fft: usize,
+) -> Result<Array> {
+    audio.eval()?;
+    let audio_data: &[f32] = audio.as_slice();
+    let audio_len = audio_data.len();
+
+    let n_frames = num_frames(audio_len, window_len, hop_len);
     if n_frames == 0 {
-        return Vec::new();
+        return Ok(Array::zeros::<f32>(&[0, n_fft as i32])?);
     }
 
+    // Always center-pad frames to match the center-padded window
     let left_pad = (n_fft - window_len) / 2;
+    let right_pad = n_fft - window_len - left_pad;
     let mut frames = Vec::with_capacity(n_frames * n_fft);
 
     for frame_idx in 0..n_frames {
@@ -277,13 +342,71 @@ pub fn frame_audio(audio: &[f32], window_len: usize, hop_len: usize, n_fft: usiz
         frames.extend(std::iter::repeat(0.0f32).take(left_pad));
 
         // Audio samples
-        frames.extend_from_slice(&audio[start..start + window_len]);
+        frames.extend_from_slice(&audio_data[start..start + window_len]);
 
         // Right zero-padding
-        frames.extend(std::iter::repeat(0.0f32).take(n_fft - window_len - left_pad));
+        frames.extend(std::iter::repeat(0.0f32).take(right_pad));
     }
 
-    frames
+    Ok(Array::from_slice(&frames, &[n_frames as i32, n_fft as i32]))
+}
+
+/// Frame batched audio into overlapping windows.
+///
+/// Returns array of shape [batch, n_frames, n_fft] with center-padded frames.
+/// Each frame has the audio centered within the FFT frame size.
+///
+/// # Arguments
+/// * `audio` - Input audio [batch, time]
+/// * `window_len` - Window length in samples
+/// * `hop_len` - Hop length in samples
+/// * `n_fft` - FFT size (frames will be zero-padded to this length)
+///
+/// # Returns
+/// MLX Array of shape [batch, n_frames, n_fft]
+pub fn frame_audio_batch(
+    audio: &Array,
+    window_len: usize,
+    hop_len: usize,
+    n_fft: usize,
+) -> Result<Array> {
+    audio.eval()?;
+    let audio_data: &[f32] = audio.as_slice();
+    let batch_size = audio.shape()[0] as usize;
+    let audio_len = audio.shape()[1] as usize;
+
+    let n_frames = num_frames(audio_len, window_len, hop_len);
+    if n_frames == 0 {
+        return Ok(Array::zeros::<f32>(&[batch_size as i32, 0, n_fft as i32])?);
+    }
+
+    // Always center-pad frames to match the center-padded window
+    let left_pad = (n_fft - window_len) / 2;
+    let right_pad = n_fft - window_len - left_pad;
+    let mut frames = Vec::with_capacity(batch_size * n_frames * n_fft);
+
+    for b in 0..batch_size {
+        let batch_offset = b * audio_len;
+        for frame_idx in 0..n_frames {
+            let start = frame_idx * hop_len;
+
+            // Left zero-padding
+            frames.extend(std::iter::repeat(0.0f32).take(left_pad));
+
+            // Audio samples
+            for i in 0..window_len {
+                frames.push(audio_data[batch_offset + start + i]);
+            }
+
+            // Right zero-padding
+            frames.extend(std::iter::repeat(0.0f32).take(right_pad));
+        }
+    }
+
+    Ok(Array::from_slice(
+        &frames,
+        &[batch_size as i32, n_frames as i32, n_fft as i32],
+    ))
 }
 
 /// Calculate number of frames from audio length.
@@ -333,52 +456,84 @@ mod tests {
 
     #[test]
     fn test_hann_window_endpoints() {
-        let window = hann_window(400);
-        assert!(window[0].abs() < 1e-6, "First hann value should be ~0");
-        assert!(window[399].abs() < 1e-6, "Last hann value should be ~0");
+        let window = hann_window(400).unwrap();
+        window.eval().unwrap();
+        let data: &[f32] = window.as_slice();
+
+        assert!(data[0].abs() < 1e-6, "First hann value should be ~0");
+        assert!(data[399].abs() < 1e-6, "Last hann value should be ~0");
     }
 
     #[test]
     fn test_hann_window_center() {
-        let window = hann_window(400);
+        let window = hann_window(400).unwrap();
+        window.eval().unwrap();
+        let data: &[f32] = window.as_slice();
+
         // Center value should be close to 1.0
-        assert!(approx_eq(window[199], 1.0, 0.01), "Center hann value should be ~1.0");
+        assert!(
+            approx_eq(data[199], 1.0, 0.01),
+            "Center hann value should be ~1.0"
+        );
     }
 
     #[test]
     fn test_hamming_window_endpoints() {
-        let window = hamming_window(400);
-        assert!(approx_eq(window[0], 0.08, 1e-4));
-        assert!(approx_eq(window[399], 0.08, 1e-4));
+        let window = hamming_window(400).unwrap();
+        window.eval().unwrap();
+        let data: &[f32] = window.as_slice();
+
+        assert!(approx_eq(data[0], 0.08, 1e-4));
+        assert!(approx_eq(data[399], 0.08, 1e-4));
     }
 
     #[test]
     fn test_create_window() {
-        assert!(create_window("hann", 100).is_some());
-        assert!(create_window("hamming", 100).is_some());
-        assert!(create_window("unknown", 100).is_none());
+        assert!(create_window("hann", 100).is_ok());
+        assert!(create_window("hamming", 100).is_ok());
+        assert!(create_window("unknown", 100).is_err());
     }
 
     #[test]
     fn test_create_window_padded() {
         let padded = create_window_padded("hann", 400, 512).unwrap();
-        assert_eq!(padded.len(), 512);
+        padded.eval().unwrap();
+        let data: &[f32] = padded.as_slice();
 
-        let left_pad = (512 - 400) / 2;
-        // Check padding is zeros
+        assert_eq!(data.len(), 512);
+
+        // Window should be center-padded
+        let left_pad = (512 - 400) / 2; // 56
+        let right_pad = 512 - 400 - left_pad; // 56
+
+        // Check left padding is zeros
         for i in 0..left_pad {
-            assert_eq!(padded[i], 0.0);
+            assert_eq!(data[i], 0.0, "Left padding at index {} should be 0", i);
         }
-        // Check window values
-        assert!(padded[left_pad].abs() < 1e-6);
+
+        // Check window values (Hann endpoints are ~0)
+        assert!(data[left_pad].abs() < 1e-6, "First hann value should be ~0");
+        assert!(
+            data[left_pad + 399].abs() < 1e-6,
+            "Last hann value should be ~0"
+        );
+
+        // Check right padding is zeros
+        for i in (512 - right_pad)..512 {
+            assert_eq!(data[i], 0.0, "Right padding at index {} should be 0", i);
+        }
     }
 
     #[test]
     fn test_window_edge_cases() {
-        assert!(hann_window(0).is_empty());
-        assert_eq!(hann_window(1), vec![1.0]);
-        assert!(hamming_window(0).is_empty());
-        assert_eq!(hamming_window(1), vec![1.0]);
+        let empty = hann_window(0).unwrap();
+        empty.eval().unwrap();
+        assert_eq!(empty.shape(), &[0]);
+
+        let single = hann_window(1).unwrap();
+        single.eval().unwrap();
+        let data: &[f32] = single.as_slice();
+        assert_eq!(data, &[1.0]);
     }
 
     // ==================== Mel Scale Tests ====================
@@ -390,20 +545,30 @@ mod tests {
             let mel = hz_to_mel(hz);
             let hz_back = mel_to_hz(mel);
             // Allow small floating point error (0.01 Hz tolerance)
-            assert!(approx_eq(hz, hz_back, 0.01), "Hz {} -> mel {} -> Hz {}", hz, mel, hz_back);
+            assert!(
+                approx_eq(hz, hz_back, 0.01),
+                "Hz {} -> mel {} -> Hz {}",
+                hz,
+                mel,
+                hz_back
+            );
         }
     }
 
     #[test]
     fn test_mel_filterbank_shape() {
-        let fb = mel_filterbank(128, 512, 16000.0, 0.0, 8000.0);
-        assert_eq!(fb.len(), 128 * 257); // n_mels * (n_fft/2 + 1)
+        let fb = mel_filterbank(128, 512, 16000.0, 0.0, 8000.0).unwrap();
+        fb.eval().unwrap();
+        assert_eq!(fb.shape(), &[128, 257]); // n_mels, n_fft/2+1
     }
 
     #[test]
     fn test_mel_filterbank_non_negative() {
-        let fb = mel_filterbank(128, 512, 16000.0, 0.0, 8000.0);
-        let min = fb.iter().cloned().fold(f32::INFINITY, f32::min);
+        let fb = mel_filterbank(128, 512, 16000.0, 0.0, 8000.0).unwrap();
+        fb.eval().unwrap();
+        let data: &[f32] = fb.as_slice();
+
+        let min = data.iter().cloned().fold(f32::INFINITY, f32::min);
         assert!(min >= 0.0, "Filterbank should be non-negative, got {}", min);
     }
 
@@ -412,11 +577,13 @@ mod tests {
         // Each mel filter row should have some non-zero values
         let n_mels = 128;
         let n_freqs = 257;
-        let fb = mel_filterbank(n_mels, 512, 16000.0, 0.0, 8000.0);
+        let fb = mel_filterbank(n_mels, 512, 16000.0, 0.0, 8000.0).unwrap();
+        fb.eval().unwrap();
+        let data: &[f32] = fb.as_slice();
 
         for m in 0..n_mels {
             let row_start = m * n_freqs;
-            let row_sum: f32 = fb[row_start..row_start + n_freqs].iter().sum();
+            let row_sum: f32 = data[row_start..row_start + n_freqs].iter().sum();
             assert!(row_sum > 0.0, "Mel filter {} has zero sum", m);
         }
     }
@@ -424,64 +591,69 @@ mod tests {
     // ==================== Audio Processing Tests ====================
 
     #[test]
-    fn test_preemphasis() {
-        let audio = vec![1.0, 2.0, 3.0, 4.0, 5.0];
-        let result = preemphasis(&audio, 0.97, 0.0);
+    fn test_preemphasis_1d() {
+        let audio = Array::from_slice(&[1.0f32, 2.0, 3.0, 4.0, 5.0], &[5]);
+        let result = preemphasis(&audio, 0.97).unwrap();
+        result.eval().unwrap();
+        let data: &[f32] = result.as_slice();
 
         // y[0] = 1.0 - 0.97 * 0.0 = 1.0
-        assert!(approx_eq(result[0], 1.0, 1e-6));
+        assert!(approx_eq(data[0], 1.0, 1e-6));
         // y[1] = 2.0 - 0.97 * 1.0 = 1.03
-        assert!(approx_eq(result[1], 1.03, 1e-6));
+        assert!(approx_eq(data[1], 1.03, 1e-6));
         // y[2] = 3.0 - 0.97 * 2.0 = 1.06
-        assert!(approx_eq(result[2], 1.06, 1e-6));
+        assert!(approx_eq(data[2], 1.06, 1e-6));
     }
 
     #[test]
-    fn test_preemphasis_continuity() {
-        let audio1 = vec![1.0, 2.0, 3.0];
-        let audio2 = vec![4.0, 5.0, 6.0];
+    fn test_preemphasis_2d() {
+        let audio = Array::from_slice(&[1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0], &[2, 3]);
+        let result = preemphasis(&audio, 0.97).unwrap();
+        result.eval().unwrap();
+        let data: &[f32] = result.as_slice();
 
-        let result1 = preemphasis(&audio1, 0.97, 0.0);
-        let last_sample = audio1[audio1.len() - 1];
-        let result2 = preemphasis(&audio2, 0.97, last_sample);
+        // First batch: [1, 2, 3] -> [1, 1.03, 1.06]
+        assert!(approx_eq(data[0], 1.0, 1e-6));
+        assert!(approx_eq(data[1], 1.03, 1e-6));
+        assert!(approx_eq(data[2], 1.06, 1e-6));
 
-        // Result should be same as processing all at once
-        let full_audio = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
-        let full_result = preemphasis(&full_audio, 0.97, 0.0);
-
-        for i in 0..3 {
-            assert!(approx_eq(result1[i], full_result[i], 1e-6));
-            assert!(approx_eq(result2[i], full_result[3 + i], 1e-6));
-        }
+        // Second batch: [4, 5, 6] -> [4, 1.12, 1.15]
+        assert!(approx_eq(data[3], 4.0, 1e-6));
+        assert!(approx_eq(data[4], 5.0 - 0.97 * 4.0, 1e-6)); // 1.12
+        assert!(approx_eq(data[5], 6.0 - 0.97 * 5.0, 1e-6)); // 1.15
     }
 
     #[test]
     fn test_dither() {
-        let audio = vec![0.0; 100];
-        let result = dither(&audio, 1e-5);
+        let audio = Array::zeros::<f32>(&[100]).unwrap();
+        let result = dither(&audio, 1e-5).unwrap();
+        result.eval().unwrap();
+        let data: &[f32] = result.as_slice();
 
         // Result should have same length
-        assert_eq!(result.len(), 100);
+        assert_eq!(data.len(), 100);
 
         // Values should be slightly different from input
-        let has_diff = result.iter().any(|&v| v != 0.0);
+        let has_diff = data.iter().any(|&v| v != 0.0);
         assert!(has_diff, "Dither should add noise");
 
         // Values should be within dither range
-        for &v in &result {
+        for &v in data {
             assert!(v.abs() <= 1e-5, "Dithered value {} exceeds range", v);
         }
     }
 
     #[test]
-    fn test_dither_deterministic() {
-        let audio = vec![0.0; 100];
-        let result1 = dither(&audio, 1e-5);
-        let result2 = dither(&audio, 1e-5);
+    fn test_dither_disabled() {
+        let audio = Array::from_slice(&[1.0f32, 2.0, 3.0], &[3]);
+        let result = dither(&audio, 0.0).unwrap();
+        result.eval().unwrap();
 
-        // Same input should give same output (deterministic)
-        for (a, b) in result1.iter().zip(result2.iter()) {
-            assert_eq!(a, b, "Dither should be deterministic");
+        // Should be identical when amount is 0
+        let original: &[f32] = audio.as_slice();
+        let processed: &[f32] = result.as_slice();
+        for (a, b) in original.iter().zip(processed.iter()) {
+            assert_eq!(a, b);
         }
     }
 
@@ -511,25 +683,64 @@ mod tests {
     #[test]
     fn test_frame_audio() {
         let audio: Vec<f32> = (0..1600).map(|i| i as f32).collect();
-        let frames = frame_audio(&audio, 400, 160, 512);
+        let audio_arr = Array::from_slice(&audio, &[1600]);
+
+        let frames = frame_audio(&audio_arr, 400, 160, 512).unwrap();
+        frames.eval().unwrap();
 
         let n_frames = num_frames(1600, 400, 160);
-        assert_eq!(frames.len(), n_frames * 512);
+        assert_eq!(frames.shape(), &[n_frames as i32, 512]);
 
-        // Check first frame
-        let left_pad = (512 - 400) / 2;
-        // Padding should be zeros
+        // Frames should be center-padded
+        let data: &[f32] = frames.as_slice();
+        let left_pad = (512 - 400) / 2; // 56
+
+        // Left padding should be zeros
         for i in 0..left_pad {
-            assert_eq!(frames[i], 0.0);
+            assert_eq!(data[i], 0.0, "Left padding at index {} should be 0", i);
         }
-        // First audio sample
-        assert_eq!(frames[left_pad], 0.0);
+
+        // First audio sample (which is 0.0 from the sequence)
+        assert_eq!(data[left_pad], 0.0);
+        // Second audio sample should be 1.0
+        assert_eq!(data[left_pad + 1], 1.0);
+
+        // Right padding should be zeros (indices 56+400=456 to 511)
+        let right_start = left_pad + 400;
+        for i in right_start..512 {
+            assert_eq!(data[i], 0.0, "Right padding at index {} should be 0", i);
+        }
     }
 
     #[test]
     fn test_frame_audio_empty() {
-        let audio = vec![0.0f32; 100];
-        let frames = frame_audio(&audio, 400, 160, 512);
-        assert!(frames.is_empty());
+        let audio = Array::from_slice(&[0.0f32; 100], &[100]);
+        let frames = frame_audio(&audio, 400, 160, 512).unwrap();
+        frames.eval().unwrap();
+        assert_eq!(frames.shape(), &[0, 512]);
+    }
+
+    #[test]
+    fn test_frame_audio_batch() {
+        let audio: Vec<f32> = (0..3200).map(|i| i as f32).collect();
+        let audio_arr = Array::from_slice(&audio, &[2, 1600]);
+
+        let frames = frame_audio_batch(&audio_arr, 400, 160, 512).unwrap();
+        frames.eval().unwrap();
+
+        let n_frames = num_frames(1600, 400, 160);
+        assert_eq!(frames.shape(), &[2, n_frames as i32, 512]);
+
+        // Frames should be center-padded
+        let data: &[f32] = frames.as_slice();
+        let left_pad = (512 - 400) / 2; // 56
+
+        // Left padding should be zeros
+        for i in 0..left_pad {
+            assert_eq!(data[i], 0.0, "Left padding at index {} should be 0", i);
+        }
+        // First audio sample
+        assert_eq!(data[left_pad], 0.0);
+        assert_eq!(data[left_pad + 1], 1.0);
     }
 }

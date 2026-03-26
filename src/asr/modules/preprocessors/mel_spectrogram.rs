@@ -135,7 +135,8 @@ impl From<PreprocessorConfig> for MelConfig {
 /// incremental mel computation.
 pub struct MelProcessor {
     config: MelConfig,
-    /// Precomputed Hann/Hamming window [win_length], zero-padded to n_fft.
+    /// Precomputed Hann/Hamming window [n_fft], center-padded.
+    /// Used for both batch and streaming processing.
     window: Array,
     /// Mel filterbank matrix [n_mels, n_fft/2 + 1].
     filterbank: Array,
@@ -153,24 +154,18 @@ impl MelProcessor {
         let win_samples = config.win_samples();
         let hop_samples = config.hop_samples();
 
-        // Create window function (zero-padded to n_fft) using dsp module
-        let window_data = dsp::create_window_padded(&config.window, win_samples, config.n_fft)
-            .ok_or_else(|| Error::config(format!("Unknown window type: {}", config.window)))?;
-        let window = Array::from_slice(&window_data, &[config.n_fft as i32]);
+        // Create window function (center-padded to n_fft)
+        // Used for both batch and streaming processing
+        let window = dsp::create_window_padded(&config.window, win_samples, config.n_fft)?;
 
         // Create mel filterbank using dsp module
-        let filterbank_data = dsp::mel_filterbank(
+        let filterbank = dsp::mel_filterbank(
             config.features,
             config.n_fft,
             config.sample_rate as f32,
             config.fmin,
             config.effective_fmax(),
-        );
-        let n_freqs = config.n_fft / 2 + 1;
-        let filterbank = Array::from_slice(
-            &filterbank_data,
-            &[config.features as i32, n_freqs as i32],
-        );
+        )?;
 
         // NeMo uses 2^-24 as log guard
         let log_guard = Array::from_f32(2.0_f32.powi(-24));
@@ -258,16 +253,20 @@ impl MelProcessor {
         let audio_len = audio.shape()[1] as usize;
 
         // Apply dithering if configured
-        let audio = self.apply_dither_batch(&audio)?;
-
-        // Apply preemphasis if configured
-        let audio = if let Some(coef) = self.config.preemph {
-            self.apply_preemphasis_batch(&audio, coef)?
+        let audio = if self.config.dither > 0.0 {
+            dsp::dither(&audio, self.config.dither)?
         } else {
             audio
         };
 
-        // Compute STFT
+        // Apply preemphasis if configured
+        let audio = if let Some(coef) = self.config.preemph {
+            dsp::preemphasis(&audio, coef)?
+        } else {
+            audio
+        };
+
+        // Compute STFT with center padding
         let stft = self.stft_batch(&audio)?;
 
         // Compute power spectrum
@@ -305,29 +304,6 @@ impl MelProcessor {
     // Private: Audio Processing
     // ========================================================================
 
-    /// Apply preemphasis in batch mode.
-    fn apply_preemphasis_batch(&self, audio: &Array, coef: f32) -> Result<Array> {
-        let batch_size = audio.shape()[0];
-        let audio_len = audio.shape()[1];
-
-        // y[n] = x[n] - coef * x[n-1], with x[-1] = 0
-        let zeros = Array::zeros::<f32>(&[batch_size, 1])?;
-        let shifted = ops::concatenate_axis(&[&zeros, &audio.index((.., ..(audio_len - 1)))], 1)?;
-        let scaled = ops::multiply(&shifted, &Array::from_f32(coef))?;
-        ops::subtract(audio, &scaled).map_err(|e| Error::model(e.to_string()))
-    }
-
-    /// Apply dithering to audio tensor (batch mode).
-    fn apply_dither_batch(&self, audio: &Array) -> Result<Array> {
-        let dither = self.config.dither;
-        if dither <= 0.0 {
-            return Ok(audio.clone());
-        }
-
-        let noise = mlx_rs::random::uniform::<_, f32>(-dither, dither, audio.shape(), None)?;
-        ops::add(audio, &noise).map_err(|e| Error::model(e.to_string()))
-    }
-
     /// Compute STFT for batch of audio with center padding.
     fn stft_batch(&self, audio: &Array) -> Result<Array> {
         let batch_size = audio.shape()[0];
@@ -335,31 +311,17 @@ impl MelProcessor {
         let n_fft = self.config.n_fft;
         let hop = self.hop_samples;
 
-        // Apply center padding (zeros, matching NeMo's torch.stft center=True)
+        // Apply signal-level center padding (zeros, matching NeMo's torch.stft center=True)
+        // This is different from FFT frame centering - it pads the entire signal so that
+        // the first and last frames are centered on the signal boundaries.
         let pad_size = n_fft / 2;
         let left_pad = Array::zeros::<f32>(&[batch_size, pad_size as i32])?;
         let right_pad = Array::zeros::<f32>(&[batch_size, pad_size as i32])?;
         let padded = ops::concatenate_axis(&[&left_pad, audio, &right_pad], 1)?;
 
-        let padded_len = audio_len + 2 * pad_size;
-        let n_frames = (padded_len - n_fft) / hop + 1;
-
-        // Frame the audio
-        padded.eval()?;
-        let padded_data: &[f32] = padded.as_slice();
-
-        let mut frames_data = Vec::with_capacity(batch_size as usize * n_frames * n_fft);
-        for b in 0..batch_size as usize {
-            let batch_offset = b * padded_len;
-            for frame_idx in 0..n_frames {
-                let start = frame_idx * hop;
-                for i in 0..n_fft {
-                    frames_data.push(padded_data[batch_offset + start + i]);
-                }
-            }
-        }
-
-        let frames = Array::from_slice(&frames_data, &[batch_size, n_frames as i32, n_fft as i32]);
+        // Frame the audio using dsp module
+        // frame_audio_batch always center-pads each FFT frame (audio centered within n_fft)
+        let frames = dsp::frame_audio_batch(&padded, n_fft, hop, n_fft)?;
 
         // Apply window
         let windowed = ops::multiply(&frames, &self.window)?;
@@ -640,7 +602,11 @@ pub fn process_audio_streaming(
 }
 
 impl MelProcessor {
-    /// Process multiple frames without center padding (for streaming).
+    /// Process multiple frames for streaming.
+    ///
+    /// Note: This does NOT apply signal-level center padding (which is only for batch mode).
+    /// However, it DOES use center-padded FFT frames (audio centered within each n_fft frame),
+    /// which is required for proper STFT alignment with the center-padded window.
     ///
     /// # Arguments
     /// * `audio` - Audio buffer with enough samples for n_frames
@@ -669,47 +635,33 @@ impl MelProcessor {
             )));
         }
 
+        // Convert to MLX array for processing
+        let audio_arr = Array::from_slice(audio, &[audio.len() as i32]);
+
         // Apply preemphasis if configured
-        let audio = if let Some(coef) = self.config.preemph {
-            apply_preemphasis(audio, coef, last_sample)
+        let audio_arr = if let Some(coef) = self.config.preemph {
+            // For streaming preemphasis, we need to prepend the last_sample
+            let last_arr = Array::from_slice(&[last_sample], &[1]);
+            let extended = ops::concatenate(&[&last_arr, &audio_arr])?;
+            let preemph = dsp::preemphasis(&extended, coef)?;
+            // Remove the first sample (it was just for continuity)
+            preemph.index(1..)
         } else {
-            audio.to_vec()
+            audio_arr
         };
 
         // Apply dithering if configured
-        let audio = if self.config.dither > 0.0 {
-            apply_dither(&audio, self.config.dither)
+        let audio_arr = if self.config.dither > 0.0 {
+            dsp::dither(&audio_arr, self.config.dither)?
         } else {
-            audio
+            audio_arr
         };
 
-        // Extract frames and apply window
-        // Each frame: take win_samples, zero-pad to n_fft, apply window
-        let mut frames_data = Vec::with_capacity(n_frames * n_fft);
-        let left_pad = (n_fft - win_samples) / 2;
+        // Frame the audio using dsp module
+        // frame_audio always center-pads each FFT frame (audio centered within n_fft)
+        let frames = dsp::frame_audio(&audio_arr, win_samples, hop_samples, n_fft)?;
 
-        for frame_idx in 0..n_frames {
-            let start = frame_idx * hop_samples;
-
-            // Zero-pad on left
-            for _ in 0..left_pad {
-                frames_data.push(0.0f32);
-            }
-
-            // Copy audio samples
-            for i in 0..win_samples {
-                frames_data.push(audio[start + i]);
-            }
-
-            // Zero-pad on right
-            for _ in 0..(n_fft - win_samples - left_pad) {
-                frames_data.push(0.0f32);
-            }
-        }
-
-        let frames = Array::from_slice(&frames_data, &[n_frames as i32, n_fft as i32]);
-
-        // Apply window
+        // Apply window (same center-padded window used for batch processing)
         let windowed = ops::multiply(&frames, &self.window)?;
 
         // Compute FFT along last axis
@@ -772,15 +724,6 @@ impl MelProcessor {
         mel.reshape(&[self.config.features as i32])
             .map_err(|e| Error::model(e.to_string()))
     }
-}
-
-// Helper functions that delegate to dsp module
-fn apply_preemphasis(audio: &[f32], coef: f32, last_sample: f32) -> Vec<f32> {
-    dsp::preemphasis(audio, coef, last_sample)
-}
-
-fn apply_dither(audio: &[f32], amount: f32) -> Vec<f32> {
-    dsp::dither(audio, amount)
 }
 
 // ============================================================================
@@ -1171,11 +1114,13 @@ mod tests {
     #[test]
     fn test_hann_window_endpoints() {
         let window = dsp::create_window_padded("hann", 400, 512).unwrap();
+        window.eval().unwrap();
+        let data: &[f32] = window.as_slice();
 
         let left_pad = (512 - 400) / 2;
-        assert!(window[left_pad].abs() < 1e-6, "First hann value should be ~0");
+        assert!(data[left_pad].abs() < 1e-6, "First hann value should be ~0");
         assert!(
-            window[left_pad + 399].abs() < 1e-6,
+            data[left_pad + 399].abs() < 1e-6,
             "Last hann value should be ~0"
         );
     }
@@ -1183,24 +1128,29 @@ mod tests {
     #[test]
     fn test_hamming_window() {
         let window = dsp::create_window_padded("hamming", 400, 512).unwrap();
+        window.eval().unwrap();
+        let data: &[f32] = window.as_slice();
 
         let left_pad = (512 - 400) / 2;
-        assert!(approx_eq(window[left_pad], 0.08, 1e-4));
+        assert!(approx_eq(data[left_pad], 0.08, 1e-4));
     }
 
     // ==================== Filterbank Tests ====================
 
     #[test]
     fn test_filterbank_shape() {
-        let fb = dsp::mel_filterbank(128, 512, 16000.0, 0.0, 8000.0);
-        assert_eq!(fb.len(), 128 * 257); // n_mels * (n_fft/2+1)
+        let fb = dsp::mel_filterbank(128, 512, 16000.0, 0.0, 8000.0).unwrap();
+        fb.eval().unwrap();
+        assert_eq!(fb.shape(), &[128, 257]); // n_mels * (n_fft/2+1)
     }
 
     #[test]
     fn test_filterbank_non_negative() {
-        let fb = dsp::mel_filterbank(128, 512, 16000.0, 0.0, 8000.0);
+        let fb = dsp::mel_filterbank(128, 512, 16000.0, 0.0, 8000.0).unwrap();
+        fb.eval().unwrap();
+        let data: &[f32] = fb.as_slice();
 
-        let min = fb.iter().cloned().fold(f32::INFINITY, f32::min);
+        let min = data.iter().cloned().fold(f32::INFINITY, f32::min);
         assert!(min >= 0.0, "Filterbank should be non-negative, got {}", min);
     }
 
