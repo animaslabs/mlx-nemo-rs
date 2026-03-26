@@ -26,13 +26,15 @@ fn find_punctuation_tokens(tokenizer: &SentencePieceProcessor) -> Vec<usize> {
 }
 use crate::asr::decoding::RnntStreamingDecoder;
 use crate::asr::models::{DecoderState, PredictionNetwork};
-use crate::asr::modules::{ConformerEncoder, MelSpectrogram, RNNTJoint};
+use crate::asr::modules::{
+    ConformerEncoder, MelSpectrogram, StreamingMelConfig, StreamingMelProcessor,
+};
 use crate::asr::streaming::{
-    compute_streaming_config, get_streaming_modes, EncoderCache, FeatureBuffer, RequestStreamer,
-    StreamingConfig, StreamingModeInfo,
+    compute_streaming_config, get_streaming_modes, EncoderCache, FeatureBuffer, StreamingConfig,
+    StreamingModeInfo,
 };
 use crate::core::checkpoint::NemoCheckpoint;
-use crate::core::error::Result;
+use crate::core::error::{Error, Result};
 
 /// Output from a transcription step.
 #[derive(Debug, Clone, Default)]
@@ -87,6 +89,129 @@ struct CumulativeStats {
     total_tokens: usize,
 }
 
+/// Check if audio chunk is silent based on RMS energy.
+fn is_silent(audio: &[f32], threshold: f32) -> bool {
+    if threshold <= 0.0 || audio.is_empty() {
+        return false;
+    }
+    let rms = (audio.iter().map(|s| s * s).sum::<f32>() / audio.len() as f32).sqrt();
+    rms < threshold
+}
+
+/// Load a WAV file and return samples and sample rate.
+#[cfg(feature = "asr")]
+fn load_wav(path: &Path) -> Result<(Vec<f32>, u32)> {
+    use hound::WavReader;
+
+    tracing::debug!(path = %path.display(), "Loading WAV file");
+
+    let reader = WavReader::open(path)
+        .map_err(|e| Error::audio(format!("Failed to open WAV file: {}", e)))?;
+
+    let spec = reader.spec();
+    let sample_rate = spec.sample_rate;
+    let channels = spec.channels as usize;
+
+    let samples: Vec<f32> = match spec.sample_format {
+        hound::SampleFormat::Float => {
+            let samples: Vec<f32> = reader
+                .into_samples::<f32>()
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(|e| Error::audio(format!("Failed to read samples: {}", e)))?;
+
+            if channels > 1 {
+                samples
+                    .chunks(channels)
+                    .map(|chunk| chunk.iter().sum::<f32>() / channels as f32)
+                    .collect()
+            } else {
+                samples
+            }
+        }
+        hound::SampleFormat::Int => {
+            let bits = spec.bits_per_sample;
+            let max_val = (1 << (bits - 1)) as f32;
+
+            let samples: Vec<i32> = reader
+                .into_samples::<i32>()
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(|e| Error::audio(format!("Failed to read samples: {}", e)))?;
+
+            if channels > 1 {
+                samples
+                    .chunks(channels)
+                    .map(|chunk| {
+                        chunk.iter().map(|&s| s as f32).sum::<f32>() / (channels as f32 * max_val)
+                    })
+                    .collect()
+            } else {
+                samples.iter().map(|&s| s as f32 / max_val).collect()
+            }
+        }
+    };
+
+    tracing::debug!(
+        num_samples = samples.len(),
+        sample_rate,
+        duration_secs = samples.len() as f32 / sample_rate as f32,
+        "WAV file loaded"
+    );
+
+    Ok((samples, sample_rate))
+}
+
+#[cfg(not(feature = "asr"))]
+fn load_wav(_path: &Path) -> Result<(Vec<f32>, u32)> {
+    Err(Error::not_implemented(
+        "Audio loading requires the 'asr' feature",
+    ))
+}
+
+/// Resample audio to target sample rate.
+#[cfg(feature = "asr")]
+fn resample_audio(samples: &[f32], from_rate: u32, to_rate: u32) -> Result<Vec<f32>> {
+    use rubato::{
+        Resampler, SincFixedIn, SincInterpolationParameters, SincInterpolationType, WindowFunction,
+    };
+
+    if from_rate == to_rate {
+        return Ok(samples.to_vec());
+    }
+
+    tracing::debug!(from_rate, to_rate, "Resampling audio");
+
+    let params = SincInterpolationParameters {
+        sinc_len: 256,
+        f_cutoff: 0.95,
+        interpolation: SincInterpolationType::Linear,
+        oversampling_factor: 256,
+        window: WindowFunction::BlackmanHarris2,
+    };
+
+    let mut resampler = SincFixedIn::<f32>::new(
+        to_rate as f64 / from_rate as f64,
+        2.0,
+        params,
+        samples.len(),
+        1,
+    )
+    .map_err(|e| Error::audio(format!("Failed to create resampler: {}", e)))?;
+
+    let waves_in = vec![samples.to_vec()];
+    let waves_out = resampler
+        .process(&waves_in, None)
+        .map_err(|e| Error::audio(format!("Resampling failed: {}", e)))?;
+
+    Ok(waves_out.into_iter().next().unwrap_or_default())
+}
+
+#[cfg(not(feature = "asr"))]
+fn resample_audio(_samples: &[f32], _from_rate: u32, _to_rate: u32) -> Result<Vec<f32>> {
+    Err(Error::not_implemented(
+        "Audio resampling requires the 'asr' feature",
+    ))
+}
+
 /// Cache-aware RNN-T streaming pipeline.
 ///
 /// This pipeline handles:
@@ -117,14 +242,21 @@ pub struct CacheAwareRNNTPipeline {
     preprocessor: MelSpectrogram,
     encoder: ConformerEncoder,
     decoder: PredictionNetwork,
-    joint: RNNTJoint,
+    joint: crate::asr::modules::RNNTJoint,
     tokenizer: Option<SentencePieceProcessor>,
 
     // Streaming components
     streaming_decoder: RnntStreamingDecoder,
     streaming_config: StreamingConfig,
     encoder_cache: EncoderCache,
-    streamer: RequestStreamer,
+    mel_processor: StreamingMelProcessor,
+
+    // Audio input state
+    file_samples: Option<Vec<f32>>,
+    file_position: usize,
+    live_buffer: Vec<f32>,
+    stream_ended: bool,
+    is_done: bool,
 
     // State
     state: StreamingState,
@@ -132,14 +264,14 @@ pub struct CacheAwareRNNTPipeline {
     n_mels: usize,
 
     // Punctuation suppression
-    /// Whether to suppress punctuation during decoding
     suppress_punctuation: bool,
-    /// Token IDs identified as punctuation (computed at load time)
     punctuation_token_ids: Vec<usize>,
 
     // Blank threshold
-    /// Blank threshold for decoder (0.0 = disabled)
     blank_threshold: f32,
+
+    // Silence detection
+    silence_threshold: f32,
 }
 
 impl CacheAwareRNNTPipeline {
@@ -214,7 +346,7 @@ impl CacheAwareRNNTPipeline {
             ..joint_config
         };
 
-        let mut joint = RNNTJoint::new(
+        let mut joint = crate::asr::modules::RNNTJoint::new(
             &effective_joint_config,
             encoder_hidden,
             pred_hidden,
@@ -247,12 +379,10 @@ impl CacheAwareRNNTPipeline {
             encoder.d_model(),
         )?;
 
-        // Create request streamer with dither disabled (same as preprocessor)
+        // Create streaming mel processor
         let n_mels = preproc_config.features;
-        let streamer = RequestStreamer::new(
-            MelSpectrogram::new(preproc_config)?,
-            streaming_config.clone(),
-        );
+        let streaming_mel_config = StreamingMelConfig::new(preproc_config, &streaming_config);
+        let mel_processor = StreamingMelProcessor::new(streaming_mel_config)?;
 
         // Create streaming decoder
         let blank_id = vocab_size;
@@ -290,13 +420,19 @@ impl CacheAwareRNNTPipeline {
             streaming_decoder,
             streaming_config,
             encoder_cache,
-            streamer,
+            mel_processor,
+            file_samples: None,
+            file_position: 0,
+            live_buffer: Vec::new(),
+            stream_ended: false,
+            is_done: false,
             state,
             blank_id,
             n_mels,
             suppress_punctuation: false,
             punctuation_token_ids,
             blank_threshold: 0.0,
+            silence_threshold: 0.0,
         })
     }
 
@@ -447,7 +583,7 @@ impl CacheAwareRNNTPipeline {
             ..joint_config
         };
 
-        let mut joint = RNNTJoint::new(
+        let mut joint = crate::asr::modules::RNNTJoint::new(
             &effective_joint_config,
             encoder_hidden,
             pred_hidden,
@@ -485,12 +621,10 @@ impl CacheAwareRNNTPipeline {
             encoder.d_model(),
         )?;
 
-        // Create request streamer with dither disabled (same as preprocessor)
+        // Create streaming mel processor
         let n_mels = preproc_config.features;
-        let streamer = RequestStreamer::new(
-            MelSpectrogram::new(preproc_config)?,
-            streaming_config.clone(),
-        );
+        let streaming_mel_config = StreamingMelConfig::new(preproc_config, &streaming_config);
+        let mel_processor = StreamingMelProcessor::new(streaming_mel_config)?;
 
         // Create streaming decoder
         let blank_id = vocab_size;
@@ -527,13 +661,19 @@ impl CacheAwareRNNTPipeline {
             streaming_decoder,
             streaming_config,
             encoder_cache,
-            streamer,
+            mel_processor,
+            file_samples: None,
+            file_position: 0,
+            live_buffer: Vec::new(),
+            stream_ended: false,
+            is_done: false,
             state,
             blank_id,
             n_mels,
             suppress_punctuation: false,
             punctuation_token_ids,
             blank_threshold: 0.0,
+            silence_threshold: 0.0,
         })
     }
 
@@ -593,8 +733,8 @@ impl CacheAwareRNNTPipeline {
     pub fn set_blank_threshold(&mut self, threshold: f32) {
         self.blank_threshold = threshold;
         // Rebuild streaming decoder with new threshold
-        self.streaming_decoder = RnntStreamingDecoder::new(self.blank_id)
-            .with_blank_threshold(threshold);
+        self.streaming_decoder =
+            RnntStreamingDecoder::new(self.blank_id).with_blank_threshold(threshold);
         if threshold > 0.0 {
             tracing::info!(
                 threshold = %format!("{:.2}", threshold),
@@ -623,7 +763,7 @@ impl CacheAwareRNNTPipeline {
     /// - 0.01-0.02 = typical environments
     /// - 0.02-0.05 = noisy environments
     pub fn set_silence_threshold(&mut self, threshold: f32) {
-        self.streamer.set_silence_threshold(threshold);
+        self.silence_threshold = threshold;
         if threshold > 0.0 {
             tracing::info!(
                 threshold = %format!("{:.4}", threshold),
@@ -634,41 +774,97 @@ impl CacheAwareRNNTPipeline {
 
     /// Get the current silence detection threshold.
     pub fn silence_threshold(&self) -> f32 {
-        self.streamer.silence_threshold()
+        self.silence_threshold
     }
 
     /// Set audio from a file path.
     pub fn set_audio_file(&mut self, path: impl AsRef<Path>) -> Result<()> {
         self.reset();
-        self.streamer.set_audio_file(path)
+
+        let (samples, file_sample_rate) = load_wav(path.as_ref())?;
+
+        // Resample if needed
+        let samples = if file_sample_rate != self.sample_rate() {
+            tracing::info!(
+                from = file_sample_rate,
+                to = self.sample_rate(),
+                "Resampling audio"
+            );
+            resample_audio(&samples, file_sample_rate, self.sample_rate())?
+        } else {
+            samples
+        };
+
+        let num_samples = samples.len();
+        let duration_secs = num_samples as f32 / self.sample_rate() as f32;
+        self.file_samples = Some(samples);
+        self.file_position = 0;
+
+        tracing::info!(
+            num_samples,
+            duration_secs,
+            sample_rate = self.sample_rate(),
+            "Loaded audio file"
+        );
+
+        Ok(())
     }
 
     /// Set audio samples directly.
     pub fn set_audio_samples(&mut self, samples: Vec<f32>) {
         self.reset();
-        self.streamer.set_audio_samples(samples);
+
+        let num_samples = samples.len();
+        let duration_secs = num_samples as f32 / self.sample_rate() as f32;
+
+        tracing::info!(
+            num_samples,
+            duration_secs,
+            sample_rate = self.sample_rate(),
+            "Set audio samples directly"
+        );
+
+        self.file_samples = Some(samples);
+        self.file_position = 0;
     }
 
     /// Add live audio samples.
     pub fn add_audio(&mut self, samples: &[f32]) {
-        self.streamer.add_audio(samples);
+        tracing::trace!(
+            added_samples = samples.len(),
+            buffer_before = self.live_buffer.len(),
+            "Adding live audio samples"
+        );
+        self.live_buffer.extend_from_slice(samples);
     }
 
     /// Signal the end of the audio stream.
     pub fn end_stream(&mut self) {
-        self.streamer.end_stream();
+        tracing::debug!(
+            live_buffer_remaining = self.live_buffer.len(),
+            mel_frames_remaining = self.mel_processor.remaining_frames(),
+            "Stream ended"
+        );
+        self.stream_ended = true;
+        self.mel_processor.end_stream();
     }
 
     /// Check if the pipeline has finished processing.
     pub fn is_done(&self) -> bool {
-        self.streamer.is_done()
+        self.is_done
     }
 
     /// Reset the pipeline for a new audio stream.
     pub fn reset(&mut self) {
-        // Reset streamer
-        self.streamer.reset();
-        self.preprocessor.reset();
+        // Reset audio state
+        self.file_samples = None;
+        self.file_position = 0;
+        self.live_buffer.clear();
+        self.stream_ended = false;
+        self.is_done = false;
+
+        // Reset mel processor
+        self.mel_processor.reset();
 
         // Reset encoder cache
         self.encoder_cache = EncoderCache::new(
@@ -693,14 +889,115 @@ impl CacheAwareRNNTPipeline {
         self.state.cumulative_stats = CumulativeStats::default();
     }
 
+    /// Get audio chunk size in samples for the current streaming config.
+    fn audio_chunk_size(&self) -> usize {
+        self.mel_processor.audio_chunk_size()
+    }
+
+    /// Process pending audio from file or live buffer.
+    fn process_pending_audio(&mut self) -> Result<()> {
+        let chunk_audio_size = self.audio_chunk_size();
+
+        // Process file audio
+        if let Some(ref samples) = self.file_samples {
+            while self.file_position < samples.len() {
+                let end = (self.file_position + chunk_audio_size).min(samples.len());
+                let audio_chunk = &samples[self.file_position..end];
+
+                // Skip silent chunks
+                if is_silent(audio_chunk, self.silence_threshold) {
+                    tracing::trace!(
+                        threshold = self.silence_threshold,
+                        chunk_samples = audio_chunk.len(),
+                        "Skipping silent audio chunk (file)"
+                    );
+                    self.file_position = end;
+
+                    // Check if we've reached end of file
+                    if end >= samples.len() && !self.stream_ended {
+                        self.stream_ended = true;
+                        self.mel_processor.end_stream();
+                    }
+                    continue;
+                }
+
+                // Add audio to mel processor
+                self.mel_processor.add_audio(audio_chunk)?;
+                self.file_position = end;
+
+                // Check if we've reached end of file
+                if end >= samples.len() && !self.stream_ended {
+                    self.stream_ended = true;
+                    self.mel_processor.end_stream();
+                }
+
+                // Only process one chunk at a time to allow interleaved extraction
+                break;
+            }
+        }
+
+        // Process live audio
+        while self.live_buffer.len() >= chunk_audio_size {
+            let audio_chunk: Vec<f32> = self.live_buffer.drain(..chunk_audio_size).collect();
+
+            // Skip silent chunks
+            if is_silent(&audio_chunk, self.silence_threshold) {
+                tracing::trace!(
+                    threshold = self.silence_threshold,
+                    "Skipping silent audio chunk (live)"
+                );
+                continue;
+            }
+
+            // Add audio to mel processor
+            self.mel_processor.add_audio(&audio_chunk)?;
+
+            // Only process one chunk at a time
+            break;
+        }
+
+        // Process remaining live audio when stream ended
+        if self.stream_ended && !self.live_buffer.is_empty() {
+            tracing::debug!(
+                remaining_samples = self.live_buffer.len(),
+                "Processing remaining audio at stream end"
+            );
+
+            let remaining = std::mem::take(&mut self.live_buffer);
+            self.mel_processor.add_audio(&remaining)?;
+        }
+
+        Ok(())
+    }
+
+    /// Try to extract the next feature buffer.
+    fn try_extract_next(&mut self) -> Result<Option<FeatureBuffer>> {
+        // Process any pending audio from file or live buffer
+        self.process_pending_audio()?;
+
+        // Try to extract a chunk from the mel processor
+        if let Some(buffer) = self.mel_processor.next_chunk() {
+            if buffer.is_last {
+                self.is_done = true;
+            }
+            return Ok(Some(buffer));
+        }
+
+        // No chunk available
+        if self.stream_ended && self.mel_processor.is_done() {
+            self.is_done = true;
+        }
+
+        Ok(None)
+    }
+
     /// Process the next available request and return transcription output.
     ///
     /// Returns `None` if no data is available to process yet.
     pub fn transcribe_step(&mut self) -> Result<Option<TranscribeOutput>> {
-        // Get next feature buffer from streamer
-        let feature_buffer = match self.streamer.next() {
-            Some(Ok(fb)) => fb,
-            Some(Err(e)) => return Err(e),
+        // Get next feature buffer
+        let feature_buffer = match self.try_extract_next()? {
+            Some(fb) => fb,
             None => return Ok(None),
         };
 
@@ -738,8 +1035,11 @@ impl CacheAwareRNNTPipeline {
         let hop_length = 160; // TODO: get from config
         let sample_rate = self.sample_rate() as f32;
         let audio_samples_this_chunk = chunk_len * hop_length;
-        let audio_time_start = self.state.cumulative_stats.total_audio_samples as f32 / sample_rate;
-        let audio_time_end = (self.state.cumulative_stats.total_audio_samples + audio_samples_this_chunk) as f32 / sample_rate;
+        let audio_time_start =
+            self.state.cumulative_stats.total_audio_samples as f32 / sample_rate;
+        let audio_time_end = (self.state.cumulative_stats.total_audio_samples
+            + audio_samples_this_chunk) as f32
+            / sample_rate;
 
         // Debug: Log feature buffer details with audio position
         tracing::debug!(
@@ -795,7 +1095,8 @@ impl CacheAwareRNNTPipeline {
         // Index formula: mel[0, i, 0] = i * time_len + 0
         {
             // Force evaluation to ensure we have the actual computed values
-            let features_contiguous = mlx_rs::ops::as_strided(&features, features.shape(), None, None)?;
+            let features_contiguous =
+                mlx_rs::ops::as_strided(&features, features.shape(), None, None)?;
             features_contiguous.eval()?;
             let mel_data = features_contiguous.as_slice::<f32>();
             let n_mels = self.n_mels;
@@ -1030,7 +1331,7 @@ impl CacheAwareRNNTPipeline {
     }
 
     /// Get a reference to the joint network.
-    pub fn joint(&self) -> &RNNTJoint {
+    pub fn joint(&self) -> &crate::asr::modules::RNNTJoint {
         &self.joint
     }
 }

@@ -526,8 +526,7 @@ impl EncDecCTCModel {
             self.encoder.d_model(),
         )?;
 
-        // Reset preprocessor streaming state (remainder buffer, preemphasis state)
-        self.preprocessor.reset();
+        // Note: preprocessor is stateless, no reset needed
 
         Ok(CtcStreamingSession {
             config,
@@ -556,26 +555,26 @@ impl EncDecCTCModel {
     ) -> Result<StreamingOutput> {
         let batch_size = session.encoder_cache.batch_size();
 
-        // Use the streaming mel spectrogram API
-        // This handles preemphasis state and remainder buffer internally
-        let mel_features = self.preprocessor.process_chunk(audio_chunk)?;
+        // Use the stateless mel spectrogram API
+        let audio_array = Array::from_slice(audio_chunk, &[1, audio_chunk.len() as i32]);
+        let (mel_features, _) = self.preprocessor.forward(&audio_array, None)?;
+        // mel_features is [batch=1, n_mels, frames]
 
         tracing::debug!(
             "PROCESS CHUNK #{}: Got mel_features size {:?}",
             self.chunk_count,
-            mel_features.size()
+            mel_features.shape()
         );
         self.chunk_count += 1;
 
         // Check if we got any frames
-        let n_frames = mel_features.dim(1) as usize;
+        let n_frames = mel_features.dim(2) as usize;
         if n_frames == 0 {
             return Ok(StreamingOutput::default());
         }
 
-        // Reshape to [batch=1, n_mels, frames] for encoder
-        let features =
-            mel_features.reshape(&[1, mel_features.dim(0), mel_features.dim(1) as i32])?;
+        // Already in correct shape [batch=1, n_mels, frames] for encoder
+        let features = mel_features;
 
         // Get lengths
         let seq_len = features.dim(2);
@@ -645,46 +644,13 @@ impl EncDecCTCModel {
 
     /// Finalize streaming and get final transcription.
     ///
-    /// Flushes any remaining audio in the preprocessor's remainder buffer
-    /// and returns the complete transcription.
+    /// Returns the complete transcription from accumulated tokens.
     pub fn finalize_streaming(
         &mut self,
-        mut session: CtcStreamingSession,
+        session: CtcStreamingSession,
     ) -> Result<StreamingOutput> {
-        // Flush any remaining audio in the preprocessor's remainder buffer
-        let final_mel = self.preprocessor.flush()?;
-        let n_frames = final_mel.dim(1) as usize;
-
-        if n_frames > 0 {
-            // Process final frames through encoder
-            let features = final_mel.reshape(&[1, final_mel.dim(0), final_mel.dim(1) as i32])?;
-
-            // Note: Normalization is handled by the preprocessor based on its config.
-
-            let seq_len = features.dim(2);
-            let lengths = Array::from_slice(&[seq_len as i32], &[1]);
-
-            let drop_extra = session.config.drop_extra_pre_encoded;
-
-            let (encoded, encoded_lengths, _, _, _) = self.encoder.forward_streaming(
-                &features,
-                &lengths,
-                &session.encoder_cache.last_channel,
-                &session.encoder_cache.last_time,
-                &session.encoder_cache.last_channel_len,
-                drop_extra,
-            )?;
-
-            let log_probs = self.decoder.forward(&encoded)?;
-            let token_sequences = greedy_decode(&log_probs, &encoded_lengths, self.blank_id)?;
-
-            // Merge final tokens
-            let delay = session.config.lookahead_frames;
-            for (i, new_tokens) in token_sequences.into_iter().enumerate() {
-                let merged = lcs_merge_buffer(&session.prev_tokens[i], &new_tokens, delay, 5, 1);
-                session.prev_tokens[i] = merged;
-            }
-        }
+        // Note: preprocessor is stateless, no flush needed
+        // All audio has been processed through process_chunk()
 
         // Final decode of accumulated tokens
         let batch_size = session.prev_tokens.len();

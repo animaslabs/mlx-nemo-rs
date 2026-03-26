@@ -921,8 +921,7 @@ impl EncDecRNNTModel {
         // Setup encoder
         self.encoder.setup_streaming(config.cache_drop_size);
 
-        // Reset preprocessor streaming state (remainder buffer, preemphasis state)
-        self.preprocessor.reset();
+        // Note: preprocessor is stateless, no reset needed
 
         // Create encoder cache
         let encoder_cache = EncoderCache::new(
@@ -986,44 +985,47 @@ impl EncDecRNNTModel {
         session: &mut RnntStreamingSession,
         audio_chunk: &[f32],
     ) -> Result<StreamingOutput> {
+        use mlx_rs::ops::indexing::IndexOp;
         let batch_size = session.encoder_cache.batch_size();
 
-        // Step 1: Use the streaming mel spectrogram API
-        // This handles preemphasis state and remainder buffer internally
-        let mel_features = self.preprocessor.process_chunk(audio_chunk)?;
-
-        tracing::debug!(
-            "PROCESS CHUNK #{} len({}) Got mel_features {:?}",
-            self.chunk_count,
-            audio_chunk.len(),
-            mel_features.shape()
-        );
-        self.chunk_count += 1;
-
-        // Track total audio samples for logging
-        session.mel_buffer.total_audio_samples += audio_chunk.len();
-
-        // Check if we got any frames
-        let n_frames = mel_features.dim(1) as usize;
-        if n_frames > 0 {
-            // Step 2: Append mel frames to the buffer
-            // mel_features is [n_mels, time], append directly as Array
-            session.mel_buffer.append_mel(&mel_features)?;
+        // Step 1: Use the stateless mel spectrogram API
+        // Only process if we have audio samples
+        let _n_frames = if !audio_chunk.is_empty() {
+            let audio_array = Array::from_slice(audio_chunk, &[1, audio_chunk.len() as i32]);
+            let (mel_features, _) = self.preprocessor.forward(&audio_array, None)?;
+            // mel_features is [batch=1, n_mels, frames]
+            // Remove batch dimension: [n_mels, frames]
+            let mel_features = mel_features.index(0);
 
             tracing::debug!(
-                frames_appended = n_frames,
-                audio_samples = audio_chunk.len(),
-                total_frames = session.mel_buffer.total_frames,
-                "appended mel frames from audio"
+                "PROCESS CHUNK #{} len({}) Got mel_features {:?}",
+                self.chunk_count,
+                audio_chunk.len(),
+                mel_features.shape()
             );
-        } else if audio_chunk.is_empty() {
-            // Empty chunk is ok, just process any buffered mel frames
+            self.chunk_count += 1;
+
+            // Track total audio samples for logging
+            session.mel_buffer.total_audio_samples += audio_chunk.len();
+
+            let n_frames = mel_features.dim(1) as usize;
+            if n_frames > 0 {
+                // Step 2: Append mel frames to the buffer
+                // mel_features is [n_mels, time], append directly as Array
+                session.mel_buffer.append_mel(&mel_features)?;
+
+                tracing::debug!(
+                    frames_appended = n_frames,
+                    audio_samples = audio_chunk.len(),
+                    total_frames = session.mel_buffer.total_frames,
+                    "appended mel frames from audio"
+                );
+            }
+            n_frames
         } else {
-            tracing::trace!(
-                audio_samples = audio_chunk.len(),
-                "not enough audio for mel frames yet"
-            );
-        }
+            // Empty chunk is ok, just process any buffered mel frames
+            0
+        };
 
         // Step 3: Process all complete mel chunks
         let mut all_new_tokens: Vec<Vec<usize>> = vec![Vec::new(); batch_size];
@@ -1360,26 +1362,13 @@ impl EncDecRNNTModel {
 
     /// Finalize streaming and get final transcription.
     ///
-    /// Flushes any remaining audio in the preprocessor's remainder buffer
-    /// and processes any remaining mel frames.
+    /// Processes any remaining mel frames in the buffer.
     pub fn finalize_streaming(
         &mut self,
         mut session: RnntStreamingSession,
     ) -> Result<StreamingOutput> {
-        // Flush any remaining audio in the preprocessor's remainder buffer
-        let final_mel = self.preprocessor.flush()?;
-        final_mel.eval()?;
-
-        let n_frames = final_mel.dim(1) as usize;
-        if n_frames > 0 {
-            // Append final mel frames to buffer (final_mel is already [n_mels, time])
-            session.mel_buffer.append_mel(&final_mel)?;
-
-            tracing::debug!(
-                final_mel_frames = n_frames,
-                "finalize: flushed remaining audio to mel frames"
-            );
-        }
+        // Note: preprocessor is stateless, no flush needed
+        // All audio has been processed through process_chunk()
 
         // Process any remaining mel frames
         // If there are remaining frames but not enough for a full chunk, pad with zeros

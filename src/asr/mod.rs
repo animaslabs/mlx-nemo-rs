@@ -42,11 +42,14 @@ pub use models::{
     CtcStreamingSession, DebugOutput, EncDecCTCModel, EncDecRNNTModel, RnntDecodingStrategy,
     RnntStreamingSession,
 };
+// Primary exports (new names)
+pub use modules::{MelConfig, MelProcessor};
+// Backwards-compatible alias
 pub use modules::MelSpectrogram;
 pub use pipeline::{CacheAwareRNNTPipeline, TranscribeOutput};
 pub use streaming::{
-    EncoderCache, FeatureBuffer, Frame, Request, RequestStreamer, StreamingConfig,
-    StreamingMelBuffer, StreamingModeInfo, StreamingOutput,
+    EncoderCache, FeatureBuffer, StreamingConfig, StreamingMelBuffer, StreamingModeInfo,
+    StreamingOutput,
 };
 
 /// Prelude for convenient imports.

@@ -43,10 +43,15 @@ fn main() -> mlx_nemo::Result<()> {
     let audio_chunk = &samples[..chunk_samples.min(samples.len())];
     println!("\nProcessing audio chunk: {} samples", audio_chunk.len());
 
-    let mel = mel_proc.process_chunk(audio_chunk)?;
+    let audio_array = mlx_rs::Array::from_slice(audio_chunk, &[1, audio_chunk.len() as i32]);
+    let (mel, _) = mel_proc.forward(&audio_array, None)?;
     mel.eval()?;
 
     println!("Mel output shape: {:?}", mel.shape());
+
+    // Remove batch dimension for analysis: [1, n_mels, frames] -> [n_mels, frames]
+    use mlx_rs::ops::indexing::IndexOp;
+    let mel = mel.index(0);
 
     let mel_flat = mel.reshape(&[-1])?;
     mel_flat.eval()?;
@@ -160,7 +165,7 @@ fn main() -> mlx_nemo::Result<()> {
         fmax: None,
     };
 
-    let mut mel_proc2 = MelSpectrogram::new(config2)?;
+    let mel_proc2 = MelSpectrogram::new(config2)?;
     let mut buffer2 = StreamingMelBuffer::new(16000, 0.025, 0.01, 128, 512);
 
     // Process audio in multiple chunks (simulating streaming)
@@ -168,8 +173,11 @@ fn main() -> mlx_nemo::Result<()> {
     let mut total_positive = 0;
 
     for (chunk_idx, audio_chunk) in samples.chunks(audio_chunk_size).enumerate() {
-        let mel_chunk = mel_proc2.process_chunk(audio_chunk)?;
-        mel_chunk.eval()?;
+        let audio_array = mlx_rs::Array::from_slice(audio_chunk, &[1, audio_chunk.len() as i32]);
+        let (mel_batch, _) = mel_proc2.forward(&audio_array, None)?;
+        mel_batch.eval()?;
+        // Remove batch dimension: [1, n_mels, frames] -> [n_mels, frames]
+        let mel_chunk = mel_batch.index(0);
 
         let mel_flat = mel_chunk.reshape(&[-1])?;
         mel_flat.eval()?;

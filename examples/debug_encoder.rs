@@ -92,14 +92,16 @@ fn main() -> mlx_nemo::Result<()> {
         }
 
         // Compute MEL
-        let mel = mel_proc.process_chunk(&chunk)?;
+        let audio_array = Array::from_slice(&chunk, &[1, chunk.len() as i32]);
+        let (mel, _) = mel_proc.forward(&audio_array, None)?;
         mel.eval()?;
 
-        let num_mel_frames = mel.dim(1) as usize;
-        let n_mels = mel.dim(0) as usize;
+        // mel is [batch=1, n_mels, frames]
+        let n_mels = mel.dim(1) as usize;
+        let num_mel_frames = mel.dim(2) as usize;
 
-        // Prepare for encoder: [n_mels, T] -> [1, n_mels, T]
-        let mel_batch = mel.reshape(&[1, n_mels as i32, num_mel_frames as i32])?;
+        // Already in correct shape [1, n_mels, T] for encoder
+        let mel_batch = mel;
         mel_batch.eval()?;
 
         // Use NeMo's mel_len formula: ceil(audio_len / hop) = audio_len / hop (for exact multiples)

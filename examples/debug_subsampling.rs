@@ -95,14 +95,18 @@ fn main() -> mlx_nemo::Result<()> {
         }
 
         // Compute MEL for this chunk
-        let mel = mel_proc.process_chunk(&chunk)?;
+        let audio_array = mlx_rs::Array::from_slice(&chunk, &[1, chunk.len() as i32]);
+        let (mel, _) = mel_proc.forward(&audio_array, None)?;
         mel.eval()?;
 
-        let num_mel_frames = mel.dim(1) as usize;
-        let n_mels = mel.dim(0) as usize;
+        // mel is [batch=1, n_mels, frames]
+        let n_mels = mel.dim(1) as usize;
+        let num_mel_frames = mel.dim(2) as usize;
 
-        // Transpose for encoder: [n_mels, T] -> [T, n_mels]
-        let mel_transposed = mlx_rs::ops::transpose_axes(&mel, &[1, 0])?;
+        // Remove batch dim and transpose: [1, n_mels, T] -> [n_mels, T] -> [T, n_mels]
+        use mlx_rs::ops::indexing::IndexOp;
+        let mel_2d = mel.index(0);
+        let mel_transposed = mlx_rs::ops::transpose_axes(&mel_2d, &[1, 0])?;
         mel_transposed.eval()?;
 
         // Add batch dimension: [T, n_mels] -> [1, T, n_mels]

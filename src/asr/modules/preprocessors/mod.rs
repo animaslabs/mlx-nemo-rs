@@ -5,4 +5,11 @@
 
 mod mel_spectrogram;
 
+// Primary exports (new names)
+pub use mel_spectrogram::{MelConfig, MelProcessor};
+
+// Streaming exports
+pub use mel_spectrogram::{StreamingMelConfig, StreamingMelProcessor};
+
+// Backwards-compatible aliases
 pub use mel_spectrogram::{MelSpectrogram, MelSpectrogramConfig};
