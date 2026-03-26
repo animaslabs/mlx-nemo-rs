@@ -30,9 +30,9 @@
 
 use mlx_rs::ops::indexing::IndexOp;
 use mlx_rs::{fft, ops, Array};
-use std::f32::consts::PI;
 
 use crate::asr::config::PreprocessorConfig;
+use crate::audio; // Use audio module for shared mel/window functions
 use crate::core::error::{Error, Result};
 
 /// Configuration for mel spectrogram computation.
@@ -581,36 +581,15 @@ impl MelSpectrogram {
     // ========================================================================
 
     /// Create window function, zero-padded to n_fft.
+    ///
+    /// Delegates to `audio::window_padded` for implementation.
     fn create_window(window_type: &str, win_len: usize, n_fft: usize) -> Result<Array> {
-        let window: Vec<f32> = match window_type {
-            "hann" => (0..win_len)
-                .map(|n| 0.5 * (1.0 - (2.0 * PI * n as f32 / (win_len - 1) as f32).cos()))
-                .collect(),
-            "hamming" => (0..win_len)
-                .map(|n| 0.54 - 0.46 * (2.0 * PI * n as f32 / (win_len - 1) as f32).cos())
-                .collect(),
-            _ => {
-                return Err(Error::config(format!(
-                    "Unknown window type: {}",
-                    window_type
-                )))
-            }
-        };
-
-        // Zero-pad to n_fft if needed (centered)
-        if win_len < n_fft {
-            let left_pad = (n_fft - win_len) / 2;
-            let right_pad = n_fft - win_len - left_pad;
-            let mut padded = vec![0.0f32; left_pad];
-            padded.extend(&window);
-            padded.extend(vec![0.0f32; right_pad]);
-            Ok(Array::from_slice(&padded, &[n_fft as i32]))
-        } else {
-            Ok(Array::from_slice(&window, &[win_len as i32]))
-        }
+        audio::window_padded(window_type, win_len, n_fft)
     }
 
     /// Create Slaney-normalized mel filterbank.
+    ///
+    /// Delegates to `audio::mel_filterbank` for implementation.
     fn create_filterbank(
         n_mels: usize,
         n_fft: usize,
@@ -618,72 +597,7 @@ impl MelSpectrogram {
         fmin: f32,
         fmax: f32,
     ) -> Result<Array> {
-        let n_freqs = n_fft / 2 + 1;
-
-        // Slaney mel scale conversion
-        let hz_to_mel = |hz: f32| -> f32 {
-            const F_SP: f32 = 200.0 / 3.0;
-            const MIN_LOG_HZ: f32 = 1000.0;
-            const MIN_LOG_MEL: f32 = MIN_LOG_HZ / F_SP;
-            const LOGSTEP: f32 = 0.06875177742094912; // ln(6.4) / 27.0
-
-            if hz >= MIN_LOG_HZ {
-                MIN_LOG_MEL + (hz / MIN_LOG_HZ).ln() / LOGSTEP
-            } else {
-                hz / F_SP
-            }
-        };
-
-        let mel_to_hz = |mel: f32| -> f32 {
-            const F_SP: f32 = 200.0 / 3.0;
-            const MIN_LOG_HZ: f32 = 1000.0;
-            const MIN_LOG_MEL: f32 = MIN_LOG_HZ / F_SP;
-            const LOGSTEP: f32 = 0.06875177742094912;
-
-            if mel >= MIN_LOG_MEL {
-                MIN_LOG_HZ * (LOGSTEP * (mel - MIN_LOG_MEL)).exp()
-            } else {
-                mel * F_SP
-            }
-        };
-
-        // Mel points
-        let mel_min = hz_to_mel(fmin);
-        let mel_max = hz_to_mel(fmax);
-        let mel_points: Vec<f32> = (0..=n_mels + 1)
-            .map(|i| mel_min + (mel_max - mel_min) * i as f32 / (n_mels + 1) as f32)
-            .collect();
-        let hz_points: Vec<f32> = mel_points.iter().map(|&m| mel_to_hz(m)).collect();
-
-        // FFT frequencies
-        let fft_freqs: Vec<f32> = (0..n_freqs)
-            .map(|i| i as f32 * sample_rate / n_fft as f32)
-            .collect();
-
-        // Frequency differences for normalization
-        let fdiff: Vec<f32> = hz_points.windows(2).map(|w| w[1] - w[0]).collect();
-
-        // Build filterbank matrix with Slaney normalization
-        let mut fb = vec![0.0f32; n_mels * n_freqs];
-
-        for m in 0..n_mels {
-            let f_left = hz_points[m];
-            let _f_center = hz_points[m + 1];
-            let f_right = hz_points[m + 2];
-
-            // Slaney normalization factor: 2 / (f_right - f_left)
-            let enorm = 2.0 / (f_right - f_left);
-
-            for (k, &freq) in fft_freqs.iter().enumerate() {
-                // Triangular filter
-                let lower = (freq - f_left) / fdiff[m];
-                let upper = (f_right - freq) / fdiff[m + 1];
-                let value = lower.min(upper).max(0.0) * enorm;
-                fb[m * n_freqs + k] = value;
-            }
-        }
-
-        Ok(Array::from_slice(&fb, &[n_mels as i32, n_freqs as i32]))
+        audio::mel_filterbank(n_mels, n_fft, sample_rate, fmin, fmax)
     }
 
     /// Apply preemphasis (stateless, matching NeMo's behavior).

@@ -31,7 +31,6 @@
 
 pub mod config;
 pub mod decoding;
-pub mod mel_stream;
 pub mod models;
 pub mod modules;
 pub mod pipeline;
@@ -39,7 +38,6 @@ pub mod streaming;
 
 // Re-exports
 pub use config::*;
-pub use mel_stream::{MelStream, MelStreamConfig, MelStreamIter};
 pub use models::{
     CtcStreamingSession, DebugOutput, EncDecCTCModel, EncDecRNNTModel, RnntDecodingStrategy,
     RnntStreamingSession,
@@ -47,7 +45,7 @@ pub use models::{
 pub use modules::MelSpectrogram;
 pub use pipeline::{CacheAwareRNNTPipeline, TranscribeOutput};
 pub use streaming::{
-    EncoderCache, FeatureBuffer, Frame, MelBuffer, Request, RequestStreamer, StreamingConfig,
+    EncoderCache, FeatureBuffer, Frame, Request, RequestStreamer, StreamingConfig,
     StreamingMelBuffer, StreamingModeInfo, StreamingOutput,
 };
 

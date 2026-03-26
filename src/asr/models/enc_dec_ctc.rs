@@ -41,7 +41,7 @@ use crate::asr::config::AsrModelConfig;
 use crate::asr::decoding::{greedy_ctc_merge, greedy_decode, lcs_merge_buffer};
 use crate::asr::modules::{CTCDecoder, ConformerEncoder, MelSpectrogram};
 use crate::asr::streaming::{
-    compute_streaming_config, get_streaming_modes, EncoderCache, MelBuffer, StreamingConfig,
+    compute_streaming_config, get_streaming_modes, EncoderCache, StreamingConfig,
     StreamingModeInfo, StreamingOutput,
 };
 use crate::core::checkpoint::NemoCheckpoint;
@@ -529,19 +529,9 @@ impl EncDecCTCModel {
         // Reset preprocessor streaming state (remainder buffer, preemphasis state)
         self.preprocessor.reset();
 
-        // Create mel buffer for running normalization stats
-        let preprocessor_config = self.preprocessor.config();
-        let mel_buffer = MelBuffer::new(
-            preprocessor_config.sample_rate,
-            preprocessor_config.window_size,
-            preprocessor_config.window_stride,
-            preprocessor_config.features,
-        );
-
         Ok(CtcStreamingSession {
             config,
             encoder_cache,
-            mel_buffer,
             prev_tokens: vec![Vec::new(); batch_size],
             is_first_chunk: true,
             blank_id: self.blank_id,
@@ -586,10 +576,6 @@ impl EncDecCTCModel {
         // Reshape to [batch=1, n_mels, frames] for encoder
         let features =
             mel_features.reshape(&[1, mel_features.dim(0), mel_features.dim(1) as i32])?;
-
-        // Note: Normalization is handled by the preprocessor based on its config.
-        // The MelBuffer is kept for potential future running-stats normalization,
-        // but currently unused since per_feature normalization in the preprocessor suffices.
 
         // Get lengths
         let seq_len = features.dim(2);
@@ -737,9 +723,6 @@ pub struct CtcStreamingSession {
 
     /// Encoder cache state (attention + convolution)
     pub encoder_cache: EncoderCache,
-
-    /// Audio/feature buffer for mel spectrogram computation
-    pub mel_buffer: MelBuffer,
 
     /// Previous tokens for each batch sample (for LCS merge)
     pub prev_tokens: Vec<Vec<usize>>,

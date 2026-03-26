@@ -302,6 +302,48 @@ pub fn window(window_type: &str, length: usize) -> Result<Array> {
     Ok(Array::from_slice(&values, &[length as i32]))
 }
 
+/// Create a window function with centered zero-padding to n_fft.
+///
+/// Used by STFT implementations where the window needs to be zero-padded
+/// to match the FFT size.
+///
+/// # Arguments
+/// * `window_type` - "hann" or "hamming"
+/// * `win_length` - Window length in samples
+/// * `n_fft` - FFT size (output length)
+///
+/// # Returns
+/// Window array `[n_fft]` with centered zero-padding
+pub fn window_padded(window_type: &str, win_length: usize, n_fft: usize) -> Result<Array> {
+    if win_length >= n_fft {
+        return window(window_type, win_length);
+    }
+
+    // Compute window values directly without creating intermediate array
+    let win_values: Vec<f32> = match window_type {
+        "hann" => (0..win_length)
+            .map(|i| 0.5 * (1.0 - (2.0 * PI * i as f32 / (win_length as f32 - 1.0)).cos()))
+            .collect(),
+        "hamming" => (0..win_length)
+            .map(|i| 0.54 - 0.46 * (2.0 * PI * i as f32 / (win_length as f32 - 1.0)).cos())
+            .collect(),
+        _ => {
+            return Err(Error::config(format!(
+                "Unknown window type: {}",
+                window_type
+            )));
+        }
+    };
+
+    // Center the window with zero-padding
+    let left_pad = (n_fft - win_length) / 2;
+
+    let mut padded = vec![0.0f32; n_fft];
+    padded[left_pad..left_pad + win_length].copy_from_slice(&win_values);
+
+    Ok(Array::from_slice(&padded, &[n_fft as i32]))
+}
+
 /// Compute Short-Time Fourier Transform power spectrum.
 ///
 /// Uses GPU-side `as_strided` for efficient framing without CPU copies.
@@ -462,6 +504,9 @@ fn apply_center_padding(audio: &Array, n_fft: usize) -> Result<Array> {
 
 /// Create Slaney-normalized mel filterbank.
 ///
+/// Uses Slaney normalization (area normalization) to ensure consistent
+/// energy across mel bands, matching NeMo's torchaudio mel filterbank.
+///
 /// # Arguments
 /// * `n_mels` - Number of mel bins
 /// * `n_fft` - FFT size
@@ -502,9 +547,9 @@ pub fn mel_filterbank(
         }
     };
 
-    // FFT frequencies
+    // FFT frequencies: i * sample_rate / n_fft
     let fft_freqs: Vec<f32> = (0..n_freqs)
-        .map(|i| (sample_rate / 2.0) * i as f32 / (n_freqs - 1) as f32)
+        .map(|i| i as f32 * sample_rate / n_fft as f32)
         .collect();
 
     // Mel points
@@ -517,28 +562,24 @@ pub fn mel_filterbank(
     // Convert back to Hz
     let hz_points: Vec<f32> = mel_points.iter().map(|&m| mel_to_hz(m)).collect();
 
-    // Build filterbank using triangular filters
+    // Frequency differences for normalization
+    let fdiff: Vec<f32> = hz_points.windows(2).map(|w| w[1] - w[0]).collect();
+
+    // Build filterbank with Slaney normalization
     let mut filterbank = vec![0.0f32; n_mels * n_freqs];
 
     for m in 0..n_mels {
         let f_left = hz_points[m];
-        let f_center = hz_points[m + 1];
         let f_right = hz_points[m + 2];
 
+        // Slaney normalization factor: 2 / (f_right - f_left)
+        let enorm = 2.0 / (f_right - f_left);
+
         for (k, &freq) in fft_freqs.iter().enumerate() {
-            let down_slope = if f_center != f_left {
-                (freq - f_left) / (f_center - f_left)
-            } else {
-                0.0
-            };
-
-            let up_slope = if f_right != f_center {
-                (f_right - freq) / (f_right - f_center)
-            } else {
-                0.0
-            };
-
-            let value = down_slope.min(up_slope).max(0.0);
+            // Triangular filter with proper slopes
+            let lower = (freq - f_left) / fdiff[m];
+            let upper = (f_right - freq) / fdiff[m + 1];
+            let value = lower.min(upper).max(0.0) * enorm;
             filterbank[m * n_freqs + k] = value;
         }
     }

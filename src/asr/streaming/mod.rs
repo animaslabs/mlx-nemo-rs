@@ -15,7 +15,7 @@ mod streamer;
 
 // Re-export core types
 pub use self::core::{
-    compute_streaming_config, get_streaming_modes, EncoderCache, MelBuffer, StreamingConfig,
+    compute_streaming_config, get_streaming_modes, EncoderCache, StreamingConfig,
     StreamingMelBuffer, StreamingModeInfo, StreamingOutput,
 };
 
