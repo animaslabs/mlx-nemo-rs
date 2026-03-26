@@ -110,11 +110,16 @@ fn causal_pad_2d(x: &Array, kernel_size: usize, stride: usize) -> Result<Array> 
     // right_pad = stride - 1
     let left_pad = (kernel_size - 1) as i32;
     let right_pad = (stride - 1) as i32;
+    // JJK test
+    // let left_pad = (kernel_size - 1) as i32;
 
     // Step 1: Pad time dimension (axis 1): [B, T, F, C] -> [B, T+left_pad+right_pad, F, C]
+    // let left_pad_time = 1 as i32;
     let time_zeros_left = mlx_rs::ops::zeros::<f32>(&[batch, left_pad, freq, channels])?;
     let time_zeros_right = mlx_rs::ops::zeros::<f32>(&[batch, right_pad, freq, channels])?;
     let x = mlx_rs::ops::concatenate_axis(&[&time_zeros_left, x, &time_zeros_right], 1)?;
+    // JJK test
+    // let x = mlx_rs::ops::concatenate_axis(&[&time_zeros_left, x], 1)?;
 
     // Step 2: Pad frequency dimension (axis 2)
     let new_time = time + left_pad + right_pad;
@@ -820,6 +825,8 @@ impl ConformerEncoder {
 
         // Total length for K/V needs to cover all tensor frames for pos_emb
         // Use tensor dimension, not valid length, to avoid pos_emb size mismatch
+        // let total_len = cache_size + tensor_seq_len;
+        // JJK test
         let total_len = cache_size + tensor_seq_len;
         // Valid length is used for masking
         let seq_len = valid_seq_len;
