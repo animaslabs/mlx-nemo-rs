@@ -976,7 +976,7 @@ impl CacheAwareRNNTPipeline {
 
         self.mel_buffer = Some(silence);
         self.mel_total_frames = pre_encode_cache;
-        self.mel_buffer_idx = 0;
+        self.mel_buffer_idx = pre_encode_cache;
         self.mel_buffer_offset = 0;
 
         tracing::debug!(
@@ -1260,7 +1260,7 @@ impl CacheAwareRNNTPipeline {
             self.mel_buffer = Some(trimmed);
             self.mel_buffer_offset += can_trim;
 
-            tracing::trace!(
+            tracing::debug!(
                 keep_frames,
                 local_idx,
                 can_trim,
@@ -1284,7 +1284,7 @@ impl CacheAwareRNNTPipeline {
             .pre_encode_cache_for_chunk(self.is_first_chunk);
 
         let remaining = self.remaining_frames();
-        let required = chunk_size + pre_encode_cache;
+        let required = chunk_size;
 
         tracing::debug!(
             remaining,
@@ -1308,10 +1308,10 @@ impl CacheAwareRNNTPipeline {
                 let frames_to_pad = required - remaining;
                 tracing::debug!(remaining, required, frames_to_pad, "Padding first chunk");
 
-                if let Err(e) = self.pad_mel_buffer(frames_to_pad) {
-                    tracing::error!("Failed to pad: {}", e);
-                    return None;
-                }
+                // if let Err(e) = self.pad_mel_buffer(frames_to_pad) {
+                //     tracing::error!("Failed to pad: {}", e);
+                //     return None;
+                // }
             } else if self.stream_ended && remaining > 0 {
                 // Pad final chunk
                 let frames_to_pad = required - remaining;
@@ -1339,7 +1339,7 @@ impl CacheAwareRNNTPipeline {
         let mel_buffer = self.mel_buffer.as_ref()?;
         let buffer_size = mel_buffer.dim(1) as usize;
 
-        let extract_start = self.mel_buffer_idx;
+        let extract_start = self.mel_buffer_offset;
         let extract_end = self.mel_total_frames.min(extract_start + chunk_size + pre_encode_cache);
         let total_extract = extract_end - extract_start;
 
@@ -1522,11 +1522,7 @@ impl CacheAwareRNNTPipeline {
 
         // Advance buffer index by shift_size
         let old_buffer_idx = self.mel_buffer_idx;
-        if self.is_first_chunk {
-            self.mel_buffer_idx += shift_size + pre_encode_cache;
-        } else {
-            self.mel_buffer_idx += shift_size;
-        }
+        self.mel_buffer_idx += shift_size;
 
         // Trim old frames to bound memory
         // Keep enough frames for the NEXT chunk's overlap (which uses subsequent pre_encode_cache)
@@ -1563,7 +1559,7 @@ impl CacheAwareRNNTPipeline {
         );
 
         Some(
-            FeatureBuffer::new(mel_chunk, total_extract)
+            FeatureBuffer::new(mel_chunk, chunk_size)
                 .with_first(is_first)
                 .with_last(is_last)
                 .with_pre_encode_cache(pre_encode_cache),
@@ -1776,43 +1772,6 @@ impl CacheAwareRNNTPipeline {
             raw_enc_len.min(valid_out_len).min(actual_tensor_frames)
         };
 
-        // Log mel input for comparison with Python
-        // Tensor layout is [1, n_mels, time] in row-major order
-        // To match Python's mel[0, :5, 0], we need indices at time=0 for mel bins 0-4
-        // Index formula: mel[0, i, 0] = i * time_len + 0
-        {
-            // Force evaluation to ensure we have the actual computed values
-            let features_contiguous =
-                mlx_rs::ops::as_strided(&features, features.shape(), None, None)?;
-            features_contiguous.eval()?;
-            let mel_data = features_contiguous.as_slice::<f32>();
-            let n_mels = self.n_mels;
-            let time_len = chunk_len;
-
-            // Get first 5 mel bins at time frame 0
-            let mel_frame0_slice: Vec<f32> = (0..5.min(n_mels))
-                .map(|i| {
-                    let idx = i * time_len; // mel[0, i, 0]
-                    (mel_data[idx] * 1_000_000.0).round() / 1_000_000.0
-                })
-                .collect();
-
-            // L2 norm of all mel bins at time frame 0
-            let mel_frame0_norm: f32 = (0..n_mels)
-                .map(|i| {
-                    let v = mel_data[i * time_len]; // mel[0, i, 0]
-                    v * v
-                })
-                .sum::<f32>()
-                .sqrt();
-
-            tracing::trace!(
-                ?mel_frame0_slice,
-                mel_frame0_norm = %format!("{:.6}", mel_frame0_norm),
-                "mel frame 0"
-            );
-        }
-
         // Debug encoder output
         self.encoder_cache.last_channel_len.eval()?;
         let cache_len = self.encoder_cache.last_channel_len.as_slice::<i64>()[0];
@@ -1845,58 +1804,16 @@ impl CacheAwareRNNTPipeline {
             "processing feature buffer"
         );
 
-        // Log encoder frame values for comparison with Python
-        if actual_tensor_frames > 0 {
-            let enc_data = encoded.as_slice::<f32>();
-            let d_model = encoded.shape()[2] as usize;
-
-            // Frame 0
-            let frame0_start = 0;
-            let frame0_slice: Vec<f32> = enc_data[frame0_start..frame0_start + 10.min(d_model)]
-                .iter()
-                .map(|&v| (v * 1_000_000.0).round() / 1_000_000.0)
-                .collect();
-            let frame0_norm: f32 = enc_data[frame0_start..frame0_start + d_model]
-                .iter()
-                .map(|v| v * v)
-                .sum::<f32>()
-                .sqrt();
-            tracing::trace!(
-                ?frame0_slice,
-                frame0_norm = %format!("{:.6}", frame0_norm),
-                "encoder frame 0"
-            );
-
-            // Frame 1 if available
-            if actual_tensor_frames > 1 {
-                let frame1_start = d_model;
-                let frame1_slice: Vec<f32> = enc_data[frame1_start..frame1_start + 10.min(d_model)]
-                    .iter()
-                    .map(|&v| (v * 1_000_000.0).round() / 1_000_000.0)
-                    .collect();
-                let frame1_norm: f32 = enc_data[frame1_start..frame1_start + d_model]
-                    .iter()
-                    .map(|v| v * v)
-                    .sum::<f32>()
-                    .sqrt();
-                tracing::trace!(
-                    ?frame1_slice,
-                    frame1_norm = %format!("{:.6}", frame1_norm),
-                    "encoder frame 1"
-                );
-            }
-        }
-
-        // Log decoder state before decoding
-        {
-            let decoder_state_norm = self.state.decoder_state.compute_norm();
-            tracing::debug!(
-                step = self.state.step_count,
-                decoder_state_norm = %format!("{:.6}", decoder_state_norm),
-                last_token = ?self.state.last_token,
-                "DECODER STATE: before decoding"
-            );
-        }
+        // // Log decoder state before decoding
+        // {
+        //     let decoder_state_norm = self.state.decoder_state.compute_norm();
+        //     tracing::debug!(
+        //         step = self.state.step_count,
+        //         decoder_state_norm = %format!("{:.6}", decoder_state_norm),
+        //         last_token = ?self.state.last_token,
+        //         "DECODER STATE: before decoding"
+        //     );
+        // }
 
         // Decode with optional punctuation masking
         let masked_ids = if self.suppress_punctuation {
@@ -1914,17 +1831,17 @@ impl CacheAwareRNNTPipeline {
             masked_ids,
         )?;
 
-        // Log decoder state after decoding
-        {
-            let decoder_state_norm = self.state.decoder_state.compute_norm();
-            tracing::debug!(
-                step = self.state.step_count,
-                decoder_state_norm = %format!("{:.6}", decoder_state_norm),
-                last_token = ?self.state.last_token,
-                new_tokens = decode_output.new_tokens.len(),
-                "DECODER STATE: after decoding"
-            );
-        }
+        // // Log decoder state after decoding
+        // {
+        //     let decoder_state_norm = self.state.decoder_state.compute_norm();
+        //     tracing::debug!(
+        //         step = self.state.step_count,
+        //         decoder_state_norm = %format!("{:.6}", decoder_state_norm),
+        //         last_token = ?self.state.last_token,
+        //         new_tokens = decode_output.new_tokens.len(),
+        //         "DECODER STATE: after decoding"
+        //     );
+        // }
 
         // Update cumulative statistics
         self.state.cumulative_stats.total_audio_samples += audio_samples_this_chunk;
