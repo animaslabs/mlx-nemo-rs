@@ -132,7 +132,7 @@ fn main() -> mlx_nemo::Result<()> {
     println!("Pipeline loaded in {:.2}s", start.elapsed().as_secs_f32());
 
     // Enable blank threshold to reduce missed sentences in streaming
-    pipeline.set_blank_threshold(2.0);
+    // pipeline.set_blank_threshold(2.0);
 
     let target_rate = pipeline.sample_rate();
     println!("Sample rate: {} Hz", target_rate);
