@@ -307,6 +307,9 @@ pub fn dither(audio: &Array, amount: f32) -> Result<Array> {
 /// Returns array of shape [n_frames, n_fft] with center-padded frames.
 /// Each frame has the audio centered within the FFT frame size.
 ///
+/// Uses MLX `as_strided` for efficient overlapping window extraction,
+/// avoiding GPU→CPU→GPU data transfer.
+///
 /// # Arguments
 /// * `audio` - Input audio [time]
 /// * `window_len` - Window length in samples
@@ -321,40 +324,41 @@ pub fn frame_audio(
     hop_len: usize,
     n_fft: usize,
 ) -> Result<Array> {
-    audio.eval()?;
-    let audio_data: &[f32] = audio.as_slice();
-    let audio_len = audio_data.len();
+    let audio_len = audio.shape()[0] as usize;
 
     let n_frames = num_frames(audio_len, window_len, hop_len);
     if n_frames == 0 {
         return Ok(Array::zeros::<f32>(&[0, n_fft as i32])?);
     }
 
-    // Always center-pad frames to match the center-padded window
-    let left_pad = (n_fft - window_len) / 2;
-    let right_pad = n_fft - window_len - left_pad;
-    let mut frames = Vec::with_capacity(n_frames * n_fft);
+    // Use as_strided to create overlapping windows without copying
+    // Shape: [n_frames, window_len], Strides: [hop_len, 1]
+    let frames = ops::as_strided(
+        audio,
+        &[n_frames as i32, window_len as i32],
+        &[hop_len as i64, 1],
+        0,
+    )?;
 
-    for frame_idx in 0..n_frames {
-        let start = frame_idx * hop_len;
-
-        // Left zero-padding
-        frames.extend(std::iter::repeat(0.0f32).take(left_pad));
-
-        // Audio samples
-        frames.extend_from_slice(&audio_data[start..start + window_len]);
-
-        // Right zero-padding
-        frames.extend(std::iter::repeat(0.0f32).take(right_pad));
+    // Center-pad each frame from window_len to n_fft
+    if window_len < n_fft {
+        let left_pad = ((n_fft - window_len) / 2) as i32;
+        let right_pad = (n_fft - window_len) as i32 - left_pad;
+        // Pad along axis 1 (the frame dimension)
+        ops::pad(&frames, &[(0, 0), (left_pad, right_pad)], None, None)
+            .map_err(|e| Error::model(e.to_string()))
+    } else {
+        Ok(frames)
     }
-
-    Ok(Array::from_slice(&frames, &[n_frames as i32, n_fft as i32]))
 }
 
 /// Frame batched audio into overlapping windows.
 ///
 /// Returns array of shape [batch, n_frames, n_fft] with center-padded frames.
 /// Each frame has the audio centered within the FFT frame size.
+///
+/// Uses MLX `as_strided` for efficient overlapping window extraction,
+/// avoiding GPU→CPU→GPU data transfer.
 ///
 /// # Arguments
 /// * `audio` - Input audio [batch, time]
@@ -370,8 +374,6 @@ pub fn frame_audio_batch(
     hop_len: usize,
     n_fft: usize,
 ) -> Result<Array> {
-    audio.eval()?;
-    let audio_data: &[f32] = audio.as_slice();
     let batch_size = audio.shape()[0] as usize;
     let audio_len = audio.shape()[1] as usize;
 
@@ -380,33 +382,26 @@ pub fn frame_audio_batch(
         return Ok(Array::zeros::<f32>(&[batch_size as i32, 0, n_fft as i32])?);
     }
 
-    // Always center-pad frames to match the center-padded window
-    let left_pad = (n_fft - window_len) / 2;
-    let right_pad = n_fft - window_len - left_pad;
-    let mut frames = Vec::with_capacity(batch_size * n_frames * n_fft);
+    // Use as_strided to create overlapping windows without copying
+    // Input: [batch, time] with strides [time, 1]
+    // Output: [batch, n_frames, window_len] with strides [time, hop_len, 1]
+    let frames = ops::as_strided(
+        audio,
+        &[batch_size as i32, n_frames as i32, window_len as i32],
+        &[audio_len as i64, hop_len as i64, 1],
+        0,
+    )?;
 
-    for b in 0..batch_size {
-        let batch_offset = b * audio_len;
-        for frame_idx in 0..n_frames {
-            let start = frame_idx * hop_len;
-
-            // Left zero-padding
-            frames.extend(std::iter::repeat(0.0f32).take(left_pad));
-
-            // Audio samples
-            for i in 0..window_len {
-                frames.push(audio_data[batch_offset + start + i]);
-            }
-
-            // Right zero-padding
-            frames.extend(std::iter::repeat(0.0f32).take(right_pad));
-        }
+    // Center-pad each frame from window_len to n_fft
+    if window_len < n_fft {
+        let left_pad = ((n_fft - window_len) / 2) as i32;
+        let right_pad = (n_fft - window_len) as i32 - left_pad;
+        // Pad along axis 2 (the frame dimension)
+        ops::pad(&frames, &[(0, 0), (0, 0), (left_pad, right_pad)], None, None)
+            .map_err(|e| Error::model(e.to_string()))
+    } else {
+        Ok(frames)
     }
-
-    Ok(Array::from_slice(
-        &frames,
-        &[batch_size as i32, n_frames as i32, n_fft as i32],
-    ))
 }
 
 /// Calculate number of frames from audio length.

@@ -1522,7 +1522,11 @@ impl CacheAwareRNNTPipeline {
 
         // Advance buffer index by shift_size
         let old_buffer_idx = self.mel_buffer_idx;
-        self.mel_buffer_idx += shift_size;
+        if self.is_first_chunk {
+            self.mel_buffer_idx += shift_size + pre_encode_cache;
+        } else {
+            self.mel_buffer_idx += shift_size;
+        }
 
         // Trim old frames to bound memory
         // Keep enough frames for the NEXT chunk's overlap (which uses subsequent pre_encode_cache)
