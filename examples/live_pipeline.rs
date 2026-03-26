@@ -34,6 +34,7 @@ use ringbuf::{
     traits::{Consumer, Producer, Split},
     HeapRb,
 };
+use rubato::{Resampler, SincFixedIn, SincInterpolationParameters, SincInterpolationType, WindowFunction};
 
 use mlx_nemo::asr::{CacheAwareRNNTPipeline, StreamingModeInfo};
 
@@ -131,9 +132,6 @@ fn main() -> mlx_nemo::Result<()> {
     };
     println!("Pipeline loaded in {:.2}s", start.elapsed().as_secs_f32());
 
-    // Enable blank threshold to reduce missed sentences in streaming
-    // pipeline.set_blank_threshold(2.0);
-
     let target_rate = pipeline.sample_rate();
     println!("Sample rate: {} Hz", target_rate);
 
@@ -194,6 +192,15 @@ fn main() -> mlx_nemo::Result<()> {
         }
     );
 
+    // Calculate chunk sizes (matching streaming.rs approach)
+    let chunk_samples = (target_rate as f32 * chunk_ms as f32 / 1000.0) as usize;
+    let source_chunk_samples = (source_rate as f32 * chunk_ms as f32 / 1000.0) as usize;
+
+    println!(
+        "\nProcessing in {} ms chunks ({} samples at target rate)",
+        chunk_ms, chunk_samples
+    );
+
     // Create ring buffer (2 seconds of audio at source rate)
     let buffer_capacity = source_rate as usize * 2;
     let ring_buffer = HeapRb::<f32>::new(buffer_capacity);
@@ -215,11 +222,11 @@ fn main() -> mlx_nemo::Result<()> {
         .build_input_stream(
             &audio_config,
             move |data: &[f32], _: &cpal::InputCallbackInfo| {
-                // Convert to mono if stereo (take first channel only)
+                // Convert to mono if stereo (average channels)
                 if channels_clone > 1 {
                     for chunk in data.chunks(channels_clone as usize) {
-                        // Take first channel, drop if buffer is full
-                        let _ = producer.try_push(chunk[0]);
+                        let mono = chunk.iter().sum::<f32>() / channels_clone as f32;
+                        let _ = producer.try_push(mono);
                     }
                 } else {
                     // Mono: push all samples, drop if buffer is full
@@ -240,16 +247,15 @@ fn main() -> mlx_nemo::Result<()> {
         .play()
         .map_err(|e| mlx_nemo::Error::audio(format!("Failed to start audio stream: {}", e)))?;
 
-    // Setup resampler if needed
-    let mut resampler = if needs_resampling {
-        Some(create_resampler(source_rate, target_rate)?)
+    // Setup resampler if needed (using same approach as streaming.rs)
+    let mut resampler: Option<SincFixedIn<f32>> = if needs_resampling {
+        Some(create_resampler(source_rate, target_rate, source_chunk_samples)?)
     } else {
         None
     };
 
-    // Processing parameters
-    let chunk_samples = (target_rate as usize * chunk_ms as usize) / 1000;
-    let source_chunk_samples = (source_rate as usize * chunk_ms as usize) / 1000;
+    // Buffer to accumulate samples from ring buffer
+    let mut audio_buffer: Vec<f32> = Vec::with_capacity(source_chunk_samples * 2);
 
     println!("\nListening... Press Ctrl+C to stop.\n");
 
@@ -257,7 +263,6 @@ fn main() -> mlx_nemo::Result<()> {
     let mut last_text = String::new();
     let mut chunks_fed = 0;
     let mut transcribe_steps = 0;
-    let mut audio_buffer: Vec<f32> = Vec::with_capacity(source_chunk_samples * 2);
 
     let debug = std::env::var("NEMO_DEBUG")
         .map(|v| v == "1")
@@ -278,48 +283,60 @@ fn main() -> mlx_nemo::Result<()> {
         };
 
         if audio_buffer.len() >= required_samples {
+            // Take exactly the required number of samples (matching streaming.rs)
             let chunk: Vec<f32> = audio_buffer.drain(..required_samples).collect();
-            let input_len = chunk.len();
+
+            // Log chunk info (matching streaming.rs debug output)
+            if debug {
+                let preview: Vec<String> = chunk.iter().take(5).map(|s| format!("{:.6}", s)).collect();
+                let max_abs = chunk.iter().map(|s| s.abs()).fold(0.0f32, f32::max);
+                let time_offset = chunks_fed as f32 * chunk_ms as f32 / 1000.0;
+                eprintln!(
+                    "CHUNK {} @ {:.2}s required_samples={} len={} max_abs={:.6} samples=[{}{}]",
+                    chunks_fed,
+                    time_offset,
+                    required_samples,
+                    chunk.len(),
+                    max_abs,
+                    preview.join(", "),
+                    if chunk.len() > 5 { ", ..." } else { "" }
+                );
+            }
 
             // Resample if needed
             let chunk = if let Some(ref mut rs) = resampler {
+                tracing::info!("RESAMPLING");
                 resample_chunk(rs, &chunk)?
             } else {
                 chunk
             };
 
-            if debug {
-                eprintln!(
-                    "[LIVE_PIPELINE DEBUG] chunk {}: input {} samples -> resampled {} samples",
-                    chunks_fed, input_len, chunk.len()
-                );
-            }
-
-            // Feed audio to pipeline
+            // Feed audio to pipeline (matching streaming.rs)
             pipeline.add_audio(&chunk);
             chunks_fed += 1;
+        }
 
-            // Process any available transcription steps
-            while let Some(output) = pipeline.transcribe_step()? {
-                transcribe_steps += 1;
+        // Process any available transcription steps unconditionally
+        // This ensures we process audio as it accumulates in the pipeline's internal buffer,
+        // rather than only when we add new audio (matching streaming.rs behavior)
+        while let Some(output) = pipeline.transcribe_step()? {
+            if debug {
+                let new_tokens_str: Vec<String> =
+                    output.new_tokens.iter().map(|t| t.to_string()).collect();
+                eprintln!(
+                    "STEP {} new_tokens=[{}] total_tokens={}",
+                    transcribe_steps,
+                    new_tokens_str.join(", "),
+                    output.token_count
+                );
+            }
+            transcribe_steps += 1;
 
-                if debug {
-                    let new_tokens_str: Vec<String> =
-                        output.new_tokens.iter().map(|t| t.to_string()).collect();
-                    eprintln!(
-                        "[LIVE_PIPELINE DEBUG] step {} new_tokens=[{}] total_tokens={}",
-                        transcribe_steps,
-                        new_tokens_str.join(", "),
-                        output.tokens.len()
-                    );
-                }
-
-                // Display partial result if text changed
-                if !output.text.is_empty() && output.text != last_text {
-                    print!("\r\x1b[K{}", output.text);
-                    io::stdout().flush().unwrap();
-                    last_text = output.text.clone();
-                }
+            // Display partial result if text changed
+            if !output.text.is_empty() && output.text != last_text {
+                print!("\r\x1b[K{}", output.text);
+                io::stdout().flush().unwrap();
+                last_text = output.text.clone();
             }
         }
 
@@ -332,6 +349,9 @@ fn main() -> mlx_nemo::Result<()> {
 
     // Process any remaining audio in buffer
     if !audio_buffer.is_empty() {
+        if debug {
+            eprintln!("Processing {} remaining samples in buffer", audio_buffer.len());
+        }
         let chunk = if let Some(ref mut rs) = resampler {
             resample_chunk(rs, &audio_buffer)?
         } else {
@@ -344,10 +364,20 @@ fn main() -> mlx_nemo::Result<()> {
         }
     }
 
-    // Signal end of stream and process remaining steps
+    // Signal end of stream and process remaining steps (matching streaming.rs)
     pipeline.end_stream();
 
     while let Some(output) = pipeline.transcribe_step()? {
+        if debug {
+            let new_tokens_str: Vec<String> =
+                output.new_tokens.iter().map(|t| t.to_string()).collect();
+            eprintln!(
+                "FINAL STEP {} new_tokens=[{}] total_tokens={}",
+                transcribe_steps,
+                new_tokens_str.join(", "),
+                output.token_count
+            );
+        }
         transcribe_steps += 1;
 
         if !output.text.is_empty() && output.text != last_text {
@@ -357,13 +387,14 @@ fn main() -> mlx_nemo::Result<()> {
         }
 
         if output.is_final {
+            println!(); // New line after final output
             break;
         }
     }
 
     let elapsed = start_time.elapsed().as_secs_f32();
 
-    println!("\n\n--- Final Result ---");
+    println!("\n--- Final Result ---");
     if !last_text.is_empty() {
         println!("{}", last_text);
     } else {
@@ -469,72 +500,45 @@ fn get_device_name(device: &cpal::Device) -> String {
     device.name().unwrap_or_else(|_| "<unknown>".to_string())
 }
 
-/// Create a resampler for converting from source to target sample rate.
-fn create_resampler(from_rate: u32, to_rate: u32) -> mlx_nemo::Result<rubato::FftFixedIn<f32>> {
-    let chunk_size = 1024;
-    let resampler = rubato::FftFixedIn::<f32>::new(
-        from_rate as usize,
-        to_rate as usize,
+/// Create a resampler matching the streaming.rs approach.
+fn create_resampler(
+    from_rate: u32,
+    to_rate: u32,
+    chunk_size: usize,
+) -> mlx_nemo::Result<SincFixedIn<f32>> {
+    let params = SincInterpolationParameters {
+        sinc_len: 256,
+        f_cutoff: 0.95,
+        interpolation: SincInterpolationType::Linear,
+        oversampling_factor: 256,
+        window: WindowFunction::BlackmanHarris2,
+    };
+
+    let resampler = SincFixedIn::<f32>::new(
+        to_rate as f64 / from_rate as f64,
+        2.0,
+        params,
         chunk_size,
-        2, // sub_chunks
-        1, // channels
+        1, // mono
     )
     .map_err(|e| mlx_nemo::Error::audio(format!("Failed to create resampler: {}", e)))?;
 
     Ok(resampler)
 }
 
-/// Resample a chunk of audio.
+/// Resample a chunk of audio using the same approach as streaming.rs.
 fn resample_chunk(
-    resampler: &mut rubato::FftFixedIn<f32>,
+    resampler: &mut SincFixedIn<f32>,
     input: &[f32],
 ) -> mlx_nemo::Result<Vec<f32>> {
-    use rubato::Resampler;
-
     if input.is_empty() {
         return Ok(Vec::new());
     }
 
-    // FftFixedIn requires specific input sizes, so we may need to pad
-    let input_frames_needed = resampler.input_frames_next();
+    let waves_in = vec![input.to_vec()];
+    let waves_out = resampler
+        .process(&waves_in, None)
+        .map_err(|e| mlx_nemo::Error::audio(format!("Resampling failed: {}", e)))?;
 
-    let mut padded_input = input.to_vec();
-    if padded_input.len() < input_frames_needed {
-        padded_input.resize(input_frames_needed, 0.0);
-    }
-
-    // Process in chunks of input_frames_needed
-    let mut output = Vec::new();
-    for chunk in padded_input.chunks(input_frames_needed) {
-        if chunk.len() < input_frames_needed {
-            // Pad the last chunk
-            let mut padded = chunk.to_vec();
-            padded.resize(input_frames_needed, 0.0);
-            let waves_in = vec![padded];
-            match resampler.process(&waves_in, None) {
-                Ok(waves_out) => {
-                    if let Some(out) = waves_out.into_iter().next() {
-                        output.extend(out);
-                    }
-                }
-                Err(e) => {
-                    return Err(mlx_nemo::Error::audio(format!("Resampling failed: {}", e)));
-                }
-            }
-        } else {
-            let waves_in = vec![chunk.to_vec()];
-            match resampler.process(&waves_in, None) {
-                Ok(waves_out) => {
-                    if let Some(out) = waves_out.into_iter().next() {
-                        output.extend(out);
-                    }
-                }
-                Err(e) => {
-                    return Err(mlx_nemo::Error::audio(format!("Resampling failed: {}", e)));
-                }
-            }
-        }
-    }
-
-    Ok(output)
+    Ok(waves_out.into_iter().next().unwrap_or_default())
 }

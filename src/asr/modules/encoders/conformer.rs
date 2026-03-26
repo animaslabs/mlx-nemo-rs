@@ -114,15 +114,17 @@ fn causal_pad_2d(x: &Array, kernel_size: usize, stride: usize) -> Result<Array> 
     // let left_pad = (kernel_size - 1) as i32;
 
     // Step 1: Pad time dimension (axis 1): [B, T, F, C] -> [B, T+left_pad+right_pad, F, C]
-    // let left_pad_time = 1 as i32;
-    let time_zeros_left = mlx_rs::ops::zeros::<f32>(&[batch, left_pad, freq, channels])?;
-    // let time_zeros_right = mlx_rs::ops::zeros::<f32>(&[batch, right_pad, freq, channels])?;
+    let left_pad_time = (kernel_size - 1) as i32;
+    // let right_pad_time = (kernel_size / 2) as i32;
+    let time_zeros_left = mlx_rs::ops::zeros::<f32>(&[batch, left_pad_time, freq, channels])?;
+    // let time_zeros_right = mlx_rs::ops::zeros::<f32>(&[batch, right_pad_time, freq, channels])?;
     // let x = mlx_rs::ops::concatenate_axis(&[&time_zeros_left, x, &time_zeros_right], 1)?;
     // JJK test
     let x = mlx_rs::ops::concatenate_axis(&[&time_zeros_left, x], 1)?;
 
     // Step 2: Pad frequency dimension (axis 2)
-    let new_time = time + left_pad;
+    // let new_time = time + left_pad_time + right_pad_time;
+    let new_time = time + left_pad_time;
     let freq_zeros_left = mlx_rs::ops::zeros::<f32>(&[batch, new_time, left_pad, channels])?;
     let freq_zeros_right = mlx_rs::ops::zeros::<f32>(&[batch, new_time, right_pad, channels])?;
     let x = mlx_rs::ops::concatenate_axis(&[&freq_zeros_left, &x, &freq_zeros_right], 2)?;
@@ -871,20 +873,21 @@ impl ConformerEncoder {
             None
         };
 
-        // Create padding mask for conv module: True where position >= valid_seq_len
-        // This zeros out padding frames after GLU, matching Python NeMo behavior
-        let pad_mask = if tensor_seq_len > valid_seq_len {
-            // Create indices [0, 1, 2, ..., tensor_seq_len - 1]
-            let indices = mlx_rs::ops::arange::<_, i32>(0, tensor_seq_len, 1)?;
-            // mask[i] = (i >= valid_seq_len) => True for padding positions
-            let valid_len_arr = Array::from_int(valid_seq_len);
-            let mask = mlx_rs::ops::ge(&indices, &valid_len_arr)?;
-            // Expand to [1, tensor_seq_len] for batch broadcasting
-            let mask = mask.reshape(&[1, tensor_seq_len])?;
-            Some(mask)
-        } else {
-            None
-        };
+        // // Create padding mask for conv module: True where position >= valid_seq_len
+        // // This zeros out padding frames after GLU, matching Python NeMo behavior
+        // let pad_mask = if tensor_seq_len > valid_seq_len {
+        //     // Create indices [0, 1, 2, ..., tensor_seq_len - 1]
+        //     let indices = mlx_rs::ops::arange::<_, i32>(0, tensor_seq_len, 1)?;
+        //     // mask[i] = (i >= valid_seq_len) => True for padding positions
+        //     let valid_len_arr = Array::from_int(valid_seq_len);
+        //     let mask = mlx_rs::ops::ge(&indices, &valid_len_arr)?;
+        //     // Expand to [1, tensor_seq_len] for batch broadcasting
+        //     let mask = mask.reshape(&[1, tensor_seq_len])?;
+        //     Some(mask)
+        // } else {
+        //     None
+        // };
+        let pad_mask = None;
 
         // Initialize output caches
         let mut cache_channel_next = Vec::with_capacity(self.layers.len());
