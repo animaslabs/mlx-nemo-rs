@@ -114,8 +114,8 @@ fn causal_pad_2d(x: &Array, kernel_size: usize, stride: usize) -> Result<Array> 
     // let left_pad = (kernel_size - 1) as i32;
 
     // Step 1: Pad time dimension (axis 1): [B, T, F, C] -> [B, T+left_pad+right_pad, F, C]
-    let left_pad_time = (kernel_size - 1) as i32;
-    let right_pad_time = 0 as i32; // (stride - 1) as i32; // ((kernel_size - 1) / 2) as i32;
+    let left_pad_time = (kernel_size - 1) as i32; // ((kernel_size - 1) / 2) as i32; // (kernel_size - 1) as i32;
+    let right_pad_time = 0; // ((kernel_size - 1) / 2) as i32;
     let time_zeros_left = mlx_rs::ops::zeros::<f32>(&[batch, left_pad_time, freq, channels])?;
     let time_zeros_right = mlx_rs::ops::zeros::<f32>(&[batch, right_pad_time, freq, channels])?;
     let x = mlx_rs::ops::concatenate_axis(&[&time_zeros_left, x, &time_zeros_right], 1)?;
@@ -844,14 +844,32 @@ impl ConformerEncoder {
         // After rel_shift in attention, these align correctly with K/V positions 0..total_len.
         let pos_emb = self.pos_enc.get_encoding(total_len as usize)?;
 
-        tracing::trace!(
-            seq_len,
-            cache_size,
-            filled_cache_len,
-            total_len,
-            pos_emb_shape = ?pos_emb.shape(),
-            expected_pos_len = 2 * total_len - 1,
-            "streaming pos_emb dimensions"
+        // Compute effective attention range
+        // offset = how many cache positions are masked (unfilled zeros on left)
+        // Attention window covers positions [offset, total_len-1] in the concatenated [cache, input]
+        let offset = cache_size - filled_cache_len;
+        let valid_positions = filled_cache_len + seq_len;
+
+        // Calculate ACTUAL audio time based on cumulative frames processed
+        // enc_call=0 processes frames 0 to seq_len-1, enc_call=1 processes seq_len to 2*seq_len-1, etc.
+        // Approximate: ~80ms per encoder frame (10ms hop * 8x subsampling)
+        const MS_PER_FRAME: f32 = 80.0;
+        let cumulative_frames = (enc_call as i32 + 1) * seq_len;
+        // Audio end = all frames processed so far
+        let audio_end_sec = cumulative_frames as f32 * MS_PER_FRAME / 1000.0;
+        // Audio start = earliest frame still in attention window (cache + current input)
+        let audio_start_sec = (cumulative_frames - valid_positions).max(0) as f32 * MS_PER_FRAME / 1000.0;
+
+        tracing::debug!(
+            enc_call,
+            window_size = total_len,
+            masked_positions = offset,
+            attend_window = %format!("[{}-{}]", offset, offset + valid_positions - 1),
+            valid_positions,
+            cumulative_frames,
+            audio_range = %format!("[{:.2}s - {:.2}s]", audio_start_sec, audio_end_sec),
+            "ATTENTION_RANGE: cumulative={} frames, attending to {} positions",
+            cumulative_frames, valid_positions
         );
 
         // Create attention mask if we have context configuration

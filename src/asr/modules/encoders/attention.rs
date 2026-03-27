@@ -677,26 +677,6 @@ impl RelPositionMultiHeadAttention {
         let matrix_bd = Self::rel_shift(&matrix_bd)?;
         let matrix_bd = matrix_bd.index((.., .., .., ..total_len));
 
-        // Debug: check matrix_bd stats after rel_shift (only at specific points)
-        let encoder_call = call_count / 24;
-        if call_count % 24 == 0 && (encoder_call < 5 || encoder_call == 35 || encoder_call == 135) {
-            matrix_bd.eval()?;
-            let bd_flat = matrix_bd.reshape(&[-1])?;
-            bd_flat.eval()?;
-            let bd_slice: &[f32] = bd_flat.as_slice();
-            let bd_min = bd_slice.iter().cloned().fold(f32::INFINITY, f32::min);
-            let bd_max = bd_slice.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-            let bd_mean: f32 = bd_slice.iter().sum::<f32>() / bd_slice.len() as f32;
-            tracing::trace!(
-                encoder_call,
-                seq_len,
-                total_len,
-                bd_min,
-                bd_max,
-                bd_mean,
-                "rel_shift matrix_bd stats"
-            );
-        }
 
         // Combine and scale
         let scale = (head_dim as f32).sqrt();

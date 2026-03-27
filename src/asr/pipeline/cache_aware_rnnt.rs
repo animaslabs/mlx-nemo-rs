@@ -1727,14 +1727,17 @@ impl CacheAwareRNNTPipeline {
         {
             cache_len_next.eval().ok();
             let cache_len_after = cache_len_next.as_slice::<i64>()[0];
+            let cache_size = self.encoder_cache.last_channel.dim(2) as i64;
 
-            // Compute new cache channel norm (sample first layer)
+            // Compute new cache channel norm (sample from END where real data lives)
+            // Cache is right-aligned: zeros on left, real data on right
             let new_cache_channel_norm: f32 = {
                 cache_channel_next.eval().ok();
                 let data = cache_channel_next.as_slice::<f32>();
                 if !data.is_empty() {
                     let sample_len = data.len().min(100);
-                    data[..sample_len].iter().map(|v| v * v).sum::<f32>().sqrt()
+                    let start = data.len().saturating_sub(sample_len);
+                    data[start..].iter().map(|v| v * v).sum::<f32>().sqrt()
                 } else {
                     0.0
                 }
@@ -1742,9 +1745,10 @@ impl CacheAwareRNNTPipeline {
 
             tracing::debug!(
                 step = self.state.step_count,
-                cache_len_after,
-                new_cache_channel_norm = %format!("{:.6}", new_cache_channel_norm),
-                "ENCODER CACHE: state after forward"
+                audio_time = %format!("{:.3}s", audio_time_end),
+                cache_filled = %format!("{}/{}", cache_len_after, cache_size),
+                cache_norm = %format!("{:.4}", new_cache_channel_norm),
+                "PIPELINE: encoder step complete"
             );
         }
 
