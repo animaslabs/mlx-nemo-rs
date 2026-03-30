@@ -644,7 +644,8 @@ pub fn compute_streaming_config(
 
     // Compute sampling frames from subsampling
     // NeMo's ConvSubsampling.get_sampling_frames() returns [1, subsampling_factor]
-    let sampling_frames = (1, subsampling_factor);
+    // JJK what to do with chunk 0?
+    let sampling_frames = (subsampling_factor, subsampling_factor);
 
     // Chunk size in pre-subsampled frames
     // NeMo: chunk_size = [sampling_frames[0] + subsampling_factor * lookahead_steps,
@@ -676,13 +677,15 @@ pub fn compute_streaming_config(
     // Drop extra pre-encoded frames after subsampling
     // NeMo: drop_extra_pre_encoded = 1 + (pre_encode_cache_size[1] - 1) // subsampling_factor
     // For 9 frames with 8x subsampling: 1 + (9-1)//8 = 1 + 1 = 2
-    let drop_extra = if pre_encode_cache.1 >= 1 {
-        // 1 + (pre_encode_cache.1 - 1) / subsampling_factor
-        // JJK test - just drop one
-        (pre_encode_cache.1 - 1) / subsampling_factor
-    } else {
-        0
-    };
+    let drop_extra = 1;
+    // if pre_encode_cache.1 >= 1 {
+    //     // 1 + (pre_encode_cache.1 - 1) / subsampling_factor
+    //     // JJK test - just drop one
+    //     // (pre_encode_cache.1 + 1) / subsampling_factor
+    //     1
+    // } else {
+    //     0
+    // };
 
     tracing::debug!(
         "Streaming config: mode={}, style={}, lookahead_steps={}, cache_drop={}, \

@@ -344,6 +344,7 @@ impl MelProcessor {
 
     /// Per-feature normalization (zero mean, unit variance per mel bin).
     fn normalize_per_feature(&self, features: &Array) -> Result<Array> {
+        tracing::debug!("Applying per-feature normalization");
         let mean = ops::mean_axis(features, 2, Some(true))?;
         let centered = ops::subtract(features, &mean)?;
         let variance = ops::mean_axis(&ops::square(&centered)?, 2, Some(true))?;
