@@ -257,7 +257,12 @@ fn main() -> mlx_nemo::Result<()> {
 
     // Setup resampler if needed (using same approach as streaming.rs)
     let mut resampler: Option<SincFixedIn<f32>> = if needs_resampling {
-        Some(create_resampler(source_rate, target_rate, source_chunk_samples)?)
+        let mut rs = create_resampler(source_rate, target_rate, source_chunk_samples)?;
+        // Warm up the resampler with silence so the sinc filter is primed.
+        // Without this, the first chunk output is shorter by ~sinc_len/2 * ratio samples.
+        let silence = vec![vec![0.0f32; source_chunk_samples]];
+        let _ = rs.process(&silence, None);
+        Some(rs)
     } else {
         None
     };
