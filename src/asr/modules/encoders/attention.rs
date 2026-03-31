@@ -326,7 +326,7 @@ impl RelPositionMultiHeadAttention {
         let matrix_bd = ops::matmul(&q_with_bias_v, &p_t)?;
 
         // Apply rel_shift to align relative positions
-        let matrix_bd = Self::rel_shift(&matrix_bd)?;
+        // let matrix_bd = Self::rel_shift(&matrix_bd)?;
 
         // Truncate to seq_len (take first seq_len columns)
         // matrix_bd: [batch, n_heads, seq_len, 2*seq_len-1] -> [batch, n_heads, seq_len, seq_len]
@@ -486,19 +486,19 @@ impl RelPositionMultiHeadAttention {
             (x.clone(), seq_len, Some(new_cache))
         };
 
-        // Verify positional encoding dimensions match expectations
-        // pos_emb should be [1, 2*total_len-1, d_model]
-        let expected_pos_len = 2 * total_len - 1;
-        let actual_pos_len = pos_emb.dim(1) as i32;
-        if actual_pos_len != expected_pos_len {
-            tracing::warn!(
-                total_len,
-                expected_pos_len,
-                actual_pos_len,
-                seq_len,
-                "positional encoding length mismatch!"
-            );
-        }
+        // // Verify positional encoding dimensions match expectations
+        // // pos_emb should be [1, 2*total_len-1, d_model]
+        // let expected_pos_len = 2 * total_len - 1;
+        // let actual_pos_len = pos_emb.dim(1) as i32;
+        // if actual_pos_len != expected_pos_len {
+        //     tracing::warn!(
+        //         total_len,
+        //         expected_pos_len,
+        //         actual_pos_len,
+        //         seq_len,
+        //         "positional encoding length mismatch!"
+        //     );
+        // }
 
         // Project Q from input only (NeMo: query = input, unchanged)
         let q = self.linear_q.forward(x)?;
