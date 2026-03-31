@@ -66,10 +66,10 @@ impl RelPositionalEncoding {
     /// NeMo's layout: pe[:, 0::2] = sin, pe[:, 1::2] = cos
     /// This means even indices get sin, odd indices get cos.
     fn create_pe(d_model: usize, max_len: usize) -> Result<Array> {
-        let pe_len = 2 * max_len - 1;
+        let pe_len = 2 * max_len + 1;
 
         // Create position indices: [max_len-1, max_len-2, ..., 1, 0, -1, ..., -(max_len-1)]
-        let positions: Vec<f32> = (-(max_len as i32 - 1)..=(max_len as i32 - 1))
+        let positions: Vec<f32> = (-(max_len as i32)..=(max_len as i32))
             .rev()
             .map(|p| p as f32)
             .collect();
@@ -147,7 +147,7 @@ impl RelPositionalEncoding {
         //   start_pos = center_pos - input_len = max_len - seq_len
         //   end_pos = center_pos + input_len - 1 = max_len + seq_len - 1
         //   length = end_pos - start_pos = 2*seq_len - 1
-        let pe_len = self.max_len * 2 - 1;
+        let pe_len = self.max_len * 2 + 1;
         let center_pos = pe_len - self.max_len;
         let out_len = seq_len * 2 - 1;
         let start = center_pos - (seq_len - 1);
@@ -554,6 +554,19 @@ impl RelPositionMultiHeadAttention {
         let n_heads = self.n_heads as i32;
         let head_dim = self.head_dim as i32;
 
+        tracing::trace!(
+            batch_size,
+            seq_len,
+            d_model,
+            n_heads,
+            head_dim,
+            cache_present = cache.is_some(),
+            cache_drop_size = self.cache_drop_size,
+            pos_emb_shape = ?pos_emb.shape(),
+            att_mask_present = att_mask.is_some(),
+            "MultiHeadAttention::forward_with_cache entry"
+        );
+
         let call_count = ATTENTION_CALL_COUNT.fetch_add(1, Ordering::SeqCst);
         let layer_idx = call_count % 24;
         let encoder_call = call_count / 24;
@@ -766,6 +779,12 @@ impl RelPositionMultiHeadAttention {
 
         // Output projection
         let output = self.linear_out.forward(&context)?;
+
+        tracing::trace!(
+            output_shape = ?output.shape(),
+            new_cache_present = new_cache.is_some(),
+            "MultiHeadAttention::forward_with_cache exit"
+        );
 
         Ok((output, new_cache))
     }

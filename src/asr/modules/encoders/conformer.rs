@@ -833,6 +833,17 @@ impl ConformerEncoder {
         // Valid length is used for masking
         let seq_len = valid_seq_len;
 
+        tracing::debug!(
+            enc_call,
+            tensor_seq_len,
+            valid_seq_len,
+            cache_size,
+            filled_cache_len,
+            total_len,
+            seq_len,
+            "streaming forward params"
+        );
+
         // Generate positional encoding for total length (full buffer + current)
         // This should cover positions for all K/V that attention will see
         //
