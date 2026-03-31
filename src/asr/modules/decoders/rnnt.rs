@@ -979,7 +979,7 @@ impl RNNTJoint {
         let pred_proj = self.pred_proj.forward(&pred)?;
 
         // Debug: compare encoder vs prediction projection magnitudes
-        {
+        if std::env::var("DEBUG_JOINT").is_ok() {
             enc_proj.eval()?;
             pred_proj.eval()?;
             let enc_flat = enc_proj.reshape(&[-1])?;
@@ -1013,7 +1013,6 @@ impl RNNTJoint {
         }
 
         // Add
-        trace!("Adding encoder and prediction projections");
         let joint = ops::add(&enc_proj, &pred_proj)?;
 
         // Apply activation

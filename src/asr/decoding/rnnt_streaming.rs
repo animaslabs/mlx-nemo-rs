@@ -184,10 +184,11 @@ impl RnntStreamingDecoder {
             "decode_frames start"
         );
 
+        let debug_decoder = std::env::var("DEBUG_DECODER").is_ok();
+
         for t in 0..valid_frames {
             // Get encoder frame: [1, 1, d_model]
             let enc_frame = encoder_output.index((0i32..1, t as i32..t as i32 + 1, ..));
-            enc_frame.eval()?;
 
             let mut symbols_emitted = 0;
 
@@ -199,11 +200,9 @@ impl RnntStreamingDecoder {
                 // Get prediction output
                 let (pred_output, new_state) =
                     decoder.predict_one(last_token_arr.as_ref(), decoder_state)?;
-                pred_output.eval()?;
 
                 // Compute joint output: [1, vocab_size+1]
                 let log_probs = joint.forward_one(&enc_frame, &pred_output)?;
-                log_probs.eval()?;
 
                 // Apply token mask if provided (set masked tokens to -inf)
                 let log_probs = if let Some(mask_ids) = masked_token_ids {
@@ -212,13 +211,16 @@ impl RnntStreamingDecoder {
                     log_probs
                 };
 
-                // Get argmax prediction
+                // Get argmax prediction - this is the only eval we need since
+                // we must read the token value for control flow
                 let prediction = argmax_axis(&log_probs, -1, false)?;
                 prediction.eval()?;
                 let pred_token = prediction.as_slice::<u32>()[0] as usize;
 
                 // Debug: log encoder and prediction norms for frame 0
-                if t == 0 && symbols_emitted == 0 {
+                if debug_decoder && t == 0 && symbols_emitted == 0 {
+                    enc_frame.eval()?;
+                    pred_output.eval()?;
                     let enc_data = enc_frame.as_slice::<f32>();
                     let enc_norm: f32 = enc_data.iter().map(|v| v * v).sum::<f32>().sqrt();
                     let pred_data = pred_output.as_slice::<f32>();
@@ -236,6 +238,7 @@ impl RnntStreamingDecoder {
                 // Apply blank threshold override if configured
                 // When blank is argmax but margin is insufficient, select best non-blank instead
                 let pred_token = if pred_token == self.blank_id && self.blank_threshold > 0.0 {
+                    log_probs.eval()?;
                     let probs_data = log_probs.as_slice::<f32>();
                     let blank_prob = probs_data[self.blank_id];
 
@@ -280,7 +283,8 @@ impl RnntStreamingDecoder {
                     }
                 } else {
                     // Debug: log probabilities for first frame when blank is predicted (no threshold)
-                    if pred_token == self.blank_id && t == 0 && symbols_emitted == 0 {
+                    if debug_decoder && pred_token == self.blank_id && t == 0 && symbols_emitted == 0 {
+                        log_probs.eval()?;
                         let probs_data = log_probs.as_slice::<f32>();
                         let blank_prob = probs_data[self.blank_id];
 

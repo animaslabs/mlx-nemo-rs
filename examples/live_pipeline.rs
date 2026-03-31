@@ -37,8 +37,16 @@ use ringbuf::{
 use rubato::{Resampler, SincFixedIn, SincInterpolationParameters, SincInterpolationType, WindowFunction};
 
 use mlx_nemo::asr::{CacheAwareRNNTPipeline, StreamingModeInfo};
+use tracing_subscriber::{EnvFilter, fmt};
 
 fn main() -> mlx_nemo::Result<()> {
+    // Initialize tracing subscriber
+    fmt()
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+        )
+        .init();
+
     let args: Vec<String> = std::env::args().collect();
 
     // Parse arguments
@@ -333,11 +341,11 @@ fn main() -> mlx_nemo::Result<()> {
             transcribe_steps += 1;
 
             // Display partial result if text changed
-            if !output.text.is_empty() && output.text != last_text {
-                print!("\r\x1b[K{}", output.text);
-                io::stdout().flush().unwrap();
-                last_text = output.text.clone();
-            }
+            // if !output.text.is_empty() && output.text != last_text {
+            print!("{}\n", output.text);
+            io::stdout().flush().unwrap();
+            last_text = output.text.clone();
+            // }
         }
 
         // Small sleep to avoid busy-waiting
@@ -381,7 +389,7 @@ fn main() -> mlx_nemo::Result<()> {
         transcribe_steps += 1;
 
         if !output.text.is_empty() && output.text != last_text {
-            print!("\r\x1b[K{}", output.text);
+            print!("{}\n", output.text);
             io::stdout().flush().unwrap();
             last_text = output.text.clone();
         }

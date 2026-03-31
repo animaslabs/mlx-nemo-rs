@@ -918,23 +918,23 @@ impl ConformerEncoder {
 
             x = x_out;
 
-            // Trace layer 0 output for chunk 0 debugging
-            if enc_call == 0 && layer_idx == 0 {
-                x.eval()?;
-                let seq = x.dim(1);
-                if seq > 4 {
-                    let x_frame4 = x.index((0, 4, ..));
-                    x_frame4.eval()?;
-                    let x4_slice: Vec<f32> = x_frame4.as_slice::<f32>()[..10].to_vec();
-                    let x4_norm = {
-                        let sq = mlx_rs::ops::square(&x_frame4)?;
-                        let sum = mlx_rs::ops::sum(&sq, None)?;
-                        sum.eval()?;
-                        sum.as_slice::<f32>()[0].sqrt()
-                    };
-                    tracing::info!(layer_idx, x4_norm, ?x4_slice, "chunk0 layer0 OUTPUT [0,4]");
-                }
-            }
+            // // Trace layer 0 output for chunk 0 debugging
+            // if enc_call == 0 && layer_idx == 0 {
+            //     x.eval()?;
+            //     let seq = x.dim(1);
+            //     if seq > 4 {
+            //         let x_frame4 = x.index((0, 4, ..));
+            //         x_frame4.eval()?;
+            //         let x4_slice: Vec<f32> = x_frame4.as_slice::<f32>()[..10].to_vec();
+            //         let x4_norm = {
+            //             let sq = mlx_rs::ops::square(&x_frame4)?;
+            //             let sum = mlx_rs::ops::sum(&sq, None)?;
+            //             sum.eval()?;
+            //             sum.as_slice::<f32>()[0].sqrt()
+            //         };
+            //         tracing::info!(layer_idx, x4_norm, ?x4_slice, "chunk0 layer0 OUTPUT [0,4]");
+            //     }
+            // }
 
             // Update cache: the attention layer returns new_cache from sliding window
             // We need to store it properly in the full cache buffer

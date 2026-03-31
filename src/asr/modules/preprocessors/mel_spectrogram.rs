@@ -879,8 +879,9 @@ impl StreamingMel {
         if n_frames == 0 {
             // Not enough audio - update lookback buffer
             self.audio_lookback = combined;
-            if let Some(&last) = audio.last() {
-                self.last_sample = last;
+            let offset = self.win_samples - self.hop_samples + 1;
+            if audio.len() >= offset {
+                self.last_sample = audio[audio.len() - offset];
             }
             return Ok(0);
         }

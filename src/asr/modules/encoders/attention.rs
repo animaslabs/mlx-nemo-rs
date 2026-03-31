@@ -89,7 +89,7 @@ impl RelPositionalEncoding {
         // Add batch dimension: [1, pe_len, d_model]
         let pe = pe.reshape(&[1, pe_len as i32, d_model as i32])?;
 
-        tracing::debug!(
+        tracing::trace!(
             pe_len,
             d_model,
             max_len,
@@ -139,7 +139,7 @@ impl RelPositionalEncoding {
         //   end_pos = center_pos + input_len - 1 = max_len + seq_len - 1
         //   length = end_pos - start_pos = 2*seq_len - 1
         let pe_len = (self.max_len - 1) * 2 + 1;
-        let center_pos = pe_len - self.max_len + 1;
+        let center_pos = (pe_len / 2) + 1;
         let out_len = seq_len * 2 - 1;
         let start = center_pos - seq_len;
         let end = start + out_len;
@@ -278,7 +278,7 @@ impl RelPositionMultiHeadAttention {
         let n_heads = self.n_heads as i32;
         let head_dim = self.head_dim as i32;
 
-        tracing::debug!(
+        tracing::trace!(
             input_shape = ?x.shape(),
             pos_emb_shape = ?pos_emb.shape(),
             "attention forward entry"
@@ -351,7 +351,7 @@ impl RelPositionMultiHeadAttention {
         // Output projection
         let output = self.linear_out.forward(&context)?;
 
-        tracing::debug!(
+        tracing::trace!(
             output_shape = ?output.shape(),
             "attention forward exit"
         );
@@ -436,7 +436,7 @@ impl RelPositionMultiHeadAttention {
             let kv_input = ops::concatenate_axis(&[cache_tensor, x], 1)?;
             let total = cache_size + seq_len;
 
-            tracing::debug!(
+            tracing::trace!(
                 cache_shape = ?cache_tensor.shape(),
                 kv_input_shape = ?kv_input.shape(),
                 cache_size,
@@ -457,7 +457,7 @@ impl RelPositionMultiHeadAttention {
                 let cache_keep = cache_tensor.index((.., q_keep_size.., ..));
                 let x_keep = x.index((.., ..q_keep_size, ..));
                 let nc = ops::concatenate_axis(&[&cache_keep, &x_keep], 1)?;
-                tracing::debug!(
+                tracing::trace!(
                     q_keep_size,
                     cache_keep_shape = ?cache_keep.shape(),
                     x_keep_shape = ?x_keep.shape(),
@@ -507,7 +507,7 @@ impl RelPositionMultiHeadAttention {
         let k = self.linear_k.forward(&kv_input)?;
         let v = self.linear_v.forward(&kv_input)?;
 
-        tracing::debug!(
+        tracing::trace!(
             q_shape = ?q.shape(),
             k_shape = ?k.shape(),
             v_shape = ?v.shape(),
@@ -525,7 +525,7 @@ impl RelPositionMultiHeadAttention {
         let k = ops::transpose_axes(&k, &[0, 2, 1, 3])?;
         let v = ops::transpose_axes(&v, &[0, 2, 1, 3])?;
 
-        tracing::debug!(
+        tracing::trace!(
             q_multihead = ?q.shape(),
             k_multihead = ?k.shape(),
             v_multihead = ?v.shape(),
@@ -538,7 +538,7 @@ impl RelPositionMultiHeadAttention {
         let p = p.reshape(&[1, pos_len, n_heads, head_dim])?;
         let p = ops::transpose_axes(&p, &[0, 2, 1, 3])?;
 
-        tracing::debug!(
+        tracing::trace!(
             pos_emb_shape = ?pos_emb.shape(),
             p_shape = ?p.shape(),
             "projected positional embeddings"
@@ -558,7 +558,7 @@ impl RelPositionMultiHeadAttention {
         let p_t = ops::transpose_axes(&p, &[0, 1, 3, 2])?;
         let matrix_bd = ops::matmul(&q_with_bias_v, &p_t)?;
 
-        tracing::debug!(
+        tracing::trace!(
             matrix_ac_shape = ?matrix_ac.shape(),
             matrix_bd_shape = ?matrix_bd.shape(),
             "content and position attention scores"
@@ -568,7 +568,7 @@ impl RelPositionMultiHeadAttention {
         let matrix_bd = Self::rel_shift(&matrix_bd)?;
         let matrix_bd = matrix_bd.index((.., .., .., ..total_len));
 
-        tracing::debug!(
+        tracing::trace!(
             matrix_bd_truncated = ?matrix_bd.shape(),
             "rel_shift applied and truncated to total_len"
         );
@@ -577,7 +577,7 @@ impl RelPositionMultiHeadAttention {
         let scale = (head_dim as f32).sqrt();
         let mut scores = (&matrix_ac + &matrix_bd) / Array::from_f32(scale);
 
-        tracing::debug!(
+        tracing::trace!(
             scores_shape = ?scores.shape(),
             scale,
             "combined scores (ac + bd) / scale"
@@ -587,7 +587,7 @@ impl RelPositionMultiHeadAttention {
         let mask_expanded = if let Some(mask) = att_mask {
             // mask: [batch, seq_len, total_len] -> [batch, 1, seq_len, total_len]
             let mask = mask.reshape(&[batch_size, 1, seq_len, total_len])?;
-            tracing::debug!(
+            tracing::trace!(
                 mask_shape = ?mask.shape(),
                 "applying attention mask"
             );
@@ -611,7 +611,7 @@ impl RelPositionMultiHeadAttention {
             attn_weights = ops::r#where(&mask, &attn_weights, &zero)?;
         }
 
-        tracing::debug!(
+        tracing::trace!(
             attn_weights_shape = ?attn_weights.shape(),
             "attention weights after softmax"
         );
@@ -625,7 +625,7 @@ impl RelPositionMultiHeadAttention {
         // Reshape: [batch, seq_len, d_model]
         let context = context.reshape(&[batch_size, seq_len, self.d_model as i32])?;
 
-        tracing::debug!(
+        tracing::trace!(
             context_shape = ?context.shape(),
             "attention context after reshape"
         );
@@ -633,7 +633,7 @@ impl RelPositionMultiHeadAttention {
         // Output projection
         let output = self.linear_out.forward(&context)?;
 
-        tracing::debug!(
+        tracing::trace!(
             output_shape = ?output.shape(),
             new_cache_shape = ?new_cache.as_ref().map(|c| c.shape().to_vec()),
             "forward_with_cache exit"
