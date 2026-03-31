@@ -4,21 +4,12 @@
 //! as used in NeMo's Conformer ASR models.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use mlx_rs::ops::indexing::IndexOp;
 use mlx_rs::{ops, Array};
 
 use crate::core::error::{Error, Result};
 use crate::core::quantization::{LinearLayer, QuantizationConfig, load_linear_layer};
-
-/// Global counter for attention forward calls (for debugging)
-static ATTENTION_CALL_COUNT: AtomicU64 = AtomicU64::new(0);
-
-/// Reset the attention call counter (call at start of streaming session)
-pub fn reset_attention_counter() {
-    ATTENTION_CALL_COUNT.store(0, Ordering::SeqCst);
-}
 
 /// Relative positional encoding generator.
 ///
@@ -66,10 +57,10 @@ impl RelPositionalEncoding {
     /// NeMo's layout: pe[:, 0::2] = sin, pe[:, 1::2] = cos
     /// This means even indices get sin, odd indices get cos.
     fn create_pe(d_model: usize, max_len: usize) -> Result<Array> {
-        let pe_len = 2 * max_len + 1;
+        let pe_len = 2 * max_len - 1;
 
         // Create position indices: [max_len-1, max_len-2, ..., 1, 0, -1, ..., -(max_len-1)]
-        let positions: Vec<f32> = (-(max_len as i32)..=(max_len as i32))
+        let positions: Vec<f32> = (-(max_len as i32 - 1)..=(max_len as i32 - 1))
             .rev()
             .map(|p| p as f32)
             .collect();
@@ -147,10 +138,10 @@ impl RelPositionalEncoding {
         //   start_pos = center_pos - input_len = max_len - seq_len
         //   end_pos = center_pos + input_len - 1 = max_len + seq_len - 1
         //   length = end_pos - start_pos = 2*seq_len - 1
-        let pe_len = self.max_len * 2 + 1;
-        let center_pos = pe_len - self.max_len;
+        let pe_len = (self.max_len - 1) * 2 + 1;
+        let center_pos = pe_len - self.max_len + 1;
         let out_len = seq_len * 2 - 1;
-        let start = center_pos - (seq_len - 1);
+        let start = center_pos - seq_len;
         let end = start + out_len;
 
         tracing::trace!(
@@ -282,77 +273,21 @@ impl RelPositionMultiHeadAttention {
     /// # Returns
     /// Output tensor [batch, seq_len, d_model]
     pub fn forward(&mut self, x: &Array, pos_emb: &Array) -> Result<Array> {
-        let debug_attn = std::env::var("DEBUG_ATTENTION").is_ok();
-
         let batch_size = x.dim(0) as i32;
         let seq_len = x.dim(1) as i32;
         let n_heads = self.n_heads as i32;
         let head_dim = self.head_dim as i32;
 
-        if debug_attn {
-            // Debug: print input x at positions 0 and 16
-            x.eval()?;
-            let x_flat = x.reshape(&[-1])?;
-            x_flat.eval()?;
-            let x_slice: &[f32] = x_flat.as_slice();
-            let d = self.d_model;
-            eprintln!("DEBUG ATTN input x shape: {:?}", x.shape());
-            eprintln!("DEBUG ATTN input x[0,0,:5]: [{:.6}, {:.6}, {:.6}, {:.6}, {:.6}]",
-                x_slice[0], x_slice[1], x_slice[2], x_slice[3], x_slice[4]);
-            let x_pos_16 = 16 * d;
-            if x_slice.len() > x_pos_16 + 4 {
-                eprintln!("DEBUG ATTN input x[0,16,:5]: [{:.6}, {:.6}, {:.6}, {:.6}, {:.6}]",
-                    x_slice[x_pos_16], x_slice[x_pos_16+1], x_slice[x_pos_16+2], x_slice[x_pos_16+3], x_slice[x_pos_16+4]);
-            }
-        }
+        tracing::debug!(
+            input_shape = ?x.shape(),
+            pos_emb_shape = ?pos_emb.shape(),
+            "attention forward entry"
+        );
 
         // Project Q, K, V: [batch, seq_len, d_model]
         let q = self.linear_q.forward(x)?;
         let k = self.linear_k.forward(x)?;
         let v = self.linear_v.forward(x)?;
-
-        if debug_attn {
-            // Debug: print Q/K/V projections before reshape
-            q.eval()?;
-            k.eval()?;
-            v.eval()?;
-            let q_flat = q.reshape(&[-1])?;
-            let k_flat = k.reshape(&[-1])?;
-            let v_flat = v.reshape(&[-1])?;
-            q_flat.eval()?;
-            k_flat.eval()?;
-            v_flat.eval()?;
-            let q_slice: &[f32] = q_flat.as_slice();
-            let k_slice: &[f32] = k_flat.as_slice();
-            let v_slice: &[f32] = v_flat.as_slice();
-            let d = self.d_model;
-            eprintln!("DEBUG ATTN Q[0,0,:5]: [{:.6}, {:.6}, {:.6}, {:.6}, {:.6}]",
-                q_slice[0], q_slice[1], q_slice[2], q_slice[3], q_slice[4]);
-            eprintln!("DEBUG ATTN Q[0,1,:5]: [{:.6}, {:.6}, {:.6}, {:.6}, {:.6}]",
-                q_slice[d], q_slice[d+1], q_slice[d+2], q_slice[d+3], q_slice[d+4]);
-            eprintln!("DEBUG ATTN K[0,0,:5]: [{:.6}, {:.6}, {:.6}, {:.6}, {:.6}]",
-                k_slice[0], k_slice[1], k_slice[2], k_slice[3], k_slice[4]);
-            // Also print K at position 16 (last valid position)
-            let k_pos_16 = 16 * d;
-            eprintln!("DEBUG ATTN K[0,16,:5]: [{:.6}, {:.6}, {:.6}, {:.6}, {:.6}]",
-                k_slice[k_pos_16], k_slice[k_pos_16+1], k_slice[k_pos_16+2], k_slice[k_pos_16+3], k_slice[k_pos_16+4]);
-            eprintln!("DEBUG ATTN V[0,0,:5]: [{:.6}, {:.6}, {:.6}, {:.6}, {:.6}]",
-                v_slice[0], v_slice[1], v_slice[2], v_slice[3], v_slice[4]);
-
-            // Debug: print position biases
-            self.pos_bias_u.eval()?;
-            self.pos_bias_v.eval()?;
-            let bias_u_flat = self.pos_bias_u.reshape(&[-1])?;
-            let bias_v_flat = self.pos_bias_v.reshape(&[-1])?;
-            bias_u_flat.eval()?;
-            bias_v_flat.eval()?;
-            let bu_slice: &[f32] = bias_u_flat.as_slice();
-            let bv_slice: &[f32] = bias_v_flat.as_slice();
-            eprintln!("DEBUG ATTN pos_bias_u[0,:5]: [{:.6}, {:.6}, {:.6}, {:.6}, {:.6}]",
-                bu_slice[0], bu_slice[1], bu_slice[2], bu_slice[3], bu_slice[4]);
-            eprintln!("DEBUG ATTN pos_bias_v[0,:5]: [{:.6}, {:.6}, {:.6}, {:.6}, {:.6}]",
-                bv_slice[0], bv_slice[1], bv_slice[2], bv_slice[3], bv_slice[4]);
-        }
 
         // Reshape to multi-head: [batch, seq_len, n_heads, head_dim]
         let q = q.reshape(&[batch_size, seq_len, n_heads, head_dim])?;
@@ -391,96 +326,18 @@ impl RelPositionMultiHeadAttention {
         let matrix_bd = ops::matmul(&q_with_bias_v, &p_t)?;
 
         // Apply rel_shift to align relative positions
-        if debug_attn {
-            // Debug: print matrix_bd shape and values BEFORE rel_shift
-            matrix_bd.eval()?;
-            eprintln!("DEBUG ATTN matrix_bd BEFORE rel_shift shape: {:?}", matrix_bd.shape());
-            let bd_pre_flat = matrix_bd.reshape(&[-1])?;
-            bd_pre_flat.eval()?;
-            let bd_pre: &[f32] = bd_pre_flat.as_slice();
-            let pos_len = matrix_bd.dim(3) as usize;
-            // Row 0 values at positions that will become [0, 1, 2, ..., 16] after rel_shift
-            eprintln!("DEBUG ATTN matrix_bd[0,0,0,:5] BEFORE shift: [{:.6}, {:.6}, {:.6}, {:.6}, {:.6}]",
-                bd_pre[0], bd_pre[1], bd_pre[2], bd_pre[3], bd_pre[4]);
-            eprintln!("DEBUG ATTN matrix_bd[0,0,0,-5:] BEFORE shift: [{:.6}, {:.6}, {:.6}, {:.6}, {:.6}]",
-                bd_pre[pos_len-5], bd_pre[pos_len-4], bd_pre[pos_len-3], bd_pre[pos_len-2], bd_pre[pos_len-1]);
-        }
-
         let matrix_bd = Self::rel_shift(&matrix_bd)?;
-
-        if debug_attn {
-            // Debug: print matrix_bd shape and values AFTER rel_shift but BEFORE truncation
-            matrix_bd.eval()?;
-            eprintln!("DEBUG ATTN matrix_bd AFTER rel_shift shape: {:?}", matrix_bd.shape());
-            let bd_post_flat = matrix_bd.reshape(&[-1])?;
-            bd_post_flat.eval()?;
-            let bd_post: &[f32] = bd_post_flat.as_slice();
-            let pos_len = matrix_bd.dim(3) as usize;
-            eprintln!("DEBUG ATTN matrix_bd[0,0,0,:5] AFTER shift: [{:.6}, {:.6}, {:.6}, {:.6}, {:.6}]",
-                bd_post[0], bd_post[1], bd_post[2], bd_post[3], bd_post[4]);
-            eprintln!("DEBUG ATTN matrix_bd[0,0,0, 12:17]: [{:.6}, {:.6}, {:.6}, {:.6}, {:.6}]",
-                bd_post[12], bd_post[13], bd_post[14], bd_post[15], bd_post[16]);
-        }
 
         // Truncate to seq_len (take first seq_len columns)
         // matrix_bd: [batch, n_heads, seq_len, 2*seq_len-1] -> [batch, n_heads, seq_len, seq_len]
         let matrix_bd = matrix_bd.index((.., .., .., ..seq_len));
 
-        if debug_attn {
-            // Debug: print matrix_ac and matrix_bd (content and position attention)
-            matrix_ac.eval()?;
-            matrix_bd.eval()?;
-            let ac_flat = matrix_ac.reshape(&[-1])?;
-            let bd_flat = matrix_bd.reshape(&[-1])?;
-            ac_flat.eval()?;
-            bd_flat.eval()?;
-            let ac_slice: &[f32] = ac_flat.as_slice();
-            let bd_slice: &[f32] = bd_flat.as_slice();
-            // Head 0, query 0, first 5 keys
-            eprintln!("DEBUG ATTN matrix_ac[0,0,0,:5]: [{:.6}, {:.6}, {:.6}, {:.6}, {:.6}]",
-                ac_slice[0], ac_slice[1], ac_slice[2], ac_slice[3], ac_slice[4]);
-            eprintln!("DEBUG ATTN matrix_bd[0,0,0,:5]: [{:.6}, {:.6}, {:.6}, {:.6}, {:.6}]",
-                bd_slice[0], bd_slice[1], bd_slice[2], bd_slice[3], bd_slice[4]);
-            eprintln!("DEBUG ATTN matrix_ac shape: {:?}", matrix_ac.shape());
-            eprintln!("DEBUG ATTN matrix_bd shape: {:?}", matrix_bd.shape());
-            // Also print last 5 positions
-            eprintln!("DEBUG ATTN matrix_ac[0,0,0,12:17]: [{:.6}, {:.6}, {:.6}, {:.6}, {:.6}]",
-                ac_slice[12], ac_slice[13], ac_slice[14], ac_slice[15], ac_slice[16]);
-        }
-
         // Combine and scale
         let scale = (head_dim as f32).sqrt();
         let scores = (&matrix_ac + &matrix_bd) / Array::from_f32(scale);
 
-        if debug_attn {
-            // Debug: print scores before softmax
-            scores.eval()?;
-            let scores_flat = scores.reshape(&[-1])?;
-            scores_flat.eval()?;
-            let s_slice: &[f32] = scores_flat.as_slice();
-            eprintln!("DEBUG ATTN scores shape: {:?}", scores.shape());
-            eprintln!("DEBUG ATTN scores[0,0,0,:5]: [{:.6}, {:.6}, {:.6}, {:.6}, {:.6}]",
-                s_slice[0], s_slice[1], s_slice[2], s_slice[3], s_slice[4]);
-            // Also show last 5 scores for row 0
-            let row_size = seq_len as usize;
-            if row_size > 5 {
-                eprintln!("DEBUG ATTN scores[0,0,0,-5:]: [{:.6}, {:.6}, {:.6}, {:.6}, {:.6}]",
-                    s_slice[row_size-5], s_slice[row_size-4], s_slice[row_size-3], s_slice[row_size-2], s_slice[row_size-1]);
-            }
-        }
-
         // Softmax
         let attn_weights = ops::softmax_axis(&scores, -1, None)?;
-
-        if debug_attn {
-            // Debug: print attention weights
-            attn_weights.eval()?;
-            let aw_flat = attn_weights.reshape(&[-1])?;
-            aw_flat.eval()?;
-            let aw_slice: &[f32] = aw_flat.as_slice();
-            eprintln!("DEBUG ATTN attn_weights[0,0,0,:5]: [{:.6}, {:.6}, {:.6}, {:.6}, {:.6}]",
-                aw_slice[0], aw_slice[1], aw_slice[2], aw_slice[3], aw_slice[4]);
-        }
 
         // Apply attention to values: [batch, n_heads, seq_len, head_dim]
         let context = ops::matmul(&attn_weights, &v)?;
@@ -494,18 +351,10 @@ impl RelPositionMultiHeadAttention {
         // Output projection
         let output = self.linear_out.forward(&context)?;
 
-        if debug_attn {
-            // Debug: print final attention output
-            output.eval()?;
-            let out_flat = output.reshape(&[-1])?;
-            out_flat.eval()?;
-            let out_slice: &[f32] = out_flat.as_slice();
-            let d = self.d_model;
-            eprintln!("DEBUG ATTN output[0,0,:5]: [{:.6}, {:.6}, {:.6}, {:.6}, {:.6}]",
-                out_slice[0], out_slice[1], out_slice[2], out_slice[3], out_slice[4]);
-            eprintln!("DEBUG ATTN output[0,1,:5]: [{:.6}, {:.6}, {:.6}, {:.6}, {:.6}]",
-                out_slice[d], out_slice[d+1], out_slice[d+2], out_slice[d+3], out_slice[d+4]);
-        }
+        tracing::debug!(
+            output_shape = ?output.shape(),
+            "attention forward exit"
+        );
 
         Ok(output)
     }
@@ -567,24 +416,6 @@ impl RelPositionMultiHeadAttention {
             "MultiHeadAttention::forward_with_cache entry"
         );
 
-        let call_count = ATTENTION_CALL_COUNT.fetch_add(1, Ordering::SeqCst);
-        let layer_idx = call_count % 24;
-        let encoder_call = call_count / 24;
-
-        // Log dimensions for first few calls to help debug
-        if layer_idx == 0 && encoder_call < 5 {
-            tracing::debug!(
-                encoder_call,
-                batch_size,
-                seq_len,
-                d_model,
-                pos_emb_shape = ?pos_emb.shape(),
-                cache_present = cache.is_some(),
-                cache_drop_size = self.cache_drop_size,
-                "attention forward_with_cache dimensions"
-            );
-        }
-
         // NeMo cache-aware streaming (arXiv:2312.17279 Section 3.3):
         //
         // The cache stores h_k values (input to self-attention layer). For K/V computation:
@@ -605,6 +436,14 @@ impl RelPositionMultiHeadAttention {
             let kv_input = ops::concatenate_axis(&[cache_tensor, x], 1)?;
             let total = cache_size + seq_len;
 
+            tracing::debug!(
+                cache_shape = ?cache_tensor.shape(),
+                kv_input_shape = ?kv_input.shape(),
+                cache_size,
+                total_len = total,
+                "concatenated cache + input for K/V"
+            );
+
             // Update cache: sliding window
             // q_keep_size = seq_len - cache_drop_size (frames to keep from input)
             // The cache stores values at the END of the buffer
@@ -617,7 +456,15 @@ impl RelPositionMultiHeadAttention {
             let new_cache = if q_keep_size > 0 {
                 let cache_keep = cache_tensor.index((.., q_keep_size.., ..));
                 let x_keep = x.index((.., ..q_keep_size, ..));
-                ops::concatenate_axis(&[&cache_keep, &x_keep], 1)?
+                let nc = ops::concatenate_axis(&[&cache_keep, &x_keep], 1)?;
+                tracing::debug!(
+                    q_keep_size,
+                    cache_keep_shape = ?cache_keep.shape(),
+                    x_keep_shape = ?x_keep.shape(),
+                    new_cache_shape = ?nc.shape(),
+                    "updated sliding window cache"
+                );
+                nc
             } else {
                 cache_tensor.clone()
             };
@@ -631,6 +478,11 @@ impl RelPositionMultiHeadAttention {
             } else {
                 ops::zeros::<f32>(&[batch_size, 0, d_model])?
             };
+            tracing::debug!(
+                q_keep_size,
+                new_cache_shape = ?new_cache.shape(),
+                "no cache present, initializing"
+            );
             (x.clone(), seq_len, Some(new_cache))
         };
 
@@ -638,9 +490,8 @@ impl RelPositionMultiHeadAttention {
         // pos_emb should be [1, 2*total_len-1, d_model]
         let expected_pos_len = 2 * total_len - 1;
         let actual_pos_len = pos_emb.dim(1) as i32;
-        if layer_idx == 0 && actual_pos_len != expected_pos_len {
+        if actual_pos_len != expected_pos_len {
             tracing::warn!(
-                encoder_call,
                 total_len,
                 expected_pos_len,
                 actual_pos_len,
@@ -656,6 +507,13 @@ impl RelPositionMultiHeadAttention {
         let k = self.linear_k.forward(&kv_input)?;
         let v = self.linear_v.forward(&kv_input)?;
 
+        tracing::debug!(
+            q_shape = ?q.shape(),
+            k_shape = ?k.shape(),
+            v_shape = ?v.shape(),
+            "projected Q/K/V"
+        );
+
         // Reshape Q to multi-head: [batch, seq_len, n_heads, head_dim]
         let q = q.reshape(&[batch_size, seq_len, n_heads, head_dim])?;
         // Reshape K, V to multi-head: [batch, total_len, n_heads, head_dim]
@@ -667,11 +525,24 @@ impl RelPositionMultiHeadAttention {
         let k = ops::transpose_axes(&k, &[0, 2, 1, 3])?;
         let v = ops::transpose_axes(&v, &[0, 2, 1, 3])?;
 
+        tracing::debug!(
+            q_multihead = ?q.shape(),
+            k_multihead = ?k.shape(),
+            v_multihead = ?v.shape(),
+            "reshaped and transposed to multi-head"
+        );
+
         // Project positional embeddings
         let p = self.linear_pos.forward(pos_emb)?;
         let pos_len = pos_emb.dim(1) as i32;
         let p = p.reshape(&[1, pos_len, n_heads, head_dim])?;
         let p = ops::transpose_axes(&p, &[0, 2, 1, 3])?;
+
+        tracing::debug!(
+            pos_emb_shape = ?pos_emb.shape(),
+            p_shape = ?p.shape(),
+            "projected positional embeddings"
+        );
 
         // Add position biases to query
         let bias_u = self.pos_bias_u.reshape(&[1, n_heads, 1, head_dim])?;
@@ -687,19 +558,39 @@ impl RelPositionMultiHeadAttention {
         let p_t = ops::transpose_axes(&p, &[0, 1, 3, 2])?;
         let matrix_bd = ops::matmul(&q_with_bias_v, &p_t)?;
 
+        tracing::debug!(
+            matrix_ac_shape = ?matrix_ac.shape(),
+            matrix_bd_shape = ?matrix_bd.shape(),
+            "content and position attention scores"
+        );
+
         // Apply rel_shift and truncate to total_len
         let matrix_bd = Self::rel_shift(&matrix_bd)?;
         let matrix_bd = matrix_bd.index((.., .., .., ..total_len));
 
+        tracing::debug!(
+            matrix_bd_truncated = ?matrix_bd.shape(),
+            "rel_shift applied and truncated to total_len"
+        );
 
         // Combine and scale
         let scale = (head_dim as f32).sqrt();
         let mut scores = (&matrix_ac + &matrix_bd) / Array::from_f32(scale);
 
+        tracing::debug!(
+            scores_shape = ?scores.shape(),
+            scale,
+            "combined scores (ac + bd) / scale"
+        );
+
         // Apply attention mask if provided
         let mask_expanded = if let Some(mask) = att_mask {
             // mask: [batch, seq_len, total_len] -> [batch, 1, seq_len, total_len]
             let mask = mask.reshape(&[batch_size, 1, seq_len, total_len])?;
+            tracing::debug!(
+                mask_shape = ?mask.shape(),
+                "applying attention mask"
+            );
             // NeMo convention: mask=True means VALID (can attend), False means MASKED
             // where(mask, scores, -inf) keeps scores where mask=True, sets -inf where mask=False
             let neg_inf = Array::from_f32(f32::NEG_INFINITY);
@@ -720,53 +611,10 @@ impl RelPositionMultiHeadAttention {
             attn_weights = ops::r#where(&mask, &attn_weights, &zero)?;
         }
 
-        // Debug: print attention stats periodically (only layer 0, every ~100 encoder calls)
-        // Each encoder call has 24 layers, so call_count/24 gives encoder call number
-        if call_count % 24 == 0
-            && (encoder_call < 10
-                || encoder_call % 50 == 0
-                || (encoder_call >= 130 && encoder_call <= 145))
-        {
-            attn_weights.eval()?;
-            let aw_flat = attn_weights.reshape(&[-1])?;
-            aw_flat.eval()?;
-            let aw_slice: &[f32] = aw_flat.as_slice();
-            let aw_min = aw_slice.iter().cloned().fold(f32::INFINITY, f32::min);
-            let aw_max = aw_slice.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-            let aw_mean: f32 = aw_slice.iter().sum::<f32>() / aw_slice.len() as f32;
-
-            // Check attention entropy (low entropy = attending to few positions)
-            let entropy: f32 = aw_slice
-                .iter()
-                .filter(|&&x| x > 1e-10)
-                .map(|&x| -x * x.ln())
-                .sum::<f32>()
-                / (n_heads * seq_len) as f32;
-
-            // Print first row of attention weights for head 0 (where is query 0 attending?)
-            let first_row = attn_weights.index((0, 0, 0, ..));
-            first_row.eval()?;
-            let row_slice: &[f32] = first_row.as_slice();
-            let top_5: Vec<(usize, f32)> = {
-                let mut indexed: Vec<_> =
-                    row_slice.iter().enumerate().map(|(i, &v)| (i, v)).collect();
-                indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
-                indexed.into_iter().take(5).collect()
-            };
-            tracing::trace!(
-                encoder_call,
-                layer = 0,
-                seq_len,
-                total_len,
-                pos_emb_len = pos_emb.dim(1),
-                aw_min,
-                aw_max,
-                aw_mean,
-                entropy,
-                ?top_5,
-                "attention weights stats"
-            );
-        }
+        tracing::debug!(
+            attn_weights_shape = ?attn_weights.shape(),
+            "attention weights after softmax"
+        );
 
         // Apply attention to values: [batch, n_heads, seq_len, head_dim]
         let context = ops::matmul(&attn_weights, &v)?;
@@ -777,13 +625,18 @@ impl RelPositionMultiHeadAttention {
         // Reshape: [batch, seq_len, d_model]
         let context = context.reshape(&[batch_size, seq_len, self.d_model as i32])?;
 
+        tracing::debug!(
+            context_shape = ?context.shape(),
+            "attention context after reshape"
+        );
+
         // Output projection
         let output = self.linear_out.forward(&context)?;
 
-        tracing::trace!(
+        tracing::debug!(
             output_shape = ?output.shape(),
-            new_cache_present = new_cache.is_some(),
-            "MultiHeadAttention::forward_with_cache exit"
+            new_cache_shape = ?new_cache.as_ref().map(|c| c.shape().to_vec()),
+            "forward_with_cache exit"
         );
 
         Ok((output, new_cache))

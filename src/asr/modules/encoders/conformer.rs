@@ -853,35 +853,8 @@ impl ConformerEncoder {
         //
         // The positional encoding covers relative positions from +(total_len-1) to -(total_len-1).
         // After rel_shift in attention, these align correctly with K/V positions 0..total_len.
+        // JJK trying to adjust size
         let pos_emb = self.pos_enc.get_encoding(cache_size as usize, total_len as usize)?;
-
-        // Compute effective attention range
-        // offset = how many cache positions are masked (unfilled zeros on left)
-        // Attention window covers positions [offset, total_len-1] in the concatenated [cache, input]
-        let offset = cache_size - filled_cache_len;
-        let valid_positions = filled_cache_len + seq_len;
-
-        // Calculate ACTUAL audio time based on cumulative frames processed
-        // enc_call=0 processes frames 0 to seq_len-1, enc_call=1 processes seq_len to 2*seq_len-1, etc.
-        // Approximate: ~80ms per encoder frame (10ms hop * 8x subsampling)
-        const MS_PER_FRAME: f32 = 80.0;
-        let cumulative_frames = (enc_call as i32 + 1) * seq_len;
-        // Audio end = all frames processed so far
-        let audio_end_sec = cumulative_frames as f32 * MS_PER_FRAME / 1000.0;
-        // Audio start = earliest frame still in attention window (cache + current input)
-        let audio_start_sec = (cumulative_frames - valid_positions).max(0) as f32 * MS_PER_FRAME / 1000.0;
-
-        tracing::debug!(
-            enc_call,
-            window_size = total_len,
-            masked_positions = offset,
-            attend_window = %format!("[{}-{}]", offset, offset + valid_positions - 1),
-            valid_positions,
-            cumulative_frames,
-            audio_range = %format!("[{:.2}s - {:.2}s]", audio_start_sec, audio_end_sec),
-            "ATTENTION_RANGE: cumulative={} frames, attending to {} positions",
-            cumulative_frames, valid_positions
-        );
 
         // Create attention mask if we have context configuration
         // NeMo: att_mask = _create_masks(...); att_mask = att_mask[:, cache_len:]
