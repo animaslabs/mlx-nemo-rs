@@ -108,8 +108,8 @@ fn causal_pad_2d(x: &Array, kernel_size: usize, stride: usize) -> Result<Array> 
     // NeMo's CausalConv2D padding formula:
     // left_pad = kernel_size - 1
     // right_pad = stride - 1
-    let left_pad = (kernel_size - 1) as i32;
-    let right_pad = (stride - 1) as i32;
+    let left_pad = 1; // (kernel_size - 1) as i32;
+    let right_pad = 1; // (stride - 1) as i32;
     // JJK test
     // let left_pad = (kernel_size - 1) as i32;
 
@@ -891,21 +891,21 @@ impl ConformerEncoder {
             None
         };
 
-        // // Create padding mask for conv module: True where position >= valid_seq_len
-        // // This zeros out padding frames after GLU, matching Python NeMo behavior
-        // let pad_mask = if tensor_seq_len > valid_seq_len {
-        //     // Create indices [0, 1, 2, ..., tensor_seq_len - 1]
-        //     let indices = mlx_rs::ops::arange::<_, i32>(0, tensor_seq_len, 1)?;
-        //     // mask[i] = (i >= valid_seq_len) => True for padding positions
-        //     let valid_len_arr = Array::from_int(valid_seq_len);
-        //     let mask = mlx_rs::ops::ge(&indices, &valid_len_arr)?;
-        //     // Expand to [1, tensor_seq_len] for batch broadcasting
-        //     let mask = mask.reshape(&[1, tensor_seq_len])?;
-        //     Some(mask)
-        // } else {
-        //     None
-        // };
-        let pad_mask = None;
+        // Create padding mask for conv module: True where position >= valid_seq_len
+        // This zeros out padding frames after GLU, matching Python NeMo behavior
+        let pad_mask = if tensor_seq_len > valid_seq_len {
+            // Create indices [0, 1, 2, ..., tensor_seq_len - 1]
+            let indices = mlx_rs::ops::arange::<_, i32>(0, tensor_seq_len, 1)?;
+            // mask[i] = (i >= valid_seq_len) => True for padding positions
+            let valid_len_arr = Array::from_int(valid_seq_len);
+            let mask = mlx_rs::ops::ge(&indices, &valid_len_arr)?;
+            // Expand to [1, tensor_seq_len] for batch broadcasting
+            let mask = mask.reshape(&[1, tensor_seq_len])?;
+            Some(mask)
+        } else {
+            None
+        };
+        // let pad_mask = None;
 
         // Initialize output caches
         let mut cache_channel_next = Vec::with_capacity(self.layers.len());
@@ -1120,6 +1120,7 @@ impl Subsampling {
             _ => 2,
         };
 
+        // Kernel size is 3x3 and stride is 2 for FastConformer
         let kernel_size: usize = 3;
         let stride: usize = 2;
 
@@ -2097,20 +2098,20 @@ impl ConvolutionModule {
             tracing::debug!(?t00, "CONV after GLU T00[:5]");
         }
 
-        // Apply causal padding if needed (pad left only)
-        let x = if self.is_causal {
-            // Pad on the left (time dimension) with zeros
-            // x is [B, T, D], we need to pad T by (kernel_size - 1) on the left
-            let pad_size = self.kernel_size - 1;
-            let batch = x.dim(0);
-            let d = x.dim(2);
+        // // Apply causal padding if needed (pad left only)
+        // let x = if self.is_causal {
+        //     // Pad on the left (time dimension) with zeros
+        //     // x is [B, T, D], we need to pad T by (kernel_size - 1) on the left
+        //     let pad_size = self.kernel_size - 1;
+        //     let batch = x.dim(0);
+        //     let d = x.dim(2);
 
-            // Create zero padding: [B, pad_size, D]
-            let zeros = mlx_rs::ops::zeros::<f32>(&[batch as i32, pad_size as i32, d as i32])?;
-            mlx_rs::ops::concatenate_axis(&[&zeros, &x], 1)?
-        } else {
-            x
-        };
+        //     // Create zero padding: [B, pad_size, D]
+        //     let zeros = mlx_rs::ops::zeros::<f32>(&[batch as i32, pad_size as i32, d as i32])?;
+        //     mlx_rs::ops::concatenate_axis(&[&zeros, &x], 1)?
+        // } else {
+        //     x
+        // };
 
         // Depthwise conv - x is [B, T, D] (or [B, T+pad, D] if causal)
         let x = self.depthwise_conv.forward(&x)?;

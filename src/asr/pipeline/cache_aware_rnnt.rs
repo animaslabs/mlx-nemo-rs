@@ -5,7 +5,6 @@
 
 use std::path::Path;
 
-use mlx_rs::ops::indexing::IndexOp;
 use mlx_rs::Array;
 use sentencepiece::SentencePieceProcessor;
 
@@ -27,9 +26,7 @@ fn find_punctuation_tokens(tokenizer: &SentencePieceProcessor) -> Vec<usize> {
 }
 use crate::asr::decoding::RnntStreamingDecoder;
 use crate::asr::models::{DecoderState, PredictionNetwork};
-use crate::asr::modules::{
-    process_audio_streaming, ConformerEncoder, MelProcessor, MelStreamState, StreamingMelConfig,
-};
+use crate::asr::modules::{ConformerEncoder, MelProcessor, StreamingMel, StreamingMelConfig};
 use crate::asr::streaming::{
     compute_streaming_config, get_streaming_modes, EncoderCache, FeatureBuffer, StreamingConfig,
     StreamingModeInfo,
@@ -257,16 +254,10 @@ pub struct CacheAwareRNNTPipeline {
     streaming_config: StreamingConfig,
     encoder_cache: EncoderCache,
 
-    // Stateless mel streaming (replaces StreamingMelProcessor)
+    // Mel streaming
     mel_stream_config: StreamingMelConfig,
-    mel_stream_state: MelStreamState,
-    audio_buffer: Vec<f32>,
-    mel_buffer: Option<Array>,
-    mel_total_frames: usize,
-    mel_buffer_idx: usize,
-    mel_buffer_offset: usize,
+    streaming_mel: StreamingMel,
     is_first_chunk: bool,
-    mel_initialized: bool,
 
     // Audio input state
     file_samples: Option<Vec<f32>>,
@@ -396,10 +387,10 @@ impl CacheAwareRNNTPipeline {
             encoder.d_model(),
         )?;
 
-        // Create stateless mel streaming components
+        // Create mel streaming components
         let n_mels = preproc_config.features;
-        let mel_stream_config = StreamingMelConfig::new(preproc_config, &streaming_config);
-        let mel_stream_state = MelStreamState::new(&preprocessor);
+        let mel_stream_config = StreamingMelConfig::new(preproc_config.clone(), &streaming_config);
+        let streaming_mel = StreamingMel::new(preproc_config)?;
 
         // Create streaming decoder
         let blank_id = vocab_size;
@@ -439,14 +430,8 @@ impl CacheAwareRNNTPipeline {
             streaming_config,
             encoder_cache,
             mel_stream_config,
-            mel_stream_state,
-            audio_buffer: Vec::new(),
-            mel_buffer: None,
-            mel_total_frames: 0,
-            mel_buffer_idx: 0,
-            mel_buffer_offset: 0,
+            streaming_mel,
             is_first_chunk: true,
-            mel_initialized: false,
             file_samples: None,
             file_position: 0,
             live_buffer: Vec::new(),
@@ -647,10 +632,10 @@ impl CacheAwareRNNTPipeline {
             encoder.d_model(),
         )?;
 
-        // Create stateless mel streaming components
+        // Create mel streaming components
         let n_mels = preproc_config.features;
-        let mel_stream_config = StreamingMelConfig::new(preproc_config, &streaming_config);
-        let mel_stream_state = MelStreamState::new(&preprocessor);
+        let mel_stream_config = StreamingMelConfig::new(preproc_config.clone(), &streaming_config);
+        let streaming_mel = StreamingMel::new(preproc_config)?;
 
         // Create streaming decoder
         let blank_id = vocab_size;
@@ -689,14 +674,8 @@ impl CacheAwareRNNTPipeline {
             streaming_config,
             encoder_cache,
             mel_stream_config,
-            mel_stream_state,
-            audio_buffer: Vec::new(),
-            mel_buffer: None,
-            mel_total_frames: 0,
-            mel_buffer_idx: 0,
-            mel_buffer_offset: 0,
+            streaming_mel,
             is_first_chunk: true,
-            mel_initialized: false,
             file_samples: None,
             file_position: 0,
             live_buffer: Vec::new(),
@@ -877,14 +856,9 @@ impl CacheAwareRNNTPipeline {
 
     /// Signal the end of the audio stream.
     pub fn end_stream(&mut self) {
-        let remaining_frames = self.mel_total_frames.saturating_sub(self.mel_buffer_idx);
-        let overlap_samples = self.mel_stream_state.overlap.len();
         tracing::debug!(
             live_buffer_remaining = self.live_buffer.len(),
-            overlap_samples,
-            mel_frames_remaining = remaining_frames,
-            mel_total_frames = self.mel_total_frames,
-            mel_buffer_idx = self.mel_buffer_idx,
+            mel_frames_remaining = self.streaming_mel.total_frames(),
             chunk_size = self.mel_stream_config.chunk_size,
             shift_size = self.mel_stream_config.shift_size,
             pre_encode_cache = self.mel_stream_config.pre_encode_cache,
@@ -907,15 +881,9 @@ impl CacheAwareRNNTPipeline {
         self.stream_ended = false;
         self.is_done = false;
 
-        // Reset stateless mel streaming state
-        self.mel_stream_state = MelStreamState::new(&self.preprocessor);
-        self.audio_buffer.clear();
-        self.mel_buffer = None;
-        self.mel_total_frames = 0;
-        self.mel_buffer_idx = 0;
-        self.mel_buffer_offset = 0;
+        // Reset mel streaming state
+        self.streaming_mel.reset();
         self.is_first_chunk = true;
-        self.mel_initialized = false;
 
         // Reset encoder cache
         self.encoder_cache = EncoderCache::new(
@@ -947,166 +915,23 @@ impl CacheAwareRNNTPipeline {
             .audio_chunk_size(self.preprocessor.hop_samples())
     }
 
-    /// Initialize mel buffer with silence for pre_encode_cache.
-    fn initialize_mel_with_silence(&mut self) -> Result<()> {
-        // For the first chunk, use pre_encode_cache_first (which may be 0)
-        let pre_encode_cache = self.mel_stream_config.pre_encode_cache_first;
-
-        tracing::debug!(
-            pre_encode_cache_first = pre_encode_cache,
-            pre_encode_cache_subsequent = self.mel_stream_config.pre_encode_cache,
-            chunk_size = self.mel_stream_config.chunk_size,
-            shift_size = self.mel_stream_config.shift_size,
-            n_mels = self.n_mels,
-            "initialize_mel_with_silence: starting"
-        );
-
-        if pre_encode_cache == 0 {
-            tracing::debug!("initialize_mel_with_silence: no pre_encode_cache needed for first chunk");
-            return Ok(());
-        }
-
-        // LOG_MEL_ZERO = ln(2^-24) ≈ -16.6355 (matches NeMo's log_zero_guard)
-        const LOG_MEL_ZERO: f32 = -16.635532;
-
-        let silence = mlx_rs::ops::full::<f32>(
-            &[self.n_mels as i32, pre_encode_cache as i32],
-            &Array::from_f32(LOG_MEL_ZERO),
-        )?;
-
-        self.mel_buffer = Some(silence);
-        self.mel_total_frames = pre_encode_cache;
-        self.mel_buffer_idx = pre_encode_cache;
-        self.mel_buffer_offset = 0;
-
-        tracing::debug!(
-            pre_encode_cache,
-            mel_total_frames = self.mel_total_frames,
-            mel_buffer_idx = self.mel_buffer_idx,
-            "initialize_mel_with_silence: complete"
-        );
-
-        Ok(())
-    }
-
-    /// Add mel frames to the mel buffer.
-    fn append_mel_frames(&mut self, mel: Array) -> Result<()> {
-        let n_frames = mel.dim(1) as usize;
-        if n_frames == 0 {
-            tracing::trace!("append_mel_frames: no frames to append");
-            return Ok(());
-        }
-
-        let mel_total_before = self.mel_total_frames;
-        let mel_buffer_size_before = self.mel_buffer.as_ref().map(|b| b.dim(1) as usize).unwrap_or(0);
-
-        // Python's approach: trim to expected length, take last chunk_size frames
-        let feature_chunk_len = self.mel_stream_config.chunk_size;
-        let expected_len = feature_chunk_len + 1;
-
-        let mel_trimmed = if n_frames > expected_len {
-            tracing::debug!(
-                n_frames,
-                expected_len,
-                trimming_to = expected_len,
-                "append_mel_frames: trimming excess frames"
-            );
-            mel.index((.., ..expected_len as i32))
-        } else {
-            mel
-        };
-        let trimmed_frames = mel_trimmed.dim(1) as usize;
-
-        let mel_to_append = if trimmed_frames > feature_chunk_len {
-            let start = (trimmed_frames - feature_chunk_len) as i32;
-            tracing::debug!(
-                trimmed_frames,
-                feature_chunk_len,
-                keeping_from = start,
-                "append_mel_frames: taking last chunk_size frames"
-            );
-            mel_trimmed.index((.., start..))
-        } else {
-            mel_trimmed
-        };
-
-        let appended_frames = mel_to_append.dim(1) as usize;
-
-        // Append to mel buffer
-        self.mel_buffer = match &self.mel_buffer {
-            Some(existing) => {
-                Some(mlx_rs::ops::concatenate_axis(&[existing, &mel_to_append], 1)?)
-            }
-            None => Some(mel_to_append),
-        };
-        self.mel_total_frames += appended_frames;
-
-        let mel_buffer_size_after = self.mel_buffer.as_ref().map(|b| b.dim(1) as usize).unwrap_or(0);
-
-        tracing::debug!(
-            mel_computed = n_frames,
-            mel_appended = appended_frames,
-            mel_total_before,
-            mel_total_after = self.mel_total_frames,
-            mel_buffer_size_before,
-            mel_buffer_size_after,
-            mel_buffer_idx = self.mel_buffer_idx,
-            remaining_frames = self.remaining_frames(),
-            "append_mel_frames: complete"
-        );
-
-        Ok(())
-    }
-
-    /// Process an audio chunk through the stateless mel streaming API.
+    /// Process an audio chunk through the streaming mel processor.
     fn process_audio_chunk(&mut self, audio_chunk: &[f32]) -> Result<()> {
         if audio_chunk.is_empty() {
             tracing::trace!("process_audio_chunk: empty chunk, skipping");
             return Ok(());
         }
 
-        let audio_len = audio_chunk.len();
-        let overlap_before = self.mel_stream_state.overlap.len();
-
-        // Add to audio buffer
-        self.audio_buffer.extend_from_slice(audio_chunk);
-        let buffer_len = self.audio_buffer.len();
+        let frames_before = self.streaming_mel.total_frames();
+        let new_frames = self.streaming_mel.add_audio(audio_chunk)?;
 
         tracing::debug!(
-            audio_chunk_len = audio_len,
-            overlap_before,
-            audio_buffer_len = buffer_len,
-            total_available = buffer_len + overlap_before,
-            "process_audio_chunk: starting"
+            audio_chunk_len = audio_chunk.len(),
+            frames_before,
+            new_frames,
+            total_frames = self.streaming_mel.total_frames(),
+            "process_audio_chunk: complete"
         );
-
-        // Process audio using stateless API
-        let (mel_frames, new_state) = process_audio_streaming(
-            &self.preprocessor,
-            &self.audio_buffer,
-            &self.mel_stream_state,
-        )?;
-
-        let overlap_after = new_state.overlap.len();
-        let frames_produced = mel_frames.as_ref().map(|m| m.dim(1) as usize).unwrap_or(0);
-
-        tracing::debug!(
-            frames_produced,
-            overlap_after,
-            "process_audio_chunk: mel processing complete"
-        );
-
-        // Update state
-        self.mel_stream_state = new_state;
-
-        // Clear audio buffer since stateless API consumed what it needed
-        // and the new state.overlap contains the overlap for next call
-        self.audio_buffer.clear();
-
-        // Append mel frames if any were produced
-        if let Some(mel) = mel_frames {
-            self.append_mel_frames(mel)?;
-        }
 
         Ok(())
     }
@@ -1182,11 +1007,8 @@ impl CacheAwareRNNTPipeline {
         // Process remaining live audio when stream ended
         if self.stream_ended && !self.live_buffer.is_empty() {
             let remaining_samples = self.live_buffer.len();
-            let overlap_samples = self.mel_stream_state.overlap.len();
             tracing::debug!(
                 remaining_samples,
-                overlap_samples,
-                total = remaining_samples + overlap_samples,
                 "Processing remaining audio at stream end"
             );
 
@@ -1194,9 +1016,7 @@ impl CacheAwareRNNTPipeline {
             self.process_audio_chunk(&remaining)?;
 
             tracing::debug!(
-                mel_total_frames = self.mel_total_frames,
-                mel_buffer_idx = self.mel_buffer_idx,
-                remaining_frames = self.remaining_frames(),
+                total_frames = self.streaming_mel.total_frames(),
                 "After processing remaining audio"
             );
         }
@@ -1204,343 +1024,114 @@ impl CacheAwareRNNTPipeline {
         Ok(())
     }
 
-    /// Get remaining mel frames to be extracted.
-    fn remaining_frames(&self) -> usize {
-        self.mel_total_frames.saturating_sub(self.mel_buffer_idx)
-    }
-
-    /// Pad mel buffer with zeros.
-    fn pad_mel_buffer(&mut self, frames: usize) -> Result<()> {
-        if frames == 0 {
-            tracing::trace!("pad_mel_buffer: no padding needed");
-            return Ok(());
-        }
-
-        let mel_total_before = self.mel_total_frames;
-        let mel_buffer_size_before = self.mel_buffer.as_ref().map(|b| b.dim(1) as usize).unwrap_or(0);
-
-        let padding = Array::zeros::<f32>(&[self.n_mels as i32, frames as i32])?;
-
-        self.mel_buffer = match &self.mel_buffer {
-            Some(existing) => Some(mlx_rs::ops::concatenate_axis(&[existing, &padding], 1)?),
-            None => Some(padding),
-        };
-        self.mel_total_frames += frames;
-
-        let mel_buffer_size_after = self.mel_buffer.as_ref().map(|b| b.dim(1) as usize).unwrap_or(0);
-
-        tracing::debug!(
-            frames_padded = frames,
-            mel_total_before,
-            mel_total_after = self.mel_total_frames,
-            mel_buffer_size_before,
-            mel_buffer_size_after,
-            mel_buffer_idx = self.mel_buffer_idx,
-            remaining_frames = self.remaining_frames(),
-            "pad_mel_buffer: complete"
-        );
-
-        Ok(())
-    }
-
-    /// Trim old mel frames that are no longer needed.
-    fn trim_old_frames(&mut self, keep_frames: usize) -> Result<()> {
-        let mel_buffer = match &self.mel_buffer {
-            Some(buf) => buf,
-            None => return Ok(()),
-        };
-
-        let buffer_size_before = mel_buffer.dim(1) as usize;
-        let local_idx = self.mel_buffer_idx.saturating_sub(self.mel_buffer_offset);
-        let can_trim = local_idx.saturating_sub(keep_frames);
-
-        if can_trim > 0 {
-            let trimmed = mel_buffer.index((.., can_trim as i32..));
-            let buffer_size_after = trimmed.dim(1) as usize;
-            self.mel_buffer = Some(trimmed);
-            self.mel_buffer_offset += can_trim;
-
-            tracing::debug!(
-                keep_frames,
-                local_idx,
-                can_trim,
-                buffer_size_before,
-                buffer_size_after,
-                new_offset = self.mel_buffer_offset,
-                "trim_old_frames: trimmed buffer"
-            );
-        }
-
-        Ok(())
-    }
-
-    /// Try to extract a mel chunk.
-    fn try_extract_chunk(&mut self) -> Option<FeatureBuffer> {
+    /// Try to extract a mel chunk from the streaming mel buffer.
+    fn try_extract_chunk(&mut self) -> Result<Option<FeatureBuffer>> {
         let chunk_size = self.mel_stream_config.chunk_size;
         let shift_size = self.mel_stream_config.shift_size;
-        // Use different pre_encode_cache for first vs subsequent chunks
         let pre_encode_cache = self
             .mel_stream_config
             .pre_encode_cache_for_chunk(self.is_first_chunk);
 
-        let remaining = self.remaining_frames();
-        let required = chunk_size;
+        let available = self.streaming_mel.total_frames();
 
         tracing::debug!(
-            remaining,
-            required,
+            available,
             chunk_size,
             shift_size,
             pre_encode_cache,
-            mel_total_frames = self.mel_total_frames,
-            mel_buffer_idx = self.mel_buffer_idx,
-            mel_buffer_offset = self.mel_buffer_offset,
             is_first_chunk = self.is_first_chunk,
             stream_ended = self.stream_ended,
             is_done = self.is_done,
             "try_extract_chunk: checking state"
         );
 
+        // For the first chunk, we need chunk_size frames of real data.
+        // For subsequent chunks, we need chunk_size + pre_encode_cache frames
+        // (pre_encode_cache frames are overlap from previous chunk that we kept).
+        let required = if self.is_first_chunk {
+            chunk_size
+        } else {
+            chunk_size + pre_encode_cache
+        };
+
         // Not enough frames yet
-        if remaining < required {
-            if self.is_first_chunk && remaining > 0 {
-                // Pad first chunk if needed
-                let frames_to_pad = required - remaining;
-                tracing::debug!(remaining, required, frames_to_pad, "Padding first chunk");
-
-                // if let Err(e) = self.pad_mel_buffer(frames_to_pad) {
-                //     tracing::error!("Failed to pad: {}", e);
-                //     return None;
-                // }
-            } else if self.stream_ended && remaining > 0 {
-                // Pad final chunk
-                let frames_to_pad = required - remaining;
-                tracing::debug!(remaining, required, frames_to_pad, "Padding final chunk");
-
-                if let Err(e) = self.pad_mel_buffer(frames_to_pad) {
-                    tracing::error!("Failed to pad: {}", e);
-                    return None;
-                }
-            } else {
-                // No frames or waiting for more
+        if available < required {
+            if self.stream_ended && available > 0 {
+                // Pad final chunk - handled below via get_frames_padded
                 tracing::debug!(
-                    remaining,
+                    available,
+                    required,
+                    "Padding final chunk"
+                );
+            } else {
+                tracing::debug!(
+                    available,
+                    required,
                     stream_ended = self.stream_ended,
                     "try_extract_chunk: not enough frames, returning None"
                 );
-                if self.stream_ended && remaining == 0 {
+                if self.stream_ended && available == 0 {
                     self.is_done = true;
                 }
-                return None;
+                return Ok(None);
             }
         }
 
-        // Extract chunk from mel buffer
-        let mel_buffer = self.mel_buffer.as_ref()?;
-        let buffer_size = mel_buffer.dim(1) as usize;
+        // Extract mel chunk
+        // LOG_MEL_ZERO = ln(2^-24) ≈ -16.6355 (matches NeMo's log_zero_guard)
+        const LOG_MEL_ZERO: f32 = -16.635532;
 
-        let extract_start = self.mel_buffer_offset;
-        let extract_end = self.mel_total_frames.min(extract_start + chunk_size + pre_encode_cache);
-        let total_extract = extract_end - extract_start;
+        let mel_chunk = if self.is_first_chunk && pre_encode_cache > 0 {
+            // First chunk: prepend silence for pre_encode_cache, then real frames
+            let silence = mlx_rs::ops::full::<f32>(
+                &[self.n_mels as i32, pre_encode_cache as i32],
+                &Array::from_f32(LOG_MEL_ZERO),
+            )?;
+            let real_frames = self
+                .streaming_mel
+                .get_frames_padded(0, chunk_size, 0.0)?;
+            mlx_rs::ops::concatenate_axis(&[&silence, &real_frames], 1)?
+        } else if self.is_first_chunk {
+            // First chunk, no pre_encode_cache needed
+            self.streaming_mel
+                .get_frames_padded(0, chunk_size, 0.0)?
+        } else {
+            // Subsequent chunks: first pre_encode_cache frames are overlap from previous
+            self.streaming_mel
+                .get_frames_padded(0, chunk_size + pre_encode_cache, 0.0)?
+        };
 
-        // Convert to local indices
-        let local_start = extract_start.saturating_sub(self.mel_buffer_offset);
-        let local_end = local_start + total_extract;
+        let total_extract = mel_chunk.dim(1) as usize;
 
         tracing::debug!(
-            extract_start,
-            extract_end,
             total_extract,
-            mel_buffer_offset = self.mel_buffer_offset,
-            local_start,
-            local_end,
-            buffer_size,
-            "try_extract_chunk: extracting frames"
+            pre_encode_cache,
+            chunk_size,
+            "try_extract_chunk: extracted frames"
         );
 
-        if local_end > buffer_size {
-            tracing::error!(
-                local_end,
-                buffer_size,
-                "try_extract_chunk: local_end exceeds buffer size!"
-            );
-        }
-
-        let mel_chunk = mel_buffer.index((.., local_start as i32..local_end as i32));
-
-        // Debug: Log mel frame values at chunk boundaries for continuity verification
-        // and compare with previous chunk's overlap region
-        {
-            mel_chunk.eval().ok();
-            let chunk_data = mel_chunk.as_slice::<f32>();
-            let n_mels = self.n_mels;
-            let n_frames = total_extract;
-
-            // Compute norms for all frames in the overlap region (first pre_encode_cache frames)
-            let overlap_norms: Vec<f32> = (0..pre_encode_cache)
-                .map(|f| {
-                    (0..n_mels)
-                        .map(|m| {
-                            let v = chunk_data[m * n_frames + f];
-                            v * v
-                        })
-                        .sum::<f32>()
-                        .sqrt()
-                })
-                .collect();
-
-            // First frame of chunk (should match last frame of previous chunk's overlap region)
-            let frame0_norm = overlap_norms.first().copied().unwrap_or(0.0);
-
-            // Pre-encode cache boundary (frame at index pre_encode_cache-1, last context frame)
-            let cache_boundary_norm = overlap_norms.last().copied().unwrap_or(0.0);
-
-            // First "new" frame (frame at index pre_encode_cache)
-            let first_new_norm: f32 = (0..n_mels)
-                .map(|m| {
-                    let v = chunk_data[m * n_frames + pre_encode_cache];
-                    v * v
-                })
-                .sum::<f32>()
-                .sqrt();
-
-            // Last frame of chunk
-            let last_frame_idx = n_frames - 1;
-            let last_frame_norm: f32 = (0..n_mels)
-                .map(|m| {
-                    let v = chunk_data[m * n_frames + last_frame_idx];
-                    v * v
-                })
-                .sum::<f32>()
-                .sqrt();
-
-            // Compute norms for the overlap region that will be used by the NEXT chunk
-            // The next chunk will use pre_encode_cache (subsequent value) as its overlap
-            let next_pre_encode_cache = self.mel_stream_config.pre_encode_cache;
-            let next_overlap_norms: Vec<f32> = (0..next_pre_encode_cache)
-                .map(|f| {
-                    // Position in mel buffer that will be frame f of next chunk's overlap
-                    // After this extraction, mel_buffer_idx will be at extract_start + shift_size
-                    // The next chunk will extract starting from that position
-                    // So the overlap frames are at indices shift_size + f within current chunk
-                    let frame_idx = shift_size + f;
-                    if frame_idx < n_frames {
-                        (0..n_mels)
-                            .map(|m| {
-                                let v = chunk_data[m * n_frames + frame_idx];
-                                v * v
-                            })
-                            .sum::<f32>()
-                            .sqrt()
-                    } else {
-                        // Frame not available in this chunk (will be computed later)
-                        // Mark as NaN to indicate invalid data
-                        f32::NAN
-                    }
-                })
-                .collect();
-
-            // Compare current overlap with what we stored from previous chunk
-            // Skip comparison if:
-            // 1. No previous overlap data (first chunk)
-            // 2. Previous overlap data contains NaN (frames weren't available)
-            // 3. Overlap sizes don't match
-            let has_valid_prev = !self.state.last_overlap_norms.is_empty()
-                && self.state.last_overlap_norms.len() == overlap_norms.len()
-                && !self.state.last_overlap_norms.iter().any(|v| v.is_nan());
-
-            let overlap_match = if has_valid_prev {
-                // Compare frame-by-frame
-                let diffs: Vec<f32> = overlap_norms
-                    .iter()
-                    .zip(self.state.last_overlap_norms.iter())
-                    .map(|(a, b)| (a - b).abs())
-                    .collect();
-                let max_diff = diffs.iter().cloned().fold(0.0f32, f32::max);
-                let avg_diff = diffs.iter().sum::<f32>() / diffs.len().max(1) as f32;
-
-                tracing::debug!(
-                    extract_start,
-                    overlap_max_diff = %format!("{:.6}", max_diff),
-                    overlap_avg_diff = %format!("{:.6}", avg_diff),
-                    prev_overlap_first = %format!("{:.4}", self.state.last_overlap_norms.first().copied().unwrap_or(0.0)),
-                    curr_overlap_first = %format!("{:.4}", overlap_norms.first().copied().unwrap_or(0.0)),
-                    prev_overlap_last = %format!("{:.4}", self.state.last_overlap_norms.last().copied().unwrap_or(0.0)),
-                    curr_overlap_last = %format!("{:.4}", overlap_norms.last().copied().unwrap_or(0.0)),
-                    "try_extract_chunk: OVERLAP CONTINUITY CHECK"
-                );
-
-                // Allow up to 5% relative difference due to numerical precision in FFT/mel computation
-                // across chunk boundaries (STFT overlap handling may introduce small variations)
-                let avg_norm = (overlap_norms.iter().sum::<f32>()
-                    + self.state.last_overlap_norms.iter().sum::<f32>())
-                    / (2.0 * overlap_norms.len() as f32);
-
-                // For near-silence regions (avg_norm < 50), use absolute threshold instead
-                // because relative differences become meaningless when signal is near zero
-                if avg_norm < 50.0 {
-                    max_diff < 10.0 // Absolute threshold for silence
-                } else {
-                    let relative_diff = max_diff / avg_norm;
-                    relative_diff < 0.05 // 5% relative tolerance
-                }
-            } else {
-                // Skip comparison - either first chunk or previous data was incomplete
-                if !self.state.last_overlap_norms.is_empty() {
-                    tracing::debug!(
-                        extract_start,
-                        prev_overlap_len = self.state.last_overlap_norms.len(),
-                        curr_overlap_len = overlap_norms.len(),
-                        prev_has_nan = self.state.last_overlap_norms.iter().any(|v| v.is_nan()),
-                        "try_extract_chunk: skipping overlap comparison (incomplete data)"
-                    );
-                }
-                true
-            };
-
-            if !overlap_match {
-                // Downgrade to trace level since small discontinuities don't significantly impact
-                // transcription quality - the encoder handles minor variations gracefully
-                tracing::trace!(
-                    extract_start,
-                    "try_extract_chunk: overlap mismatch detected (minor discontinuity)"
-                );
-            }
-
-            // Store the overlap region that will be used for the NEXT chunk's comparison
-            self.state.last_overlap_norms = next_overlap_norms;
-
-            tracing::debug!(
-                extract_start,
-                frame0_norm = %format!("{:.4}", frame0_norm),
-                cache_boundary_norm = %format!("{:.4}", cache_boundary_norm),
-                first_new_norm = %format!("{:.4}", first_new_norm),
-                last_frame_norm = %format!("{:.4}", last_frame_norm),
-                "try_extract_chunk: mel frame norms at boundaries"
-            );
-        }
-
-        // Advance buffer index by shift_size
-        let old_buffer_idx = self.mel_buffer_idx;
-        self.mel_buffer_idx += shift_size;
-
-        // Trim old frames to bound memory
-        // Keep enough frames for the NEXT chunk's overlap (which uses subsequent pre_encode_cache)
-        let keep_for_next = self.mel_stream_config.pre_encode_cache;
-        if let Err(e) = self.trim_old_frames(keep_for_next) {
-            tracing::error!("Failed to trim: {}", e);
-        }
+        // Trim by shift_size to advance the window
+        // The remaining pre_encode_cache frames become overlap for the next chunk
+        let trim_amount = if self.is_first_chunk {
+            // First chunk: we only have real data starting at 0, advance by shift_size
+            shift_size
+        } else {
+            // Subsequent: we had pre_encode_cache + chunk_size frames, advance by shift_size
+            shift_size
+        };
+        self.streaming_mel.trim(trim_amount);
 
         let is_first = self.is_first_chunk;
         self.is_first_chunk = false;
 
-        let remaining_after = self.remaining_frames();
-        let is_last = self.stream_ended && remaining_after < chunk_size;
+        let remaining_after = self.streaming_mel.total_frames();
+        let next_required = chunk_size + self.mel_stream_config.pre_encode_cache;
+        let is_last = self.stream_ended && remaining_after < next_required;
         if is_last {
             self.is_done = true;
             tracing::info!(
                 remaining_after,
-                chunk_size,
+                next_required,
                 "Final chunk extracted - stream complete"
             );
         }
@@ -1548,34 +1139,28 @@ impl CacheAwareRNNTPipeline {
         tracing::debug!(
             is_first,
             is_last,
-            valid_frames = total_extract,
+            total_extract,
             pre_encode_cache,
-            mel_buffer_idx_before = old_buffer_idx,
-            mel_buffer_idx_after = self.mel_buffer_idx,
             shift_size,
             remaining_after,
-            mel_total_frames = self.mel_total_frames,
             "try_extract_chunk: extraction complete"
         );
 
-        Some(
+        Ok(Some(
             FeatureBuffer::new(mel_chunk, chunk_size)
                 .with_first(is_first)
                 .with_last(is_last)
                 .with_pre_encode_cache(pre_encode_cache),
-        )
+        ))
     }
 
     /// Try to extract the next feature buffer.
     fn try_extract_next(&mut self) -> Result<Option<FeatureBuffer>> {
         tracing::trace!(
             is_done = self.is_done,
-            mel_initialized = self.mel_initialized,
             stream_ended = self.stream_ended,
             live_buffer_len = self.live_buffer.len(),
-            mel_total_frames = self.mel_total_frames,
-            mel_buffer_idx = self.mel_buffer_idx,
-            remaining_frames = self.remaining_frames(),
+            total_frames = self.streaming_mel.total_frames(),
             "try_extract_next: starting"
         );
 
@@ -1585,17 +1170,11 @@ impl CacheAwareRNNTPipeline {
             return Ok(None);
         }
 
-        // Initialize with silence if not done yet
-        if !self.mel_initialized {
-            self.initialize_mel_with_silence()?;
-            self.mel_initialized = true;
-        }
-
         // Process any pending audio from file or live buffer
         self.process_pending_audio()?;
 
         // Try to extract a chunk
-        if let Some(buffer) = self.try_extract_chunk() {
+        if let Some(buffer) = self.try_extract_chunk()? {
             tracing::debug!(
                 is_first = buffer.is_first,
                 is_last = buffer.is_last,
@@ -1610,7 +1189,7 @@ impl CacheAwareRNNTPipeline {
         }
 
         // No chunk available
-        let remaining = self.remaining_frames();
+        let remaining = self.streaming_mel.total_frames();
         tracing::trace!(
             remaining,
             stream_ended = self.stream_ended,
