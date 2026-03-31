@@ -130,7 +130,7 @@ impl RelPositionalEncoding {
     /// pos_emb = self.pe[:, start_pos:end_pos]
     /// ```
     /// This extracts positions centered at 0, giving 2*input_len-1 positions.
-    pub fn get_encoding(&self, seq_len: usize) -> Result<Array> {
+    pub fn get_encoding(&self, cache_size: usize, seq_len: usize) -> Result<Array> {
         if seq_len > self.max_len {
             return Err(Error::model(format!(
                 "Sequence length {} exceeds maximum positional encoding length {}",
@@ -147,9 +147,10 @@ impl RelPositionalEncoding {
         //   start_pos = center_pos - input_len = max_len - seq_len
         //   end_pos = center_pos + input_len - 1 = max_len + seq_len - 1
         //   length = end_pos - start_pos = 2*seq_len - 1
-        let pe_len = 2 * self.max_len - 1;
-        let out_len = 2 * seq_len - 1;
-        let start = (pe_len - out_len) / 2;
+        let pe_len = self.max_len * 2 - 1;
+        let center_pos = pe_len - self.max_len;
+        let out_len = seq_len * 2 - 1;
+        let start = center_pos - (seq_len - 1);
         let end = start + out_len;
 
         tracing::trace!(
@@ -863,10 +864,10 @@ mod tests {
     #[test]
     fn test_rel_positional_encoding_shape() {
         let pe = RelPositionalEncoding::new(512, 100, false).unwrap();
-        let encoding = pe.get_encoding(50).unwrap();
+        let encoding = pe.get_encoding(50, 2).unwrap();
         let shape = encoding.shape();
         assert_eq!(shape[0], 1);
-        assert_eq!(shape[1], 99); // 2*50 - 1
+        assert_eq!(shape[1], 52); // 2*50 - 1
         assert_eq!(shape[2], 512);
     }
 
@@ -962,7 +963,7 @@ mod tests {
         let pe = RelPositionalEncoding::new(d_model, max_len, false).unwrap();
 
         // Get encoding for seq_len=3 -> output shape [1, 5, 4] (2*3-1 = 5 positions)
-        let encoding = pe.get_encoding(3).unwrap();
+        let encoding = pe.get_encoding(3, 2).unwrap();
         encoding.eval().unwrap();
 
         let shape = encoding.shape();

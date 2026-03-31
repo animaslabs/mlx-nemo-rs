@@ -108,13 +108,13 @@ fn causal_pad_2d(x: &Array, kernel_size: usize, stride: usize) -> Result<Array> 
     // NeMo's CausalConv2D padding formula:
     // left_pad = kernel_size - 1
     // right_pad = stride - 1
-    let left_pad = 1; // (kernel_size - 1) as i32;
-    let right_pad = 1; // (stride - 1) as i32;
+    let left_pad = ((kernel_size - 1) / 2 + (stride - 1)) as i32;
+    let right_pad = (stride - 1) as i32;
     // JJK test
     // let left_pad = (kernel_size - 1) as i32;
 
     // Step 1: Pad time dimension (axis 1): [B, T, F, C] -> [B, T+left_pad+right_pad, F, C]
-    let left_pad_time = (kernel_size - 1) as i32; // ((kernel_size - 1) / 2) as i32; // (kernel_size - 1) as i32;
+    let left_pad_time = 2; // ((kernel_size - 1) / 2) as i32; // (kernel_size - 1) as i32;
     let right_pad_time = 0; // ((kernel_size - 1) / 2) as i32;
     let time_zeros_left = mlx_rs::ops::zeros::<f32>(&[batch, left_pad_time, freq, channels])?;
     let time_zeros_right = mlx_rs::ops::zeros::<f32>(&[batch, right_pad_time, freq, channels])?;
@@ -554,7 +554,7 @@ impl ConformerEncoder {
 
         // Generate positional encoding for this sequence length
         let seq_len = x.dim(1) as usize;
-        let pos_emb = self.pos_enc.get_encoding(seq_len)?;
+        let pos_emb = self.pos_enc.get_encoding(0, seq_len)?;
 
         // Process through conformer blocks with positional info
         for layer in &mut self.layers {
@@ -657,7 +657,7 @@ impl ConformerEncoder {
 
     /// Get positional encoding for a given sequence length (for debugging).
     pub fn get_pos_encoding(&self, seq_len: usize) -> Result<Array> {
-        self.pos_enc.get_encoding(seq_len)
+        self.pos_enc.get_encoding(0, seq_len)
     }
 
     /// Get the xscale factor (for debugging).
@@ -696,7 +696,7 @@ impl ConformerEncoder {
 
         // Generate positional encoding
         let seq_len = x.dim(1) as usize;
-        let pos_emb = self.pos_enc.get_encoding(seq_len)?;
+        let pos_emb = self.pos_enc.get_encoding(0, seq_len)?;
         pos_emb.eval()?;
 
         // Process through conformer blocks
@@ -842,7 +842,7 @@ impl ConformerEncoder {
         //
         // The positional encoding covers relative positions from +(total_len-1) to -(total_len-1).
         // After rel_shift in attention, these align correctly with K/V positions 0..total_len.
-        let pos_emb = self.pos_enc.get_encoding(total_len as usize)?;
+        let pos_emb = self.pos_enc.get_encoding(cache_size as usize, total_len as usize)?;
 
         // Compute effective attention range
         // offset = how many cache positions are masked (unfilled zeros on left)
@@ -1131,7 +1131,7 @@ impl Subsampling {
         // First conv: 1 input channel (mono spectrogram) -> conv_channels
         let first_conv = nn::Conv2dBuilder::new(1, conv_channels as i32, kernel_size as i32)
             .stride(stride as i32)
-            .padding(padding)
+            .padding(0) // JJK hard code causal for testing
             .build()?;
 
         // Depthwise + pointwise pairs for remaining strides
@@ -1146,7 +1146,7 @@ impl Subsampling {
                 kernel_size as i32,
             )
             .stride(stride as i32)
-            .padding(padding)
+            .padding(0) // JJK hard code causal for testing
             .groups(conv_channels as i32)
             .build()?;
             depthwise_convs.push(dw_conv);
@@ -1355,14 +1355,14 @@ impl Subsampling {
             tracing::info!("DEBUG subsampling: after reshape to [B,T,F,1]: {:?}", x.shape());
         }
 
-        // Apply mask before first conv (NeMo's MaskedConvSequential behavior)
-        if self.is_causal {
-            let mask = Self::create_time_mask(&x, &current_lengths.as_dtype(mlx_rs::Dtype::Int32)?)?;
-            x = mlx_rs::ops::multiply(&x, &mask)?;
-            if debug_enabled {
-                tracing::info!("DEBUG subsampling: applied mask before first conv, lengths={:?}", current_lengths.as_slice::<f32>());
-            }
-        }
+        // // Apply mask before first conv (NeMo's MaskedConvSequential behavior)
+        // if self.is_causal {
+        //     let mask = Self::create_time_mask(&x, &current_lengths.as_dtype(mlx_rs::Dtype::Int32)?)?;
+        //     x = mlx_rs::ops::multiply(&x, &mask)?;
+        //     if debug_enabled {
+        //         tracing::info!("DEBUG subsampling: applied mask before first conv, lengths={:?}", current_lengths.as_slice::<f32>());
+        //     }
+        // }
 
         // Apply causal padding if needed before first conv
         if self.is_causal {
@@ -1414,14 +1414,14 @@ impl Subsampling {
             .zip(self.pointwise_convs.iter_mut())
             .enumerate()
         {
-            // Apply mask before depthwise conv (NeMo's MaskedConvSequential behavior)
-            if is_causal {
-                let mask = Self::create_time_mask(&x, &current_lengths.as_dtype(mlx_rs::Dtype::Int32)?)?;
-                x = mlx_rs::ops::multiply(&x, &mask)?;
-                if debug_enabled {
-                    tracing::info!("DEBUG subsampling: applied mask before dw_conv_{}, lengths={:?}", i, current_lengths.as_slice::<f32>());
-                }
-            }
+            // // Apply mask before depthwise conv (NeMo's MaskedConvSequential behavior)
+            // if is_causal {
+            //     let mask = Self::create_time_mask(&x, &current_lengths.as_dtype(mlx_rs::Dtype::Int32)?)?;
+            //     x = mlx_rs::ops::multiply(&x, &mask)?;
+            //     if debug_enabled {
+            //         tracing::info!("DEBUG subsampling: applied mask before dw_conv_{}, lengths={:?}", i, current_lengths.as_slice::<f32>());
+            //     }
+            // }
 
             // Apply causal padding before each depthwise conv
             if is_causal {
