@@ -326,7 +326,7 @@ impl RelPositionMultiHeadAttention {
         let matrix_bd = ops::matmul(&q_with_bias_v, &p_t)?;
 
         // Apply rel_shift to align relative positions
-        // let matrix_bd = Self::rel_shift(&matrix_bd)?;
+        let matrix_bd = Self::rel_shift(&matrix_bd)?;
 
         // Truncate to seq_len (take first seq_len columns)
         // matrix_bd: [batch, n_heads, seq_len, 2*seq_len-1] -> [batch, n_heads, seq_len, seq_len]
