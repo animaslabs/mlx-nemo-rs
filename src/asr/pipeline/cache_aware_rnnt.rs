@@ -1082,6 +1082,8 @@ impl CacheAwareRNNTPipeline {
         // LOG_MEL_ZERO = ln(2^-24) ≈ -16.6355 (matches NeMo's log_zero_guard)
         const LOG_MEL_ZERO: f32 = -16.635532;
 
+        const LOOKAHEAD_FRAMES: usize = 0;
+
         let mel_chunk = if self.is_first_chunk && pre_encode_cache > 0 {
             // First chunk: prepend silence for pre_encode_cache, then real frames
             let silence = mlx_rs::ops::full::<f32>(
@@ -1090,16 +1092,16 @@ impl CacheAwareRNNTPipeline {
             )?;
             let real_frames = self
                 .streaming_mel
-                .get_frames_padded(0, chunk_size, 0.0)?;
+                .get_frames_padded(0, chunk_size + LOOKAHEAD_FRAMES, 0.0)?;
             mlx_rs::ops::concatenate_axis(&[&silence, &real_frames], 1)?
         } else if self.is_first_chunk {
-            // First chunk, no pre_encode_cache needed
+            // First chunk, no pre_encode_cache
             self.streaming_mel
-                .get_frames_padded(0, chunk_size, 0.0)?
+                .get_frames_padded(0, chunk_size + LOOKAHEAD_FRAMES, 0.0)?
         } else {
             // Subsequent chunks: first pre_encode_cache frames are overlap from previous
             self.streaming_mel
-                .get_frames_padded(0, chunk_size + pre_encode_cache, 0.0)?
+                .get_frames_padded(0, chunk_size + pre_encode_cache + LOOKAHEAD_FRAMES, 0.0)?
         };
 
         let total_extract = mel_chunk.dim(1) as usize;

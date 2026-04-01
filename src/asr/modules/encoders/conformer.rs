@@ -114,7 +114,8 @@ fn causal_pad_2d(x: &Array, kernel_size: usize, stride: usize) -> Result<Array> 
     // let left_pad = (kernel_size - 1) as i32;
 
     // Step 1: Pad time dimension (axis 1): [B, T, F, C] -> [B, T+left_pad+right_pad, F, C]
-    let left_pad_time = 2; // (kernel_size - 1) as i32; // (kernel_size - 1) as i32;
+    // (kernel_size - 1) as i32; // (kernel_size - 1) as i32;
+    let left_pad_time = 0; // if time % 2 == 0 { 1 } else { 0 };
     let right_pad_time = 0; // ((kernel_size - 1) / 2) as i32;
     let time_zeros_left = mlx_rs::ops::zeros::<f32>(&[batch, left_pad_time, freq, channels])?;
     let time_zeros_right = mlx_rs::ops::zeros::<f32>(&[batch, right_pad_time, freq, channels])?;
@@ -270,22 +271,22 @@ fn create_attention_mask(
     // No inversion needed: mask is True where attention is ALLOWED
     // The attention layer will use: where(mask, scores, -inf) to keep scores where mask=True
 
-    {
-        att_mask.eval()?;
-        // Count how many positions are visible (True = visible)
-        let flat = att_mask.reshape(&[-1])?;
-        flat.eval()?;
-        let flat_slice: &[bool] = flat.as_slice();
-        let visible_count = flat_slice.iter().filter(|&&x| x).count();
-        let total = flat_slice.len();
-        tracing::trace!(
-            shape = ?att_mask.shape(),
-            visible_count,
-            total,
-            visible_percent = 100.0 * visible_count as f64 / total as f64,
-            "mask output stats"
-        );
-    }
+    // {
+    //     att_mask.eval()?;
+    //     // Count how many positions are visible (True = visible)
+    //     let flat = att_mask.reshape(&[-1])?;
+    //     flat.eval()?;
+    //     let flat_slice: &[bool] = flat.as_slice();
+    //     let visible_count = flat_slice.iter().filter(|&&x| x).count();
+    //     let total = flat_slice.len();
+    //     tracing::trace!(
+    //         shape = ?att_mask.shape(),
+    //         visible_count,
+    //         total,
+    //         visible_percent = 100.0 * visible_count as f64 / total as f64,
+    //         "mask output stats"
+    //     );
+    // }
 
     Ok(att_mask)
 }
@@ -805,7 +806,7 @@ impl ConformerEncoder {
             let x_len = lengths.as_slice::<i32>()[0];
             // x = x.index((.., ..(x_len-drop), ..));
             // JJK test
-            x = x.index((.., ..-drop, ..));
+            x = x.index((.., drop.., ..));
             // lengths = mlx_rs::ops::clip(
             //     &(&lengths - &Array::from_int(drop)),
             //     (&Array::from_int(0), ()),
@@ -833,9 +834,9 @@ impl ConformerEncoder {
         // Use tensor dimension, not valid length, to avoid pos_emb size mismatch
         // let total_len = cache_size + tensor_seq_len;
         // JJK test
-        let total_len = cache_size + valid_seq_len;
+        let total_len = cache_size + tensor_seq_len;
         // Valid length is used for masking
-        let seq_len = valid_seq_len;
+        let seq_len = cache_size + valid_seq_len;
 
         tracing::debug!(
             enc_call,
@@ -858,7 +859,7 @@ impl ConformerEncoder {
         // The positional encoding covers relative positions from +(total_len-1) to -(total_len-1).
         // After rel_shift in attention, these align correctly with K/V positions 0..total_len.
         // JJK trying to adjust size
-        let pos_emb = self.pos_enc.get_encoding(cache_size as usize, seq_len as usize)?;
+        let pos_emb = self.pos_enc.get_encoding(cache_size as usize, total_len as usize)?;
 
         tracing::trace!(
             enc_call,
@@ -887,21 +888,21 @@ impl ConformerEncoder {
 
         tracing::trace!("Generated attention");
 
-        // Create padding mask for conv module: True where position >= valid_seq_len
-        // This zeros out padding frames after GLU, matching Python NeMo behavior
-        let pad_mask = if tensor_seq_len > valid_seq_len {
-            // Create indices [0, 1, 2, ..., tensor_seq_len - 1]
-            let indices = mlx_rs::ops::arange::<_, i32>(0, tensor_seq_len, 1)?;
-            // mask[i] = (i >= valid_seq_len) => True for padding positions
-            let valid_len_arr = Array::from_int(valid_seq_len);
-            let mask = mlx_rs::ops::ge(&indices, &valid_len_arr)?;
-            // Expand to [1, tensor_seq_len] for batch broadcasting
-            let mask = mask.reshape(&[1, tensor_seq_len])?;
-            Some(mask)
-        } else {
-            None
-        };
-        // let pad_mask = None;
+        // // Create padding mask for conv module: True where position >= valid_seq_len
+        // // This zeros out padding frames after GLU, matching Python NeMo behavior
+        // let pad_mask = if tensor_seq_len > valid_seq_len {
+        //     // Create indices [0, 1, 2, ..., tensor_seq_len - 1]
+        //     let indices = mlx_rs::ops::arange::<_, i32>(0, tensor_seq_len, 1)?;
+        //     // mask[i] = (i >= valid_seq_len) => True for padding positions
+        //     let valid_len_arr = Array::from_int(valid_seq_len);
+        //     let mask = mlx_rs::ops::ge(&indices, &valid_len_arr)?;
+        //     // Expand to [1, tensor_seq_len] for batch broadcasting
+        //     let mask = mask.reshape(&[1, tensor_seq_len])?;
+        //     Some(mask)
+        // } else {
+        //     None
+        // };
+        let pad_mask = None;
 
         tracing::trace!(
             enc_call,
@@ -1384,14 +1385,14 @@ impl Subsampling {
             tracing::info!("DEBUG subsampling: after reshape to [B,T,F,1]: {:?}", x.shape());
         }
 
-        // Apply mask before first conv (NeMo's MaskedConvSequential behavior)
-        if self.is_causal {
-            let mask = Self::create_time_mask(&x, &current_lengths.as_dtype(mlx_rs::Dtype::Int32)?)?;
-            x = mlx_rs::ops::multiply(&x, &mask)?;
-            if debug_enabled {
-                tracing::info!("DEBUG subsampling: applied mask before first conv, lengths={:?}", current_lengths.as_slice::<f32>());
-            }
-        }
+        // // Apply mask before first conv (NeMo's MaskedConvSequential behavior)
+        // if self.is_causal {
+        //     let mask = Self::create_time_mask(&x, &current_lengths.as_dtype(mlx_rs::Dtype::Int32)?)?;
+        //     x = mlx_rs::ops::multiply(&x, &mask)?;
+        //     if debug_enabled {
+        //         tracing::info!("DEBUG subsampling: applied mask before first conv, lengths={:?}", current_lengths.as_slice::<f32>());
+        //     }
+        // }
 
         // Apply causal padding if needed before first conv
         if self.is_causal {
@@ -1442,14 +1443,14 @@ impl Subsampling {
             .zip(self.pointwise_convs.iter_mut())
             .enumerate()
         {
-            // Apply mask before depthwise conv (NeMo's MaskedConvSequential behavior)
-            if is_causal {
-                let mask = Self::create_time_mask(&x, &current_lengths.as_dtype(mlx_rs::Dtype::Int32)?)?;
-                x = mlx_rs::ops::multiply(&x, &mask)?;
-                if debug_enabled {
-                    tracing::info!("DEBUG subsampling: applied mask before dw_conv_{}, lengths={:?}", i, current_lengths.as_slice::<f32>());
-                }
-            }
+            // // Apply mask before depthwise conv (NeMo's MaskedConvSequential behavior)
+            // if is_causal {
+            //     let mask = Self::create_time_mask(&x, &current_lengths.as_dtype(mlx_rs::Dtype::Int32)?)?;
+            //     x = mlx_rs::ops::multiply(&x, &mask)?;
+            //     if debug_enabled {
+            //         tracing::info!("DEBUG subsampling: applied mask before dw_conv_{}, lengths={:?}", i, current_lengths.as_slice::<f32>());
+            //     }
+            // }
 
             // Apply causal padding before each depthwise conv
             if is_causal {
@@ -1488,14 +1489,14 @@ impl Subsampling {
             }
         }
 
-        // Apply final masking (NeMo's MaskedConvSequential applies mask at end too)
-        if is_causal {
-            let mask = Self::create_time_mask(&x, &current_lengths.as_dtype(mlx_rs::Dtype::Int32)?)?;
-            x = mlx_rs::ops::multiply(&x, &mask)?;
-            if debug_enabled {
-                tracing::info!("DEBUG subsampling: applied final mask, lengths={:?}", current_lengths.as_slice::<f32>());
-            }
-        }
+        // // Apply final masking (NeMo's MaskedConvSequential applies mask at end too)
+        // if is_causal {
+        //     let mask = Self::create_time_mask(&x, &current_lengths.as_dtype(mlx_rs::Dtype::Int32)?)?;
+        //     x = mlx_rs::ops::multiply(&x, &mask)?;
+        //     if debug_enabled {
+        //         tracing::info!("DEBUG subsampling: applied final mask, lengths={:?}", current_lengths.as_slice::<f32>());
+        //     }
+        // }
 
         // x is now [B, T', F', C] where T' = T/subsampling_factor, F' = F/subsampling_factor
         // In MLX (N, H, W, C), H=T', W=F', C=conv_channels

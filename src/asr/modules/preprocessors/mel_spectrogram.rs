@@ -969,20 +969,47 @@ impl StreamingMel {
         Ok(Array::from_slice(&output, &[self.n_mels as i32, count as i32]))
     }
 
-    /// Get mel frames for a range, with optional padding.
+    /// Get mel frames for a range, with lookahead from the audio lookback buffer.
     ///
-    /// If the range extends beyond available frames, pads with the specified value.
+    /// If the range extends beyond available committed frames, this method
+    /// speculatively computes mel frames from the audio lookback buffer
+    /// (zero-padded) to provide real-ish context for convolution layers.
+    /// These speculative frames are NOT committed to the buffer — the next
+    /// `add_audio` call will produce the real frames from the same audio.
+    ///
+    /// Falls back to `pad_value` for any frames that can't be produced
+    /// even from the lookback.
     ///
     /// # Arguments
     /// * `start` - Start frame index
     /// * `count` - Number of frames to get
-    /// * `pad_value` - Value to use for padding
+    /// * `pad_value` - Fallback value for frames beyond lookback reach
     pub fn get_frames_padded(&self, start: usize, count: usize, pad_value: f32) -> Result<Array> {
         let available_start = start.min(self.total_frames);
         let available_end = (start + count).min(self.total_frames);
         let available_count = available_end.saturating_sub(available_start);
         let pad_before = start.saturating_sub(available_start);
         let pad_after = count - available_count - pad_before;
+
+        // Try to produce speculative frames from the lookback buffer
+        let peek_frames = if pad_after > 0 && !self.audio_lookback.is_empty() {
+            self.peek_frames_from_lookback(pad_after)?
+        } else {
+            None
+        };
+
+        let peek_count = peek_frames.as_ref().map_or(0, |data| data.len() / self.n_mels);
+        let const_pad_after = pad_after.saturating_sub(peek_count);
+
+        if peek_count > 0 {
+            tracing::debug!(
+                pad_after,
+                peek_count,
+                const_pad_after,
+                lookback_len = self.audio_lookback.len(),
+                "get_frames_padded: using lookback peek for trailing context"
+            );
+        }
 
         let mut output = Vec::with_capacity(self.n_mels * count);
 
@@ -995,18 +1022,75 @@ impl StreamingMel {
             for _ in 0..pad_before {
                 output.push(pad_value);
             }
-            // Actual frames
+            // Committed frames
             for frame in available_start..available_end {
                 let idx = frame * self.n_mels + mel_bin;
                 output.push(self.mel_frames[idx]);
             }
-            // Pad after
-            for _ in 0..pad_after {
+            // Speculative frames from lookback
+            if let Some(ref peek_data) = peek_frames {
+                // peek_data is stored as [n_mels, peek_count] row-major
+                for frame in 0..peek_count {
+                    output.push(peek_data[mel_bin * peek_count + frame]);
+                }
+            }
+            // Constant padding for anything beyond lookback reach
+            for _ in 0..const_pad_after {
                 output.push(pad_value);
             }
         }
 
         Ok(Array::from_slice(&output, &[self.n_mels as i32, count as i32]))
+    }
+
+    /// Compute speculative mel frames from the lookback buffer without consuming it.
+    ///
+    /// Zero-pads the lookback audio to produce frames, but only frames where
+    /// at least half the STFT window covers real audio. Returns the mel data
+    /// as [n_mels, n_frames] in row-major order, or None if no useful frames
+    /// can be produced.
+    fn peek_frames_from_lookback(&self, max_frames: usize) -> Result<Option<Vec<f32>>> {
+        let lookback_len = self.audio_lookback.len();
+        if lookback_len == 0 || max_frames == 0 {
+            return Ok(None);
+        }
+
+        // Only produce frames where at least half the window has real audio.
+        // Frame i covers samples [i*hop, i*hop + win). Real audio ends at lookback_len.
+        // Real samples in frame i = lookback_len - i*hop (clamped to [0, win]).
+        // We want: real_samples >= win/2, i.e. lookback_len - i*hop >= win/2
+        // => i <= (lookback_len - win/2) / hop
+        let max_useful = if lookback_len >= self.win_samples / 2 {
+            (lookback_len - self.win_samples / 2) / self.hop_samples + 1
+        } else {
+            0
+        };
+        let n_target = max_useful.min(max_frames);
+
+        if n_target == 0 {
+            return Ok(None);
+        }
+
+        // Pad lookback to produce n_target frames
+        let needed = (n_target - 1) * self.hop_samples + self.win_samples;
+        let pad_len = needed.saturating_sub(lookback_len);
+
+        let mut padded = Vec::with_capacity(lookback_len + pad_len);
+        padded.extend_from_slice(&self.audio_lookback);
+        padded.resize(lookback_len + pad_len, 0.0);
+
+        let n_frames = dsp::num_frames(padded.len(), self.win_samples, self.hop_samples)
+            .min(n_target);
+
+        if n_frames == 0 {
+            return Ok(None);
+        }
+
+        let mel = self.processor.process_frames(&padded, n_frames, self.last_sample)?;
+        mel.eval()?;
+
+        // mel is [n_mels, n_frames] row-major
+        Ok(Some(mel.as_slice::<f32>().to_vec()))
     }
 
     /// Total mel frames available.
@@ -1733,10 +1817,24 @@ mod tests {
         // Should have requested count
         assert_eq!(frames.shape(), &[128, (total + 5) as i32]);
 
-        // Check that padding values are present
+        // The first frames beyond `total` should come from lookback peek
+        // (speculative mel frames from zero-padded lookback audio), not constant padding.
+        // Only frames beyond what the lookback can produce get constant padding.
         let data: &[f32] = frames.as_slice();
-        // Last 5 frames should be padded (for each mel bin)
-        let last_frame_start = 127 * (total + 5) + total; // mel bin 127, frame 'total'
-        assert!(approx_eq(data[last_frame_start], -16.0, 1e-6));
+
+        // The lookback has 240 samples. Zero-padded to 1 frame (240 + 160 zeros = 400).
+        // So frame `total` should be a real-ish mel value (not -16.0).
+        let peek_frame_idx = 127 * (total + 5) + total; // mel bin 127, frame 'total'
+        assert!(
+            !approx_eq(data[peek_frame_idx], -16.0, 1e-6),
+            "First trailing frame should come from lookback peek, not constant pad"
+        );
+
+        // Frames well beyond lookback reach should still get constant padding
+        let far_pad_idx = 127 * (total + 5) + total + 4; // mel bin 127, last frame
+        assert!(
+            approx_eq(data[far_pad_idx], -16.0, 1e-6),
+            "Frames beyond lookback reach should use constant padding"
+        );
     }
 }

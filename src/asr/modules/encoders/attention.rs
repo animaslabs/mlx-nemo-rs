@@ -138,14 +138,20 @@ impl RelPositionalEncoding {
         //   start_pos = center_pos - input_len = max_len - seq_len
         //   end_pos = center_pos + input_len - 1 = max_len + seq_len - 1
         //   length = end_pos - start_pos = 2*seq_len - 1
+        // let center_pos = self.max_len;
+        // let total_seq_len = cache_size + seq_len;
+        let pe_len = self.max_len * 2 - 1;
         let center_pos = self.max_len;
-        let total_len = cache_size + seq_len;
-        let start = center_pos - total_len;
-        let end = center_pos + total_len;
+        let total_len = seq_len * 2 - 1;
+        let start = self.max_len - seq_len;
+        let end = self.max_len + seq_len + 1;
 
         tracing::trace!(
             seq_len,
             cache_size,
+            pe_len,
+            center_pos,
+            total_len,
             start,
             end,
             max_len = self.max_len,
@@ -446,6 +452,9 @@ impl RelPositionMultiHeadAttention {
             // q_keep_size = seq_len - cache_drop_size (frames to keep from input)
             // The cache stores values at the END of the buffer
             // new_cache = concat(old_cache[q_keep_size:], x[:q_keep_size])
+            // let q_keep_size = (seq_len - self.cache_drop_size as i32).max(0);
+            // let q_keep_size = (seq_len - self.cache_drop_size as i32).max(0);
+            // JJK test
             let q_keep_size = (seq_len - self.cache_drop_size as i32).max(0);
 
             // For the new cache, we slide the window:
