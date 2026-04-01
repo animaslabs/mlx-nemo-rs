@@ -114,7 +114,7 @@ fn causal_pad_2d(x: &Array, kernel_size: usize, stride: usize) -> Result<Array> 
     // let left_pad = (kernel_size - 1) as i32;
 
     // Step 1: Pad time dimension (axis 1): [B, T, F, C] -> [B, T+left_pad+right_pad, F, C]
-    let left_pad_time = 2; // ((kernel_size - 1) / 2) as i32; // (kernel_size - 1) as i32;
+    let left_pad_time = 2; // (kernel_size - 1) as i32; // (kernel_size - 1) as i32;
     let right_pad_time = 0; // ((kernel_size - 1) / 2) as i32;
     let time_zeros_left = mlx_rs::ops::zeros::<f32>(&[batch, left_pad_time, freq, channels])?;
     let time_zeros_right = mlx_rs::ops::zeros::<f32>(&[batch, right_pad_time, freq, channels])?;
@@ -905,7 +905,7 @@ impl ConformerEncoder {
 
         tracing::trace!(
             enc_call,
-            // ?att_mask,
+            ?att_mask,
             ?pad_mask,
             "created masks"
         );
@@ -1149,7 +1149,7 @@ impl Subsampling {
                 kernel_size as i32,
             )
             .stride(stride as i32)
-            .padding(0) // JJK hard code causal for testing
+            // .padding(0) // JJK hard code causal for testing
             .groups(conv_channels as i32)
             .build()?;
             depthwise_convs.push(dw_conv);
@@ -1319,9 +1319,9 @@ impl Subsampling {
     }
 
     /// Calculate conv output size (matching NeMo's calculate_conv_output_size)
-    fn calc_conv_output_size(input_size: &Array, kernel_size: i32, stride: i32, left_pad: i32, right_pad: i32) -> Result<Array> {
+    fn calc_conv_output_size(input_size: &Array, kernel_size: i32, stride: i32) -> Result<Array> {
         // output = (input + left_pad + right_pad - kernel) / stride + 1
-        let total_pad = Array::from_int(left_pad + right_pad);
+        let total_pad = Array::from_int(2); // JJK Array::from_int(left_pad + right_pad);
         let kernel_arr = Array::from_int(kernel_size);
         let stride_arr = Array::from_int(stride);
         // JJK
@@ -1337,8 +1337,8 @@ impl Subsampling {
             input_size = ?input_size.item::<i32>(),
             kernel_size = kernel_size,
             stride = stride,
-            left_pad = left_pad,
-            right_pad = right_pad,
+            // left_pad = left_pad,
+            // right_pad = right_pad,
             total_pad = ?total_pad.item::<i32>(),
             padded = ?padded.item::<i32>(),
             after_kernel = ?after_kernel.item::<i32>(),
@@ -1417,15 +1417,13 @@ impl Subsampling {
 
         // Update lengths after stride operation (CausalConv2D: left_pad=k-1, right_pad=s-1)
         if self.is_causal {
-            let left_pad = (self.kernel_size - 1) as i32;
-            let right_pad = 0; // JJK (self.stride - 1) as i32;
+            // let left_pad = 1; // (self.kernel_size - 1) as i32;
+            // let right_pad = 1; // JJK (self.stride - 1) as i32;
             // let right_pad = (self.stride - 1) as i32;
             current_lengths = Self::calc_conv_output_size(
                 &current_lengths.as_dtype(mlx_rs::Dtype::Int32)?,
                 self.kernel_size as i32,
                 self.stride as i32,
-                left_pad,
-                right_pad,
             )?.as_dtype(mlx_rs::Dtype::Float32)?;
             if debug_enabled {
                 tracing::info!("DEBUG subsampling: updated lengths after first conv: {:?}", current_lengths.as_slice::<f32>());
@@ -1475,14 +1473,14 @@ impl Subsampling {
 
             // Update lengths after stride operation
             if is_causal {
-                let left_pad = (kernel_size - 1) as i32;
-                let right_pad = 0; // JJK (stride - 1) as i32;
+                // let left_pad = 1; // JJK (kernel_size - 1) as i32;
+                // let right_pad = 1; // JJK (stride - 1) as i32;
                 current_lengths = Self::calc_conv_output_size(
                     &current_lengths.as_dtype(mlx_rs::Dtype::Int32)?,
                     kernel_size as i32,
                     stride as i32,
-                    left_pad,
-                    right_pad,
+                    // left_pad,
+                    // right_pad,
                 )?.as_dtype(mlx_rs::Dtype::Float32)?;
                 if debug_enabled {
                     tracing::info!("DEBUG subsampling: updated lengths after dw_conv_{}: {:?}", i, current_lengths.as_slice::<f32>());
