@@ -143,8 +143,8 @@ impl RelPositionalEncoding {
         let pe_len = self.max_len * 2 - 1;
         let center_pos = self.max_len;
         let total_len = seq_len * 2 - 1;
-        let start = self.max_len - seq_len;
-        let end = self.max_len + seq_len + 1;
+        let start = self.max_len - seq_len + 1;
+        let end = self.max_len + seq_len - 1;
 
         tracing::trace!(
             seq_len,
