@@ -1048,6 +1048,7 @@ impl CacheAwareRNNTPipeline {
         // For the first chunk, we need chunk_size frames of real data.
         // For subsequent chunks, we need chunk_size + pre_encode_cache frames
         // (pre_encode_cache frames are overlap from previous chunk that we kept).
+        // let required = chunk_size;
         let required = if self.is_first_chunk {
             chunk_size
         } else {
@@ -1114,11 +1115,13 @@ impl CacheAwareRNNTPipeline {
         // The remaining pre_encode_cache frames become overlap for the next chunk
         let trim_amount = if self.is_first_chunk {
             // First chunk: we only have real data starting at 0, advance by shift_size
-            shift_size
+            shift_size - pre_encode_cache
         } else {
             // Subsequent: we had pre_encode_cache + chunk_size frames, advance by shift_size
             shift_size
         };
+        // JJK
+        // let trim_amount = shift_size - pre_encode_cache;
         self.streaming_mel.trim(trim_amount);
 
         let is_first = self.is_first_chunk;
@@ -1239,13 +1242,15 @@ impl CacheAwareRNNTPipeline {
         // Python uses mel_len (valid_size) for the lengths parameter, not tensor dimension.
         // The tensor has chunk_len frames, but only valid_len are considered valid.
         // The encoder uses lengths for attention masking.
-        let lengths = Array::from_slice(&[valid_len as i32], &[1]);
+        // JJK try chunk_len
+        // let lengths = Array::from_slice(&[chunk_len as i32], &[1]);
+        let lengths = Array::from_slice(&[chunk_len as i32], &[1]);
 
         // Calculate audio time position based on mel frames processed
         // Each mel frame = hop_length samples = 160 samples at 16kHz = 10ms
         let hop_length = 160; // TODO: get from config
         let sample_rate = self.sample_rate() as f32;
-        let audio_samples_this_chunk = chunk_len * hop_length;
+        let audio_samples_this_chunk = valid_len * hop_length;
         let audio_time_start =
             self.state.cumulative_stats.total_audio_samples as f32 / sample_rate;
         let audio_time_end = (self.state.cumulative_stats.total_audio_samples

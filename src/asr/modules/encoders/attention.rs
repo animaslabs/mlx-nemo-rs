@@ -138,16 +138,16 @@ impl RelPositionalEncoding {
         //   start_pos = center_pos - input_len = max_len - seq_len
         //   end_pos = center_pos + input_len - 1 = max_len + seq_len - 1
         //   length = end_pos - start_pos = 2*seq_len - 1
-        let pe_len = (self.max_len - 1) * 2 + 1;
-        let center_pos = (pe_len / 2) + 1;
-        let out_len = seq_len * 2 - 1;
-        let start = center_pos - seq_len;
-        let end = start + out_len;
+        let center_pos = self.max_len;
+        let total_len = cache_size + seq_len;
+        let pe_len = total_len * 2 - 1;
+        let start = center_pos - total_len;
+        let end = start + pe_len;
 
         tracing::trace!(
             seq_len,
             pe_len,
-            out_len,
+            cache_size,
             start,
             end,
             max_len = self.max_len,
@@ -918,7 +918,7 @@ mod tests {
         let seq_len = 14;
         let total_len = cache_size + seq_len;
 
-        let encoding = pe.get_encoding(total_len).unwrap();
+        let encoding = pe.get_encoding(50, total_len).unwrap();
         let shape = encoding.shape();
 
         // Should be [1, 2*84-1, 512] = [1, 167, 512]

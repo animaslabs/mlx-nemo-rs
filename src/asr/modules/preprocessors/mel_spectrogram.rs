@@ -986,6 +986,10 @@ impl StreamingMel {
 
         let mut output = Vec::with_capacity(self.n_mels * count);
 
+        if pad_before > 0 {
+            tracing::info!("padding MEL frame");
+        }
+
         for mel_bin in 0..self.n_mels {
             // Pad before
             for _ in 0..pad_before {

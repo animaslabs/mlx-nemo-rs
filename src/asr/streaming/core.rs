@@ -654,12 +654,20 @@ pub fn compute_streaming_config(
         sampling_frames.1 + subsampling_factor * lookahead_steps,
         sampling_frames.1 + subsampling_factor * lookahead_steps,
     );
+    // JJK: for chunk aware streaming, make chunk size = shift size
+    // let chunk_size = (
+    //     subsampling_factor * (lookahead_steps + 1),
+    //     subsampling_factor * (lookahead_steps + 1),
+    // );
+
 
     // Shift size - how many pre-subsampled frames to advance each step
     let shift_size = (
         sampling_frames.1 + sampling_frames.1 * lookahead_steps.saturating_sub(cache_drop_size),
         sampling_frames.1 + sampling_frames.1 * lookahead_steps.saturating_sub(cache_drop_size),
     );
+    // JJK hardcode them to equal for chunk aware streaming
+    // let shift_size = chunk_size;
 
     // Valid output length - how many OUTPUT frames are valid per chunk
     let valid_out_len = if sampling_frames.1 > 0 {
@@ -673,13 +681,14 @@ pub fn compute_streaming_config(
     // For 8x subsampling: [0, 9]
     // For 4x subsampling: [0, 5]
     // let pre_encode_cache = (subsampling_factor + 1, subsampling_factor + 1);
+    // let pre_encode_cache = (subsampling_factor + 1, subsampling_factor + 1);
     let pre_encode_cache = (subsampling_factor, subsampling_factor);
 
     // Drop extra pre-encoded frames after subsampling
     // NeMo: drop_extra_pre_encoded = 1 + (pre_encode_cache_size[1] - 1) // subsampling_factor
     // For 9 frames with 8x subsampling: 1 + (9-1)//8 = 1 + 1 = 2
-    // let drop_extra = 1;
     let drop_extra = 1;
+    // let drop_extra = 0;
     // if pre_encode_cache.1 >= 1 {
     //     // 1 + (pre_encode_cache.1 - 1) / subsampling_factor
     //     // JJK test - just drop one

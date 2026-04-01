@@ -431,6 +431,8 @@ impl ConformerEncoder {
         let subsampling = Subsampling::new(&config)?;
 
         // Create relative positional encoding
+        // let pos_enc = RelPositionalEncoding::new(d_model, pos_emb_max_len, xscaling)?;
+        // JJK 70 length
         let pos_enc = RelPositionalEncoding::new(d_model, pos_emb_max_len, xscaling)?;
 
         // Create conformer blocks
@@ -801,7 +803,9 @@ impl ConformerEncoder {
                 "dropping extra pre-encoded frames from end"
             );
             let x_len = lengths.as_slice::<i32>()[0];
-            x = x.index((.., ..(x_len-drop), ..));
+            // x = x.index((.., ..(x_len-drop), ..));
+            // JJK test
+            x = x.index((.., drop..x_len, ..));
             lengths = mlx_rs::ops::clip(
                 &(&lengths - &Array::from_int(drop)),
                 (&Array::from_int(0), ()),
@@ -854,7 +858,13 @@ impl ConformerEncoder {
         // The positional encoding covers relative positions from +(total_len-1) to -(total_len-1).
         // After rel_shift in attention, these align correctly with K/V positions 0..total_len.
         // JJK trying to adjust size
-        let pos_emb = self.pos_enc.get_encoding(cache_size as usize, total_len as usize)?;
+        let pos_emb = self.pos_enc.get_encoding(cache_size as usize, seq_len as usize)?;
+
+        tracing::trace!(
+            enc_call,
+            pos_emb_shape = ?pos_emb.shape(),
+            "generated positional encoding"
+        );
 
         // Create attention mask if we have context configuration
         // NeMo: att_mask = _create_masks(...); att_mask = att_mask[:, cache_len:]
@@ -875,6 +885,8 @@ impl ConformerEncoder {
             None
         };
 
+        tracing::trace!("Generated attention");
+
         // Create padding mask for conv module: True where position >= valid_seq_len
         // This zeros out padding frames after GLU, matching Python NeMo behavior
         let pad_mask = if tensor_seq_len > valid_seq_len {
@@ -890,6 +902,13 @@ impl ConformerEncoder {
             None
         };
         // let pad_mask = None;
+
+        tracing::trace!(
+            enc_call,
+            // ?att_mask,
+            ?pad_mask,
+            "created masks"
+        );
 
         // Initialize output caches
         let mut cache_channel_next = Vec::with_capacity(self.layers.len());
@@ -1017,7 +1036,7 @@ impl ConformerEncoder {
         // This guards against any issues with the clip operation
         // Note: cache_last_channel_len is i64, so we need to match that type
         let cache_channel_len_next = if filled_after > cache_size as i64 {
-            tracing::debug!(
+            tracing::trace!(
                 from = filled_after,
                 to = cache_size,
                 "clamping cache length"
@@ -1297,13 +1316,31 @@ impl Subsampling {
         let total_pad = Array::from_int(left_pad + right_pad);
         let kernel_arr = Array::from_int(kernel_size);
         let stride_arr = Array::from_int(stride);
+        // JJK
         let one = Array::from_int(1);
 
         let padded = input_size + &total_pad;
-        let after_kernel = &padded - &kernel_arr;
+        let after_kernel = &padded - &kernel_arr + &one;
         let divided = mlx_rs::ops::floor_divide(&after_kernel, &stride_arr)?;
-        let result = &divided + &one;
-        Ok(result)
+        // let result = &divided;
+
+        // Debug logging for all local variables
+        tracing::trace!(
+            input_size = ?input_size.item::<i32>(),
+            kernel_size = kernel_size,
+            stride = stride,
+            left_pad = left_pad,
+            right_pad = right_pad,
+            total_pad = ?total_pad.item::<i32>(),
+            padded = ?padded.item::<i32>(),
+            after_kernel = ?after_kernel.item::<i32>(),
+            divided = ?divided.item::<i32>(),
+            // result = ?result.item::<i32>(),
+            "calc_conv_output_size"
+        );
+
+        // Ok(result)
+        Ok(divided)
     }
 
     fn forward(&mut self, x: &Array, lengths: &Array) -> Result<(Array, Array)> {
@@ -1373,7 +1410,8 @@ impl Subsampling {
         // Update lengths after stride operation (CausalConv2D: left_pad=k-1, right_pad=s-1)
         if self.is_causal {
             let left_pad = (self.kernel_size - 1) as i32;
-            let right_pad = (self.stride - 1) as i32;
+            let right_pad = 0; // JJK (self.stride - 1) as i32;
+            // let right_pad = (self.stride - 1) as i32;
             current_lengths = Self::calc_conv_output_size(
                 &current_lengths.as_dtype(mlx_rs::Dtype::Int32)?,
                 self.kernel_size as i32,
@@ -1430,7 +1468,7 @@ impl Subsampling {
             // Update lengths after stride operation
             if is_causal {
                 let left_pad = (kernel_size - 1) as i32;
-                let right_pad = (stride - 1) as i32;
+                let right_pad = 0; // (stride - 1) as i32;
                 current_lengths = Self::calc_conv_output_size(
                     &current_lengths.as_dtype(mlx_rs::Dtype::Int32)?,
                     kernel_size as i32,
@@ -1812,6 +1850,17 @@ impl ConformerBlock {
         att_mask: Option<&Array>,
         pad_mask: Option<&Array>,
     ) -> Result<(Array, Option<Array>, Option<Array>)> {
+        tracing::trace!(
+            x_shape = ?x.shape(),
+            pos_emb_shape = ?pos_emb.shape(),
+            cache_last_channel_shape = ?cache_last_channel.map(|c| c.shape().to_vec()),
+            cache_filled_len,
+            cache_last_time_shape = ?cache_last_time.map(|c| c.shape().to_vec()),
+            has_att_mask = att_mask.is_some(),
+            has_pad_mask = pad_mask.is_some(),
+            "ConformerBlock::forward_with_cache entry"
+        );
+
         // Feed-forward 1 (half-step residual)
         let residual = x.clone();
         let ff1_norm_out = self.ff1_norm.forward(x)?;
@@ -1819,6 +1868,8 @@ impl ConformerBlock {
         let half = Array::from_f32(0.5);
         let scaled_ff1 = &half * &ff1_out;
         let x = &residual + &scaled_ff1;
+
+        tracing::trace!(x_shape = ?x.shape(), "after ff1");
 
         // Self-attention with cache
         let residual = x.clone();
@@ -1832,12 +1883,24 @@ impl ConformerBlock {
         )?;
         let x = &residual + &attn_out;
 
+        tracing::trace!(
+            attn_out_shape = ?attn_out.shape(),
+            new_cache_channel_shape = ?new_cache_channel.as_ref().map(|c| c.shape().to_vec()),
+            "after self-attention"
+        );
+
         // Convolution with cache
         let residual = x.clone();
         let conv_norm_out = self.conv_norm.forward(&x)?;
         let (conv_out, new_cache_time) =
             self.conv.forward_with_cache(&conv_norm_out, cache_last_time, pad_mask)?;
         let x = &residual + &conv_out;
+
+        tracing::trace!(
+            conv_out_shape = ?conv_out.shape(),
+            new_cache_time_shape = ?new_cache_time.as_ref().map(|c| c.shape().to_vec()),
+            "after convolution"
+        );
 
         // Feed-forward 2 (half-step residual)
         let residual = x.clone();
@@ -1846,8 +1909,12 @@ impl ConformerBlock {
         let scaled_ff2 = &half * &ff2_out;
         let x = &residual + &scaled_ff2;
 
+        tracing::trace!(x_shape = ?x.shape(), "after ff2");
+
         // Final layer norm
         let x = self.final_norm.forward(&x)?;
+
+        tracing::trace!(x_shape = ?x.shape(), "ConformerBlock::forward_with_cache output");
 
         Ok((x, new_cache_channel, new_cache_time))
     }
@@ -2162,6 +2229,15 @@ impl ConvolutionModule {
         cache: Option<&Array>,
         pad_mask: Option<&Array>,
     ) -> Result<(Array, Option<Array>)> {
+        tracing::debug!(
+            x_shape = ?x.shape(),
+            cache_shape = ?cache.map(|c| c.shape().to_vec()),
+            has_pad_mask = pad_mask.is_some(),
+            kernel_size = self.kernel_size,
+            d_model = self.d_model,
+            "ConvModule::forward_with_cache entry"
+        );
+
         // Pointwise conv 1 with GLU activation
         let x = self.pointwise_conv1.forward(x)?;
 
