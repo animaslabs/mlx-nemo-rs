@@ -663,8 +663,8 @@ pub fn compute_streaming_config(
 
     // Shift size - how many pre-subsampled frames to advance each step
     let shift_size = (
-        sampling_frames.1 + sampling_frames.1 * lookahead_steps.saturating_sub(cache_drop_size),
-        sampling_frames.1 + sampling_frames.1 * lookahead_steps.saturating_sub(cache_drop_size),
+        sampling_frames.1 + subsampling_factor * lookahead_steps.saturating_sub(cache_drop_size),
+        sampling_frames.1 + subsampling_factor * lookahead_steps.saturating_sub(cache_drop_size),
     );
     // JJK hardcode them to equal for chunk aware streaming
     // let shift_size = chunk_size;

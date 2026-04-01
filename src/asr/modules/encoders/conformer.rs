@@ -805,7 +805,7 @@ impl ConformerEncoder {
             let x_len = lengths.as_slice::<i32>()[0];
             // x = x.index((.., ..(x_len-drop), ..));
             // JJK test
-            x = x.index((.., drop..x_len, ..));
+            x = x.index((.., ..-drop, ..));
             lengths = mlx_rs::ops::clip(
                 &(&lengths - &Array::from_int(drop)),
                 (&Array::from_int(0), ()),
@@ -833,7 +833,7 @@ impl ConformerEncoder {
         // Use tensor dimension, not valid length, to avoid pos_emb size mismatch
         // let total_len = cache_size + tensor_seq_len;
         // JJK test
-        let total_len = cache_size + tensor_seq_len;
+        let total_len = cache_size + valid_seq_len;
         // Valid length is used for masking
         let seq_len = valid_seq_len;
 
@@ -1289,6 +1289,14 @@ impl Subsampling {
         let time_dim = tensor.dim(1) as i32;
         let freq_dim = tensor.dim(2) as i32;
         let channels = tensor.dim(3) as i32;
+        
+        tracing::debug!(
+            batch_size,
+            time_dim,
+            freq_dim,
+            channels,
+            "create_time_mask"
+        );
 
         // Create time indices: [1, T]
         let time_indices_data: Vec<i32> = (0..time_dim).collect();
@@ -1376,14 +1384,14 @@ impl Subsampling {
             tracing::info!("DEBUG subsampling: after reshape to [B,T,F,1]: {:?}", x.shape());
         }
 
-        // // Apply mask before first conv (NeMo's MaskedConvSequential behavior)
-        // if self.is_causal {
-        //     let mask = Self::create_time_mask(&x, &current_lengths.as_dtype(mlx_rs::Dtype::Int32)?)?;
-        //     x = mlx_rs::ops::multiply(&x, &mask)?;
-        //     if debug_enabled {
-        //         tracing::info!("DEBUG subsampling: applied mask before first conv, lengths={:?}", current_lengths.as_slice::<f32>());
-        //     }
-        // }
+        // Apply mask before first conv (NeMo's MaskedConvSequential behavior)
+        if self.is_causal {
+            let mask = Self::create_time_mask(&x, &current_lengths.as_dtype(mlx_rs::Dtype::Int32)?)?;
+            x = mlx_rs::ops::multiply(&x, &mask)?;
+            if debug_enabled {
+                tracing::info!("DEBUG subsampling: applied mask before first conv, lengths={:?}", current_lengths.as_slice::<f32>());
+            }
+        }
 
         // Apply causal padding if needed before first conv
         if self.is_causal {
@@ -1468,7 +1476,7 @@ impl Subsampling {
             // Update lengths after stride operation
             if is_causal {
                 let left_pad = (kernel_size - 1) as i32;
-                let right_pad = 0; // (stride - 1) as i32;
+                let right_pad = 0; // JJK (stride - 1) as i32;
                 current_lengths = Self::calc_conv_output_size(
                     &current_lengths.as_dtype(mlx_rs::Dtype::Int32)?,
                     kernel_size as i32,
