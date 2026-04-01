@@ -806,10 +806,10 @@ impl ConformerEncoder {
             // x = x.index((.., ..(x_len-drop), ..));
             // JJK test
             x = x.index((.., ..-drop, ..));
-            lengths = mlx_rs::ops::clip(
-                &(&lengths - &Array::from_int(drop)),
-                (&Array::from_int(0), ()),
-            )?;
+            // lengths = mlx_rs::ops::clip(
+            //     &(&lengths - &Array::from_int(drop)),
+            //     (&Array::from_int(0), ()),
+            // )?;
         }
 
         // Scale input by sqrt(d_model) if xscaling is enabled
@@ -1444,14 +1444,14 @@ impl Subsampling {
             .zip(self.pointwise_convs.iter_mut())
             .enumerate()
         {
-            // // Apply mask before depthwise conv (NeMo's MaskedConvSequential behavior)
-            // if is_causal {
-            //     let mask = Self::create_time_mask(&x, &current_lengths.as_dtype(mlx_rs::Dtype::Int32)?)?;
-            //     x = mlx_rs::ops::multiply(&x, &mask)?;
-            //     if debug_enabled {
-            //         tracing::info!("DEBUG subsampling: applied mask before dw_conv_{}, lengths={:?}", i, current_lengths.as_slice::<f32>());
-            //     }
-            // }
+            // Apply mask before depthwise conv (NeMo's MaskedConvSequential behavior)
+            if is_causal {
+                let mask = Self::create_time_mask(&x, &current_lengths.as_dtype(mlx_rs::Dtype::Int32)?)?;
+                x = mlx_rs::ops::multiply(&x, &mask)?;
+                if debug_enabled {
+                    tracing::info!("DEBUG subsampling: applied mask before dw_conv_{}, lengths={:?}", i, current_lengths.as_slice::<f32>());
+                }
+            }
 
             // Apply causal padding before each depthwise conv
             if is_causal {
@@ -2157,20 +2157,20 @@ impl ConvolutionModule {
             tracing::debug!(?t00, "CONV after GLU T00[:5]");
         }
 
-        // // Apply causal padding if needed (pad left only)
-        // let x = if self.is_causal {
-        //     // Pad on the left (time dimension) with zeros
-        //     // x is [B, T, D], we need to pad T by (kernel_size - 1) on the left
-        //     let pad_size = self.kernel_size - 1;
-        //     let batch = x.dim(0);
-        //     let d = x.dim(2);
+        // Apply causal padding if needed (pad left only)
+        let x = if self.is_causal {
+            // Pad on the left (time dimension) with zeros
+            // x is [B, T, D], we need to pad T by (kernel_size - 1) on the left
+            let pad_size = self.kernel_size - 1;
+            let batch = x.dim(0);
+            let d = x.dim(2);
 
-        //     // Create zero padding: [B, pad_size, D]
-        //     let zeros = mlx_rs::ops::zeros::<f32>(&[batch as i32, pad_size as i32, d as i32])?;
-        //     mlx_rs::ops::concatenate_axis(&[&zeros, &x], 1)?
-        // } else {
-        //     x
-        // };
+            // Create zero padding: [B, pad_size, D]
+            let zeros = mlx_rs::ops::zeros::<f32>(&[batch as i32, pad_size as i32, d as i32])?;
+            mlx_rs::ops::concatenate_axis(&[&zeros, &x], 1)?
+        } else {
+            x
+        };
 
         // Depthwise conv - x is [B, T, D] (or [B, T+pad, D] if causal)
         let x = self.depthwise_conv.forward(&x)?;

@@ -687,8 +687,8 @@ pub fn compute_streaming_config(
     // Drop extra pre-encoded frames after subsampling
     // NeMo: drop_extra_pre_encoded = 1 + (pre_encode_cache_size[1] - 1) // subsampling_factor
     // For 9 frames with 8x subsampling: 1 + (9-1)//8 = 1 + 1 = 2
+    // let drop_extra = 1;
     let drop_extra = 1;
-    // let drop_extra = 0;
     // if pre_encode_cache.1 >= 1 {
     //     // 1 + (pre_encode_cache.1 - 1) / subsampling_factor
     //     // JJK test - just drop one

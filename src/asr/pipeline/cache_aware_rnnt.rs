@@ -1244,7 +1244,7 @@ impl CacheAwareRNNTPipeline {
         // The encoder uses lengths for attention masking.
         // JJK try chunk_len
         // let lengths = Array::from_slice(&[chunk_len as i32], &[1]);
-        let lengths = Array::from_slice(&[chunk_len as i32], &[1]);
+        let lengths = Array::from_slice(&[valid_len as i32], &[1]);
 
         // Calculate audio time position based on mel frames processed
         // Each mel frame = hop_length samples = 160 samples at 16kHz = 10ms
