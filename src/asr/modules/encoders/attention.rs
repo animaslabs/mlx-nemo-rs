@@ -121,7 +121,7 @@ impl RelPositionalEncoding {
     /// pos_emb = self.pe[:, start_pos:end_pos]
     /// ```
     /// This extracts positions centered at 0, giving 2*input_len-1 positions.
-    pub fn get_encoding(&self, cache_size: usize, seq_len: usize) -> Result<Array> {
+    pub fn get_encoding(&self, seq_len: usize) -> Result<Array> {
         if seq_len > self.max_len {
             return Err(Error::model(format!(
                 "Sequence length {} exceeds maximum positional encoding length {}",
@@ -144,11 +144,10 @@ impl RelPositionalEncoding {
         let center_pos = self.max_len;
         let total_len = seq_len * 2 - 1;
         let start = self.max_len - seq_len + 1;
-        let end = self.max_len + seq_len - 1;
+        let end = self.max_len + seq_len;
 
         tracing::trace!(
             seq_len,
-            cache_size,
             pe_len,
             center_pos,
             total_len,
@@ -573,11 +572,16 @@ impl RelPositionMultiHeadAttention {
 
         // Apply rel_shift and truncate to total_len
         let matrix_bd = Self::rel_shift(&matrix_bd)?;
+
+        tracing::trace!(
+            matrix_bd_truncated = ?matrix_bd.shape(),
+            "rel_shift applied"
+        );
         let matrix_bd = matrix_bd.index((.., .., .., ..total_len));
 
         tracing::trace!(
             matrix_bd_truncated = ?matrix_bd.shape(),
-            "rel_shift applied and truncated to total_len"
+            "truncated to total_len"
         );
 
         // Combine and scale
@@ -743,7 +747,7 @@ mod tests {
     #[test]
     fn test_rel_positional_encoding_shape() {
         let pe = RelPositionalEncoding::new(512, 100, false).unwrap();
-        let encoding = pe.get_encoding(50, 2).unwrap();
+        let encoding = pe.get_encoding(2).unwrap();
         let shape = encoding.shape();
         assert_eq!(shape[0], 1);
         assert_eq!(shape[1], 52); // 2*50 - 1
@@ -842,7 +846,7 @@ mod tests {
         let pe = RelPositionalEncoding::new(d_model, max_len, false).unwrap();
 
         // Get encoding for seq_len=3 -> output shape [1, 5, 4] (2*3-1 = 5 positions)
-        let encoding = pe.get_encoding(3, 2).unwrap();
+        let encoding = pe.get_encoding(2).unwrap();
         encoding.eval().unwrap();
 
         let shape = encoding.shape();
@@ -912,6 +916,101 @@ mod tests {
         );
     }
 
+    /// Helper: verify the rel_shift mathematical property.
+    ///
+    /// After rel_shift + truncation to `num_keys` columns, the result should satisfy:
+    ///   output[i][j] = input[i][seq_len - 1 - i + j]
+    ///
+    /// This ensures query i attending to key j gets the score for relative position (i - j)
+    /// mapped through the position embedding ordering [pos_max, ..., 0, ..., pos_min].
+    fn verify_rel_shift(seq_len: usize, pos_len: usize, num_keys: usize) {
+        // Build input where input[i][j] = i * pos_len + j (unique per element)
+        let mut input_data = Vec::with_capacity(seq_len * pos_len);
+        for i in 0..seq_len {
+            for j in 0..pos_len {
+                input_data.push((i * pos_len + j) as f32);
+            }
+        }
+        let x = Array::from_slice(
+            &input_data,
+            &[1, 1, seq_len as i32, pos_len as i32],
+        );
+
+        let shifted = RelPositionMultiHeadAttention::rel_shift(&x).unwrap();
+        mlx_rs::transforms::eval([&shifted]).unwrap();
+        let shifted_data: Vec<f32> = shifted.as_slice().to_vec();
+
+        // Verify: output[i][j] == input[i][seq_len - 1 - i + j] for j < num_keys
+        for i in 0..seq_len {
+            for j in 0..num_keys {
+                let expected_col = seq_len - 1 - i + j;
+                let expected = (i * pos_len + expected_col) as f32;
+                let actual = shifted_data[i * pos_len + j];
+                assert_eq!(
+                    actual, expected,
+                    "seq_len={seq_len}, pos_len={pos_len}, num_keys={num_keys}: \
+                     output[{i}][{j}] = {actual}, expected input[{i}][{expected_col}] = {expected}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_rel_shift_property_standard() {
+        // Standard (non-streaming) case: pos_len = 2*seq_len - 1, num_keys = seq_len
+        for seq_len in 1..=8 {
+            let pos_len = 2 * seq_len - 1;
+            verify_rel_shift(seq_len, pos_len, seq_len);
+        }
+    }
+
+    #[test]
+    fn test_rel_shift_property_streaming() {
+        // Streaming case: seq_len < total_len, pos_len = 2*total_len - 1, num_keys = total_len
+        for seq_len in 1..=6 {
+            for cache_len in 1..=6 {
+                let total_len = seq_len + cache_len;
+                let pos_len = 2 * total_len - 1;
+                verify_rel_shift(seq_len, pos_len, total_len);
+            }
+        }
+    }
+
+    #[test]
+    fn test_rel_shift_no_padding_zeros_in_output() {
+        // Verify that padding zeros never appear in the truncated output region.
+        // Use large values so a stray 0.0 would be conspicuous.
+        let seq_len = 4;
+        let total_len = 7;
+        let pos_len = 2 * total_len - 1; // 13
+
+        let mut input_data = Vec::with_capacity(seq_len * pos_len);
+        for i in 0..seq_len {
+            for j in 0..pos_len {
+                // All values > 100 so any 0.0 is clearly a padding artifact
+                input_data.push(100.0 + (i * pos_len + j) as f32);
+            }
+        }
+        let x = Array::from_slice(
+            &input_data,
+            &[1, 1, seq_len as i32, pos_len as i32],
+        );
+
+        let shifted = RelPositionMultiHeadAttention::rel_shift(&x).unwrap();
+        mlx_rs::transforms::eval([&shifted]).unwrap();
+        let shifted_data: Vec<f32> = shifted.as_slice().to_vec();
+
+        for i in 0..seq_len {
+            for j in 0..total_len {
+                let val = shifted_data[i * pos_len + j];
+                assert!(
+                    val >= 100.0,
+                    "Padding zero leaked into output[{i}][{j}] = {val}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn test_rel_positional_encoding_streaming_dimensions() {
         // Test that streaming dimensions work correctly
@@ -925,7 +1024,7 @@ mod tests {
         let seq_len = 14;
         let total_len = cache_size + seq_len;
 
-        let encoding = pe.get_encoding(50, total_len).unwrap();
+        let encoding = pe.get_encoding(total_len).unwrap();
         let shape = encoding.shape();
 
         // Should be [1, 2*84-1, 512] = [1, 167, 512]

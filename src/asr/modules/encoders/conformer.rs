@@ -115,7 +115,7 @@ fn causal_pad_2d(x: &Array, kernel_size: usize, stride: usize) -> Result<Array> 
 
     // Step 1: Pad time dimension (axis 1): [B, T, F, C] -> [B, T+left_pad+right_pad, F, C]
     // (kernel_size - 1) as i32; // (kernel_size - 1) as i32;
-    let left_pad_time = 0; // if time % 2 == 0 { 1 } else { 0 };
+    let left_pad_time = 2; // if time % 2 == 0 { 1 } else { 0 };
     let right_pad_time = 0; // ((kernel_size - 1) / 2) as i32;
     let time_zeros_left = mlx_rs::ops::zeros::<f32>(&[batch, left_pad_time, freq, channels])?;
     let time_zeros_right = mlx_rs::ops::zeros::<f32>(&[batch, right_pad_time, freq, channels])?;
@@ -557,7 +557,7 @@ impl ConformerEncoder {
 
         // Generate positional encoding for this sequence length
         let seq_len = x.dim(1) as usize;
-        let pos_emb = self.pos_enc.get_encoding(0, seq_len)?;
+        let pos_emb = self.pos_enc.get_encoding(seq_len)?;
 
         // Process through conformer blocks with positional info
         for layer in &mut self.layers {
@@ -660,7 +660,7 @@ impl ConformerEncoder {
 
     /// Get positional encoding for a given sequence length (for debugging).
     pub fn get_pos_encoding(&self, seq_len: usize) -> Result<Array> {
-        self.pos_enc.get_encoding(0, seq_len)
+        self.pos_enc.get_encoding(seq_len)
     }
 
     /// Get the xscale factor (for debugging).
@@ -699,7 +699,7 @@ impl ConformerEncoder {
 
         // Generate positional encoding
         let seq_len = x.dim(1) as usize;
-        let pos_emb = self.pos_enc.get_encoding(0, seq_len)?;
+        let pos_emb = self.pos_enc.get_encoding(seq_len)?;
         pos_emb.eval()?;
 
         // Process through conformer blocks
@@ -859,7 +859,7 @@ impl ConformerEncoder {
         // The positional encoding covers relative positions from +(total_len-1) to -(total_len-1).
         // After rel_shift in attention, these align correctly with K/V positions 0..total_len.
         // JJK trying to adjust size
-        let pos_emb = self.pos_enc.get_encoding(cache_size as usize, total_len as usize)?;
+        let pos_emb = self.pos_enc.get_encoding(seq_len as usize)?;
 
         tracing::trace!(
             enc_call,
