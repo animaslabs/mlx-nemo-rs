@@ -141,15 +141,13 @@ impl RelPositionalEncoding {
         // let center_pos = self.max_len;
         // let total_seq_len = cache_size + seq_len;
         let pe_len = self.max_len * 2 - 1;
-        let center_pos = self.max_len;
         let total_len = seq_len * 2 - 1;
         let start = self.max_len - seq_len + 1;
-        let end = self.max_len + seq_len;
+        let end = start + total_len;
 
         tracing::trace!(
             seq_len,
             pe_len,
-            center_pos,
             total_len,
             start,
             end,
@@ -492,19 +490,19 @@ impl RelPositionMultiHeadAttention {
             (x.clone(), seq_len, Some(new_cache))
         };
 
-        // // Verify positional encoding dimensions match expectations
-        // // pos_emb should be [1, 2*total_len-1, d_model]
-        // let expected_pos_len = 2 * total_len - 1;
-        // let actual_pos_len = pos_emb.dim(1) as i32;
-        // if actual_pos_len != expected_pos_len {
-        //     tracing::warn!(
-        //         total_len,
-        //         expected_pos_len,
-        //         actual_pos_len,
-        //         seq_len,
-        //         "positional encoding length mismatch!"
-        //     );
-        // }
+        // Verify positional encoding dimensions match expectations
+        // pos_emb should be [1, 2*total_len-1, d_model]
+        let expected_pos_len = 2 * total_len - 1;
+        let actual_pos_len = pos_emb.dim(1) as i32;
+        if actual_pos_len != expected_pos_len {
+            tracing::warn!(
+                total_len,
+                expected_pos_len,
+                actual_pos_len,
+                seq_len,
+                "positional encoding length mismatch!"
+            );
+        }
 
         // Project Q from input only (NeMo: query = input, unchanged)
         let q = self.linear_q.forward(x)?;
