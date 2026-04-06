@@ -190,15 +190,15 @@ fn main() -> mlx_nemo::Result<()> {
         let preview: Vec<String> = chunk.iter().take(5).map(|s| format!("{:.6}", s)).collect();
         let max_abs = chunk.iter().map(|s| s.abs()).fold(0.0f32, f32::max);
         let time_offset = (chunk_idx * chunk_samples) as f32 / sample_rate as f32;
-        eprintln!(
-            "CHUNK {} @ {:.2}s len={} max_abs={:.6} samples=[{}{}]",
-            chunk_idx,
-            time_offset,
-            chunk.len(),
-            max_abs,
-            preview.join(", "),
-            if chunk.len() > 5 { ", ..." } else { "" }
-        );
+        // eprintln!(
+        //     "CHUNK {} @ {:.2}s len={} max_abs={:.6} samples=[{}{}]",
+        //     chunk_idx,
+        //     time_offset,
+        //     chunk.len(),
+        //     max_abs,
+        //     preview.join(", "),
+        //     if chunk.len() > 5 { ", ..." } else { "" }
+        // );
 
         // Feed audio chunk to pipeline
         pipeline.add_audio(chunk);
@@ -213,13 +213,13 @@ fn main() -> mlx_nemo::Result<()> {
         // Process any available transcription steps
         while let Some(output) = pipeline.transcribe_step()? {
             // Display step info for debugging
-            let new_tokens_str: Vec<String> = output.new_tokens.iter().map(|t| t.to_string()).collect();
-            eprintln!(
-                "STEP {} new_tokens=[{}] total_tokens={}",
-                transcribe_steps,
-                new_tokens_str.join(", "),
-                output.token_count
-            );
+            // let new_tokens_str: Vec<String> = output.new_tokens.iter().map(|t| t.to_string()).collect();
+            // eprintln!(
+            //     "STEP {} new_tokens=[{}] total_tokens={}",
+            //     transcribe_steps,
+            //     new_tokens_str.join(", "),
+            //     output.token_count
+            // );
             transcribe_steps += 1;
 
             // Display partial result if text changed
@@ -230,10 +230,12 @@ fn main() -> mlx_nemo::Result<()> {
             }
 
             if output.is_final {
-                println!(); // New line after final output
+                println!("Total tokens: {}", output.token_count);
+                // println!(); // New line after final output
             }
         }
     }
+
 
     let elapsed = start.elapsed().as_secs_f32();
     let rtf = elapsed / audio_duration;

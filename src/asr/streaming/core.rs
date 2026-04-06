@@ -682,7 +682,7 @@ pub fn compute_streaming_config(
     // For 4x subsampling: [0, 5]
     // let pre_encode_cache = (subsampling_factor + 1, subsampling_factor + 1);
     // let pre_encode_cache = (subsampling_factor + 1, subsampling_factor + 1);
-    let pre_encode_cache = (subsampling_factor + 7, subsampling_factor + 7);
+    let pre_encode_cache = (subsampling_factor + 1, subsampling_factor + 1);
 
     // Drop extra pre-encoded frames after subsampling
     // NeMo: drop_extra_pre_encoded = 1 + (pre_encode_cache_size[1] - 1) // subsampling_factor

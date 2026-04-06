@@ -116,7 +116,7 @@ fn causal_pad_2d(x: &Array, kernel_size: usize, stride: usize) -> Result<Array> 
     // Step 1: Pad time dimension (axis 1): [B, T, F, C] -> [B, T+left_pad+right_pad, F, C]
     // (kernel_size - 1) as i32; // (kernel_size - 1) as i32;
     let left_pad_time = 2; // if time % 2 == 0 { 1 } else { 0 };
-    let right_pad_time = 0; // ((kernel_size - 1) / 2) as i32;
+    let right_pad_time = 1; // ((kernel_size - 1) / 2) as i32;
     let time_zeros_left = mlx_rs::ops::zeros::<f32>(&[batch, left_pad_time, freq, channels])?;
     let time_zeros_right = mlx_rs::ops::zeros::<f32>(&[batch, right_pad_time, freq, channels])?;
     let x = mlx_rs::ops::concatenate_axis(&[&time_zeros_left, x, &time_zeros_right], 1)?;
@@ -888,21 +888,21 @@ impl ConformerEncoder {
 
         tracing::trace!("Generated attention");
 
-        // // Create padding mask for conv module: True where position >= valid_seq_len
-        // // This zeros out padding frames after GLU, matching Python NeMo behavior
-        // let pad_mask = if tensor_seq_len > valid_seq_len {
-        //     // Create indices [0, 1, 2, ..., tensor_seq_len - 1]
-        //     let indices = mlx_rs::ops::arange::<_, i32>(0, tensor_seq_len, 1)?;
-        //     // mask[i] = (i >= valid_seq_len) => True for padding positions
-        //     let valid_len_arr = Array::from_int(valid_seq_len);
-        //     let mask = mlx_rs::ops::ge(&indices, &valid_len_arr)?;
-        //     // Expand to [1, tensor_seq_len] for batch broadcasting
-        //     let mask = mask.reshape(&[1, tensor_seq_len])?;
-        //     Some(mask)
-        // } else {
-        //     None
-        // };
-        let pad_mask = None;
+        // Create padding mask for conv module: True where position >= valid_seq_len
+        // This zeros out padding frames after GLU, matching Python NeMo behavior
+        let pad_mask = if tensor_seq_len > valid_seq_len {
+            // Create indices [0, 1, 2, ..., tensor_seq_len - 1]
+            let indices = mlx_rs::ops::arange::<_, i32>(0, tensor_seq_len, 1)?;
+            // mask[i] = (i >= valid_seq_len) => True for padding positions
+            let valid_len_arr = Array::from_int(valid_seq_len);
+            let mask = mlx_rs::ops::ge(&indices, &valid_len_arr)?;
+            // Expand to [1, tensor_seq_len] for batch broadcasting
+            let mask = mask.reshape(&[1, tensor_seq_len])?;
+            Some(mask)
+        } else {
+            None
+        };
+        // let pad_mask = None;
 
         tracing::trace!(
             enc_call,

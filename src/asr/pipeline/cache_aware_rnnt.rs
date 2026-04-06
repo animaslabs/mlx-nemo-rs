@@ -1082,7 +1082,7 @@ impl CacheAwareRNNTPipeline {
         // LOG_MEL_ZERO = ln(2^-24) ≈ -16.6355 (matches NeMo's log_zero_guard)
         const LOG_MEL_ZERO: f32 = -16.635532;
 
-        const LOOKAHEAD_FRAMES: usize = 4;
+        const LOOKAHEAD_FRAMES: usize = 1;
 
         let mel_chunk = if self.is_first_chunk && pre_encode_cache > 0 {
             // First chunk: prepend silence for pre_encode_cache, then real frames
