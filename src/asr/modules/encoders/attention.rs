@@ -495,7 +495,7 @@ impl RelPositionMultiHeadAttention {
         let expected_pos_len = 2 * total_len - 1;
         let actual_pos_len = pos_emb.dim(1) as i32;
         if actual_pos_len != expected_pos_len {
-            tracing::warn!(
+            tracing::info!(
                 total_len,
                 expected_pos_len,
                 actual_pos_len,

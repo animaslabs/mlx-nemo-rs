@@ -836,7 +836,7 @@ impl ConformerEncoder {
         // JJK test
         let total_len = cache_size + tensor_seq_len;
         // Valid length is used for masking
-        let seq_len = cache_size + tensor_seq_len;
+        let seq_len = cache_size + valid_seq_len;
 
         tracing::debug!(
             enc_call,
@@ -859,7 +859,7 @@ impl ConformerEncoder {
         // The positional encoding covers relative positions from +(total_len-1) to -(total_len-1).
         // After rel_shift in attention, these align correctly with K/V positions 0..total_len.
         // JJK trying to adjust size
-        let pos_emb = self.pos_enc.get_encoding(seq_len as usize)?;
+        let pos_emb = self.pos_enc.get_encoding(total_len as usize)?;
 
         tracing::trace!(
             enc_call,
@@ -880,7 +880,8 @@ impl ConformerEncoder {
                 cache_size,       // Full cache buffer size (for slicing)
                 filled_cache_len, // How much is filled (for offset masking)
                 tensor_seq_len,   // Tensor dimension for mask row count
-                valid_seq_len,    // Valid frames for query row masking
+                // valid_seq_len,    // Valid frames for query row masking
+                valid_seq_len - 1,    // JJK test 
             )?)
         } else {
             None
