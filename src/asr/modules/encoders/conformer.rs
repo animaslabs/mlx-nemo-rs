@@ -193,6 +193,7 @@ fn create_attention_mask(
 
             // Create chunk-based visibility mask
             att_mask = create_chunked_limited_mask(max_audio_length, chunk_size, left_chunks_num)?;
+            att_mask = apply_triu(&att_mask, -filled_cache_len)?;
         }
     } else {
         // Regular style - simple triangular masking
@@ -888,6 +889,60 @@ impl ConformerEncoder {
         };
 
         tracing::trace!("Generated attention");
+
+        // Print the full attention mask matrix
+        if let Some(ref mask) = att_mask {
+            mask.eval()?;
+            let shape = mask.shape();
+            let rows = shape[1] as usize; // seq_len (query positions)
+            let cols = shape[2] as usize; // max_audio_length (key positions)
+            let flat = mask.reshape(&[-1])?;
+            flat.eval()?;
+            let data: &[bool] = flat.as_slice();
+
+            let mut grid = String::new();
+            grid.push_str(&format!(
+                "\n=== ATTENTION MASK [1, {}, {}] (enc_call={}) ===\n",
+                rows, cols, enc_call
+            ));
+            // Column header: cache positions then input positions
+            grid.push_str("     "); // row label padding
+            for c in 0..cols {
+                if c == cache_size as usize {
+                    grid.push('|'); // separator between cache and input
+                }
+                grid.push_str(&format!("{}", c % 10));
+            }
+            grid.push('\n');
+            // Separator line
+            grid.push_str("     ");
+            for c in 0..cols {
+                if c == cache_size as usize {
+                    grid.push('|');
+                }
+                grid.push('-');
+            }
+            grid.push('\n');
+
+            for r in 0..rows {
+                grid.push_str(&format!("{:4} ", r));
+                for c in 0..cols {
+                    if c == cache_size as usize {
+                        grid.push('|');
+                    }
+                    let val = data[r * cols + c];
+                    grid.push(if val { '#' } else { '.' });
+                }
+                grid.push('\n');
+            }
+            grid.push_str(&format!(
+                "Legend: #=visible .=masked  |=cache/input boundary\n\
+                 cache_size={} filled={} tensor_seq={} valid_seq={}\n\
+                 ==========================================\n",
+                cache_size, filled_cache_len, tensor_seq_len, valid_seq_len
+            ));
+            tracing::info!("{}", grid);
+        }
 
         // Create padding mask for conv module: True where position >= valid_seq_len
         // This zeros out padding frames after GLU, matching Python NeMo behavior
