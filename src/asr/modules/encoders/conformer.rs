@@ -193,7 +193,7 @@ fn create_attention_mask(
 
             // Create chunk-based visibility mask
             att_mask = create_chunked_limited_mask(max_audio_length, chunk_size, left_chunks_num)?;
-            att_mask = apply_triu(&att_mask, -filled_cache_len)?;
+            // att_mask = apply_triu(&att_mask, -filled_cache_len)?;
         }
     } else {
         // Regular style - simple triangular masking
@@ -268,6 +268,17 @@ fn create_attention_mask(
         // AND with attention mask: rows >= valid_seq_len become all False
         att_mask = att_mask.logical_and(&row_valid)?;
     }
+
+    // // Always mask out the last column (last key position in the current input).
+    // {
+    //     let total_cols = cache_len + tensor_seq_len;
+    //     let col_indices: Vec<i32> = (0..total_cols).collect();
+    //     let col_indices = Array::from_slice(&col_indices, &[total_cols]);
+    //     let last_col = Array::from_int(total_cols - 1);
+    //     let col_valid = col_indices.lt(&last_col)?; // True for all cols except last
+    //     let col_valid = col_valid.reshape(&[1, 1, total_cols])?;
+    //     att_mask = att_mask.logical_and(&col_valid)?;
+    // }
 
     // No inversion needed: mask is True where attention is ALLOWED
     // The attention layer will use: where(mask, scores, -inf) to keep scores where mask=True
