@@ -2,6 +2,7 @@
 /models
 /samples
 /logs
+/docs/papers/
 .DS_Store
 __pycache__/
 scripts/.venv

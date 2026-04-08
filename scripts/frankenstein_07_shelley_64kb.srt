@@ -1,0 +1,699 @@
+1
+00:00:02,720 --> 00:00:05,040
+This is a LibriVox recording.
+
+2
+00:00:05,040 --> 00:00:08,000
+All LibriVox recordings are in the public domain.
+
+3
+00:00:08,000 --> 00:00:12,960
+For more information, please visit LibriVox.blogsom.com.
+
+4
+00:00:12,960 --> 00:00:16,480
+Today's reading by Alex Foster.
+
+5
+00:00:16,480 --> 00:00:19,600
+Frankenstein by Mary Shelley.
+
+6
+00:00:19,600 --> 00:00:24,240
+Chapter 8.
+
+7
+00:00:24,240 --> 00:00:29,120
+We passed a few sad hours until eleven o'clock, when the trial was to commence.
+
+8
+00:00:29,120 --> 00:00:35,200
+My father and the rest of the family being obliged to attend as witnesses, I accompanied them to the court.
+
+9
+00:00:35,200 --> 00:00:40,240
+During the whole of this wretched mockery of justice, I suffered living torture.
+
+10
+00:00:40,240 --> 00:01:00,240
+It was to be decided whether the result of my curiosity and lawless devices would cause the death of two of my fellow beings, one a smiling babe full of innocence and joy, the other far more dreadfully murdered, with every aggravation of infamy that could make the murder memorable in horror.
+
+11
+00:01:00,240 --> 00:01:06,000
+Justine also was a girl of merit and possessed qualities which promised to render her life happy.
+
+12
+00:01:06,000 --> 00:01:12,800
+Now all was to be obliterated in an ignominious grave, and I the cause.
+
+13
+00:01:12,800 --> 00:01:18,880
+A thousand times rather would I have confessed myself guilty of the crime ascribed to Justine.
+
+14
+00:01:18,880 --> 00:01:29,840
+But I was absent when it was committed, and such a declaration would have been considered as the ravings of a madman, and would not have exculpated her who suffered through me.
+
+15
+00:01:29,840 --> 00:01:32,640
+The appearance of Justine was calm.
+
+16
+00:01:32,640 --> 00:01:41,280
+She was dressed in mourning, and her countenance, always engaging, was rendered by the solemnity of her feelings exquisitely beautiful.
+
+17
+00:01:41,280 --> 00:01:58,080
+Yet she appeared confident in innocence and did not tremble, although gazed on and execrated by thousands for all the kindness which her beauty might otherwise have excited, was obliterated in the minds of the spectators by the imagination of the enormity she was supposed to have committed.
+
+18
+00:01:58,080 --> 00:02:11,080
+She was tranquil, yet her tranquility was evidently constrained, and as her confusion had before her been adduced as proof of her guilt, she worked up in her mind to an appearance of courage.
+
+19
+00:02:11,080 --> 00:02:17,080
+When she entered the court, she threw her eyes round it and quickly discovered where we were seated.
+
+20
+00:02:17,080 --> 00:02:27,480
+A tear seemed to dim her eye when she saw us, but she quickly recovered herself, and a look of sorrowful affection seemed to attest her utter guiltlessness.
+
+21
+00:02:27,480 --> 00:02:34,360
+The trial began, and after the advocate against her had stated the charge, several witnesses were called.
+
+22
+00:02:34,360 --> 00:02:42,120
+Several strange facts combined against her, which might have staggered anyone who had not such proof of her innocence as I had.
+
+23
+00:02:42,120 --> 00:02:53,640
+She had been out the whole of the night on which the murder had been committed, and towards morning had been perceived by a market woman not far from the spot where the body of the murdered child had been afterwards found.
+
+24
+00:02:53,640 --> 00:03:01,640
+The woman asked her what she did there, but she looked very strangely and only returned a confused and unintelligible answer.
+
+25
+00:03:01,640 --> 00:03:13,880
+She returned to the house about eight o'clock, and when one inquired where she had passed the night, she replied that she had been looking for the child and demanded earnestly if anything had been heard concerning him.
+
+26
+00:03:13,880 --> 00:03:19,640
+When shown the body, she fell into violent hysterics and kept her bed for several days.
+
+27
+00:03:19,640 --> 00:03:33,720
+The picture was then produced, which the servant had found in her pocket, and when Elizabeth, in a faltering voice, proved that it was the same which, an hour before the child had been missed, she had placed around his neck.
+
+28
+00:03:33,720 --> 00:03:38,600
+A murmur of horror and indignation filled the court.
+
+29
+00:03:38,600 --> 00:03:41,720
+Justine was called on for her defence.
+
+30
+00:03:41,720 --> 00:03:46,320
+As the trial had proceeded, her countenance had halted.
+
+31
+00:03:44,840 --> 00:03:50,480
+Surprise, horror, and misery were strongly expressed.
+
+32
+00:03:50,880 --> 00:04:04,000
+Sometimes she struggled with her tears, but when she was desired to plead, she collected her powers and spoke in an audible though variable voice.
+
+33
+00:04:04,240 --> 00:04:13,040
+God knows, she said, how entirely I am innocent, but I do not pretend that my protestations should acquit me.
+
+34
+00:04:13,040 --> 00:04:30,000
+I rest my innocence on a plain and simple explanation of the facts which have been adduced against me, and I hope the character I have always borne will incline my judges to a favorable interpretation, where any circumstance appears doubtful or suspicious.
+
+35
+00:04:30,000 --> 00:04:42,720
+She then related that by the permission of Elizabeth, she had passed the evening of the night on which the murder had been committed at the house of an aunt at Schen, a village situated about a league from Geneva.
+
+36
+00:04:42,720 --> 00:04:49,920
+On her return, at about nine o'clock, she met a man who asked her if she had seen anything of the child who was lost.
+
+37
+00:04:49,920 --> 00:05:04,400
+She was alarmed by this account and passed several hours in looking for him when the gates of Geneva were shut, and she was forced to remain several hours of the night in a barn belonging to a cottage, being unwilling to call up the inhabitants to whom she was well known.
+
+38
+00:05:04,400 --> 00:05:06,960
+Most of the night she spent here watching.
+
+39
+00:05:06,960 --> 00:05:10,240
+Towards morning, she believed that she slept for a few minutes.
+
+40
+00:05:10,240 --> 00:05:13,120
+Some steps disturbed her, and she awoke.
+
+41
+00:05:13,120 --> 00:05:19,200
+It was dawn, and she quitted her asylum that she might again endeavour to find my brother.
+
+42
+00:05:19,200 --> 00:05:24,480
+If she had gone near the spot where his body lay, it was without her knowledge.
+
+43
+00:05:24,480 --> 00:05:33,640
+That she had been bewildered when questioned by the marketwoman was not surprising, since she had passed a sleepless night, and the fate of poor William was yet uncertain.
+
+44
+00:05:34,120 --> 00:05:38,440
+Concerning the picture, she could give no account.
+
+45
+00:05:38,600 --> 00:05:57,560
+I know, continued the unhappy victim, how heavily and fatally this one circumstance weighs against me, but I have no power of explaining it, and when I have expressed my utter ignorance, I am only left to conjecture concerning the probabilities by which it might have been placed in my pocket.
+
+46
+00:05:57,560 --> 00:05:59,560
+But here also I am checked.
+
+47
+00:05:59,560 --> 00:06:06,280
+I believe that I have no enemy on earth, and none surely would have been so wicked as to destroy me wantonly.
+
+48
+00:06:06,280 --> 00:06:08,520
+Did the murderer place it there?
+
+49
+00:06:08,520 --> 00:06:19,400
+I know of no opportunity afforded him for so doing, or if I had, why should he have stolen the jewel to part with it again so soon?
+
+50
+00:06:19,400 --> 00:06:25,560
+I commit my cause to the justice of my judges, yet I see no room for hope.
+
+51
+00:06:25,560 --> 00:06:41,480
+I beg permission to have a few witnesses examined concerning my character, and if their testimony shall not overweigh my supposed guilt, I must be condemned, although I would pledge my salvation on my innocence.
+
+52
+00:06:41,480 --> 00:06:46,840
+Several witnesses were called who had known her for many years, and they spoke well of her.
+
+53
+00:06:46,840 --> 00:06:54,600
+But fear and hatred of the crime of which they supposed her guilty rendered them timorous and unwilling to come forward.
+
+54
+00:06:54,600 --> 00:07:08,280
+Elizabeth saw even this last resource, her excellent dispositions and irreproachable conduct about to fail the accused, when, although violently agitated, she desired permission to address the court.
+
+55
+00:07:08,440 --> 00:07:21,280
+I am said she, the cousin of the unhappy child who was murdered, or rather his sister, for I was educated by and have lived with his parents ever since and even long before his birth.
+
+56
+00:07:21,520 --> 00:07:37,040
+It may therefore be judged indecent in me to come forward on this occasion, but when I see a fellow creature about to perish due the cowardice of her pretended friends, I wish to be allowed to speak that I may say what I know of her character.
+
+57
+00:07:37,040 --> 00:07:39,760
+I am well acquainted with the accused.
+
+58
+00:07:39,760 --> 00:07:46,400
+I have lived in the same house with her at one time for five and at another for nearly two years.
+
+59
+00:07:46,400 --> 00:07:52,880
+During all that period, she appeared to me the most amiable and benevolent of human creatures.
+
+60
+00:07:52,880 --> 00:08:06,720
+She nursed Madame Frankenstein, my aunt in her last illness, with the greatest affection and care, and afterwards attended her own mother during a tedious illness, in a manner that excited the admiration of all who knew her.
+
+61
+00:08:06,720 --> 00:08:12,080
+After which she again lived in my uncle's house, where she was beloved by all the family.
+
+62
+00:08:12,080 --> 00:08:18,720
+She was warmly attached to the child who is now dead, and acted towards him like a most affectionate mother.
+
+63
+00:08:18,720 --> 00:08:28,720
+For my own part, I do not hesitate to say that, notwithstanding all the evidence produced against her, I believe and rely on her perfect innocence.
+
+64
+00:08:28,720 --> 00:08:31,760
+She had no temptation for such an action.
+
+65
+00:08:31,760 --> 00:08:43,280
+As to the bauble on which the chief proof rests, if she had so earnestly desired it, I should have willingly given it to her, so much do I esteem and value her.
+
+66
+00:08:45,160 --> 00:08:59,800
+Followed Elizabeth's simple and powerful appeal, but it was excited by her generous interference, and not in favour of poor Justine, on whom the public indignation was turned with renewed violence, charging her with the blackest ingratitude.
+
+67
+00:08:59,800 --> 00:09:04,920
+She herself wept as Elizabeth spoke, but she did not answer.
+
+68
+00:09:04,920 --> 00:09:09,320
+My own agitation and anguish was extreme during the whole trial.
+
+69
+00:09:09,320 --> 00:09:12,520
+I believed in her innocence, I knew it.
+
+70
+00:09:12,520 --> 00:09:21,560
+Could the demon who had, I did not a minute doubt, murdered my brother also in his hellish sport, have betrayed the innocent to death and ignominy.
+
+71
+00:09:21,560 --> 00:09:34,360
+I could not sustain the horror of my situation, and when I perceived that the popular voice and the countenances of the judge had already condemned my unhappy victim, I rushed out of the court in agony.
+
+72
+00:09:34,360 --> 00:09:37,960
+The tortures of the accused did not equal mine.
+
+73
+00:09:37,960 --> 00:09:46,360
+She was sustained by innocence, but the fangs of remorse tore my bosom and would not forgo their hold.
+
+74
+00:09:46,360 --> 00:09:50,200
+I passed the night of unmingled wretchedness.
+
+75
+00:09:50,200 --> 00:09:52,680
+In the morning I went to the court.
+
+76
+00:09:52,680 --> 00:09:55,400
+My lips and throat were parched.
+
+77
+00:09:55,400 --> 00:10:01,720
+I dared not ask the fatal question, but I was known, and the officer guessed the cause of my visit.
+
+78
+00:10:01,720 --> 00:10:08,440
+The ballots had been thrown, they were all black, and Justine was condemned.
+
+79
+00:10:08,440 --> 00:10:12,760
+I cannot pretend to describe what I then felt.
+
+80
+00:10:12,760 --> 00:10:25,880
+I had before experienced sensations of horror, and when I have endeavoured to bestow upon them adequate expressions, but words cannot convey an idea of the heart-sickening despair that I then endured.
+
+81
+00:10:25,880 --> 00:10:32,040
+The person to whom I addressed myself added that Justine had already confessed her guilt.
+
+82
+00:10:32,040 --> 00:10:45,280
+That evidence, he observed, was hardly required in so glaring a case, but I am glad of it, and indeed, none of our judges like to condemn a criminal upon circumstantial evidence, be it ever so decisive.
+
+83
+00:10:44,360 --> 00:10:48,480
+This was strange and unexpected intelligence.
+
+84
+00:10:48,720 --> 00:10:50,480
+What could it mean?
+
+85
+00:10:50,480 --> 00:10:58,720
+Had my eyes deceived me, and was I really as mad as the whole world would believe me to be if I disclosed the object of my suspicions.
+
+86
+00:10:58,720 --> 00:11:04,080
+I hastened to return home, and Elizabeth eagerly demanded the result.
+
+87
+00:11:04,240 --> 00:11:10,160
+My cousin, replied I, it is decided as you may have expected.
+
+88
+00:11:10,160 --> 00:11:16,400
+All judges had rather that ten innocent should suffer than that one guilty should escape.
+
+89
+00:11:16,400 --> 00:11:25,360
+But she has confessed.
+
+90
+00:11:25,360 --> 00:11:32,000
+This was a dire blow to poor Elizabeth, who had relied with firmness upon Justine's innocence.
+
+91
+00:11:32,000 --> 00:11:36,400
+Alas, said she, how shall I ever again believe in human goodness?
+
+92
+00:11:36,400 --> 00:11:43,360
+Justine, whom I loved and esteemed as my sister, how could she put on those smiles of innocence only to betray?
+
+93
+00:11:43,360 --> 00:11:50,880
+Her mild eyes seemed incapable of any severity or guile, and yet she has committed a murder.
+
+94
+00:11:50,880 --> 00:11:56,320
+Soon after we heard that the poor victim had expressed a desire to see my cousin.
+
+95
+00:11:56,320 --> 00:12:02,560
+My father wished her not to go, but said that he left it to her own judgment and feelings to decide.
+
+96
+00:12:02,560 --> 00:12:09,520
+Yes, said Elizabeth, I will go, although she is guilty, and you, Victor, shall accompany me.
+
+97
+00:12:09,520 --> 00:12:12,240
+I cannot go alone.
+
+98
+00:12:12,240 --> 00:12:17,360
+The idea of this visit was torture to me, yet I could not refuse.
+
+99
+00:12:17,360 --> 00:12:23,120
+We entered the gloomy prison chamber and beheld Justine sitting on some straw at the farther end.
+
+100
+00:12:23,120 --> 00:12:27,360
+Her hands were manacled, and her head rested on her knees.
+
+101
+00:12:27,360 --> 00:12:35,080
+She rose on seeing us enter, and when we were left alone with her, she threw herself at the feet of Elizabeth, weeping bitterly.
+
+102
+00:12:35,400 --> 00:12:38,120
+My cousin wept also.
+
+103
+00:12:43,640 --> 00:12:51,960
+I relied on your innocence, and although I was then very wretched, I was not so miserable as I am now.
+
+104
+00:12:51,960 --> 00:12:55,640
+And do you also believe that I am so very, very wicked?
+
+105
+00:12:55,640 --> 00:13:00,280
+Do you also join with my enemies to crush me, to condemn me as a murderer?
+
+106
+00:13:00,280 --> 00:13:03,880
+Her voice was suffocated with sobs.
+
+107
+00:13:05,560 --> 00:13:09,160
+Elizabeth, why do you kneel if you are innocent?
+
+108
+00:13:09,160 --> 00:13:11,080
+I am not one of your enemies.
+
+109
+00:13:11,080 --> 00:13:18,200
+I believed you guiltless, notwithstanding every evidence, until I heard that you had yourself declared your guilt.
+
+110
+00:13:18,200 --> 00:13:28,200
+That report you say is false, and be assured, dear Justine, that nothing can shake my confidence in you for a moment, but your own confession.
+
+111
+00:13:28,200 --> 00:13:32,040
+I did confess, but I confessed a lie.
+
+112
+00:13:32,040 --> 00:13:40,040
+I confessed that I might obtain absolution, but now that falsehood lies heavier at my heart than all my other sins.
+
+113
+00:13:40,040 --> 00:13:42,520
+The God of heaven forgive me.
+
+114
+00:13:42,520 --> 00:13:46,200
+Ever since I was condemned, my confessor has besieged me.
+
+115
+00:13:46,200 --> 00:13:51,800
+He threatened and menaced until I almost began to think that I was the monster that he said I was.
+
+116
+00:13:51,800 --> 00:13:57,640
+He threatened excommunication and hellfire in my last moments if I continued obdurate.
+
+117
+00:13:57,640 --> 00:14:00,360
+Dear lady, I I had none to support me.
+
+118
+00:14:00,520 --> 00:14:05,000
+All looked on me as a wretch, doomed to ignominy and perition.
+
+119
+00:14:05,000 --> 00:14:06,600
+What could I do?
+
+120
+00:14:06,600 --> 00:14:13,160
+In an evil hour, I subscribed to a lie, and now only am I truly miserable.
+
+121
+00:14:13,160 --> 00:14:16,800
+She paused, weeping, and then continued.
+
+122
+00:14:17,680 --> 00:14:31,280
+I thought with horror, my sweet lady, that you should believe your Justine, whom your blessed aunt had so highly honored and whom you loved was a creature capable of a crime which none but the devil himself could have perpetrated.
+
+123
+00:14:31,280 --> 00:14:46,240
+Dear William, dearest blessed child, I soon shall see you again in heaven, where we shall all be happy, and that consoles me, going as I am to suffer ignominy and death.
+
+124
+00:14:46,240 --> 00:14:51,120
+Oh Justine, forgive me for having for one moment distrusted you.
+
+125
+00:14:51,120 --> 00:14:53,440
+Why did you confess?
+
+126
+00:14:53,440 --> 00:14:56,480
+But do not mourn, dear girl, do not fear.
+
+127
+00:14:56,480 --> 00:15:04,320
+I will proclaim, I will prove your innocence, I will melt the stony hearts of your enemies by the tears and prayers.
+
+128
+00:15:04,320 --> 00:15:05,920
+You shall not die.
+
+129
+00:15:05,920 --> 00:15:11,520
+You, my playfellow, my companion, my sister, perish on the scaffold?
+
+130
+00:15:11,520 --> 00:15:18,320
+No, I could never survive so horrible a misfortune.
+
+131
+00:15:18,320 --> 00:15:20,960
+Justine shook her head mournfully.
+
+132
+00:15:20,960 --> 00:15:23,920
+I do not fear to die, she said.
+
+133
+00:15:23,920 --> 00:15:26,000
+That pang is past.
+
+134
+00:15:26,000 --> 00:15:30,080
+God raises my weakness and gives me courage to endure the worst.
+
+135
+00:15:30,080 --> 00:15:39,280
+I leave a sad and bitter world, and if you remember me and think of me as of one unjustly condemned, I am resigned to the fate awaiting me.
+
+136
+00:15:39,280 --> 00:15:46,160
+Learn from me, dear lady, to submit in patience to the will of heaven.
+
+137
+00:15:46,160 --> 00:15:54,160
+During this conversation, I had retired to a corner of the prison room where I could conceal the horrid anguish that possessed me.
+
+138
+00:15:54,160 --> 00:15:55,200
+Despair?
+
+139
+00:15:55,200 --> 00:15:57,040
+Who dared talk of that?
+
+140
+00:15:57,280 --> 00:16:06,760
+The poor victim, who on the morrow was to pass the awful boundary between life and death, felt not as I did, such deep and bitter agony.
+
+141
+00:16:06,760 --> 00:16:13,640
+I gnashed my teeth and ground them together, uttering a groan that came from my inmost soul.
+
+142
+00:16:13,640 --> 00:16:15,800
+Justine started.
+
+143
+00:16:15,800 --> 00:16:22,520
+When she saw who it was, she approached me and said, Dear sir, you are very kind to visit me.
+
+144
+00:16:22,520 --> 00:16:27,240
+I do hope you do not believe that I am guilty.
+
+145
+00:16:27,240 --> 00:16:29,160
+I could not answer.
+
+146
+00:16:29,160 --> 00:16:31,400
+No, Justine said Elizabeth.
+
+147
+00:16:31,400 --> 00:16:38,600
+He is more convinced of your innocence than I was, for even when he heard that you had confessed, he did not credit it.
+
+148
+00:16:38,600 --> 00:16:40,440
+I truly thank him.
+
+149
+00:16:40,440 --> 00:16:46,920
+In these last moments, I feel the sincerest gratitude towards those who think of me with kindness.
+
+150
+00:16:46,920 --> 00:16:50,840
+How sweet is the affection of others to such a wretch as I am.
+
+151
+00:16:50,840 --> 00:17:03,480
+It removes more than half my misfortune, and I feel as if I could die in peace now that my innocence is acknowledged by you, dear lady, and your cousin.
+
+152
+00:17:03,480 --> 00:17:08,200
+Thus the poor sufferer tried to comfort others and herself.
+
+153
+00:17:08,200 --> 00:17:21,240
+She indeed gained the resignation she desired, but I, the true murderer, felt the never-dying worm alive in my bosom, which allowed of no hope or consolation.
+
+154
+00:17:21,240 --> 00:17:34,120
+Elizabeth also wept and was unhappy, but hers also was the misery of innocence, which, like a cloud that passes over the fair moon, for a while hides but cannot tarnish its brightness.
+
+155
+00:17:34,120 --> 00:17:38,040
+Anguish and despair had penetrated into the core of my heart.
+
+156
+00:17:38,040 --> 00:17:42,360
+I bore a hell within me, which nothing could extinguish.
+
+157
+00:17:42,360 --> 00:17:48,720
+We stayed several hours with Justine, and it was with great difficulty that Elizabeth could tear herself away.
+
+158
+00:17:48,960 --> 00:17:52,720
+I wish, cried she, that I were to die with you.
+
+159
+00:17:52,720 --> 00:17:56,720
+I cannot live in this world of misery.
+
+160
+00:17:56,720 --> 00:18:03,280
+Justine assumed an air of cheerfulness, while she with difficulty repressed her bitter tears.
+
+161
+00:18:03,280 --> 00:18:13,440
+She embraced Elizabeth and said in a voice of half-suppressed emotion, Farewell, sweet lady, dearest Elizabeth, my beloved and only friend.
+
+162
+00:18:13,440 --> 00:18:17,760
+May heaven, in its bounty, bless and preserve you.
+
+163
+00:18:17,760 --> 00:18:21,360
+May this be the last misfortune that you will ever suffer.
+
+164
+00:18:21,360 --> 00:18:27,600
+Live and be happy and make others so.
+
+165
+00:18:59,520 --> 00:19:04,480
+She perished on the scaffold as a murderess.
+
+166
+00:19:04,480 --> 00:19:11,200
+From the tortures of my own heart, I turned to contemplate the deep and voiceless grief of my Elizabeth.
+
+167
+00:19:11,200 --> 00:19:21,440
+This also was my doing, and my father's woe and the desolation of that late so smiling home, all was the work of my thrice-accursed hands.
+
+168
+00:19:21,440 --> 00:19:25,920
+Ye weep, unhappy ones, but these are not your last tears.
+
+169
+00:19:25,920 --> 00:19:32,600
+Again shall you rise the funeral wail, and the sound of your lamentations shall again and again be heard.
+
+170
+00:19:32,920 --> 00:19:51,960
+Frankenstein, your son, your kinsman, your early much loved friend, he who would spend each vital drop of blood for your sakes, who has no thought nor sense of joy, except as it is mirrored also in your dear countenances, who would fill the air with blessings and spend his life in serving you.
+
+171
+00:19:51,960 --> 00:19:55,880
+He bids you weep to shed countless tears.
+
+172
+00:19:55,880 --> 00:20:07,400
+Happy beyond his hopes, if thus inexorable fate be satisfied, and if the destruction pause before the peace of the grave have succeeded to your sad torment.
+
+173
+00:20:07,400 --> 00:20:24,760
+Thus spoke my prophetic soul, as torn by remorse, horror, and despair, I beheld those I loved spend vain sorrow upon the graves of William and Justine, the first hapless victims to my unhallowed arts.
+
+174
+00:20:24,760 --> 00:20:26,600
+End of chapter 8.
+
+175
+00:20:26,600 --> 00:20:34,280
+Recorded 22nd of September 2005 by Alex Foster, www.alxfoster.me.uk
