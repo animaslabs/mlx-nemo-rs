@@ -934,6 +934,16 @@ impl StreamingMel {
         Ok(n_frames)
     }
 
+    /// Flush remaining audio from the lookback buffer by padding with silence.
+    ///
+    /// The lookback buffer holds `overlap_size` (win_samples - hop_samples) samples
+    /// from previous calls. Padding with `hop_samples` zeros gives exactly
+    /// `win_samples` total, producing one final mel frame.
+    pub fn flush(&mut self) -> Result<usize> {
+        let pad = vec![0.0f32; self.hop_samples];
+        self.add_audio(&pad)
+    }
+
     /// Get mel frames as Array [n_mels, count].
     ///
     /// # Arguments

@@ -360,6 +360,11 @@ fn main() -> mlx_nemo::Result<()> {
     // Stop audio stream
     drop(stream);
 
+    // Drain remaining samples from ring buffer that weren't popped in the main loop
+    while let Some(sample) = consumer.try_pop() {
+        audio_buffer.push(sample);
+    }
+
     // Process any remaining audio in buffer
     if !audio_buffer.is_empty() {
         if debug {

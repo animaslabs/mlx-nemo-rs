@@ -265,6 +265,7 @@ pub struct CacheAwareRNNTPipeline {
     live_buffer: Vec<f32>,
     stream_ended: bool,
     is_done: bool,
+    mel_flushed: bool,
 
     // State
     state: StreamingState,
@@ -437,6 +438,7 @@ impl CacheAwareRNNTPipeline {
             live_buffer: Vec::new(),
             stream_ended: false,
             is_done: false,
+            mel_flushed: false,
             state,
             blank_id,
             n_mels,
@@ -681,6 +683,7 @@ impl CacheAwareRNNTPipeline {
             live_buffer: Vec::new(),
             stream_ended: false,
             is_done: false,
+            mel_flushed: false,
             state,
             blank_id,
             n_mels,
@@ -880,6 +883,7 @@ impl CacheAwareRNNTPipeline {
         self.live_buffer.clear();
         self.stream_ended = false;
         self.is_done = false;
+        self.mel_flushed = false;
 
         // Reset mel streaming state
         self.streaming_mel.reset();
@@ -1021,6 +1025,19 @@ impl CacheAwareRNNTPipeline {
             );
         }
 
+        // Flush final mel frames from audio lookback buffer
+        if self.stream_ended && self.live_buffer.is_empty() && !self.mel_flushed {
+            self.mel_flushed = true;
+            let flushed = self.streaming_mel.flush()?;
+            if flushed > 0 {
+                tracing::debug!(
+                    flushed_frames = flushed,
+                    total_frames = self.streaming_mel.total_frames(),
+                    "Flushed final mel frames from audio lookback"
+                );
+            }
+        }
+
         Ok(())
     }
 
@@ -1092,16 +1109,16 @@ impl CacheAwareRNNTPipeline {
             )?;
             let real_frames = self
                 .streaming_mel
-                .get_frames_padded(0, chunk_size + LOOKAHEAD_FRAMES, 0.0)?;
+                .get_frames_padded(0, chunk_size + LOOKAHEAD_FRAMES, LOG_MEL_ZERO)?;
             mlx_rs::ops::concatenate_axis(&[&silence, &real_frames], 1)?
         } else if self.is_first_chunk {
             // First chunk, no pre_encode_cache
             self.streaming_mel
-                .get_frames_padded(0, chunk_size + LOOKAHEAD_FRAMES, 0.0)?
+                .get_frames_padded(0, chunk_size + LOOKAHEAD_FRAMES, LOG_MEL_ZERO)?
         } else {
             // Subsequent chunks: first pre_encode_cache frames are overlap from previous
             self.streaming_mel
-                .get_frames_padded(0, chunk_size + pre_encode_cache + LOOKAHEAD_FRAMES, 0.0)?
+                .get_frames_padded(0, chunk_size + pre_encode_cache + LOOKAHEAD_FRAMES, LOG_MEL_ZERO)?
         };
 
         let total_extract = mel_chunk.dim(1) as usize;
