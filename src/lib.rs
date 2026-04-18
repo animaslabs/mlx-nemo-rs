@@ -34,6 +34,8 @@ pub use core::error::{Error, Result};
 pub use core::weights::WeightFormat;
 pub use core::checkpoint::SafetensorsLoader;
 pub use mlx_rs::Array;
+pub use mlx_rs::fft;
+pub use mlx_rs::ops;
 
 /// Prelude module for convenient imports
 pub mod prelude {
