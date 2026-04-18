@@ -11,7 +11,6 @@ use std::collections::HashMap;
 use mlx_rs::builder::Builder;
 use mlx_rs::module::Module;
 use mlx_rs::nn;
-use mlx_rs::ops::indexing::{IndexOp, IntoStrideBy};
 use mlx_rs::Array;
 
 use crate::asr::config::{JasperBlockConfig, JasperEncoderConfig};
@@ -234,7 +233,12 @@ impl JasperBlock {
             if self.stride > 1 {
                 // Subsample residual to match output time dimension
                 // Take every `stride`-th frame: res[:, ::stride, :]
-                res = res.index((.., (..).stride_by(self.stride as i32), ..));
+                // Use arange + take_axis to produce a contiguous result (stride_by
+                // creates a non-contiguous strided view that can corrupt the
+                // subsequent add on the Metal backend).
+                let t = res.dim(1) as i32;
+                let indices = Array::arange::<_, i32>(0, t, self.stride as i32)?;
+                res = res.take_axis(&indices, 1)?;
             }
             out = mlx_rs::ops::add(&out, &res)?;
         }
