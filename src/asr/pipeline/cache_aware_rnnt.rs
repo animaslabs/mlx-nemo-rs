@@ -1241,6 +1241,87 @@ impl CacheAwareRNNTPipeline {
         self.process_feature_buffer(feature_buffer)
     }
 
+    /// Run one additional encoder+decoder pass with silence mel input after the
+    /// last real chunk. The encoder cache from the last real audio provides left
+    /// context, while the silence input provides "future context" showing that
+    /// speech has ended, allowing deferred tokens (e.g. punctuation) to be emitted.
+    fn flush_decode_with_silence(&mut self) -> Result<Vec<usize>> {
+        const LOG_MEL_ZERO: f32 = -16.635532;
+
+        let chunk_size = self.mel_stream_config.chunk_size;
+        let pre_encode_cache = self.mel_stream_config.pre_encode_cache;
+        let total_frames = chunk_size + pre_encode_cache;
+
+        // Create silence mel chunk: [1, n_mels, chunk_size + pre_encode_cache]
+        let silence = mlx_rs::ops::full::<f32>(
+            &[1, self.n_mels as i32, total_frames as i32],
+            &Array::from_f32(LOG_MEL_ZERO),
+        )?;
+
+        let lengths = Array::from_slice(&[chunk_size as i32], &[1]);
+        let drop_extra = self.streaming_config.drop_extra_pre_encoded;
+
+        // Run encoder with existing cache
+        let (encoded, encoded_lengths, cache_channel_next, cache_time_next, cache_len_next) =
+            self.encoder.forward_streaming(
+                &silence,
+                &lengths,
+                &self.encoder_cache.last_channel,
+                &self.encoder_cache.last_time,
+                &self.encoder_cache.last_channel_len,
+                drop_extra,
+            )?;
+
+        // Update encoder cache
+        self.encoder_cache.last_channel = cache_channel_next;
+        self.encoder_cache.last_time = cache_time_next;
+        self.encoder_cache.last_channel_len = cache_len_next;
+
+        // Transpose [B, D, T] -> [B, T, D]
+        let encoded = mlx_rs::ops::transpose_axes(&encoded, &[0, 2, 1])?;
+        encoded.eval()?;
+        encoded_lengths.eval()?;
+
+        // Use ALL encoder output frames (keep_all_outputs for flush)
+        let raw_enc_len = encoded_lengths.as_slice::<i32>()[0] as usize;
+        let actual_tensor_frames = encoded.shape()[1] as usize;
+        let enc_seq_len = raw_enc_len.min(actual_tensor_frames);
+
+        tracing::debug!(
+            enc_seq_len,
+            raw_enc_len,
+            actual_tensor_frames,
+            "flush_decode_with_silence: encoder output"
+        );
+
+        // Decode with optional punctuation masking
+        let masked_ids = if self.suppress_punctuation {
+            Some(self.punctuation_token_ids.as_slice())
+        } else {
+            None
+        };
+
+        let decode_output = self.streaming_decoder.decode_frames(
+            &encoded,
+            enc_seq_len,
+            &self.decoder,
+            &mut self.state.decoder_state,
+            &self.joint,
+            &mut self.state.last_token,
+            masked_ids,
+        )?;
+
+        if !decode_output.new_tokens.is_empty() {
+            tracing::debug!(
+                new_tokens = decode_output.new_tokens.len(),
+                blanks = decode_output.blank_count,
+                "flush_decode_with_silence: emitted tokens"
+            );
+        }
+
+        Ok(decode_output.new_tokens)
+    }
+
     /// Process a feature buffer and return transcription output.
     fn process_feature_buffer(&mut self, fb: FeatureBuffer) -> Result<Option<TranscribeOutput>> {
         let is_first = fb.is_first || self.state.is_first_chunk;
@@ -1371,8 +1452,8 @@ impl CacheAwareRNNTPipeline {
         let raw_enc_len = encoded_lengths.as_slice::<i32>()[0] as usize;
         let actual_tensor_frames = encoded.shape()[1] as usize;
         let valid_out_len = self.streaming_config.valid_out_len;
-        let enc_seq_len = if self.encoder.is_chunked_limited() {
-            // chunked_limited with keep_all_outputs=True: use all encoder outputs
+        let enc_seq_len = if self.encoder.is_chunked_limited() || is_last {
+            // chunked_limited or last chunk: use all encoder outputs (keep_all_outputs=True)
             raw_enc_len.min(actual_tensor_frames)
         } else {
             // regular style: clip to valid_out_len
@@ -1428,7 +1509,7 @@ impl CacheAwareRNNTPipeline {
         } else {
             None
         };
-        let decode_output = self.streaming_decoder.decode_frames(
+        let mut decode_output = self.streaming_decoder.decode_frames(
             &encoded,
             enc_seq_len,
             &self.decoder,
@@ -1495,6 +1576,19 @@ impl CacheAwareRNNTPipeline {
         self.state
             .accumulated_tokens
             .extend(&decode_output.new_tokens);
+
+        // On the last chunk, run one additional decode pass with silence input.
+        // This gives the model "future context" showing that speech has ended,
+        // allowing it to emit deferred tokens like sentence-ending punctuation.
+        if is_last {
+            let flush_tokens = self.flush_decode_with_silence()?;
+            if !flush_tokens.is_empty() {
+                tracing::info!(flush_tokens = flush_tokens.len(), "flush decode emitted tokens");
+                self.state.accumulated_tokens.extend(&flush_tokens);
+                decode_output.new_tokens.extend(flush_tokens);
+            }
+        }
+
         self.state.is_first_chunk = false;
 
         // Generate text
