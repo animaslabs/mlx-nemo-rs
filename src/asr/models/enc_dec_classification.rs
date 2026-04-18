@@ -16,7 +16,6 @@
 use std::path::Path;
 
 use mlx_rs::ops;
-use mlx_rs::ops::indexing::IndexOp;
 use mlx_rs::Array;
 
 use crate::asr::config::ClassificationModelConfig;
@@ -44,7 +43,10 @@ pub struct EncDecClassificationModel {
 impl EncDecClassificationModel {
     /// Create a new model from configuration.
     pub fn new(config: ClassificationModelConfig) -> Result<Self> {
-        let preprocessor = MelSpectrogram::new(config.preprocessor.clone().into())?;
+        // Disable dithering for inference to ensure deterministic mel output
+        let mut mel_config: crate::asr::modules::MelConfig = config.preprocessor.clone().into();
+        mel_config.dither = 0.0;
+        let preprocessor = MelSpectrogram::new(mel_config)?;
         let encoder = JasperEncoder::new(&config.encoder)?;
 
         let feat_in = encoder.output_dim();
@@ -100,44 +102,51 @@ impl EncDecClassificationModel {
         &mut self,
         weights: &std::collections::HashMap<String, Array>,
     ) -> Result<()> {
+        // Load preprocessor filterbank from checkpoint if available.
+        // This ensures exact match with the model's training filterbank.
+        if let Some(fb) = weights.get("preprocessor.featurizer.fb") {
+            // Checkpoint fb shape: [1, n_mels, n_fft/2+1], need [n_mels, n_fft/2+1]
+            let fb = if fb.ndim() == 3 {
+                fb.squeeze_axes(&[0]).unwrap_or_else(|_| fb.clone())
+            } else {
+                fb.clone()
+            };
+            tracing::debug!("Loaded preprocessor filterbank: {:?}", fb.shape());
+            self.preprocessor.set_filterbank(fb);
+        }
+
         self.encoder.load_weights(weights);
 
-        // Try ConvASRDecoderClassification path first
-        // NeMo stores as: decoder.decoder_layers.0.weight / .bias
-        let weight_key = "decoder.decoder_layers.0.weight";
-        let bias_key = "decoder.decoder_layers.0.bias";
+        // Try decoder weight paths in order of likelihood
+        let decoder_key_pairs = [
+            // ConvASRDecoderClassification (NeMo EncDecClassificationModel)
+            ("decoder.decoder_layers.0.weight", "decoder.decoder_layers.0.bias"),
+            // MultiLayerPerceptron decoder
+            ("decoder._layer0.weight", "decoder._layer0.bias"),
+            // Simple linear decoder (Frame_VAD_Multilingual_MarbleNet)
+            ("decoder.layer0.weight", "decoder.layer0.bias"),
+        ];
 
-        if let Some(weight) = weights.get(weight_key) {
-            // NeMo may store as Conv1d [out, in, 1], squeeze if needed
-            let weight = if weight.ndim() == 3 {
-                weight.squeeze_axes(&[-1]).unwrap_or_else(|_| weight.clone())
-            } else {
-                weight.clone()
-            };
-            let bias = weights.get(bias_key).cloned();
-            self.decoder = LinearLayer::standard(weight, bias);
-            tracing::debug!("Loaded decoder from {}", weight_key);
-            return Ok(());
+        for (weight_key, bias_key) in &decoder_key_pairs {
+            if let Some(weight) = weights.get(*weight_key) {
+                // NeMo may store as Conv1d [out, in, 1], squeeze if needed
+                let weight = if weight.ndim() == 3 {
+                    weight.squeeze_axes(&[-1]).unwrap_or_else(|_| weight.clone())
+                } else {
+                    weight.clone()
+                };
+                let bias = weights.get(*bias_key).cloned();
+                weight.eval()?;
+                let sample: f32 = weight.as_slice::<f32>()[0];
+                self.decoder = LinearLayer::standard(weight, bias);
+                tracing::debug!("Loaded decoder from {} (weight sample: {:.6})", weight_key, sample);
+                return Ok(());
+            }
         }
 
-        // Try alternative path: decoder._layer0.weight / .bias
-        let alt_weight_key = "decoder._layer0.weight";
-        let alt_bias_key = "decoder._layer0.bias";
-
-        if let Some(weight) = weights.get(alt_weight_key) {
-            let weight = if weight.ndim() == 3 {
-                weight.squeeze_axes(&[-1]).unwrap_or_else(|_| weight.clone())
-            } else {
-                weight.clone()
-            };
-            let bias = weights.get(alt_bias_key).cloned();
-            self.decoder = LinearLayer::standard(weight, bias);
-            tracing::debug!("Loaded decoder from {}", alt_weight_key);
-            return Ok(());
-        }
-
-        tracing::warn!("Could not find decoder weights");
-        Ok(())
+        Err(Error::model(
+            "Could not find decoder weights in checkpoint (tried decoder.decoder_layers.0.*, decoder._layer0.*, decoder.layer0.*)"
+        ))
     }
 
     /// Run forward pass on preprocessed audio.
@@ -178,23 +187,28 @@ impl EncDecClassificationModel {
         let audio_batch = self.load_audio_batch(paths)?;
         let (logits, lengths) = self.forward(&audio_batch.0, Some(&audio_batch.1))?;
 
-        // Apply softmax to get probabilities
+        // Apply softmax to get probabilities: [B, T, num_classes]
         let probs = mlx_rs::ops::softmax_axis(&logits, -1, None)?;
         probs.eval()?;
         lengths.eval()?;
 
         // Extract class-1 (speech) probabilities for each batch item
         let batch_size = probs.dim(0) as usize;
+        let time_dim = probs.dim(1) as usize;
+        let num_classes = self.num_classes;
         let lengths_data: &[i32] = lengths.as_slice();
+        let probs_data: &[f32] = probs.as_slice();
 
         let mut results = Vec::with_capacity(batch_size);
         for b in 0..batch_size {
             let valid_len = lengths_data[b] as usize;
-            // Extract [b, :valid_len, 1] - speech probability
-            let batch_probs = probs.index((b as i32, ..valid_len as i32, 1));
-            batch_probs.eval()?;
-            let data: &[f32] = batch_probs.as_slice();
-            results.push(data.to_vec());
+            let batch_offset = b * time_dim * num_classes;
+            let mut batch_result = Vec::with_capacity(valid_len);
+            for f in 0..valid_len {
+                let idx = batch_offset + f * num_classes + 1; // class 1
+                batch_result.push(probs_data[idx]);
+            }
+            results.push(batch_result);
         }
 
         Ok(results)
@@ -210,17 +224,36 @@ impl EncDecClassificationModel {
     pub fn infer_samples(&mut self, samples: &[f32]) -> Result<Vec<f32>> {
         let audio = Array::from_slice(samples, &[1, samples.len() as i32]);
         let lengths = Array::from_slice(&[samples.len() as i32], &[1]);
+
+        // Calibrate BN: run forward passes in training mode to update running stats.
+        // This compensates for differences between our mel spectrogram and NeMo's.
+        // With momentum=0.1, need ~20 passes for convergence.
+        self.encoder.set_training(true);
+        for _ in 0..20 {
+            let _ = self.forward(&audio, Some(&lengths))?;
+        }
+        self.encoder.set_training(false);
+
         let (logits, out_lengths) = self.forward(&audio, Some(&lengths))?;
 
+        // Apply softmax: [1, T, 2] -> [1, T, 2]
         let probs = mlx_rs::ops::softmax_axis(&logits, -1, None)?;
         probs.eval()?;
         out_lengths.eval()?;
 
         let valid_len = out_lengths.as_slice::<i32>()[0] as usize;
-        let batch_probs = probs.index((0, ..valid_len as i32, 1));
-        batch_probs.eval()?;
-        let data: &[f32] = batch_probs.as_slice();
-        Ok(data.to_vec())
+
+        // Extract class-1 (speech) probabilities
+        // Read directly from flat array to avoid indexing issues
+        let probs_data: &[f32] = probs.as_slice();
+        let num_classes = self.num_classes;
+        let mut result = Vec::with_capacity(valid_len);
+        for f in 0..valid_len {
+            let idx = f * num_classes + 1; // class 1
+            result.push(probs_data[idx]);
+        }
+
+        Ok(result)
     }
 
     /// Get the frame duration in seconds, accounting for encoder stride.

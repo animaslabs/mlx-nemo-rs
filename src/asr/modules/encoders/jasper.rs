@@ -28,18 +28,25 @@ fn load_conv1d(layer: &mut nn::Conv1d, weights: &HashMap<String, Array>, prefix:
 
 /// Helper to load BatchNorm weights.
 fn load_batch_norm(layer: &mut nn::BatchNorm, weights: &HashMap<String, Array>, prefix: &str) {
+    let mut loaded = Vec::new();
     if let Some(weight) = weights.get(&format!("{}.weight", prefix)) {
         layer.weight.value = Some(weight.clone());
+        loaded.push("weight");
     }
     if let Some(bias) = weights.get(&format!("{}.bias", prefix)) {
         layer.bias.value = Some(bias.clone());
+        loaded.push("bias");
     }
     if let Some(running_mean) = weights.get(&format!("{}.running_mean", prefix)) {
         layer.running_mean.value = Some(running_mean.clone());
+        loaded.push("running_mean");
     }
     if let Some(running_var) = weights.get(&format!("{}.running_var", prefix)) {
         layer.running_var.value = Some(running_var.clone());
+        loaded.push("running_var");
     }
+    // Use inference mode so we use loaded running stats, not batch stats
+    layer.training = false;
 }
 
 /// A single sub-block within a JasperBlock.
@@ -321,6 +328,20 @@ impl JasperEncoder {
         Ok(Self { blocks, output_dim })
     }
 
+    /// Set training mode for all BatchNorm layers.
+    pub fn set_training(&mut self, training: bool) {
+        for block in &mut self.blocks {
+            for sub in &mut block.sub_blocks {
+                sub.bn.training = training;
+            }
+            if let Some(ref mut res_branches) = block.residual {
+                for branch in res_branches.iter_mut() {
+                    branch.bn.training = training;
+                }
+            }
+        }
+    }
+
     /// Get the output dimension (number of channels).
     pub fn output_dim(&self) -> usize {
         self.output_dim
@@ -343,10 +364,9 @@ impl JasperEncoder {
         let mut x = features.clone();
         let mut lens = lengths.clone();
 
-        for block in &mut self.blocks {
+        for (i, block) in self.blocks.iter_mut().enumerate() {
             x = block.forward(&x)?;
             if block.stride > 1 {
-                // Update lengths for stride: new_len = (len - 1) / stride + 1
                 let one = Array::from_int(1);
                 let stride_arr = Array::from_int(block.stride as i32);
                 let subtracted = &lens - &one;

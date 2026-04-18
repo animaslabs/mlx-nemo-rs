@@ -220,6 +220,16 @@ impl MelProcessor {
         &self.filterbank
     }
 
+    /// Set the mel filterbank matrix (e.g., from checkpoint weights).
+    pub fn set_filterbank(&mut self, fb: Array) {
+        self.filterbank = fb;
+    }
+
+    /// Set the window function (e.g., from checkpoint weights).
+    pub fn set_window(&mut self, window: Array) {
+        self.window = window;
+    }
+
     /// Calculate number of output frames for given audio length.
     ///
     /// With center padding: frames = audio_len / hop + 1

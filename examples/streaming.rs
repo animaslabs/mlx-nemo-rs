@@ -221,6 +221,26 @@ fn main() -> mlx_nemo::Result<()> {
             probs.len()
         );
 
+        // Diagnostic: show probability distribution
+        if !probs.is_empty() {
+            let min_p = probs.iter().cloned().fold(f32::INFINITY, f32::min);
+            let max_p = probs.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            let mean_p: f32 = probs.iter().sum::<f32>() / probs.len() as f32;
+            let below_offset = probs.iter().filter(|&&p| p < vad_offset).count();
+            let above_onset = probs.iter().filter(|&&p| p >= vad_onset).count();
+            println!(
+                "VAD probs: min={:.4}, max={:.4}, mean={:.4}, below_offset({})={}, above_onset({})={}",
+                min_p, max_p, mean_p, vad_offset, below_offset, vad_onset, above_onset
+            );
+            // Show first 20 probabilities
+            let n = probs.len().min(20);
+            print!("VAD first {} probs: ", n);
+            for p in &probs[..n] {
+                print!("{:.4} ", p);
+            }
+            println!();
+        }
+
         // Post-process to get speech segments
         let vad_config = VadPostProcessConfig {
             onset: vad_onset,
