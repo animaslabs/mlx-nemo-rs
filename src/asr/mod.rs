@@ -36,13 +36,15 @@ pub mod models;
 pub mod modules;
 pub mod pipeline;
 pub mod streaming;
+pub mod vad;
 
 // Re-exports
 pub use config::*;
 pub use models::{
-    CtcStreamingSession, DebugOutput, EncDecCTCModel, EncDecRNNTModel, RnntDecodingStrategy,
-    RnntStreamingSession,
+    CtcStreamingSession, DebugOutput, EncDecCTCModel, EncDecClassificationModel, EncDecRNNTModel,
+    RnntDecodingStrategy, RnntStreamingSession,
 };
+pub use vad::{SpeechSegment, VadPostProcessConfig, VadPostProcessor};
 // Primary exports (new names)
 pub use modules::{MelConfig, MelProcessor, StreamingMel};
 // Backwards-compatible alias

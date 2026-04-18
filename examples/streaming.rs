@@ -16,12 +16,19 @@
 //!   --no-punctuation     Strip punctuation from output
 //!   --blank-threshold <f>  Blank probability threshold (0.0 = disabled, try 0.5-2.0)
 //!   --list-modes         List available streaming modes and exit
+//!   --vad <path>         VAD model (.nemo) to suppress non-speech audio
+//!   --vad-onset <f>      VAD onset threshold (default: 0.5)
+//!   --vad-offset <f>     VAD offset threshold (default: 0.3)
+//!   --vad-pad <f>        VAD padding in seconds added before/after speech (default: 0.1)
 
 use std::io::{self, Write};
 use std::path::Path;
 use std::time::Instant;
 
-use mlx_nemo::asr::{CacheAwareRNNTPipeline, StreamingModeInfo};
+use mlx_nemo::asr::{
+    CacheAwareRNNTPipeline, EncDecClassificationModel, StreamingModeInfo, VadPostProcessConfig,
+    VadPostProcessor,
+};
 use tracing_subscriber::{fmt, EnvFilter};
 
 fn main() -> mlx_nemo::Result<()> {
@@ -42,6 +49,10 @@ fn main() -> mlx_nemo::Result<()> {
     let mut list_modes = false;
     let mut no_punctuation = false;
     let mut blank_threshold: f32 = 0.0;
+    let mut vad_model_path: Option<&str> = None;
+    let mut vad_onset: f32 = 0.5;
+    let mut vad_offset: f32 = 0.3;
+    let mut vad_pad: f32 = 0.1;
 
     let mut i = 1;
     while i < args.len() {
@@ -61,6 +72,22 @@ fn main() -> mlx_nemo::Result<()> {
             "--blank-threshold" => {
                 i += 1;
                 blank_threshold = args[i].parse().unwrap_or(0.0);
+            }
+            "--vad" => {
+                i += 1;
+                vad_model_path = Some(&args[i]);
+            }
+            "--vad-onset" => {
+                i += 1;
+                vad_onset = args[i].parse().unwrap_or(vad_onset);
+            }
+            "--vad-offset" => {
+                i += 1;
+                vad_offset = args[i].parse().unwrap_or(vad_offset);
+            }
+            "--vad-pad" => {
+                i += 1;
+                vad_pad = args[i].parse().unwrap_or(vad_pad);
             }
             "--list-modes" => {
                 list_modes = true;
@@ -90,6 +117,10 @@ fn main() -> mlx_nemo::Result<()> {
         eprintln!("  --blank-threshold <f>  Blank probability threshold (default: 0.0 = disabled)");
         eprintln!("                         Try 0.5-2.0 to reduce missed sentences");
         eprintln!("  --list-modes         List available streaming modes and exit");
+        eprintln!("  --vad <path>         VAD model (.nemo) to suppress non-speech audio");
+        eprintln!("  --vad-onset <f>      VAD onset threshold (default: 0.5)");
+        eprintln!("  --vad-offset <f>     VAD offset threshold (default: 0.3)");
+        eprintln!("  --vad-pad <f>        VAD padding in seconds (default: 0.1)");
         std::process::exit(1);
     });
 
@@ -164,6 +195,64 @@ fn main() -> mlx_nemo::Result<()> {
             file_sample_rate, sample_rate
         );
         resample_audio(&samples, file_sample_rate, sample_rate)?
+    } else {
+        samples
+    };
+
+    // Apply VAD if requested: zero out non-speech regions
+    let samples = if let Some(vad_path) = vad_model_path {
+        println!("\nLoading VAD model from: {}", vad_path);
+        let vad_start = Instant::now();
+        let mut vad_model = EncDecClassificationModel::restore(vad_path)?;
+        println!("VAD model loaded in {:.2}s", vad_start.elapsed().as_secs_f32());
+        println!(
+            "VAD frame duration: {:.1}ms, onset: {}, offset: {}",
+            vad_model.frame_duration() * 1000.0,
+            vad_onset,
+            vad_offset
+        );
+
+        // Run VAD inference on the full audio
+        let vad_start = Instant::now();
+        let probs = vad_model.infer_samples(&samples)?;
+        println!(
+            "VAD inference done in {:.2}s ({} frames)",
+            vad_start.elapsed().as_secs_f32(),
+            probs.len()
+        );
+
+        // Post-process to get speech segments
+        let vad_config = VadPostProcessConfig {
+            onset: vad_onset,
+            offset: vad_offset,
+            pad_onset: vad_pad,
+            pad_offset: vad_pad,
+            min_duration_on: 0.1,
+            min_duration_off: 0.1,
+        };
+        let processor = VadPostProcessor::new(vad_config);
+        let frame_duration = vad_model.frame_duration();
+        let segments = processor.process(&probs, frame_duration, audio_duration);
+
+        println!("VAD detected {} speech segment(s):", segments.len());
+        for (i, seg) in segments.iter().enumerate() {
+            println!(
+                "  [{:3}] {:.3}s - {:.3}s  ({:.3}s)",
+                i, seg.start, seg.end, seg.duration()
+            );
+        }
+
+        // Zero out non-speech regions
+        let mut filtered = vec![0.0f32; samples.len()];
+        for seg in &segments {
+            let start_sample = (seg.start * sample_rate as f32) as usize;
+            let end_sample = ((seg.end * sample_rate as f32) as usize).min(samples.len());
+            if start_sample < samples.len() {
+                filtered[start_sample..end_sample]
+                    .copy_from_slice(&samples[start_sample..end_sample]);
+            }
+        }
+        filtered
     } else {
         samples
     };

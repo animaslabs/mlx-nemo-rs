@@ -743,3 +743,141 @@ impl Default for DecodingConfig {
         }
     }
 }
+
+// ==================== Jasper / Classification Config ====================
+
+/// Top-level configuration for classification models (e.g., VAD with MarbleNet).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClassificationModelConfig {
+    /// Target class
+    #[serde(rename = "_target_", default)]
+    pub target: Option<String>,
+
+    /// Sample rate in Hz
+    #[serde(default = "default_sample_rate")]
+    pub sample_rate: u32,
+
+    /// Preprocessor configuration
+    pub preprocessor: PreprocessorConfig,
+
+    /// Encoder configuration (Jasper blocks)
+    pub encoder: JasperEncoderConfig,
+
+    /// Decoder configuration
+    pub decoder: ClassificationDecoderConfig,
+
+    /// Class labels (e.g., ["0", "1"] for VAD)
+    #[serde(default)]
+    pub labels: Vec<String>,
+
+    /// Additional fields we don't need to parse
+    #[serde(flatten)]
+    pub extra: std::collections::HashMap<String, serde_yaml::Value>,
+}
+
+/// Jasper/ConvASR encoder configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JasperEncoderConfig {
+    /// Target class
+    #[serde(rename = "_target_", default)]
+    pub target: Option<String>,
+
+    /// Input feature dimension (must match preprocessor output)
+    #[serde(default = "default_features")]
+    pub feat_in: usize,
+
+    /// Activation function (e.g., "relu")
+    #[serde(default = "default_jasper_activation")]
+    pub activation: String,
+
+    /// Jasper block configurations
+    pub jasper: Vec<JasperBlockConfig>,
+
+    /// Additional fields
+    #[serde(flatten)]
+    pub extra: std::collections::HashMap<String, serde_yaml::Value>,
+}
+
+fn default_jasper_activation() -> String {
+    "relu".to_string()
+}
+
+/// Configuration for a single Jasper block.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JasperBlockConfig {
+    /// Output channels (filters)
+    pub filters: usize,
+
+    /// Number of sub-block repetitions
+    #[serde(default = "default_repeat")]
+    pub repeat: usize,
+
+    /// Kernel sizes
+    pub kernel: Vec<usize>,
+
+    /// Strides
+    pub stride: Vec<usize>,
+
+    /// Dilations
+    pub dilation: Vec<usize>,
+
+    /// Dropout rate
+    #[serde(default)]
+    pub dropout: f32,
+
+    /// Whether to use residual connections
+    #[serde(default)]
+    pub residual: bool,
+
+    /// Whether to use depthwise separable convolutions
+    #[serde(default)]
+    pub separable: bool,
+
+    /// Number of residual connection groups
+    #[serde(default = "default_residual_dense")]
+    pub residual_dense: bool,
+
+    /// Additional fields
+    #[serde(flatten)]
+    pub extra: std::collections::HashMap<String, serde_yaml::Value>,
+}
+
+fn default_repeat() -> usize {
+    1
+}
+
+fn default_residual_dense() -> bool {
+    false
+}
+
+/// Decoder configuration for classification models.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClassificationDecoderConfig {
+    /// Target class
+    #[serde(rename = "_target_", default)]
+    pub target: Option<String>,
+
+    /// Input feature dimension (from encoder)
+    #[serde(default)]
+    pub feat_in: usize,
+
+    /// Number of output classes
+    #[serde(default = "default_num_classes_2")]
+    pub num_classes: usize,
+
+    /// Whether to apply log softmax
+    #[serde(default)]
+    pub log_softmax: Option<bool>,
+
+    /// Whether this returns logits per frame or per sequence
+    #[serde(default = "default_true")]
+    pub return_logits: bool,
+
+    /// Additional fields
+    #[serde(flatten)]
+    pub extra: std::collections::HashMap<String, serde_yaml::Value>,
+}
+
+fn default_num_classes_2() -> usize {
+    2
+}
