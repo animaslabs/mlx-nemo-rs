@@ -1689,6 +1689,14 @@ impl CacheAwareRNNTPipeline {
         &self.streaming_mel
     }
 
+    /// Set a spectrum transform hook to modify the power spectrum before mel filterbank.
+    pub fn set_spectrum_transform(
+        &mut self,
+        transform: std::sync::Arc<dyn crate::asr::SpectrumTransform>,
+    ) {
+        self.streaming_mel.set_spectrum_transform(transform);
+    }
+
     /// Process any pending audio in the live buffer through the streaming MEL
     /// processor, even if there isn't a full chunk yet.
     ///

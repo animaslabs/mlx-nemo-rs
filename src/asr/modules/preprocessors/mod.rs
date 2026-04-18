@@ -6,7 +6,7 @@
 mod mel_spectrogram;
 
 // Primary exports (new names)
-pub use mel_spectrogram::{MelConfig, MelProcessor, StreamingMel};
+pub use mel_spectrogram::{MelConfig, MelProcessor, SpectrumTransform, StreamingMel};
 
 // Stateless streaming exports (legacy API - use StreamingMel for new code)
 pub use mel_spectrogram::{

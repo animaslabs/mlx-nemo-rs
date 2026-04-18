@@ -34,12 +34,27 @@
 //! }
 //! ```
 
+use std::sync::Arc;
+
 use mlx_rs::ops::indexing::IndexOp;
 use mlx_rs::{fft, ops, Array};
 
 use crate::asr::config::PreprocessorConfig;
 use crate::asr::dsp;
 use crate::core::error::{Error, Result};
+
+/// Hook for modifying the power spectrum between STFT and mel filterbank.
+///
+/// Used for noise reduction, gain control, or other spectral processing.
+/// Implementors should use interior mutability (e.g. `Mutex`) since
+/// `transform` takes `&self` to match `MelProcessor::process_frames`.
+pub trait SpectrumTransform: Send + Sync {
+    /// Transform a power spectrum. Called once per `process_frames()` invocation.
+    ///
+    /// `power` has shape `[n_frames, n_fft/2+1]` (magnitude squared).
+    /// Returns a modified power spectrum with the same shape.
+    fn transform(&self, power: Array) -> Result<Array>;
+}
 
 /// Configuration for mel spectrogram computation.
 ///
@@ -146,6 +161,8 @@ pub struct MelProcessor {
     win_samples: usize,
     /// Derived: hop samples.
     hop_samples: usize,
+    /// Optional hook to transform the power spectrum before the mel filterbank.
+    spectrum_transform: Option<Arc<dyn SpectrumTransform>>,
 }
 
 impl MelProcessor {
@@ -177,7 +194,13 @@ impl MelProcessor {
             log_guard,
             win_samples,
             hop_samples,
+            spectrum_transform: None,
         })
+    }
+
+    /// Set a spectrum transform hook to modify the power spectrum before mel filterbank.
+    pub fn set_spectrum_transform(&mut self, transform: Arc<dyn SpectrumTransform>) {
+        self.spectrum_transform = Some(transform);
     }
 
     /// Get the configuration.
@@ -677,6 +700,13 @@ impl MelProcessor {
         // Compute power spectrum
         let power = self.power_spectrum(&fft_result)?;
 
+        // Apply spectrum transform hook (noise reduction, AGC, etc.)
+        let power = if let Some(ref transform) = self.spectrum_transform {
+            transform.transform(power)?
+        } else {
+            power
+        };
+
         // Apply mel filterbank: power [frames, freqs] -> mel [frames, n_mels]
         // Transpose power to [freqs, frames] for matmul
         let power_t = ops::transpose(&power)?;
@@ -861,6 +891,11 @@ impl StreamingMel {
             win_samples,
             hop_samples,
         })
+    }
+
+    /// Set a spectrum transform hook to modify the power spectrum before mel filterbank.
+    pub fn set_spectrum_transform(&mut self, transform: Arc<dyn SpectrumTransform>) {
+        self.processor.set_spectrum_transform(transform);
     }
 
     /// Add audio chunk and compute mel frames.

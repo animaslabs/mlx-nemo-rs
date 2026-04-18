@@ -33,6 +33,7 @@ pub mod utils;
 pub use core::error::{Error, Result};
 pub use core::weights::WeightFormat;
 pub use core::checkpoint::SafetensorsLoader;
+pub use mlx_rs::Array;
 
 /// Prelude module for convenient imports
 pub mod prelude {

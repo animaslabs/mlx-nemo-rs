@@ -14,7 +14,7 @@ pub use decoders::{LstmState, RNNTDecoder, RNNTJoint, StatelessTransducerDecoder
 pub use encoders::ConformerEncoder;
 
 // Primary exports (new names)
-pub use preprocessors::{MelConfig, MelProcessor, StreamingMel};
+pub use preprocessors::{MelConfig, MelProcessor, SpectrumTransform, StreamingMel};
 
 // Stateless streaming exports
 pub use preprocessors::{

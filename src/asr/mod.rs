@@ -46,7 +46,7 @@ pub use models::{
 };
 pub use vad::{SpeechSegment, VadPostProcessConfig, VadPostProcessor};
 // Primary exports (new names)
-pub use modules::{MelConfig, MelProcessor, StreamingMel};
+pub use modules::{MelConfig, MelProcessor, SpectrumTransform, StreamingMel};
 // Backwards-compatible alias
 pub use modules::MelSpectrogram;
 pub use pipeline::{CacheAwareRNNTPipeline, TranscribeOutput};
