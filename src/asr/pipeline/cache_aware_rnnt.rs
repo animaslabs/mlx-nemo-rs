@@ -1396,6 +1396,16 @@ impl CacheAwareRNNTPipeline {
         //     );
         // }
 
+        // Save the encoder cache before processing the last chunk.
+        // flush_decode_with_silence needs the speech-context cache (not the
+        // cache updated with silence) to give the decoder the best chance
+        // of emitting deferred tokens like sentence-ending punctuation.
+        let pre_silence_cache = if is_last {
+            Some(self.encoder_cache.clone())
+        } else {
+            None
+        };
+
         // Run encoder with cache
         let (encoded, encoded_lengths, cache_channel_next, cache_time_next, cache_len_next) =
             self.encoder.forward_streaming(
@@ -1580,8 +1590,19 @@ impl CacheAwareRNNTPipeline {
         // On the last chunk, run one additional decode pass with silence input.
         // This gives the model "future context" showing that speech has ended,
         // allowing it to emit deferred tokens like sentence-ending punctuation.
+        //
+        // Use the speech-context encoder cache (saved before the encoder forward
+        // pass) so the flush decode sees the cache from real speech, not the
+        // cache already updated with the last chunk's output. This gives the
+        // decoder better context for emitting deferred punctuation.
         if is_last {
+            let post_chunk_cache = self.encoder_cache.clone();
+            if let Some(speech_cache) = pre_silence_cache {
+                self.encoder_cache = speech_cache;
+            }
             let flush_tokens = self.flush_decode_with_silence()?;
+            // Restore post-chunk cache
+            self.encoder_cache = post_chunk_cache;
             if !flush_tokens.is_empty() {
                 tracing::info!(flush_tokens = flush_tokens.len(), "flush decode emitted tokens");
                 self.state.accumulated_tokens.extend(&flush_tokens);
