@@ -316,18 +316,14 @@ impl MelProcessor {
 
     /// Compute STFT for batch of audio with center padding.
     fn stft_batch(&self, audio: &Array) -> Result<Array> {
-        let batch_size = audio.shape()[0];
-        let audio_len = audio.shape()[1] as usize;
         let n_fft = self.config.n_fft;
         let hop = self.hop_samples;
 
         // Apply signal-level center padding (zeros, matching NeMo's torch.stft center=True)
         // This is different from FFT frame centering - it pads the entire signal so that
         // the first and last frames are centered on the signal boundaries.
-        let pad_size = n_fft / 2;
-        let left_pad = Array::zeros::<f32>(&[batch_size, pad_size as i32])?;
-        let right_pad = Array::zeros::<f32>(&[batch_size, pad_size as i32])?;
-        let padded = ops::concatenate_axis(&[&left_pad, audio, &right_pad], 1)?;
+        let pad_size = (n_fft / 2) as i32;
+        let padded = ops::pad(audio, &[(0, 0), (pad_size, pad_size)], None, None)?;
 
         // Frame the audio using dsp module
         // frame_audio_batch always center-pads each FFT frame (audio centered within n_fft)

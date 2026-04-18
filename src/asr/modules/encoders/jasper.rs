@@ -11,6 +11,7 @@ use std::collections::HashMap;
 use mlx_rs::builder::Builder;
 use mlx_rs::module::Module;
 use mlx_rs::nn;
+use mlx_rs::ops::indexing::{IndexOp, IntoStrideBy};
 use mlx_rs::Array;
 
 use crate::asr::config::{JasperBlockConfig, JasperEncoderConfig};
@@ -233,13 +234,7 @@ impl JasperBlock {
             if self.stride > 1 {
                 // Subsample residual to match output time dimension
                 // Take every `stride`-th frame: res[:, ::stride, :]
-                let t = res.dim(1) as usize;
-                let indices: Vec<i32> = (0..t)
-                    .step_by(self.stride)
-                    .map(|i| i as i32)
-                    .collect();
-                let idx = Array::from_slice(&indices, &[indices.len() as i32]);
-                res = mlx_rs::ops::indexing::take_axis(&res, &idx, 1)?;
+                res = res.index((.., (..).stride_by(self.stride as i32), ..));
             }
             out = mlx_rs::ops::add(&out, &res)?;
         }
