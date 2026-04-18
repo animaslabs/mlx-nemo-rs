@@ -16,7 +16,7 @@
 use std::path::Path;
 
 use mlx_rs::ops;
-use mlx_rs::ops::indexing::IndexOp;
+
 use mlx_rs::Array;
 
 use crate::asr::config::ClassificationModelConfig;
@@ -187,21 +187,25 @@ impl EncDecClassificationModel {
         let (logits, lengths) = self.forward(&audio_batch.0, Some(&audio_batch.1))?;
 
         let probs = mlx_rs::ops::softmax_axis(&logits, -1, None)?;
-        // Extract class-1 on GPU: [B, T, num_classes] -> [B, T]
-        let speech_probs = probs.index((.., .., 1i32));
+        probs.eval()?;
+        lengths.eval()?;
 
-        mlx_rs::transforms::eval([&speech_probs, &lengths])?;
-
-        let batch_size = speech_probs.dim(0) as usize;
-        let time_dim = speech_probs.dim(1) as usize;
+        let batch_size = probs.dim(0) as usize;
+        let time_dim = probs.dim(1) as usize;
+        let num_classes = self.num_classes;
         let lengths_data: &[i32] = lengths.as_slice();
-        let speech_data: &[f32] = speech_probs.as_slice();
+        let probs_data: &[f32] = probs.as_slice();
 
         let mut results = Vec::with_capacity(batch_size);
         for b in 0..batch_size {
             let valid_len = lengths_data[b] as usize;
-            let offset = b * time_dim;
-            results.push(speech_data[offset..offset + valid_len].to_vec());
+            let batch_offset = b * time_dim * num_classes;
+            let mut frame_probs = Vec::with_capacity(valid_len);
+            for f in 0..valid_len {
+                let idx = batch_offset + f * num_classes + 1;
+                frame_probs.push(probs_data[idx]);
+            }
+            results.push(frame_probs);
         }
 
         Ok(results)
@@ -220,16 +224,19 @@ impl EncDecClassificationModel {
 
         let (logits, out_lengths) = self.forward(&audio, Some(&lengths))?;
 
-        // Softmax + extract class-1 on GPU: [1, T, 2] -> [T]
         let probs = mlx_rs::ops::softmax_axis(&logits, -1, None)?;
-        let speech_probs = probs.index((.., .., 1i32)).squeeze_axes(&[0])?;
-
-        // Single batched eval instead of two separate evals
-        mlx_rs::transforms::eval([&speech_probs, &out_lengths])?;
+        probs.eval()?;
+        out_lengths.eval()?;
 
         let valid_len = out_lengths.as_slice::<i32>()[0] as usize;
-        let speech_data: &[f32] = speech_probs.as_slice();
-        Ok(speech_data[..valid_len].to_vec())
+        let probs_data: &[f32] = probs.as_slice();
+        let num_classes = self.num_classes;
+        let mut result = Vec::with_capacity(valid_len);
+        for f in 0..valid_len {
+            let idx = f * num_classes + 1;
+            result.push(probs_data[idx]);
+        }
+        Ok(result)
     }
 
     /// Get the frame duration in seconds, accounting for encoder stride.
