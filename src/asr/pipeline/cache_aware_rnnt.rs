@@ -1568,6 +1568,28 @@ impl CacheAwareRNNTPipeline {
     pub fn joint(&self) -> &crate::asr::modules::RNNTJoint {
         &self.joint
     }
+
+    /// Get a reference to the streaming MEL processor.
+    pub fn streaming_mel(&self) -> &StreamingMel {
+        &self.streaming_mel
+    }
+
+    /// Process any pending audio in the live buffer through the streaming MEL
+    /// processor, even if there isn't a full chunk yet.
+    ///
+    /// Normally `transcribe_step()` only feeds audio to the MEL processor in
+    /// full `audio_chunk_size` batches. This method flushes whatever is
+    /// buffered so that `streaming_mel().latest_frame_bins()` reflects the
+    /// most recent audio — useful for real-time visualization without
+    /// duplicating the MEL processor.
+    pub fn flush_audio_to_mel(&mut self) -> Result<()> {
+        if self.live_buffer.is_empty() {
+            return Ok(());
+        }
+        let audio = std::mem::take(&mut self.live_buffer);
+        self.process_audio_chunk(&audio)?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]

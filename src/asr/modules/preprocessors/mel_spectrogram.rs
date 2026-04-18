@@ -1152,6 +1152,18 @@ impl StreamingMel {
     pub fn lookback_size(&self) -> usize {
         self.audio_lookback.len()
     }
+
+    /// Get the mel bins of the most recent frame without allocation or GPU work.
+    ///
+    /// Returns a slice of `n_mels` floats (low frequency at index 0), or `None`
+    /// if no frames have been produced yet.
+    pub fn latest_frame_bins(&self) -> Option<&[f32]> {
+        if self.total_frames == 0 {
+            return None;
+        }
+        let start = (self.total_frames - 1) * self.n_mels;
+        Some(&self.mel_frames[start..start + self.n_mels])
+    }
 }
 
 #[cfg(test)]
