@@ -68,6 +68,49 @@ fn load_conv1d(layer: &mut nn::Conv1d, weights: &HashMap<String, Array>, prefix:
     }
 }
 
+/// Load a pointwise conv weight as a LinearLayer.
+///
+/// Tries `load_linear_layer()` first (handles quantized models where the weight
+/// was squeezed to 2D during conversion). Falls back to loading the 3D conv weight
+/// and squeezing the K=1 dimension for backward compatibility with non-quantized models.
+fn load_pointwise_conv_as_linear(
+    weights: &HashMap<String, Array>,
+    prefix: &str,
+    quant: Option<&QuantizationConfig>,
+) -> Option<LinearLayer> {
+    // Try loading as a linear layer first (quantized or already-2D weights)
+    if let Some(layer) = load_linear_layer(weights, prefix, quant) {
+        return Some(layer);
+    }
+
+    // Fallback: load 3D conv weight [O, K, I] (MLX format) and squeeze K=1 to get [O, I]
+    let weight_key = format!("{}.weight", prefix);
+    if let Some(weight) = weights.get(&weight_key) {
+        let shape = weight.shape();
+        let squeezed = if shape.len() == 3 && shape[1] == 1 {
+            // MLX format: [O, K=1, I] -> squeeze axis 1 -> [O, I]
+            weight.squeeze_axes(&[1]).ok()?
+        } else if shape.len() == 2 {
+            weight.clone()
+        } else {
+            tracing::warn!(
+                prefix,
+                shape = ?shape,
+                "unexpected pointwise conv weight shape"
+            );
+            return None;
+        };
+
+        let bias_key = format!("{}.bias", prefix);
+        let bias = weights.get(&bias_key).cloned();
+
+        Some(LinearLayer::standard(squeezed, bias))
+    } else {
+        tracing::warn!(prefix, "pointwise conv weights not found");
+        None
+    }
+}
+
 /// Helper to load BatchNorm weights
 fn load_batch_norm(layer: &mut nn::BatchNorm, weights: &HashMap<String, Array>, prefix: &str) {
     if let Some(weight) = weights.get(&format!("{}.weight", prefix)) {
@@ -2022,9 +2065,9 @@ impl ConformerBlock {
             &format!("{}.norm_self_att", prefix),
         );
 
-        // Load convolution module (convolutions are not quantized)
+        // Load convolution module (pointwise convs may be quantized)
         self.conv
-            .load_weights(weights, &format!("{}.conv", prefix))?;
+            .load_weights(weights, &format!("{}.conv", prefix), quant)?;
         load_layer_norm(
             &mut self.conv_norm,
             weights,
@@ -2121,9 +2164,9 @@ impl ConvNorm {
 /// Convolution module for Conformer.
 struct ConvolutionModule {
     d_model: usize,
-    pointwise_conv1: nn::Conv1d,
+    pointwise_conv1: LinearLayer,
     depthwise_conv: nn::Conv1d,
-    pointwise_conv2: nn::Conv1d,
+    pointwise_conv2: LinearLayer,
     norm: ConvNorm,
     /// Whether this is a causal convolution (for streaming)
     is_causal: bool,
@@ -2156,11 +2199,16 @@ impl ConvolutionModule {
             _ => ConvNorm::BatchNorm(nn::BatchNorm::new(d_model as i32)?),
         };
 
+        // Create zero-initialized pointwise linear layers (will be loaded from weights)
+        let pw1_weight = mlx_rs::ops::zeros::<f32>(&[(2 * d_model) as i32, d_model as i32])?;
+        let pw1_bias = Some(mlx_rs::ops::zeros::<f32>(&[(2 * d_model) as i32])?);
+        let pw2_weight = mlx_rs::ops::zeros::<f32>(&[d_model as i32, d_model as i32])?;
+        let pw2_bias = Some(mlx_rs::ops::zeros::<f32>(&[d_model as i32])?);
+
         Ok(Self {
             d_model,
-            // Pointwise expansion (d_model -> 2*d_model)
-            pointwise_conv1: nn::Conv1dBuilder::new(d_model as i32, (2 * d_model) as i32, 1)
-                .build()?,
+            // Pointwise expansion (d_model -> 2*d_model) as linear layer
+            pointwise_conv1: LinearLayer::standard(pw1_weight, pw1_bias),
             // Depthwise convolution
             depthwise_conv: nn::Conv1dBuilder::new(
                 d_model as i32,
@@ -2170,8 +2218,8 @@ impl ConvolutionModule {
             .padding(padding as i32)
             .groups(d_model as i32)
             .build()?,
-            // Pointwise compression (d_model -> d_model)
-            pointwise_conv2: nn::Conv1dBuilder::new(d_model as i32, d_model as i32, 1).build()?,
+            // Pointwise compression (d_model -> d_model) as linear layer
+            pointwise_conv2: LinearLayer::standard(pw2_weight, pw2_bias),
             norm,
             is_causal,
             kernel_size,
@@ -2381,22 +2429,36 @@ impl ConvolutionModule {
         self.kernel_size - 1
     }
 
-    fn load_weights(&mut self, weights: &HashMap<String, Array>, prefix: &str) -> Result<()> {
-        load_conv1d(
-            &mut self.pointwise_conv1,
+    fn load_weights(
+        &mut self,
+        weights: &HashMap<String, Array>,
+        prefix: &str,
+        quant: Option<&QuantizationConfig>,
+    ) -> Result<()> {
+        // Load pointwise conv1 as LinearLayer (may be quantized)
+        if let Some(layer) = load_pointwise_conv_as_linear(
             weights,
             &format!("{}.pointwise_conv1", prefix),
-        );
+            quant,
+        ) {
+            self.pointwise_conv1 = layer;
+        }
+
+        // Depthwise conv stays as nn::Conv1d (not quantizable)
         load_conv1d(
             &mut self.depthwise_conv,
             weights,
             &format!("{}.depthwise_conv", prefix),
         );
-        load_conv1d(
-            &mut self.pointwise_conv2,
+
+        // Load pointwise conv2 as LinearLayer (may be quantized)
+        if let Some(layer) = load_pointwise_conv_as_linear(
             weights,
             &format!("{}.pointwise_conv2", prefix),
-        );
+            quant,
+        ) {
+            self.pointwise_conv2 = layer;
+        }
 
         // Load normalization weights based on type
         match &mut self.norm {
