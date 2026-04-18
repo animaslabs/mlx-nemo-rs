@@ -92,7 +92,10 @@ impl SubBlock {
                 .bias(false)
                 .build()?;
 
-            let bn = nn::BatchNorm::new(out_channels as i32)?;
+            // NeMo uses eps=1e-3 for Jasper BatchNorm
+            let bn = nn::BatchNormBuilder::new(out_channels as i32)
+                .eps(1e-3)
+                .build()?;
 
             Ok(Self {
                 dw_conv: Some(dw_conv),
@@ -112,7 +115,10 @@ impl SubBlock {
             .bias(false)
             .build()?;
 
-            let bn = nn::BatchNorm::new(out_channels as i32)?;
+            // NeMo uses eps=1e-3 for Jasper BatchNorm
+            let bn = nn::BatchNormBuilder::new(out_channels as i32)
+                .eps(1e-3)
+                .build()?;
 
             Ok(Self {
                 dw_conv: None,
@@ -145,7 +151,10 @@ impl ResidualBranch {
             nn::Conv1dBuilder::new(in_channels as i32, out_channels as i32, 1)
                 .bias(false)
                 .build()?;
-        let bn = nn::BatchNorm::new(out_channels as i32)?;
+        // NeMo uses eps=1e-3 for Jasper BatchNorm
+        let bn = nn::BatchNormBuilder::new(out_channels as i32)
+            .eps(1e-3)
+            .build()?;
         Ok(Self { conv, bn })
     }
 
@@ -364,7 +373,7 @@ impl JasperEncoder {
         let mut x = features.clone();
         let mut lens = lengths.clone();
 
-        for (i, block) in self.blocks.iter_mut().enumerate() {
+        for block in self.blocks.iter_mut() {
             x = block.forward(&x)?;
             if block.stride > 1 {
                 let one = Array::from_int(1);

@@ -225,15 +225,6 @@ impl EncDecClassificationModel {
         let audio = Array::from_slice(samples, &[1, samples.len() as i32]);
         let lengths = Array::from_slice(&[samples.len() as i32], &[1]);
 
-        // Calibrate BN: run forward passes in training mode to update running stats.
-        // This compensates for differences between our mel spectrogram and NeMo's.
-        // With momentum=0.1, need ~20 passes for convergence.
-        self.encoder.set_training(true);
-        for _ in 0..20 {
-            let _ = self.forward(&audio, Some(&lengths))?;
-        }
-        self.encoder.set_training(false);
-
         let (logits, out_lengths) = self.forward(&audio, Some(&lengths))?;
 
         // Apply softmax: [1, T, 2] -> [1, T, 2]
