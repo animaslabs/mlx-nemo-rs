@@ -309,6 +309,13 @@ pub fn load_linear_layer(
         // Standard float layer
         let bias = weights.get(&bias_key).cloned();
 
+        // Handle 3D pointwise conv weights [O, 1, I] by squeezing to [O, I]
+        let weight = if weight.ndim() == 3 && weight.dim(1) == 1 {
+            weight.squeeze_axes(&[1]).ok()?
+        } else {
+            weight.clone()
+        };
+
         tracing::trace!(
             prefix,
             weight_shape = ?weight.shape(),
@@ -316,7 +323,7 @@ pub fn load_linear_layer(
             "loading standard linear layer"
         );
 
-        Some(LinearLayer::standard(weight.clone(), bias))
+        Some(LinearLayer::standard(weight, bias))
     } else {
         tracing::warn!(prefix, "linear layer weights not found");
         None
