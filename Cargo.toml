@@ -25,7 +25,7 @@ asr = ["dep:hound", "dep:rubato"]
 
 [dependencies]
 # MLX bindings
-mlx-rs = { version = "0.25", features = ["safetensors"] }
+mlx-rs = { version = "0.25", features = ["safetensors", "metal", "accelerate"] }
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
