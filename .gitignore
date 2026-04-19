@@ -1,6 +1,8 @@
 /target
 /models
-/samples
+!/samples/
+/samples/*
+!/samples/2086-149220-0033.wav
 /logs
 /docs/papers/
 .DS_Store
