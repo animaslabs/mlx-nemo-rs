@@ -881,3 +881,182 @@ pub struct ClassificationDecoderConfig {
 fn default_num_classes_2() -> usize {
     2
 }
+
+// ==================== SortFormer / Diarization Config ====================
+
+/// Configuration for the SortFormer transformer encoder.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TransformerEncoderConfig {
+    /// Number of transformer layers
+    #[serde(default = "default_tf_num_layers")]
+    pub num_layers: usize,
+
+    /// Hidden size (d_model for transformer)
+    #[serde(default = "default_tf_hidden_size")]
+    pub hidden_size: usize,
+
+    /// Inner (feed-forward) size
+    #[serde(default = "default_tf_inner_size")]
+    pub inner_size: usize,
+
+    /// Number of attention heads
+    #[serde(default = "default_tf_num_heads")]
+    pub num_attention_heads: usize,
+
+    /// Activation function for FFN ("relu", "gelu", etc.)
+    #[serde(default = "default_tf_hidden_act")]
+    pub hidden_act: String,
+
+    /// Whether to use pre-layer-norm (True) or post-layer-norm (False)
+    #[serde(default)]
+    pub pre_ln: bool,
+
+    /// Whether to add a final layer norm (only used when pre_ln=False)
+    #[serde(default)]
+    pub pre_ln_final_layer_norm: bool,
+
+    /// Dropout rate for attention (ignored at inference)
+    #[serde(default)]
+    pub attn_score_dropout: Option<f32>,
+
+    /// Dropout rate for FFN (ignored at inference)
+    #[serde(default)]
+    pub ffn_dropout: Option<f32>,
+
+    /// Additional fields
+    #[serde(flatten)]
+    pub extra: std::collections::HashMap<String, serde_yaml::Value>,
+}
+
+fn default_tf_num_layers() -> usize {
+    18
+}
+fn default_tf_hidden_size() -> usize {
+    192
+}
+fn default_tf_inner_size() -> usize {
+    768
+}
+fn default_tf_num_heads() -> usize {
+    8
+}
+fn default_tf_hidden_act() -> String {
+    "relu".to_string()
+}
+
+impl Default for TransformerEncoderConfig {
+    fn default() -> Self {
+        Self {
+            num_layers: 18,
+            hidden_size: 192,
+            inner_size: 768,
+            num_attention_heads: 8,
+            hidden_act: "relu".to_string(),
+            pre_ln: false,
+            pre_ln_final_layer_norm: true,
+            attn_score_dropout: None,
+            ffn_dropout: None,
+            extra: std::collections::HashMap::new(),
+        }
+    }
+}
+
+/// Configuration for the SortFormer speaker head modules.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SortformerModulesConfig {
+    /// Number of speakers
+    #[serde(default = "default_num_spks")]
+    pub num_spks: usize,
+
+    /// FastConformer output dimension
+    #[serde(default = "default_fc_d_model")]
+    pub fc_d_model: usize,
+
+    /// Transformer hidden dimension
+    #[serde(default = "default_tf_d_model")]
+    pub tf_d_model: usize,
+
+    /// Dropout rate (ignored at inference)
+    #[serde(default)]
+    pub dropout_rate: Option<f32>,
+
+    /// Additional fields
+    #[serde(flatten)]
+    pub extra: std::collections::HashMap<String, serde_yaml::Value>,
+}
+
+fn default_num_spks() -> usize {
+    4
+}
+fn default_fc_d_model() -> usize {
+    512
+}
+fn default_tf_d_model() -> usize {
+    192
+}
+
+impl Default for SortformerModulesConfig {
+    fn default() -> Self {
+        Self {
+            num_spks: 4,
+            fc_d_model: 512,
+            tf_d_model: 192,
+            dropout_rate: None,
+            extra: std::collections::HashMap::new(),
+        }
+    }
+}
+
+/// Top-level configuration for SortFormer diarization models.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SortformerConfig {
+    /// Target class
+    #[serde(rename = "_target_", default)]
+    pub target: Option<String>,
+
+    /// Maximum number of speakers
+    #[serde(default = "default_num_spks")]
+    pub max_num_of_spks: usize,
+
+    /// Sample rate
+    #[serde(default = "default_sample_rate")]
+    pub sample_rate: u32,
+
+    /// Preprocessor configuration
+    pub preprocessor: PreprocessorConfig,
+
+    /// FastConformer encoder configuration
+    pub encoder: EncoderConfig,
+
+    /// Transformer encoder configuration
+    pub transformer_encoder: TransformerEncoderConfig,
+
+    /// SortFormer modules (speaker head) configuration
+    pub sortformer_modules: SortformerModulesConfig,
+
+    /// Streaming chunk length in encoder frames
+    #[serde(default = "default_chunk_len")]
+    pub chunk_len: usize,
+
+    /// Speaker cache length in encoder frames
+    #[serde(default = "default_spkcache_len")]
+    pub spkcache_len: usize,
+
+    /// FIFO buffer length in encoder frames
+    #[serde(default = "default_fifo_len")]
+    pub fifo_len: usize,
+
+    /// Additional fields
+    #[serde(flatten)]
+    pub extra: std::collections::HashMap<String, serde_yaml::Value>,
+}
+
+fn default_chunk_len() -> usize {
+    50
+}
+fn default_spkcache_len() -> usize {
+    100
+}
+fn default_fifo_len() -> usize {
+    50
+}

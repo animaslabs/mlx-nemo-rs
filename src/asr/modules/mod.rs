@@ -8,10 +8,13 @@
 pub mod decoders;
 pub mod encoders;
 pub mod preprocessors;
+pub mod sortformer;
 
 pub use decoders::CTCDecoder;
 pub use decoders::{LstmState, RNNTDecoder, RNNTJoint, StatelessTransducerDecoder};
 pub use encoders::ConformerEncoder;
+pub use encoders::TransformerEncoder;
+pub use sortformer::SortformerModules;
 
 // Primary exports (new names)
 pub use preprocessors::{MelConfig, MelProcessor, SpectrumTransform, StreamingMel};

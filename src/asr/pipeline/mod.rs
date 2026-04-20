@@ -29,5 +29,7 @@
 //! ```
 
 mod cache_aware_rnnt;
+mod multi_talker;
 
 pub use cache_aware_rnnt::{CacheAwareRNNTPipeline, TranscribeOutput};
+pub use multi_talker::{MultiTalkerOutput, MultiTalkerPipeline, SpeakerSegment};

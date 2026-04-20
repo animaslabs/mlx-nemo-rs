@@ -5,6 +5,7 @@
 
 mod core;
 mod request;
+mod sortformer_state;
 
 // Re-export core types
 pub use self::core::{
@@ -14,3 +15,6 @@ pub use self::core::{
 
 // Re-export request types
 pub use request::FeatureBuffer;
+
+// Re-export sortformer streaming state
+pub use sortformer_state::StreamingSortformerState;

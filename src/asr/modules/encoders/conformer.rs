@@ -713,6 +713,43 @@ impl ConformerEncoder {
         self.subsampling.forward(features, lengths)
     }
 
+    /// Forward pass starting from already-subsampled embeddings.
+    ///
+    /// This skips the subsampling stage and runs only the conformer blocks.
+    /// Used by SortFormer's streaming mode where embeddings from multiple sources
+    /// (speaker cache, FIFO, chunk) are concatenated before running the conformer.
+    ///
+    /// # Arguments
+    /// * `embeddings` - Pre-subsampled embeddings [batch, time, d_model]
+    /// * `lengths` - Valid sequence lengths [batch]
+    ///
+    /// # Returns
+    /// * Encoded features [batch, d_model, time]
+    /// * Output lengths [batch]
+    pub fn forward_from_embeddings(&mut self, embeddings: &Array, lengths: &Array) -> Result<(Array, Array)> {
+        let mut x = embeddings.clone();
+
+        // Scale input by sqrt(d_model) if xscaling is enabled
+        let xscale = self.pos_enc.xscale();
+        if xscale != 1.0 {
+            x = &x * Array::from_f32(xscale);
+        }
+
+        // Generate positional encoding for this sequence length
+        let seq_len = x.dim(1) as usize;
+        let pos_emb = self.pos_enc.get_encoding(seq_len)?;
+
+        // Process through conformer blocks
+        for layer in &mut self.layers {
+            x = layer.forward(&x, &pos_emb)?;
+        }
+
+        // Transpose to [B, D, T]
+        let x = mlx_rs::ops::transpose_axes(&x, &[0, 2, 1])?;
+
+        Ok((x, lengths.clone()))
+    }
+
     /// Get positional encoding for a given sequence length (for debugging).
     pub fn get_pos_encoding(&self, seq_len: usize) -> Result<Array> {
         self.pos_enc.get_encoding(seq_len)
