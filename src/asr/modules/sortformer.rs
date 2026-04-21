@@ -124,11 +124,11 @@ impl SortformerModules {
         prefix: &str,
         quant: Option<&QuantizationConfig>,
     ) -> Result<()> {
-        if let Some(layer) = load_linear_layer(weights, &format!("{}.encoder_proj.0", prefix), quant) {
+        if let Some(layer) = load_linear_layer(weights, &format!("{}.encoder_proj", prefix), quant) {
             self.encoder_proj = Some(layer);
         }
 
-        if let Some(layer) = load_linear_layer(weights, &format!("{}.first_hidden_to_hidden.0", prefix), quant) {
+        if let Some(layer) = load_linear_layer(weights, &format!("{}.first_hidden_to_hidden", prefix), quant) {
             self.first_hidden_to_hidden = layer;
         }
 

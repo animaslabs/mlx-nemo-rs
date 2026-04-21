@@ -176,10 +176,10 @@ impl PositionWiseFF {
         prefix: &str,
         quant: Option<&QuantizationConfig>,
     ) {
-        if let Some(layer) = load_linear_layer(weights, &format!("{}.0", prefix), quant) {
+        if let Some(layer) = load_linear_layer(weights, &format!("{}.dense_in", prefix), quant) {
             self.linear1 = layer;
         }
-        if let Some(layer) = load_linear_layer(weights, &format!("{}.3", prefix), quant) {
+        if let Some(layer) = load_linear_layer(weights, &format!("{}.dense_out", prefix), quant) {
             self.linear2 = layer;
         }
     }
@@ -256,7 +256,7 @@ impl TransformerEncoderBlock {
     ) {
         // NeMo weight prefix: {prefix}.first_sub_layer (MHA), {prefix}.second_sub_layer (FFN)
         self.self_attn.load_weights(weights, &format!("{}.first_sub_layer", prefix), quant);
-        self.ffn.load_weights(weights, &format!("{}.second_sub_layer.layer", prefix), quant);
+        self.ffn.load_weights(weights, &format!("{}.second_sub_layer", prefix), quant);
         load_layer_norm(&mut self.layer_norm_1, weights, &format!("{}.layer_norm_1", prefix));
         load_layer_norm(&mut self.layer_norm_2, weights, &format!("{}.layer_norm_2", prefix));
     }

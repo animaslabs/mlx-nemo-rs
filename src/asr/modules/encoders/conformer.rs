@@ -1280,9 +1280,12 @@ impl Subsampling {
         let padding = if is_causal { 0 } else { 1 }; // (kernel_size - 1) / 2
 
         // First conv: 1 input channel (mono spectrogram) -> conv_channels
+        // For causal: padding=0 (manual causal padding applied before each conv)
+        // For non-causal: padding=1 (symmetric padding to preserve frequency dimension)
+        let conv_padding = if is_causal { 0 } else { (kernel_size / 2) as i32 };
         let first_conv = nn::Conv2dBuilder::new(1, conv_channels as i32, kernel_size as i32)
             .stride(stride as i32)
-            .padding(0) // JJK hard code causal for testing
+            .padding(conv_padding)
             .build()?;
 
         // Depthwise + pointwise pairs for remaining strides
@@ -1297,7 +1300,7 @@ impl Subsampling {
                 kernel_size as i32,
             )
             .stride(stride as i32)
-            // .padding(0) // JJK hard code causal for testing
+            .padding(conv_padding)
             .groups(conv_channels as i32)
             .build()?;
             depthwise_convs.push(dw_conv);
