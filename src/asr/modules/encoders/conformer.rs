@@ -1032,7 +1032,7 @@ impl ConformerEncoder {
                  ==========================================\n",
                 cache_size, filled_cache_len, tensor_seq_len, valid_seq_len
             ));
-            tracing::info!("{}", grid);
+            tracing::debug!("{}", grid);
         }
 
         // Create padding mask for conv module: True where position >= valid_seq_len

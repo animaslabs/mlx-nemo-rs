@@ -219,7 +219,7 @@ impl MultiTalkerPipeline {
     }
 
     /// Run diarization on all buffered audio (batch mode).
-    fn run_diarization(&mut self) -> Result<()> {
+    pub fn run_diarization(&mut self) -> Result<()> {
         if self.diar_audio_buffer.is_empty() {
             return Ok(());
         }

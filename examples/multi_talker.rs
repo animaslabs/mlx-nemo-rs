@@ -98,20 +98,38 @@ fn main() -> mlx_nemo::Result<()> {
     tracing::info!("Loading audio from: {}", audio_path);
     pipeline.set_audio_file(audio_path)?;
 
-    // Run transcription
+    // Run diarization on all audio first
+    pipeline.run_diarization()?;
+
+    // Stream transcription step-by-step
     println!("\n--- Multi-Talker Transcription ---\n");
 
     let start = Instant::now();
-    let segments = pipeline.run()?;
-    let elapsed = start.elapsed();
+    let mut prev_speaker: Option<usize> = None;
 
-    for segment in &segments {
-        println!(
-            "[Speaker {}] ({:.1}s - {:.1}s) {}",
-            segment.speaker, segment.start_time, segment.end_time, segment.text
-        );
+    while let Some(output) = pipeline.transcribe_step()? {
+        for segment in &output.segments {
+            if segment.text.is_empty() {
+                continue;
+            }
+            // Print speaker tag when speaker changes
+            if prev_speaker != Some(segment.speaker) {
+                if prev_speaker.is_some() {
+                    println!();
+                }
+                print!("[Speaker {}] ", segment.speaker);
+                prev_speaker = Some(segment.speaker);
+            }
+            print!("{}", segment.text);
+            io::stdout().flush().ok();
+        }
+        if output.is_final {
+            break;
+        }
     }
+    println!();
 
+    let elapsed = start.elapsed();
     println!("\n--- Done in {:.2}s ---", elapsed.as_secs_f32());
 
     io::stdout().flush().ok();
