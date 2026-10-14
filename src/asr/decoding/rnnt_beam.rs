@@ -9,6 +9,7 @@ use mlx_rs::ops::indexing::IndexOp;
 use mlx_rs::Array;
 
 use crate::asr::modules::{RNNTJoint, StatelessTransducerDecoder};
+use crate::core::ArrayExt;
 use crate::core::error::Result;
 
 /// Maximum number of symbols that can be emitted per encoder frame.
@@ -108,7 +109,7 @@ pub fn rnnt_beam_decode(
     // Get encoder lengths
     let lengths_i32 = encoder_lengths.as_type::<i32>()?;
     lengths_i32.eval()?;
-    let lengths_data: Vec<i32> = lengths_i32.as_slice::<i32>().to_vec();
+    let lengths_data: Vec<i32> = lengths_i32.to_vec_row_major::<i32>()?;
 
     let mut results = Vec::with_capacity(batch_size);
 
@@ -226,7 +227,7 @@ fn expand_hypothesis(
             log_probs.eval()?;
 
             // Get log probabilities as a slice
-            let log_probs_data: Vec<f32> = log_probs.as_slice::<f32>().to_vec();
+            let log_probs_data: Vec<f32> = log_probs.to_vec_row_major::<f32>()?;
 
             // Add blank hypothesis (terminates this expansion)
             let blank_log_prob = log_probs_data[blank_id];

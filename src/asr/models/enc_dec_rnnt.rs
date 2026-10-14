@@ -38,6 +38,7 @@ use crate::asr::streaming::{
     compute_streaming_config, get_streaming_modes, EncoderCache, StreamingConfig,
     StreamingMelBuffer, StreamingModeInfo, StreamingOutput,
 };
+use crate::core::ArrayExt;
 use crate::core::checkpoint::NemoCheckpoint;
 use crate::core::config::from_yaml_str;
 use crate::core::error::{Error, Result};
@@ -80,7 +81,7 @@ impl DecoderState {
         match self {
             DecoderState::Stateless(arr) => {
                 arr.eval().ok();
-                let data = arr.as_slice::<f32>();
+                let data = arr.to_vec_row_major::<f32>().unwrap_or_default();
                 if !data.is_empty() {
                     // Sample first 100 values for efficiency
                     let sample_len = data.len().min(100);
@@ -92,7 +93,7 @@ impl DecoderState {
             DecoderState::Lstm(lstm_state) => {
                 // Compute norm of hidden state
                 lstm_state.hidden.eval().ok();
-                let data = lstm_state.hidden.as_slice::<f32>();
+                let data = lstm_state.hidden.to_vec_row_major::<f32>().unwrap_or_default();
                 if !data.is_empty() {
                     let sample_len = data.len().min(100);
                     data[..sample_len].iter().map(|v| v * v).sum::<f32>().sqrt()
@@ -667,7 +668,7 @@ impl EncDecRNNTModel {
         // Get encoder lengths as a vector
         let lengths_i32 = encoder_lengths.as_type::<i32>()?;
         lengths_i32.eval()?;
-        let lengths_data: Vec<i32> = lengths_i32.as_slice::<i32>().to_vec();
+        let lengths_data: Vec<i32> = lengths_i32.to_vec_row_major::<i32>()?;
 
         let mut results = Vec::with_capacity(batch_size);
 
@@ -707,7 +708,7 @@ impl EncDecRNNTModel {
                     // Get argmax
                     let prediction = argmax_axis(&log_probs, -1, false)?;
                     prediction.eval()?;
-                    let pred_token = prediction.as_slice::<u32>()[0] as usize;
+                    let pred_token = prediction.to_vec_row_major::<u32>()?[0] as usize;
 
                     if pred_token == self.blank_id {
                         // Blank: advance to next encoder frame
@@ -753,11 +754,11 @@ impl EncDecRNNTModel {
         tracing::debug!(
             "Mel spectrogram shape: {:?}, length: {:?}",
             features.shape(),
-            feature_lengths.as_slice::<i32>()
+            feature_lengths.to_vec_row_major::<i32>()?
         );
         let features_flat = features.reshape(&[-1])?;
         features_flat.eval()?;
-        let f_slice: &[f32] = features_flat.as_slice();
+        let f_slice: Vec<f32> = features_flat.to_vec_row_major()?;
         let f_min = f_slice.iter().cloned().fold(f32::INFINITY, f32::min);
         let f_max = f_slice.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
         let f_mean: f32 = f_slice.iter().sum::<f32>() / f_slice.len() as f32;
@@ -777,11 +778,11 @@ impl EncDecRNNTModel {
         tracing::debug!(
             "Encoder output shape: {:?}, length: {:?}",
             encoded.shape(),
-            encoded_lengths.as_slice::<i32>()
+            encoded_lengths.to_vec_row_major::<i32>()?
         );
         let encoded_flat = encoded.reshape(&[-1])?;
         encoded_flat.eval()?;
-        let e_slice: &[f32] = encoded_flat.as_slice();
+        let e_slice: Vec<f32> = encoded_flat.to_vec_row_major()?;
         let e_min = e_slice.iter().cloned().fold(f32::INFINITY, f32::min);
         let e_max = e_slice.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
         let e_mean: f32 = e_slice.iter().sum::<f32>() / e_slice.len() as f32;
@@ -1115,7 +1116,7 @@ impl EncDecRNNTModel {
                 let mel_flat: Vec<f32> = mel_chunk
                     .flatten(0, -1)
                     .ok()
-                    .and_then(|a| a.as_slice::<f32>().to_vec().into())
+                    .and_then(|a| a.to_vec_row_major::<f32>().ok())
                     .unwrap_or_default();
                 let mel_min = mel_flat.iter().cloned().fold(f32::INFINITY, f32::min);
                 let mel_max = mel_flat.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
@@ -1156,7 +1157,7 @@ impl EncDecRNNTModel {
             let lengths = Array::from_slice(&[chunk_len as i32], &[1]);
 
             // Run encoder with cache
-            let cache_len_before = session.encoder_cache.last_channel_len.as_slice::<i64>()[0];
+            let cache_len_before = session.encoder_cache.last_channel_len.to_vec_row_major::<i64>()?[0];
 
             let (encoded, encoded_lengths, cache_channel_next, cache_time_next, cache_len_next) =
                 self.encoder.forward_streaming(
@@ -1178,14 +1179,14 @@ impl EncDecRNNTModel {
             encoded.eval()?;
             encoded_lengths.eval()?;
 
-            let raw_enc_len = encoded_lengths.as_slice::<i32>()[0] as usize;
-            let cache_len_after = session.encoder_cache.last_channel_len.as_slice::<i64>()[0];
+            let raw_enc_len = encoded_lengths.to_vec_row_major::<i32>()?[0] as usize;
+            let cache_len_after = session.encoder_cache.last_channel_len.to_vec_row_major::<i64>()?[0];
 
             {
                 // Show encoder output stats
                 let enc_flat = encoded.reshape(&[-1]).unwrap();
                 enc_flat.eval().unwrap();
-                let enc_slice: &[f32] = enc_flat.as_slice();
+                let enc_slice: Vec<f32> = enc_flat.to_vec_row_major()?;
                 let enc_min = enc_slice.iter().cloned().fold(f32::INFINITY, f32::min);
                 let enc_max = enc_slice.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
                 let enc_mean: f32 = enc_slice.iter().sum::<f32>() / enc_slice.len() as f32;
@@ -1251,11 +1252,11 @@ impl EncDecRNNTModel {
 
                         let prediction = argmax_axis(&log_probs, -1, false)?;
                         prediction.eval()?;
-                        let pred_token = prediction.as_slice::<u32>()[0] as usize;
+                        let pred_token = prediction.to_vec_row_major::<u32>()?[0] as usize;
 
                         // Debug: log top predictions when we get a blank at first symbol
                         if pred_token == session.blank_id && symbols_emitted == 0 && t == 0 {
-                            let lp_slice: &[f32] = log_probs.as_slice();
+                            let lp_slice: Vec<f32> = log_probs.to_vec_row_major()?;
                             // Get top 5 predictions
                             let mut indexed: Vec<(usize, f32)> =
                                 lp_slice.iter().cloned().enumerate().collect();

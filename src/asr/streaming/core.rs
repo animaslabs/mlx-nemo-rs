@@ -42,6 +42,7 @@
 use mlx_rs::Array;
 
 use crate::asr::config::EncoderConfig;
+use crate::core::ArrayExt;
 use crate::core::error::{Error, Result};
 
 /// Streaming configuration computed from model config.
@@ -865,7 +866,7 @@ mod tests {
 
         // Verify extracted values start at frame 20
         chunk2.eval().unwrap();
-        let chunk2_data: &[f32] = chunk2.as_slice();
+        let chunk2_data: Vec<f32> = chunk2.to_vec_row_major().unwrap();
         assert_eq!(chunk2_data[0] as i32, 20); // First frame is 20
         assert_eq!(chunk2_data[24] as i32, 44); // Last frame is 44
     }

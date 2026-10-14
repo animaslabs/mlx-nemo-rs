@@ -7,6 +7,7 @@ use mlx_rs::ops;
 use mlx_rs::ops::indexing::IndexOp;
 use mlx_rs::Array;
 
+use crate::core::ArrayExt;
 use crate::core::error::Result;
 
 /// Streaming state for the SortFormer diarizer.
@@ -224,7 +225,7 @@ impl StreamingSortformerState {
         // We operate on batch=0 (single batch for streaming)
         let scores = max_probs.index(0); // [filled]
         scores.eval()?;
-        let scores_data: &[f32] = scores.as_slice();
+        let scores_data: Vec<f32> = scores.to_vec_row_major()?;
 
         // Get indices sorted by score (descending)
         let mut indices: Vec<(usize, f32)> = scores_data.iter().copied().enumerate().collect();
@@ -278,7 +279,7 @@ impl StreamingSortformerState {
         is_silence.eval()?;
         let sil_mask = is_silence.index(0); // [time]
         sil_mask.eval()?;
-        let sil_data: &[bool] = sil_mask.as_slice();
+        let sil_data: Vec<bool> = sil_mask.to_vec_row_major()?;
 
         let n_new_sil = sil_data.iter().filter(|&&b| b).count();
         if n_new_sil == 0 {

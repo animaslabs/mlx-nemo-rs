@@ -41,6 +41,7 @@ use mlx_rs::{fft, ops, Array};
 
 use crate::asr::config::PreprocessorConfig;
 use crate::asr::dsp;
+use crate::core::ArrayExt;
 use crate::core::error::{Error, Result};
 
 /// Hook for modifying the power spectrum between STFT and mel filterbank.
@@ -932,7 +933,7 @@ impl StreamingMel {
         mel.eval()?;
 
         // Extract mel data and append to buffer
-        let mel_data: &[f32] = mel.as_slice();
+        let mel_data: Vec<f32> = mel.to_vec_row_major()?;
         // mel is [n_mels, n_frames], stored in row-major order
         // We need to transpose to [n_frames, n_mels] for our buffer
         for frame in 0..n_frames {
@@ -1141,7 +1142,7 @@ impl StreamingMel {
         mel.eval()?;
 
         // mel is [n_mels, n_frames] row-major
-        Ok(Some(mel.as_slice::<f32>().to_vec()))
+        Ok(Some(mel.to_vec_row_major::<f32>()?))
     }
 
     /// Total mel frames available.
@@ -1268,7 +1269,7 @@ mod tests {
     fn test_hann_window_endpoints() {
         let window = dsp::create_window_padded("hann", 400, 512).unwrap();
         window.eval().unwrap();
-        let data: &[f32] = window.as_slice();
+        let data: Vec<f32> = window.to_vec_row_major().unwrap();
 
         let left_pad = (512 - 400) / 2;
         assert!(data[left_pad].abs() < 1e-6, "First hann value should be ~0");
@@ -1282,7 +1283,7 @@ mod tests {
     fn test_hamming_window() {
         let window = dsp::create_window_padded("hamming", 400, 512).unwrap();
         window.eval().unwrap();
-        let data: &[f32] = window.as_slice();
+        let data: Vec<f32> = window.to_vec_row_major().unwrap();
 
         let left_pad = (512 - 400) / 2;
         assert!(approx_eq(data[left_pad], 0.08, 1e-4));
@@ -1301,7 +1302,7 @@ mod tests {
     fn test_filterbank_non_negative() {
         let fb = dsp::mel_filterbank(128, 512, 16000.0, 0.0, 8000.0).unwrap();
         fb.eval().unwrap();
-        let data: &[f32] = fb.as_slice();
+        let data: Vec<f32> = fb.to_vec_row_major().unwrap();
 
         let min = data.iter().cloned().fold(f32::INFINITY, f32::min);
         assert!(min >= 0.0, "Filterbank should be non-negative, got {}", min);
@@ -1329,7 +1330,7 @@ mod tests {
         assert_eq!(features.shape()[2], 101);
 
         lengths.eval().unwrap();
-        let len_data: &[i32] = lengths.as_slice();
+        let len_data: Vec<i32> = lengths.to_vec_row_major().unwrap();
         assert_eq!(len_data[0], 101);
     }
 
@@ -1369,7 +1370,7 @@ mod tests {
         assert_eq!(features.shape()[2], 101);
 
         lengths.eval().unwrap();
-        let len_data: &[i32] = lengths.as_slice();
+        let len_data: Vec<i32> = lengths.to_vec_row_major().unwrap();
         assert_eq!(len_data.len(), 2);
     }
 
@@ -1391,8 +1392,8 @@ mod tests {
         feat1.eval().unwrap();
         feat2.eval().unwrap();
 
-        let data1: &[f32] = feat1.as_slice();
-        let data2: &[f32] = feat2.as_slice();
+        let data1: Vec<f32> = feat1.to_vec_row_major().unwrap();
+        let data2: Vec<f32> = feat2.to_vec_row_major().unwrap();
 
         for (a, b) in data1.iter().zip(data2.iter()) {
             assert!(approx_eq(*a, *b, 1e-6), "Should be deterministic");
@@ -1427,8 +1428,8 @@ mod tests {
         feat_with.eval().unwrap();
         feat_without.eval().unwrap();
 
-        let data_with: &[f32] = feat_with.as_slice();
-        let data_without: &[f32] = feat_without.as_slice();
+        let data_with: Vec<f32> = feat_with.to_vec_row_major().unwrap();
+        let data_without: Vec<f32> = feat_without.to_vec_row_major().unwrap();
 
         // Values should differ
         let mut has_diff = false;
@@ -1462,9 +1463,9 @@ mod tests {
         // Check that mean is ~0 per feature
         let mean = ops::mean_axis(&features, 2, Some(false)).unwrap();
         mean.eval().unwrap();
-        let mean_data: &[f32] = mean.as_slice();
+        let mean_data: Vec<f32> = mean.to_vec_row_major().unwrap();
 
-        for &m in mean_data {
+        for &m in &mean_data {
             assert!(
                 m.abs() < 1e-4,
                 "Mean should be ~0 after normalization, got {}",
@@ -1484,7 +1485,7 @@ mod tests {
         let output_lens = mel.compute_output_lengths(&input_lens).unwrap();
         output_lens.eval().unwrap();
 
-        let data: &[i32] = output_lens.as_slice();
+        let data: Vec<i32> = output_lens.to_vec_row_major().unwrap();
         // 16000/160+1=101, 8000/160+1=51, 32000/160+1=201
         assert_eq!(data, &[101, 51, 201]);
     }
@@ -1509,8 +1510,8 @@ mod tests {
         feat1.eval().unwrap();
         feat2.eval().unwrap();
 
-        let data1: &[f32] = feat1.as_slice();
-        let data2: &[f32] = feat2.as_slice();
+        let data1: Vec<f32> = feat1.to_vec_row_major().unwrap();
+        let data2: Vec<f32> = feat2.to_vec_row_major().unwrap();
 
         for (a, b) in data1.iter().zip(data2.iter()) {
             assert!(
@@ -1538,8 +1539,8 @@ mod tests {
         feat1.eval().unwrap();
         feat2.eval().unwrap();
 
-        let data1: &[f32] = feat1.as_slice();
-        let data2: &[f32] = feat2.as_slice();
+        let data1: Vec<f32> = feat1.to_vec_row_major().unwrap();
+        let data2: Vec<f32> = feat2.to_vec_row_major().unwrap();
 
         // Check that outputs differ (due to random dither)
         let mut has_diff = false;
@@ -1883,7 +1884,7 @@ mod tests {
         // The first frames beyond `total` should come from lookback peek
         // (speculative mel frames from zero-padded lookback audio), not constant padding.
         // Only frames beyond what the lookback can produce get constant padding.
-        let data: &[f32] = frames.as_slice();
+        let data: Vec<f32> = frames.to_vec_row_major().unwrap();
 
         // The lookback has 240 samples. Zero-padded to 1 frame (240 + 160 zeros = 400).
         // So frame `total` should be a real-ish mel value (not -16.0).

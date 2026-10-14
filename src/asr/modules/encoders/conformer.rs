@@ -14,6 +14,7 @@ use mlx_rs::Array;
 
 use super::attention::{RelPositionMultiHeadAttention, RelPositionalEncoding};
 use crate::asr::config::EncoderConfig;
+use crate::core::ArrayExt;
 use crate::core::error::Result;
 use crate::core::quantization::{LinearLayer, QuantizationConfig, load_linear_layer};
 
@@ -572,18 +573,18 @@ impl ConformerEncoder {
         if debug_mask {
             x.eval()?;
             mel_mask.eval()?;
-            let mask_flat: &[bool] = mel_mask.as_slice();
+            let mask_flat: Vec<bool> = mel_mask.to_vec_row_major()?;
             let num_masked = mask_flat.iter().filter(|&&b| b).count();
             let x_flat = x.reshape(&[-1])?;
             x_flat.eval()?;
-            let x_slice: &[f32] = x_flat.as_slice();
+            let x_slice: Vec<f32> = x_flat.to_vec_row_major()?;
             let n_features = x.dim(2) as usize;
             let last_frame_offset = (mel_time as usize - 1) * n_features;
             let before_mask: Vec<f32> = x_slice[last_frame_offset..last_frame_offset+5].to_vec();
             tracing::debug!(
                 x_shape = ?x.shape(),
                 mel_time,
-                lengths = ?lengths.as_slice::<i32>(),
+                lengths = ?lengths.to_vec_row_major::<i32>()?,
                 num_masked,
                 ?before_mask,
                 "MEL masking before"
@@ -596,7 +597,7 @@ impl ConformerEncoder {
             x.eval()?;
             let x_flat = x.reshape(&[-1])?;
             x_flat.eval()?;
-            let x_slice: &[f32] = x_flat.as_slice();
+            let x_slice: Vec<f32> = x_flat.to_vec_row_major()?;
             let n_features = x.dim(2) as usize;
             let last_frame_offset = (mel_time as usize - 1) * n_features;
             let after_mask: Vec<f32> = x_slice[last_frame_offset..last_frame_offset+5].to_vec();
@@ -897,7 +898,7 @@ impl ConformerEncoder {
                 drop_extra_pre_encoded,
                 "dropping extra pre-encoded frames from end"
             );
-            let x_len = lengths.as_slice::<i32>()[0];
+            let x_len = lengths.to_vec_row_major::<i32>()?[0];
             // x = x.index((.., ..(x_len-drop), ..));
             // JJK test
             x = x.index((.., drop.., ..));
@@ -917,12 +918,12 @@ impl ConformerEncoder {
         // Python NeMo uses lengths for attention masking, but we need tensor dimension for pos_emb
         let tensor_seq_len = x.dim(1) as i32; // Actual tensor frames
         lengths.eval()?;
-        let valid_seq_len = lengths.as_slice::<i32>()[0]; // Valid frames (for masking)
+        let valid_seq_len = lengths.to_vec_row_major::<i32>()?[0]; // Valid frames (for masking)
         let cache_size = cache_last_channel.dim(2) as i32; // Allocated cache size
 
         // Get the actual filled cache length (use first batch element, assume all same)
         cache_last_channel_len.eval()?;
-        let filled_cache_len = cache_last_channel_len.as_slice::<i64>()[0].max(0) as i32;
+        let filled_cache_len = cache_last_channel_len.to_vec_row_major::<i64>()?[0].max(0) as i32;
 
         // Total length for K/V needs to cover all tensor frames for pos_emb
         // Use tensor dimension, not valid length, to avoid pos_emb size mismatch
@@ -991,7 +992,7 @@ impl ConformerEncoder {
             let cols = shape[2] as usize; // max_audio_length (key positions)
             let flat = mask.reshape(&[-1])?;
             flat.eval()?;
-            let data: &[bool] = flat.as_slice();
+            let data: Vec<bool> = flat.to_vec_row_major()?;
 
             let mut grid = String::new();
             grid.push_str(&format!(
@@ -1169,7 +1170,7 @@ impl ConformerEncoder {
 
         // Verify and debug the result
         cache_channel_len_next.eval()?;
-        let filled_after = cache_channel_len_next.as_slice::<i64>()[0];
+        let filled_after = cache_channel_len_next.to_vec_row_major::<i64>()?[0];
 
         tracing::trace!(
             filled_after,
@@ -1408,7 +1409,10 @@ impl Subsampling {
         }
 
         // Get data as f32
-        let data: &[f32] = arr.as_slice();
+        let Ok(data) = arr.to_vec_row_major::<f32>() else {
+            tracing::info!("  {} could not be read", name);
+            return;
+        };
         let n = data.len();
 
         // Calculate stats
@@ -1579,7 +1583,7 @@ impl Subsampling {
                 self.stride as i32,
             )?.as_dtype(mlx_rs::Dtype::Float32)?;
             if debug_enabled {
-                tracing::info!("DEBUG subsampling: updated lengths after first conv: {:?}", current_lengths.as_slice::<f32>());
+                tracing::info!("DEBUG subsampling: updated lengths after first conv: {:?}", current_lengths.to_vec_row_major::<f32>()?);
             }
         }
 
@@ -1636,7 +1640,7 @@ impl Subsampling {
                     // right_pad,
                 )?.as_dtype(mlx_rs::Dtype::Float32)?;
                 if debug_enabled {
-                    tracing::info!("DEBUG subsampling: updated lengths after dw_conv_{}: {:?}", i, current_lengths.as_slice::<f32>());
+                    tracing::info!("DEBUG subsampling: updated lengths after dw_conv_{}: {:?}", i, current_lengths.to_vec_row_major::<f32>()?);
                 }
             }
         }
@@ -1704,7 +1708,7 @@ impl Subsampling {
 
         if debug_enabled {
             new_lengths.eval()?;
-            let len_data: &[i32] = new_lengths.as_slice();
+            let len_data: Vec<i32> = new_lengths.to_vec_row_major()?;
             tracing::info!("DEBUG subsampling: output_lengths={:?}", len_data);
         }
 
@@ -1820,7 +1824,7 @@ impl ConformerBlock {
             ff1_normed.eval()?;
             let flat = ff1_normed.reshape(&[-1])?;
             flat.eval()?;
-            let slice: &[f32] = flat.as_slice();
+            let slice: Vec<f32> = flat.to_vec_row_major()?;
             let t00: Vec<f32> = slice[..5].to_vec();
             tracing::debug!(?t00, "after ff1_norm T00[:5]");
         }
@@ -1831,7 +1835,7 @@ impl ConformerBlock {
             ff1_out.eval()?;
             let flat = ff1_out.reshape(&[-1])?;
             flat.eval()?;
-            let slice: &[f32] = flat.as_slice();
+            let slice: Vec<f32> = flat.to_vec_row_major()?;
             let t00: Vec<f32> = slice[..5].to_vec();
             tracing::debug!(?t00, "after ff1 T00[:5]");
         }
@@ -1844,7 +1848,7 @@ impl ConformerBlock {
             x.eval()?;
             let flat = x.reshape(&[-1])?;
             flat.eval()?;
-            let slice: &[f32] = flat.as_slice();
+            let slice: Vec<f32> = flat.to_vec_row_major()?;
             let d = x.dim(2) as usize;
             let t00: Vec<f32> = slice[..5].to_vec();
             let t16_offset = 16 * d;
@@ -1864,7 +1868,7 @@ impl ConformerBlock {
             attn_normed.eval()?;
             let flat = attn_normed.reshape(&[-1])?;
             flat.eval()?;
-            let slice: &[f32] = flat.as_slice();
+            let slice: Vec<f32> = flat.to_vec_row_major()?;
             let d = attn_normed.dim(2) as usize;
             let t00: Vec<f32> = slice[..5].to_vec();
             let t16_offset = 16 * d;
@@ -1882,7 +1886,7 @@ impl ConformerBlock {
             attn_out.eval()?;
             let flat = attn_out.reshape(&[-1])?;
             flat.eval()?;
-            let slice: &[f32] = flat.as_slice();
+            let slice: Vec<f32> = flat.to_vec_row_major()?;
             let t00: Vec<f32> = slice[..5].to_vec();
             tracing::debug!(?t00, "after self_attn T00[:5]");
         }
@@ -1893,7 +1897,7 @@ impl ConformerBlock {
             x.eval()?;
             let flat = x.reshape(&[-1])?;
             flat.eval()?;
-            let slice: &[f32] = flat.as_slice();
+            let slice: Vec<f32> = flat.to_vec_row_major()?;
             let t00: Vec<f32> = slice[..5].to_vec();
             tracing::debug!(?t00, "after self_attn+residual T00[:5]");
         }
@@ -1906,7 +1910,7 @@ impl ConformerBlock {
             conv_out.eval()?;
             let flat = conv_out.reshape(&[-1])?;
             flat.eval()?;
-            let slice: &[f32] = flat.as_slice();
+            let slice: Vec<f32> = flat.to_vec_row_major()?;
             let t00: Vec<f32> = slice[..5].to_vec();
             tracing::debug!(?t00, "after conv_norm T00[:5]");
         }
@@ -1917,7 +1921,7 @@ impl ConformerBlock {
             conv_out.eval()?;
             let flat = conv_out.reshape(&[-1])?;
             flat.eval()?;
-            let slice: &[f32] = flat.as_slice();
+            let slice: Vec<f32> = flat.to_vec_row_major()?;
             let t00: Vec<f32> = slice[..5].to_vec();
             tracing::debug!(?t00, "after conv T00[:5]");
         }
@@ -1928,7 +1932,7 @@ impl ConformerBlock {
             x.eval()?;
             let flat = x.reshape(&[-1])?;
             flat.eval()?;
-            let slice: &[f32] = flat.as_slice();
+            let slice: Vec<f32> = flat.to_vec_row_major()?;
             let t00: Vec<f32> = slice[..5].to_vec();
             tracing::debug!(?t00, "after conv+residual T00[:5]");
         }
@@ -1941,7 +1945,7 @@ impl ConformerBlock {
             ff2_out.eval()?;
             let flat = ff2_out.reshape(&[-1])?;
             flat.eval()?;
-            let slice: &[f32] = flat.as_slice();
+            let slice: Vec<f32> = flat.to_vec_row_major()?;
             let t00: Vec<f32> = slice[..5].to_vec();
             tracing::debug!(?t00, "after ff2_norm T00[:5]");
         }
@@ -1952,7 +1956,7 @@ impl ConformerBlock {
             ff2_out.eval()?;
             let flat = ff2_out.reshape(&[-1])?;
             flat.eval()?;
-            let slice: &[f32] = flat.as_slice();
+            let slice: Vec<f32> = flat.to_vec_row_major()?;
             let t00: Vec<f32> = slice[..5].to_vec();
             tracing::debug!(?t00, "after ff2 T00[:5]");
         }
@@ -1964,7 +1968,7 @@ impl ConformerBlock {
             x.eval()?;
             let flat = x.reshape(&[-1])?;
             flat.eval()?;
-            let slice: &[f32] = flat.as_slice();
+            let slice: Vec<f32> = flat.to_vec_row_major()?;
             let t00: Vec<f32> = slice[..5].to_vec();
             tracing::debug!(?t00, "after ff2+residual T00[:5]");
         }
@@ -1976,7 +1980,7 @@ impl ConformerBlock {
             x.eval()?;
             let flat = x.reshape(&[-1])?;
             flat.eval()?;
-            let slice: &[f32] = flat.as_slice();
+            let slice: Vec<f32> = flat.to_vec_row_major()?;
             let t00: Vec<f32> = slice[..5].to_vec();
             tracing::debug!(?t00, "after final_norm T00[:5]");
         }
@@ -2277,7 +2281,7 @@ impl ConvolutionModule {
             x.eval()?;
             let flat = x.reshape(&[-1])?;
             flat.eval()?;
-            let slice: &[f32] = flat.as_slice();
+            let slice: Vec<f32> = flat.to_vec_row_major()?;
             let t00: Vec<f32> = slice[..5].to_vec();
             tracing::debug!(?t00, "CONV input T00[:5]");
         }
@@ -2290,7 +2294,7 @@ impl ConvolutionModule {
             x.eval()?;
             let flat = x.reshape(&[-1])?;
             flat.eval()?;
-            let slice: &[f32] = flat.as_slice();
+            let slice: Vec<f32> = flat.to_vec_row_major()?;
             let t00: Vec<f32> = slice[..5].to_vec();
             tracing::debug!(?t00, shape = ?x.shape(), "CONV after pointwise1");
         }
@@ -2308,7 +2312,7 @@ impl ConvolutionModule {
             x.eval()?;
             let flat = x.reshape(&[-1])?;
             flat.eval()?;
-            let slice: &[f32] = flat.as_slice();
+            let slice: Vec<f32> = flat.to_vec_row_major()?;
             let t00: Vec<f32> = slice[..5].to_vec();
             tracing::debug!(?t00, "CONV after GLU T00[:5]");
         }
@@ -2335,7 +2339,7 @@ impl ConvolutionModule {
             x.eval()?;
             let flat = x.reshape(&[-1])?;
             flat.eval()?;
-            let slice: &[f32] = flat.as_slice();
+            let slice: Vec<f32> = flat.to_vec_row_major()?;
             let t00: Vec<f32> = slice[..5].to_vec();
             tracing::debug!(?t00, "CONV after depthwise T00[:5]");
         }
@@ -2346,7 +2350,7 @@ impl ConvolutionModule {
             x.eval()?;
             let flat = x.reshape(&[-1])?;
             flat.eval()?;
-            let slice: &[f32] = flat.as_slice();
+            let slice: Vec<f32> = flat.to_vec_row_major()?;
             let t00: Vec<f32> = slice[..5].to_vec();
             tracing::debug!(?t00, "CONV after norm T00[:5]");
         }
@@ -2357,7 +2361,7 @@ impl ConvolutionModule {
             x.eval()?;
             let flat = x.reshape(&[-1])?;
             flat.eval()?;
-            let slice: &[f32] = flat.as_slice();
+            let slice: Vec<f32> = flat.to_vec_row_major()?;
             let t00: Vec<f32> = slice[..5].to_vec();
             tracing::debug!(?t00, "CONV after silu T00[:5]");
         }
@@ -2369,7 +2373,7 @@ impl ConvolutionModule {
             x.eval()?;
             let flat = x.reshape(&[-1])?;
             flat.eval()?;
-            let slice: &[f32] = flat.as_slice();
+            let slice: Vec<f32> = flat.to_vec_row_major()?;
             let t00: Vec<f32> = slice[..5].to_vec();
             tracing::debug!(?t00, "CONV after pointwise2 (final) T00[:5]");
         }

@@ -28,6 +28,7 @@ use mlx_rs::Array;
 use super::cache_aware_rnnt::{CacheAwareRNNTPipeline, TranscribeOutput};
 use crate::asr::models::SortformerEncLabelModel;
 use crate::asr::streaming::StreamingSortformerState;
+use crate::core::ArrayExt;
 use crate::core::error::Result;
 
 /// A segment of text attributed to a specific speaker.
@@ -237,7 +238,7 @@ impl MultiTalkerPipeline {
         let n_frames = preds.dim(1) as usize;
         let preds_flat = preds.reshape(&[-1])?;
         preds_flat.eval()?;
-        let preds_data: &[f32] = preds_flat.as_slice();
+        let preds_data: Vec<f32> = preds_flat.to_vec_row_major()?;
 
         for frame_idx in 0..n_frames {
             let start = frame_idx * self.max_num_spks;
@@ -266,7 +267,7 @@ impl MultiTalkerPipeline {
             let n_frames = preds.dim(1) as usize;
             let preds_flat = preds.reshape(&[-1])?;
             preds_flat.eval()?;
-            let preds_data: &[f32] = preds_flat.as_slice();
+            let preds_data: Vec<f32> = preds_flat.to_vec_row_major()?;
 
             for frame_idx in 0..n_frames {
                 let start = frame_idx * self.max_num_spks;

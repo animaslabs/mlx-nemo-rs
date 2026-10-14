@@ -8,6 +8,7 @@ use std::f32::consts::PI;
 use mlx_rs::ops::indexing::IndexOp;
 use mlx_rs::{ops, Array};
 
+use crate::core::ArrayExt;
 use crate::core::error::{Error, Result};
 
 // ============================================================================
@@ -453,7 +454,7 @@ mod tests {
     fn test_hann_window_endpoints() {
         let window = hann_window(400).unwrap();
         window.eval().unwrap();
-        let data: &[f32] = window.as_slice();
+        let data: Vec<f32> = window.to_vec_row_major().unwrap();
 
         assert!(data[0].abs() < 1e-6, "First hann value should be ~0");
         assert!(data[399].abs() < 1e-6, "Last hann value should be ~0");
@@ -463,7 +464,7 @@ mod tests {
     fn test_hann_window_center() {
         let window = hann_window(400).unwrap();
         window.eval().unwrap();
-        let data: &[f32] = window.as_slice();
+        let data: Vec<f32> = window.to_vec_row_major().unwrap();
 
         // Center value should be close to 1.0
         assert!(
@@ -476,7 +477,7 @@ mod tests {
     fn test_hamming_window_endpoints() {
         let window = hamming_window(400).unwrap();
         window.eval().unwrap();
-        let data: &[f32] = window.as_slice();
+        let data: Vec<f32> = window.to_vec_row_major().unwrap();
 
         assert!(approx_eq(data[0], 0.08, 1e-4));
         assert!(approx_eq(data[399], 0.08, 1e-4));
@@ -493,7 +494,7 @@ mod tests {
     fn test_create_window_padded() {
         let padded = create_window_padded("hann", 400, 512).unwrap();
         padded.eval().unwrap();
-        let data: &[f32] = padded.as_slice();
+        let data: Vec<f32> = padded.to_vec_row_major().unwrap();
 
         assert_eq!(data.len(), 512);
 
@@ -527,7 +528,7 @@ mod tests {
 
         let single = hann_window(1).unwrap();
         single.eval().unwrap();
-        let data: &[f32] = single.as_slice();
+        let data: Vec<f32> = single.to_vec_row_major().unwrap();
         assert_eq!(data, &[1.0]);
     }
 
@@ -561,7 +562,7 @@ mod tests {
     fn test_mel_filterbank_non_negative() {
         let fb = mel_filterbank(128, 512, 16000.0, 0.0, 8000.0).unwrap();
         fb.eval().unwrap();
-        let data: &[f32] = fb.as_slice();
+        let data: Vec<f32> = fb.to_vec_row_major().unwrap();
 
         let min = data.iter().cloned().fold(f32::INFINITY, f32::min);
         assert!(min >= 0.0, "Filterbank should be non-negative, got {}", min);
@@ -574,7 +575,7 @@ mod tests {
         let n_freqs = 257;
         let fb = mel_filterbank(n_mels, 512, 16000.0, 0.0, 8000.0).unwrap();
         fb.eval().unwrap();
-        let data: &[f32] = fb.as_slice();
+        let data: Vec<f32> = fb.to_vec_row_major().unwrap();
 
         for m in 0..n_mels {
             let row_start = m * n_freqs;
@@ -590,7 +591,7 @@ mod tests {
         let audio = Array::from_slice(&[1.0f32, 2.0, 3.0, 4.0, 5.0], &[5]);
         let result = preemphasis(&audio, 0.97).unwrap();
         result.eval().unwrap();
-        let data: &[f32] = result.as_slice();
+        let data: Vec<f32> = result.to_vec_row_major().unwrap();
 
         // y[0] = 1.0 - 0.97 * 0.0 = 1.0
         assert!(approx_eq(data[0], 1.0, 1e-6));
@@ -605,7 +606,7 @@ mod tests {
         let audio = Array::from_slice(&[1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0], &[2, 3]);
         let result = preemphasis(&audio, 0.97).unwrap();
         result.eval().unwrap();
-        let data: &[f32] = result.as_slice();
+        let data: Vec<f32> = result.to_vec_row_major().unwrap();
 
         // First batch: [1, 2, 3] -> [1, 1.03, 1.06]
         assert!(approx_eq(data[0], 1.0, 1e-6));
@@ -623,7 +624,7 @@ mod tests {
         let audio = Array::zeros::<f32>(&[100]).unwrap();
         let result = dither(&audio, 1e-5).unwrap();
         result.eval().unwrap();
-        let data: &[f32] = result.as_slice();
+        let data: Vec<f32> = result.to_vec_row_major().unwrap();
 
         // Result should have same length
         assert_eq!(data.len(), 100);
@@ -633,7 +634,7 @@ mod tests {
         assert!(has_diff, "Dither should add noise");
 
         // Values should be within dither range
-        for &v in data {
+        for &v in &data {
             assert!(v.abs() <= 1e-5, "Dithered value {} exceeds range", v);
         }
     }
@@ -645,8 +646,8 @@ mod tests {
         result.eval().unwrap();
 
         // Should be identical when amount is 0
-        let original: &[f32] = audio.as_slice();
-        let processed: &[f32] = result.as_slice();
+        let original: Vec<f32> = audio.to_vec_row_major().unwrap();
+        let processed: Vec<f32> = result.to_vec_row_major().unwrap();
         for (a, b) in original.iter().zip(processed.iter()) {
             assert_eq!(a, b);
         }
@@ -687,7 +688,7 @@ mod tests {
         assert_eq!(frames.shape(), &[n_frames as i32, 512]);
 
         // Frames should be center-padded
-        let data: &[f32] = frames.as_slice();
+        let data: Vec<f32> = frames.to_vec_row_major().unwrap();
         let left_pad = (512 - 400) / 2; // 56
 
         // Left padding should be zeros
@@ -727,7 +728,7 @@ mod tests {
         assert_eq!(frames.shape(), &[2, n_frames as i32, 512]);
 
         // Frames should be center-padded
-        let data: &[f32] = frames.as_slice();
+        let data: Vec<f32> = frames.to_vec_row_major().unwrap();
         let left_pad = (512 - 400) / 2; // 56
 
         // Left padding should be zeros

@@ -31,6 +31,7 @@ use crate::asr::streaming::{
     compute_streaming_config, get_streaming_modes, EncoderCache, FeatureBuffer, StreamingConfig,
     StreamingModeInfo,
 };
+use crate::core::ArrayExt;
 use crate::core::checkpoint::NemoCheckpoint;
 use crate::core::error::{Error, Result};
 
@@ -1286,7 +1287,7 @@ impl CacheAwareRNNTPipeline {
         encoded_lengths.eval()?;
 
         // Use ALL encoder output frames (keep_all_outputs for flush)
-        let raw_enc_len = encoded_lengths.as_slice::<i32>()[0] as usize;
+        let raw_enc_len = encoded_lengths.to_vec_row_major::<i32>()?[0] as usize;
         let actual_tensor_frames = encoded.shape()[1] as usize;
         let enc_seq_len = raw_enc_len.min(actual_tensor_frames);
 
@@ -1423,14 +1424,14 @@ impl CacheAwareRNNTPipeline {
         // Log encoder cache state AFTER processing (before updating)
         {
             cache_len_next.eval().ok();
-            let cache_len_after = cache_len_next.as_slice::<i64>()[0];
+            let cache_len_after = cache_len_next.to_vec_row_major::<i64>()?[0];
             let cache_size = self.encoder_cache.last_channel.dim(2) as i64;
 
             // Compute new cache channel norm (sample from END where real data lives)
             // Cache is right-aligned: zeros on left, real data on right
             let new_cache_channel_norm: f32 = {
                 cache_channel_next.eval().ok();
-                let data = cache_channel_next.as_slice::<f32>();
+                let data = cache_channel_next.to_vec_row_major::<f32>()?;
                 if !data.is_empty() {
                     let sample_len = data.len().min(100);
                     let start = data.len().saturating_sub(sample_len);
@@ -1462,7 +1463,7 @@ impl CacheAwareRNNTPipeline {
         // Get valid output length
         // For chunked_limited style, keep all outputs (matches NeMo's keep_all_outputs=True)
         // For regular style, clip to valid_out_len
-        let raw_enc_len = encoded_lengths.as_slice::<i32>()[0] as usize;
+        let raw_enc_len = encoded_lengths.to_vec_row_major::<i32>()?[0] as usize;
         let actual_tensor_frames = encoded.shape()[1] as usize;
         let valid_out_len = self.streaming_config.valid_out_len;
         let enc_seq_len = if self.encoder.is_chunked_limited() || is_last {
@@ -1475,7 +1476,7 @@ impl CacheAwareRNNTPipeline {
 
         // Debug encoder output
         self.encoder_cache.last_channel_len.eval()?;
-        let cache_len = self.encoder_cache.last_channel_len.as_slice::<i64>()[0];
+        let cache_len = self.encoder_cache.last_channel_len.to_vec_row_major::<i64>()?[0];
 
         // Detailed debug for alignment diagnosis
         tracing::debug!(

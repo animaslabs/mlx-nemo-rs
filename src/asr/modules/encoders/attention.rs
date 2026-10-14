@@ -8,6 +8,7 @@ use std::collections::HashMap;
 use mlx_rs::ops::indexing::IndexOp;
 use mlx_rs::{ops, Array};
 
+use crate::core::ArrayExt;
 use crate::core::error::{Error, Result};
 use crate::core::quantization::{LinearLayer, QuantizationConfig, load_linear_layer};
 
@@ -74,7 +75,9 @@ impl RelPositionalEncoding {
         let div_term = Array::from_slice(&div_term, &[1, (d_model / 2) as i32]);
 
         // Compute angles: positions * div_term -> [pe_len, d_model/2]
-        let angles = ops::matmul(&positions, &div_term)?;
+        // Broadcast multiply (as NeMo does) rather than matmul: an outer product
+        // via matmul can run at reduced precision on the GPU.
+        let angles = ops::multiply(&positions, &div_term)?;
 
         // Compute sin and cos: each is [pe_len, d_model/2]
         let pe_sin = ops::sin(&angles)?;
@@ -746,10 +749,10 @@ mod tests {
     #[test]
     fn test_rel_positional_encoding_shape() {
         let pe = RelPositionalEncoding::new(512, 100, false).unwrap();
-        let encoding = pe.get_encoding(2).unwrap();
+        let encoding = pe.get_encoding(50).unwrap();
         let shape = encoding.shape();
         assert_eq!(shape[0], 1);
-        assert_eq!(shape[1], 52); // 2*50 - 1
+        assert_eq!(shape[1], 99); // 2*50 - 1
         assert_eq!(shape[2], 512);
     }
 
@@ -787,7 +790,7 @@ mod tests {
 
         // Evaluate and get values
         mlx_rs::transforms::eval([&shifted]).unwrap();
-        let shifted_data: Vec<f32> = shifted.as_slice().to_vec();
+        let shifted_data: Vec<f32> = shifted.to_vec_row_major().unwrap();
 
         // After shift and taking first 3 columns:
         // Row 0 should have rel_pos [0, -1, -2] = values [2, 3, 4]
@@ -845,14 +848,14 @@ mod tests {
         let pe = RelPositionalEncoding::new(d_model, max_len, false).unwrap();
 
         // Get encoding for seq_len=3 -> output shape [1, 5, 4] (2*3-1 = 5 positions)
-        let encoding = pe.get_encoding(2).unwrap();
+        let encoding = pe.get_encoding(3).unwrap();
         encoding.eval().unwrap();
 
         let shape = encoding.shape();
         assert_eq!(shape, &[1, 5, 4]);
 
         // The positions are: [2, 1, 0, -1, -2] (from pos 2 down to pos -2)
-        let data: &[f32] = encoding.as_slice();
+        let data: Vec<f32> = encoding.to_vec_row_major().unwrap();
 
         // For d_model=4, we have div_term for i=0 and i=2:
         // div_term[0] = exp(0) = 1.0
@@ -937,7 +940,7 @@ mod tests {
 
         let shifted = RelPositionMultiHeadAttention::rel_shift(&x).unwrap();
         mlx_rs::transforms::eval([&shifted]).unwrap();
-        let shifted_data: Vec<f32> = shifted.as_slice().to_vec();
+        let shifted_data: Vec<f32> = shifted.to_vec_row_major().unwrap();
 
         // Verify: output[i][j] == input[i][seq_len - 1 - i + j] for j < num_keys
         for i in 0..seq_len {
@@ -997,7 +1000,7 @@ mod tests {
 
         let shifted = RelPositionMultiHeadAttention::rel_shift(&x).unwrap();
         mlx_rs::transforms::eval([&shifted]).unwrap();
-        let shifted_data: Vec<f32> = shifted.as_slice().to_vec();
+        let shifted_data: Vec<f32> = shifted.to_vec_row_major().unwrap();
 
         for i in 0..seq_len {
             for j in 0..total_len {

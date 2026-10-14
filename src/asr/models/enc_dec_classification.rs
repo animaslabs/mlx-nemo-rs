@@ -22,6 +22,7 @@ use mlx_rs::Array;
 use crate::asr::config::ClassificationModelConfig;
 use crate::asr::modules::encoders::JasperEncoder;
 use crate::asr::modules::MelSpectrogram;
+use crate::core::ArrayExt;
 use crate::core::checkpoint::NemoCheckpoint;
 use crate::core::config::from_yaml_str;
 use crate::core::error::{Error, Result};
@@ -193,8 +194,8 @@ impl EncDecClassificationModel {
         let batch_size = probs.dim(0) as usize;
         let time_dim = probs.dim(1) as usize;
         let num_classes = self.num_classes;
-        let lengths_data: &[i32] = lengths.as_slice();
-        let probs_data: &[f32] = probs.as_slice();
+        let lengths_data: Vec<i32> = lengths.to_vec_row_major()?;
+        let probs_data: Vec<f32> = probs.to_vec_row_major()?;
 
         let mut results = Vec::with_capacity(batch_size);
         for b in 0..batch_size {
@@ -228,8 +229,8 @@ impl EncDecClassificationModel {
         probs.eval()?;
         out_lengths.eval()?;
 
-        let valid_len = out_lengths.as_slice::<i32>()[0] as usize;
-        let probs_data: &[f32] = probs.as_slice();
+        let valid_len = out_lengths.to_vec_row_major::<i32>()?[0] as usize;
+        let probs_data: Vec<f32> = probs.to_vec_row_major()?;
         let num_classes = self.num_classes;
         let mut result = Vec::with_capacity(valid_len);
         for f in 0..valid_len {

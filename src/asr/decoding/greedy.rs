@@ -5,6 +5,7 @@
 use mlx_rs::ops::indexing::argmax_axis;
 use mlx_rs::Array;
 
+use crate::core::ArrayExt;
 use crate::core::error::Result;
 
 /// Perform greedy CTC decoding.
@@ -36,12 +37,12 @@ pub fn greedy_decode(
     // Get lengths as a vector - convert to i32 if needed
     let lengths_i32 = lengths.as_type::<i32>()?;
     lengths_i32.eval()?;
-    let lengths_data: Vec<i32> = lengths_i32.as_slice::<i32>().to_vec();
+    let lengths_data: Vec<i32> = lengths_i32.to_vec_row_major::<i32>()?;
 
     // Get predictions as a flat vector
     let predictions_u32 = predictions.as_type::<u32>()?;
     predictions_u32.eval()?;
-    let pred_data: Vec<u32> = predictions_u32.as_slice::<u32>().to_vec();
+    let pred_data: Vec<u32> = predictions_u32.to_vec_row_major::<u32>()?;
 
     let mut results = Vec::with_capacity(batch_size);
 
@@ -86,8 +87,8 @@ pub fn greedy_decode_with_timestamps(
     let predictions = argmax_axis(log_probs, 2, false)?;
     predictions.eval()?;
 
-    let lengths_data: Vec<i32> = lengths.as_slice::<i32>().to_vec();
-    let pred_data: Vec<i32> = predictions.as_slice::<i32>().to_vec();
+    let lengths_data: Vec<i32> = lengths.to_vec_row_major::<i32>()?;
+    let pred_data: Vec<i32> = predictions.to_vec_row_major::<i32>()?;
 
     let mut results = Vec::with_capacity(batch_size);
 

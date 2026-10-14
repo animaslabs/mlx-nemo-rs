@@ -12,6 +12,7 @@ use std::collections::HashMap;
 use mlx_rs::ops::{self, indexing};
 use mlx_rs::Array;
 
+use crate::core::ArrayExt;
 use crate::core::error::Result;
 
 /// Quantization configuration from model config.json.
@@ -408,7 +409,7 @@ mod tests {
 
         // Expected: [1, 2] = [[1+2+3+0.1, 4+5+6+0.2]] = [[6.1, 15.2]]
         assert_eq!(y.shape(), &[1, 2]);
-        let y_data: &[f32] = y.as_slice();
+        let y_data: Vec<f32> = y.to_vec_row_major().unwrap();
         assert!((y_data[0] - 6.1).abs() < 1e-5);
         assert!((y_data[1] - 15.2).abs() < 1e-5);
     }
@@ -433,7 +434,7 @@ mod tests {
         embeddings.eval().unwrap();
 
         assert_eq!(embeddings.shape(), &[2, 3]);
-        let data: &[f32] = embeddings.as_slice();
+        let data: Vec<f32> = embeddings.to_vec_row_major().unwrap();
         // Token 1: [4, 5, 6]
         assert!((data[0] - 4.0).abs() < 1e-5);
         assert!((data[1] - 5.0).abs() < 1e-5);

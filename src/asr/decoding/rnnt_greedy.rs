@@ -9,6 +9,7 @@ use mlx_rs::Array;
 use tracing::{debug, instrument, trace};
 
 use crate::asr::modules::{RNNTJoint, StatelessTransducerDecoder};
+use crate::core::ArrayExt;
 use crate::core::error::Result;
 
 /// Maximum number of symbols that can be emitted per encoder frame.
@@ -62,7 +63,7 @@ pub fn rnnt_greedy_decode(
     // Get encoder lengths as a vector
     let lengths_i32 = encoder_lengths.as_type::<i32>()?;
     lengths_i32.eval()?;
-    let lengths_data: Vec<i32> = lengths_i32.as_slice::<i32>().to_vec();
+    let lengths_data: Vec<i32> = lengths_i32.to_vec_row_major::<i32>()?;
 
     let mut results = Vec::with_capacity(batch_size);
 
@@ -103,7 +104,7 @@ pub fn rnnt_greedy_decode(
                 // Get argmax
                 let prediction = argmax_axis(&log_probs, -1, false)?;
                 prediction.eval()?;
-                let pred_token = prediction.as_slice::<u32>()[0] as usize;
+                let pred_token = prediction.to_vec_row_major::<u32>()?[0] as usize;
 
                 trace!(
                     batch_idx = b,
@@ -214,7 +215,7 @@ pub fn rnnt_greedy_decode_batched(
     // Get encoder lengths as a vector
     let lengths_i32 = encoder_lengths.as_type::<i32>()?;
     lengths_i32.eval()?;
-    let lengths_data: Vec<i32> = lengths_i32.as_slice::<i32>().to_vec();
+    let lengths_data: Vec<i32> = lengths_i32.to_vec_row_major::<i32>()?;
 
     // Initialize results and states for each sequence
     let mut results: Vec<Vec<usize>> = vec![Vec::new(); batch_size];
@@ -289,7 +290,7 @@ pub fn rnnt_greedy_decode_batched(
                 // Get prediction
                 let prediction = argmax_axis(&log_probs, -1, false)?;
                 prediction.eval()?;
-                let pred_token = prediction.as_slice::<u32>()[0] as usize;
+                let pred_token = prediction.to_vec_row_major::<u32>()?[0] as usize;
 
                 trace!(
                     batch_idx = b,

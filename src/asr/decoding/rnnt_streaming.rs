@@ -14,6 +14,7 @@ use tracing::{debug, trace};
 
 use crate::asr::models::{DecoderState, PredictionNetwork};
 use crate::asr::modules::RNNTJoint;
+use crate::core::ArrayExt;
 use crate::core::error::Result;
 
 /// Apply a mask to log probabilities, setting specified token indices to -inf.
@@ -25,7 +26,7 @@ fn apply_token_mask(log_probs: &Array, masked_ids: &[usize]) -> Result<Array> {
     }
 
     // Get the log probs data
-    let mut probs_data: Vec<f32> = log_probs.as_slice::<f32>().to_vec();
+    let mut probs_data: Vec<f32> = log_probs.to_vec_row_major::<f32>()?;
     let vocab_size = log_probs.dim(-1) as usize;
 
     // Set masked token probabilities to -inf
@@ -215,15 +216,15 @@ impl RnntStreamingDecoder {
                 // we must read the token value for control flow
                 let prediction = argmax_axis(&log_probs, -1, false)?;
                 prediction.eval()?;
-                let pred_token = prediction.as_slice::<u32>()[0] as usize;
+                let pred_token = prediction.to_vec_row_major::<u32>()?[0] as usize;
 
                 // Debug: log encoder and prediction norms for frame 0
                 if debug_decoder && t == 0 && symbols_emitted == 0 {
                     enc_frame.eval()?;
                     pred_output.eval()?;
-                    let enc_data = enc_frame.as_slice::<f32>();
+                    let enc_data = enc_frame.to_vec_row_major::<f32>()?;
                     let enc_norm: f32 = enc_data.iter().map(|v| v * v).sum::<f32>().sqrt();
-                    let pred_data = pred_output.as_slice::<f32>();
+                    let pred_data = pred_output.to_vec_row_major::<f32>()?;
                     let pred_norm: f32 = pred_data.iter().map(|v| v * v).sum::<f32>().sqrt();
                     trace!(
                         frame = t,
@@ -239,7 +240,7 @@ impl RnntStreamingDecoder {
                 // When blank is argmax but margin is insufficient, select best non-blank instead
                 let pred_token = if pred_token == self.blank_id && self.blank_threshold > 0.0 {
                     log_probs.eval()?;
-                    let probs_data = log_probs.as_slice::<f32>();
+                    let probs_data = log_probs.to_vec_row_major::<f32>()?;
                     let blank_prob = probs_data[self.blank_id];
 
                     // Find best non-blank token
@@ -285,7 +286,7 @@ impl RnntStreamingDecoder {
                     // Debug: log probabilities for first frame when blank is predicted (no threshold)
                     if debug_decoder && pred_token == self.blank_id && t == 0 && symbols_emitted == 0 {
                         log_probs.eval()?;
-                        let probs_data = log_probs.as_slice::<f32>();
+                        let probs_data = log_probs.to_vec_row_major::<f32>()?;
                         let blank_prob = probs_data[self.blank_id];
 
                         // Find top non-blank token

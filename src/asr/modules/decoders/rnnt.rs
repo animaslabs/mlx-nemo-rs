@@ -11,6 +11,7 @@ use mlx_rs::Array;
 use tracing::{debug, instrument, trace, trace_span};
 
 use crate::asr::config::{DecoderConfig, JointConfig};
+use crate::core::ArrayExt;
 use crate::core::error::{Error, Result};
 use crate::core::quantization::{
     EmbeddingLayer, LinearLayer, QuantizationConfig, load_embedding_layer, load_linear_layer,
@@ -986,8 +987,8 @@ impl RNNTJoint {
             let pred_flat = pred_proj.reshape(&[-1])?;
             enc_flat.eval()?;
             pred_flat.eval()?;
-            let enc_slice: &[f32] = enc_flat.as_slice();
-            let pred_slice: &[f32] = pred_flat.as_slice();
+            let enc_slice: Vec<f32> = enc_flat.to_vec_row_major()?;
+            let pred_slice: Vec<f32> = pred_flat.to_vec_row_major()?;
             let enc_std = {
                 let mean: f32 = enc_slice.iter().sum::<f32>() / enc_slice.len() as f32;
                 (enc_slice.iter().map(|&v| (v - mean).powi(2)).sum::<f32>()
