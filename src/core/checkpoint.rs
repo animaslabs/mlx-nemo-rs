@@ -169,7 +169,7 @@ impl NemoCheckpoint {
     ///
     /// This parses the config_yaml into the specified type.
     pub fn load_config<T: serde::de::DeserializeOwned>(&self) -> Result<T> {
-        serde_yaml::from_str(&self.config_yaml)
+        yaml_serde::from_str(&self.config_yaml)
             .map_err(|e| Error::config(format!("Failed to parse model config: {}", e)))
     }
 
@@ -334,7 +334,7 @@ impl NemoCheckpointWriter {
 
     /// Set the model configuration.
     pub fn config<T: serde::Serialize>(mut self, config: &T) -> Result<Self> {
-        self.config_yaml = Some(serde_yaml::to_string(config)?);
+        self.config_yaml = Some(yaml_serde::to_string(config)?);
         Ok(self)
     }
 
@@ -531,7 +531,7 @@ impl SafetensorsLoader {
         }
 
         // Try parsing as YAML
-        if let Ok(yaml) = serde_yaml::from_str::<serde_yaml::Value>(config_content) {
+        if let Ok(yaml) = yaml_serde::from_str::<yaml_serde::Value>(config_content) {
             if let Some(quant) = yaml.get("quantization") {
                 let bits = quant.get("bits").and_then(|v| v.as_i64()).unwrap_or(8) as i32;
                 let group_size = quant.get("group_size").and_then(|v| v.as_i64()).unwrap_or(64) as i32;
@@ -617,7 +617,7 @@ impl SafetensorsLoader {
     /// Automatically detects YAML vs JSON format.
     pub fn load_config<T: serde::de::DeserializeOwned>(&self) -> Result<T> {
         // Try YAML first, then JSON
-        if let Ok(config) = serde_yaml::from_str(&self.config_content) {
+        if let Ok(config) = yaml_serde::from_str(&self.config_content) {
             return Ok(config);
         }
 

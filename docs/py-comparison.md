@@ -161,7 +161,7 @@ Output
 
 | Aspect | **mlx-nemo-rs** | **NeMo Python** |
 |--------|-----------------|-----------------|
-| Format | YAML (serde_yaml) | YAML + OmegaConf |
+| Format | YAML (yaml_serde) | YAML + OmegaConf |
 | Config struct | `AsrModelConfig` | `DictConfig` (dynamic) |
 | Target resolution | `extract_target()` / `target_class_name()` | Hydra `_target_` field |
 | Type safety | Compile-time (Rust structs) | Runtime (OmegaConf) |

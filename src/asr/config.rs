@@ -103,11 +103,11 @@ pub struct AsrModelConfig {
 
     /// Spec augmentation (training only)
     #[serde(default)]
-    pub spec_augment: Option<serde_yaml::Value>,
+    pub spec_augment: Option<yaml_serde::Value>,
 
     /// Additional fields we don't need to parse
     #[serde(flatten)]
-    pub extra: std::collections::HashMap<String, serde_yaml::Value>,
+    pub extra: std::collections::HashMap<String, yaml_serde::Value>,
 }
 
 impl AsrModelConfig {
@@ -350,7 +350,7 @@ pub struct EncoderConfig {
 
     /// Additional fields
     #[serde(flatten)]
-    pub extra: std::collections::HashMap<String, serde_yaml::Value>,
+    pub extra: std::collections::HashMap<String, yaml_serde::Value>,
 }
 
 fn default_feat_out() -> i32 {
@@ -651,7 +651,7 @@ pub struct DecodingConfig {
 
     /// Additional fields
     #[serde(flatten)]
-    pub extra: std::collections::HashMap<String, serde_yaml::Value>,
+    pub extra: std::collections::HashMap<String, yaml_serde::Value>,
 }
 
 fn default_strategy() -> String {
@@ -859,7 +859,7 @@ pub struct ClassificationModelConfig {
 
     /// Additional fields we don't need to parse
     #[serde(flatten)]
-    pub extra: std::collections::HashMap<String, serde_yaml::Value>,
+    pub extra: std::collections::HashMap<String, yaml_serde::Value>,
 }
 
 /// Jasper/ConvASR encoder configuration.
@@ -882,7 +882,7 @@ pub struct JasperEncoderConfig {
 
     /// Additional fields
     #[serde(flatten)]
-    pub extra: std::collections::HashMap<String, serde_yaml::Value>,
+    pub extra: std::collections::HashMap<String, yaml_serde::Value>,
 }
 
 fn default_jasper_activation() -> String {
@@ -926,7 +926,7 @@ pub struct JasperBlockConfig {
 
     /// Additional fields
     #[serde(flatten)]
-    pub extra: std::collections::HashMap<String, serde_yaml::Value>,
+    pub extra: std::collections::HashMap<String, yaml_serde::Value>,
 }
 
 fn default_repeat() -> usize {
@@ -962,7 +962,7 @@ pub struct ClassificationDecoderConfig {
 
     /// Additional fields
     #[serde(flatten)]
-    pub extra: std::collections::HashMap<String, serde_yaml::Value>,
+    pub extra: std::collections::HashMap<String, yaml_serde::Value>,
 }
 
 fn default_num_classes_2() -> usize {
@@ -1012,7 +1012,7 @@ pub struct TransformerEncoderConfig {
 
     /// Additional fields
     #[serde(flatten)]
-    pub extra: std::collections::HashMap<String, serde_yaml::Value>,
+    pub extra: std::collections::HashMap<String, yaml_serde::Value>,
 }
 
 fn default_tf_num_layers() -> usize {
@@ -1069,7 +1069,7 @@ pub struct SortformerModulesConfig {
 
     /// Additional fields
     #[serde(flatten)]
-    pub extra: std::collections::HashMap<String, serde_yaml::Value>,
+    pub extra: std::collections::HashMap<String, yaml_serde::Value>,
 }
 
 fn default_num_spks() -> usize {
@@ -1135,7 +1135,7 @@ pub struct SortformerConfig {
 
     /// Additional fields
     #[serde(flatten)]
-    pub extra: std::collections::HashMap<String, serde_yaml::Value>,
+    pub extra: std::collections::HashMap<String, yaml_serde::Value>,
 }
 
 fn default_chunk_len() -> usize {
@@ -1207,7 +1207,7 @@ mod tests {
         let mut tdt = asr_config("nemo.collections.asr.models.EncDecRNNTBPEModel");
         tdt.extra.insert(
             "model_defaults".to_string(),
-            serde_yaml::from_str("tdt_durations: [0, 1, 2, 3, 4]").unwrap(),
+            yaml_serde::from_str("tdt_durations: [0, 1, 2, 3, 4]").unwrap(),
         );
         assert!(tdt.validate().is_err());
     }

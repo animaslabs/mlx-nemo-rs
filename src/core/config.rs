@@ -21,7 +21,7 @@ pub trait FromConfig: Sized {
 
 /// Load configuration from a YAML string.
 pub fn from_yaml_str<T: DeserializeOwned>(yaml: &str) -> Result<T> {
-    serde_yaml::from_str(yaml).map_err(|e| Error::config_with_source("Failed to parse YAML", e))
+    yaml_serde::from_str(yaml).map_err(|e| Error::config_with_source("Failed to parse YAML", e))
 }
 
 /// Load configuration from a YAML file.
@@ -33,7 +33,7 @@ pub fn from_yaml_file<T: DeserializeOwned>(path: impl AsRef<Path>) -> Result<T> 
 
 /// Serialize configuration to a YAML string.
 pub fn to_yaml_string<T: Serialize>(config: &T) -> Result<String> {
-    serde_yaml::to_string(config)
+    yaml_serde::to_string(config)
         .map_err(|e| Error::config_with_source("Failed to serialize YAML", e))
 }
 
@@ -41,7 +41,7 @@ pub fn to_yaml_string<T: Serialize>(config: &T) -> Result<String> {
 ///
 /// This is useful for handling NeMo's `_target_` pattern where the type
 /// is specified in the configuration.
-pub fn extract_target(config: &serde_yaml::Value) -> Option<&str> {
+pub fn extract_target(config: &yaml_serde::Value) -> Option<&str> {
     config.get("_target_").and_then(|v| v.as_str())
 }
 

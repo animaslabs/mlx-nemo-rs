@@ -69,7 +69,7 @@ pub enum Error {
 
     /// YAML parsing error.
     #[error("YAML error: {0}")]
-    Yaml(#[from] serde_yaml::Error),
+    Yaml(#[from] yaml_serde::Error),
 
     /// JSON parsing error.
     #[error("JSON error: {0}")]

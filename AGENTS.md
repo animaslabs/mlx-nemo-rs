@@ -184,7 +184,7 @@ mlx-nemo-rs/
 
 - `mlx-rs` (0.25) - MLX bindings for Apple Silicon
 - `thiserror` (2.0) - Error derive macros
-- `serde` / `serde_yaml` / `serde_json` - Serialization
+- `serde` / `yaml_serde` / `serde_json` - Serialization
 - `hound` / `rubato` - Audio I/O and resampling (optional, "asr" feature)
 - `sentencepiece` - Tokenization
 - `tracing` - Structured logging
