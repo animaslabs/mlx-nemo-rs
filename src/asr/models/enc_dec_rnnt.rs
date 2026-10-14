@@ -246,6 +246,7 @@ pub struct EncDecRNNTModel {
 impl EncDecRNNTModel {
     /// Create a new model from configuration.
     pub fn new(config: AsrModelConfig) -> Result<Self> {
+        config.validate()?;
         let preprocessor = MelSpectrogram::new(config.preprocessor.clone().into())?;
         let encoder = ConformerEncoder::new(config.encoder.clone())?;
 

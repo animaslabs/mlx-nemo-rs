@@ -5,6 +5,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::core::error::{Error, Result};
+
 /// Attention context size configuration.
 ///
 /// NeMo supports two formats:
@@ -122,6 +124,34 @@ impl AsrModelConfig {
     /// Check if this is a CTC model.
     pub fn is_ctc(&self) -> bool {
         !self.is_rnnt()
+    }
+
+    /// Reject model variants that would load without error but decode incorrectly.
+    ///
+    /// Encoder settings are checked separately by [`EncoderConfig::validate`].
+    pub fn validate(&self) -> Result<()> {
+        if let Some(target) = self.target.as_deref() {
+            if target.contains("WithPrompt") {
+                return Err(Error::not_implemented(format!(
+                    "prompt-conditioned model `{}` (prompt_kernel and target language are not supported)",
+                    target
+                )));
+            }
+        }
+
+        let has_tdt_durations = self
+            .extra
+            .get("model_defaults")
+            .and_then(|d| d.get("tdt_durations"))
+            .and_then(|d| d.as_sequence())
+            .is_some_and(|d| !d.is_empty());
+        if has_tdt_durations {
+            return Err(Error::not_implemented(
+                "TDT (token-and-duration transducer) models",
+            ));
+        }
+
+        Ok(())
     }
 }
 
@@ -707,6 +737,63 @@ impl EncoderConfig {
     pub fn effective_use_bias(&self) -> bool {
         self.use_bias.unwrap_or(true)
     }
+
+    /// Reject encoder settings this port does not implement.
+    ///
+    /// Weight loading is lenient, so an unsupported architecture would otherwise
+    /// load into the wrong modules and silently produce garbage output.
+    pub fn validate(&self) -> Result<()> {
+        if let Some(target) = self.target.as_deref() {
+            if !target.ends_with("ConformerEncoder") {
+                return Err(Error::not_implemented(format!("encoder `{}`", target)));
+            }
+        }
+
+        if self.self_attention_model != "rel_pos" {
+            return Err(Error::not_implemented(format!(
+                "self_attention_model `{}` (only rel_pos is supported)",
+                self.self_attention_model
+            )));
+        }
+
+        if let Some(style) = self.att_context_style.as_deref() {
+            if style != "regular" && style != "chunked_limited" {
+                return Err(Error::not_implemented(format!(
+                    "att_context_style `{}` (only regular and chunked_limited are supported)",
+                    style
+                )));
+            }
+        }
+
+        if let Some(context) = &self.att_context_size {
+            let bad_len = match context {
+                AttContextSize::Single(v) => v.len() != 2,
+                AttContextSize::Multiple(modes) => modes.iter().any(|m| m.len() != 2),
+            };
+            if bad_len {
+                return Err(Error::config(format!(
+                    "att_context_size {:?} must contain [left, right] pairs",
+                    context
+                )));
+            }
+        }
+
+        if self.subsampling != "dw_striding" {
+            return Err(Error::not_implemented(format!(
+                "subsampling `{}` (only dw_striding is supported)",
+                self.subsampling
+            )));
+        }
+
+        if ![2, 4, 8].contains(&self.subsampling_factor) {
+            return Err(Error::not_implemented(format!(
+                "subsampling_factor {} (only 2, 4 and 8 are supported)",
+                self.subsampling_factor
+            )));
+        }
+
+        Ok(())
+    }
 }
 
 impl Default for DecoderConfig {
@@ -1059,4 +1146,69 @@ fn default_spkcache_len() -> usize {
 }
 fn default_fifo_len() -> usize {
     50
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn asr_config(target: &str) -> AsrModelConfig {
+        AsrModelConfig {
+            target: Some(target.to_string()),
+            sample_rate: 16000,
+            preprocessor: PreprocessorConfig::default(),
+            encoder: EncoderConfig::default(),
+            decoder: DecoderConfig::default(),
+            joint: None,
+            tokenizer: None,
+            decoding: None,
+            spec_augment: None,
+            extra: std::collections::HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn test_encoder_validate_accepts_supported() {
+        let mut config = EncoderConfig::default();
+        config.target = Some("nemo.collections.asr.modules.ConformerEncoder".to_string());
+        assert!(config.validate().is_ok());
+
+        config.att_context_style = Some("chunked_limited".to_string());
+        config.att_context_size = Some(AttContextSize::Multiple(vec![vec![70, 13], vec![70, 0]]));
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_encoder_validate_rejects_unsupported() {
+        let cases: Vec<fn(&mut EncoderConfig)> = vec![
+            |c| c.target = Some("nemo.collections.asr.modules.TransformerEncoder".to_string()),
+            |c| c.self_attention_model = "rope".to_string(),
+            |c| c.att_context_style = Some("chunked_limited_with_rc".to_string()),
+            |c| c.att_context_size = Some(AttContextSize::Multiple(vec![vec![70, 1, 13]])),
+            |c| c.subsampling = "feature_stacking".to_string(),
+            |c| c.subsampling_factor = 16,
+        ];
+        for mutate in cases {
+            let mut config = EncoderConfig::default();
+            mutate(&mut config);
+            assert!(config.validate().is_err(), "accepted {:?}", config);
+        }
+    }
+
+    #[test]
+    fn test_model_validate() {
+        assert!(asr_config("nemo.collections.asr.models.EncDecRNNTBPEModel").validate().is_ok());
+        assert!(asr_config(
+            "nemo.collections.asr.models.rnnt_bpe_models_prompt.EncDecRNNTBPEModelWithPrompt"
+        )
+        .validate()
+        .is_err());
+
+        let mut tdt = asr_config("nemo.collections.asr.models.EncDecRNNTBPEModel");
+        tdt.extra.insert(
+            "model_defaults".to_string(),
+            serde_yaml::from_str("tdt_durations: [0, 1, 2, 3, 4]").unwrap(),
+        );
+        assert!(tdt.validate().is_err());
+    }
 }

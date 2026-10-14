@@ -296,6 +296,7 @@ impl CacheAwareRNNTPipeline {
         // Load checkpoint
         let checkpoint = NemoCheckpoint::open(path)?;
         let config: AsrModelConfig = checkpoint.load_config()?;
+        config.validate()?;
 
         // Create preprocessor with dither disabled for inference
         // NeMo only applies dither during training, not inference
@@ -539,6 +540,8 @@ impl CacheAwareRNNTPipeline {
         loader: crate::core::checkpoint::SafetensorsLoader,
         mode_idx: usize,
     ) -> Result<Self> {
+        config.validate()?;
+
         // Create preprocessor with dither disabled for inference
         let mut preproc_config: crate::asr::modules::MelSpectrogramConfig =
             config.preprocessor.clone().into();

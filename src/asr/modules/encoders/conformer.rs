@@ -478,6 +478,8 @@ pub struct ConformerEncoder {
 impl ConformerEncoder {
     /// Create a new Conformer encoder from configuration.
     pub fn new(config: EncoderConfig) -> Result<Self> {
+        config.validate()?;
+
         let d_model = config.d_model;
         let n_layers = config.n_layers;
         let pos_emb_max_len = config.pos_emb_max_len;

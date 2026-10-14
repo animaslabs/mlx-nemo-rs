@@ -703,30 +703,31 @@ impl RelPositionMultiHeadAttention {
         prefix: &str,
         quant: Option<&QuantizationConfig>,
     ) -> Result<()> {
+        // All of these are required: a checkpoint without them (e.g. a RoPE or
+        // abs_pos encoder) would otherwise run with zero-initialized position terms.
+        let linear = |name: &str| {
+            let key = format!("{}.{}", prefix, name);
+            load_linear_layer(weights, &key, quant)
+                .ok_or_else(|| Error::checkpoint(format!("missing attention weight `{}.weight`", key)))
+        };
+
         // Load linear projections (supports both standard and quantized)
-        if let Some(layer) = load_linear_layer(weights, &format!("{}.linear_q", prefix), quant) {
-            self.linear_q = layer;
-        }
-        if let Some(layer) = load_linear_layer(weights, &format!("{}.linear_k", prefix), quant) {
-            self.linear_k = layer;
-        }
-        if let Some(layer) = load_linear_layer(weights, &format!("{}.linear_v", prefix), quant) {
-            self.linear_v = layer;
-        }
-        if let Some(layer) = load_linear_layer(weights, &format!("{}.linear_out", prefix), quant) {
-            self.linear_out = layer;
-        }
-        if let Some(layer) = load_linear_layer(weights, &format!("{}.linear_pos", prefix), quant) {
-            self.linear_pos = layer;
-        }
+        self.linear_q = linear("linear_q")?;
+        self.linear_k = linear("linear_k")?;
+        self.linear_v = linear("linear_v")?;
+        self.linear_out = linear("linear_out")?;
+        self.linear_pos = linear("linear_pos")?;
 
         // Load position biases (per-layer, not shared, not quantized)
-        if let Some(bias_u) = weights.get(&format!("{}.pos_bias_u", prefix)) {
-            self.pos_bias_u = bias_u.clone();
-        }
-        if let Some(bias_v) = weights.get(&format!("{}.pos_bias_v", prefix)) {
-            self.pos_bias_v = bias_v.clone();
-        }
+        let param = |name: &str| {
+            let key = format!("{}.{}", prefix, name);
+            weights
+                .get(&key)
+                .cloned()
+                .ok_or_else(|| Error::checkpoint(format!("missing attention weight `{}`", key)))
+        };
+        self.pos_bias_u = param("pos_bias_u")?;
+        self.pos_bias_v = param("pos_bias_v")?;
 
         Ok(())
     }
