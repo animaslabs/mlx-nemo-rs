@@ -13,10 +13,16 @@
 //!
 //! # Example
 //!
-//! ```rust,ignore
+//! ```no_run
+//! # fn main() -> mlx_nemo::Result<()> {
+//! # use mlx_nemo::{asr::SortformerEncLabelModel, Array};
+//! # let audio_array = Array::from_slice(&[0.0f32; 16000], &[1, 16000]);
+//! # let lengths = Array::from_slice(&[16000i32], &[1]);
 //! let mut model = SortformerEncLabelModel::restore("diar_model.nemo")?;
 //! let preds = model.forward(&audio_array, &lengths)?;
 //! // preds: [1, T, 4] - per-frame speaker probabilities
+//! # Ok(())
+//! # }
 //! ```
 
 use std::collections::HashMap;

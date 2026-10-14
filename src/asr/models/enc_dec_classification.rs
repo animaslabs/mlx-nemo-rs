@@ -5,12 +5,15 @@
 //!
 //! # Example
 //!
-//! ```rust,ignore
+//! ```no_run
+//! # fn main() -> mlx_nemo::Result<()> {
 //! use mlx_nemo::asr::EncDecClassificationModel;
 //!
 //! let mut model = EncDecClassificationModel::restore("vad_model.nemo")?;
 //! let probs = model.infer(&["audio.wav"])?;
 //! // probs[0] contains per-frame speech probabilities
+//! # Ok(())
+//! # }
 //! ```
 
 use std::path::Path;

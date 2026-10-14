@@ -9,15 +9,18 @@
 //!
 //! ## Quick Start
 //!
-//! ```rust,ignore
+//! ```no_run
+//! # fn main() -> mlx_nemo::Result<()> {
 //! use mlx_nemo::asr::EncDecCTCModel;
 //!
 //! // Load a pretrained model from a .nemo file
-//! let model = EncDecCTCModel::restore("path/to/model.nemo")?;
+//! let mut model = EncDecCTCModel::restore("path/to/model.nemo")?;
 //!
 //! // Transcribe audio
 //! let transcriptions = model.transcribe(&["audio.wav"])?;
 //! println!("{}", transcriptions[0]);
+//! # Ok(())
+//! # }
 //! ```
 
 pub mod core;

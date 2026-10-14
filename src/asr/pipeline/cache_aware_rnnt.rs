@@ -190,7 +190,10 @@ fn resample_audio(samples: &[f32], from_rate: u32, to_rate: u32) -> Result<Vec<f
 ///
 /// # Example
 ///
-/// ```rust,ignore
+/// ```no_run
+/// # fn main() -> mlx_nemo::Result<()> {
+/// # use mlx_nemo::asr::CacheAwareRNNTPipeline;
+/// # let samples: Vec<f32> = Vec::new();
 /// let mut pipeline = CacheAwareRNNTPipeline::restore("model.nemo", 0)?;
 ///
 /// // File mode
@@ -203,6 +206,8 @@ fn resample_audio(samples: &[f32], from_rate: u32, to_rate: u32) -> Result<Vec<f
 /// while let Some(output) = pipeline.transcribe_step()? {
 ///     print!("{}", output.text);
 /// }
+/// # Ok(())
+/// # }
 /// ```
 pub struct CacheAwareRNNTPipeline {
     // Model components
@@ -428,7 +433,9 @@ impl CacheAwareRNNTPipeline {
     ///
     /// # Example
     ///
-    /// ```rust,ignore
+    /// ```no_run
+    /// # fn main() -> mlx_nemo::Result<()> {
+    /// # use mlx_nemo::{asr::CacheAwareRNNTPipeline, WeightFormat};
     /// let pipeline = CacheAwareRNNTPipeline::restore_safetensors(
     ///     "weights.safetensors",
     ///     "config.yaml",
@@ -436,6 +443,8 @@ impl CacheAwareRNNTPipeline {
     ///     0,
     ///     Some(WeightFormat::Mlx),
     /// )?;
+    /// # Ok(())
+    /// # }
     /// ```
     pub fn restore_safetensors(
         weights_path: impl AsRef<Path>,
@@ -483,8 +492,12 @@ impl CacheAwareRNNTPipeline {
     ///
     /// # Example
     ///
-    /// ```rust,ignore
+    /// ```no_run
+    /// # fn main() -> mlx_nemo::Result<()> {
+    /// # use mlx_nemo::asr::CacheAwareRNNTPipeline;
     /// let pipeline = CacheAwareRNNTPipeline::restore_from_directory("my_model/", 0)?;
+    /// # Ok(())
+    /// # }
     /// ```
     pub fn restore_from_directory(dir: impl AsRef<Path>, mode_idx: usize) -> Result<Self> {
         use crate::core::checkpoint::SafetensorsLoader;

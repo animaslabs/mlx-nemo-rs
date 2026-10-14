@@ -5,7 +5,9 @@
 //!
 //! # Example
 //!
-//! ```rust,ignore
+//! ```no_run
+//! # fn main() -> mlx_nemo::Result<()> {
+//! # let chunk1: Vec<f32> = Vec::new();
 //! use mlx_nemo::asr::pipeline::CacheAwareRNNTPipeline;
 //!
 //! // Load model and create pipeline
@@ -26,6 +28,8 @@
 //! while let Some(output) = pipeline.transcribe_step()? {
 //!     print!("{}", output.text);
 //! }
+//! # Ok(())
+//! # }
 //! ```
 
 mod cache_aware_rnnt;

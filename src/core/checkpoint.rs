@@ -416,7 +416,10 @@ impl Default for NemoCheckpointWriter {
 ///
 /// # Example
 ///
-/// ```rust,ignore
+/// ```no_run
+/// # fn main() -> mlx_nemo::Result<()> {
+/// # use mlx_nemo::SafetensorsLoader;
+/// # use mlx_nemo::asr::AsrModelConfig;
 /// // Load from explicit paths
 /// let loader = SafetensorsLoader::new(
 ///     "weights.safetensors",
@@ -430,6 +433,8 @@ impl Default for NemoCheckpointWriter {
 /// // Access components
 /// let weights = loader.load_weights()?;
 /// let config: AsrModelConfig = loader.load_config()?;
+/// # Ok(())
+/// # }
 /// ```
 #[derive(Debug)]
 pub struct SafetensorsLoader {

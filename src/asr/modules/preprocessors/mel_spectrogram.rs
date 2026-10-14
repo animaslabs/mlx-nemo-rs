@@ -9,18 +9,28 @@
 //!
 //! # Batch Processing Example
 //!
-//! ```rust,ignore
+//! ```no_run
+//! # fn main() -> mlx_nemo::Result<()> {
+//! # use mlx_nemo::{asr::{MelConfig, MelProcessor}, Array};
+//! # let audio = Array::from_slice(&[0.0f32; 16000], &[1, 16000]);
 //! let config = MelConfig::default();
 //! let mel = MelProcessor::new(config)?;
 //!
 //! // Process audio (stateless - no streaming state)
 //! let (features, lengths) = mel.forward(&audio, None)?;
 //! // features: [batch, n_mels, frames]
+//! # Ok(())
+//! # }
 //! ```
 //!
 //! # Streaming Processing Example
 //!
-//! ```rust,ignore
+//! ```no_run
+//! # fn main() -> mlx_nemo::Result<()> {
+//! # use mlx_nemo::asr::{MelConfig, StreamingMel};
+//! # let config = MelConfig::default();
+//! # let audio_chunks: Vec<Vec<f32>> = Vec::new();
+//! # let (chunk_size, shift_size) = (16, 8);
 //! let mut mel = StreamingMel::new(config)?;
 //!
 //! for audio_chunk in audio_chunks {
@@ -32,6 +42,8 @@
 //!         mel.trim(shift_size);
 //!     }
 //! }
+//! # Ok(())
+//! # }
 //! ```
 
 use std::sync::Arc;
@@ -459,12 +471,16 @@ impl MelStreamState {
 /// Number of complete frames that can be computed.
 ///
 /// # Example
-/// ```rust,ignore
+/// ```
+/// # fn main() -> mlx_nemo::Result<()> {
+/// # use mlx_nemo::asr::modules::frames_available;
 /// // With 240 samples overlap and 1600 new samples:
 /// // Total = 1840, need 400 for first frame, then 160 per additional
 /// // frames = (1840 - 400) / 160 + 1 = 10 frames
 /// let frames = frames_available(240, 1600, 400, 160);
 /// assert_eq!(frames, 10);
+/// # Ok(())
+/// # }
 /// ```
 #[inline]
 pub fn frames_available(
@@ -507,7 +523,12 @@ pub fn frames_available(
 ///
 /// # Example
 ///
-/// ```rust,ignore
+/// ```no_run
+/// # fn main() -> mlx_nemo::Result<()> {
+/// # use mlx_nemo::asr::modules::{process_audio_streaming, MelConfig, MelProcessor, MelStreamState};
+/// # let config = MelConfig::default();
+/// # let audio_chunks: Vec<Vec<f32>> = Vec::new();
+/// # fn process_mel_chunk(_mel: mlx_nemo::Array) {}
 /// let processor = MelProcessor::new(config)?;
 /// let mut state = MelStreamState::new(&processor);
 ///
@@ -520,6 +541,8 @@ pub fn frames_available(
 ///         process_mel_chunk(mel);
 ///     }
 /// }
+/// # Ok(())
+/// # }
 /// ```
 pub fn process_audio_streaming(
     processor: &MelProcessor,
@@ -828,7 +851,12 @@ impl StreamingMelConfig {
 ///
 /// # Example
 ///
-/// ```rust,ignore
+/// ```no_run
+/// # fn main() -> mlx_nemo::Result<()> {
+/// # use mlx_nemo::asr::{MelConfig, StreamingMel};
+/// # let config = MelConfig::default();
+/// # let audio_stream: Vec<Vec<f32>> = Vec::new();
+/// # let (chunk_size, overlap) = (16, 4);
 /// let mut mel = StreamingMel::new(config)?;
 ///
 /// for audio_chunk in audio_stream {
@@ -842,6 +870,8 @@ impl StreamingMelConfig {
 ///         mel.trim(chunk_size - overlap);
 ///     }
 /// }
+/// # Ok(())
+/// # }
 /// ```
 pub struct StreamingMel {
     /// The underlying mel processor

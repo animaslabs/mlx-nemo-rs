@@ -12,8 +12,10 @@
 //!
 //! # Example
 //!
-//! ```rust,ignore
-//! use mlx_nemo::asr::{EncDecCTCModel, StreamingSession};
+//! ```no_run
+//! # fn main() -> mlx_nemo::Result<()> {
+//! # let audio_chunks: Vec<Vec<f32>> = Vec::new();
+//! use mlx_nemo::asr::EncDecCTCModel;
 //!
 //! let mut model = EncDecCTCModel::restore("model.nemo")?;
 //!
@@ -25,18 +27,17 @@
 //! // Initialize streaming
 //! let mut session = model.init_streaming(0, 1)?;
 //!
-//! // Process audio chunks
-//! loop {
-//!     let audio_chunk = get_audio_chunk(); // ~160ms of audio
-//!     let output = model.process_chunk(&mut session, &audio_chunk)?;
-//!     print!("{}", output.text);
-//!     
-//!     if end_of_audio {
-//!         let final_output = model.finalize_streaming(session)?;
-//!         println!("\nFinal: {}", final_output.text);
-//!         break;
-//!     }
+//! // Process audio chunks (~160ms each)
+//! for audio_chunk in &audio_chunks {
+//!     let output = model.process_chunk(&mut session, audio_chunk)?;
+//!     print!("{}", output.text[0]);
 //! }
+//!
+//! // Flush remaining frames at end of audio
+//! let final_output = model.finalize_streaming(session)?;
+//! println!("\nFinal: {}", final_output.text[0]);
+//! # Ok(())
+//! # }
 //! ```
 
 use mlx_rs::Array;

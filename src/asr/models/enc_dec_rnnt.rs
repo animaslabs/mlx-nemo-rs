@@ -7,20 +7,25 @@
 //!
 //! For streaming-capable models, this module provides cache-aware streaming:
 //!
-//! ```rust,ignore
+//! ```no_run
+//! # fn main() -> mlx_nemo::Result<()> {
+//! # use mlx_nemo::asr::EncDecRNNTModel;
+//! # let audio_chunks: Vec<Vec<f32>> = Vec::new();
 //! let mut model = EncDecRNNTModel::restore("model.nemo")?;
 //!
 //! // Initialize streaming
 //! let mut session = model.init_streaming(0, 1)?;
 //!
 //! // Process audio chunks
-//! while let Some(chunk) = audio_source.next_chunk() {
-//!     let output = model.process_chunk(&mut session, &chunk)?;
+//! for chunk in &audio_chunks {
+//!     let output = model.process_chunk(&mut session, chunk)?;
 //!     print!("{}", output.text[0]);
 //! }
 //!
 //! // Finalize
 //! let final_output = model.finalize_streaming(session)?;
+//! # Ok(())
+//! # }
 //! ```
 
 use std::collections::HashMap;
@@ -222,14 +227,17 @@ impl PredictionNetwork {
 ///
 /// # Example
 ///
-/// ```rust,ignore
+/// ```no_run
+/// # fn main() -> mlx_nemo::Result<()> {
 /// use mlx_nemo::asr::EncDecRNNTModel;
 ///
 /// // Load from .nemo checkpoint
-/// let model = EncDecRNNTModel::restore("parakeet-rnnt-0.6b.nemo")?;
+/// let mut model = EncDecRNNTModel::restore("parakeet-rnnt-0.6b.nemo")?;
 ///
 /// // Transcribe audio files
 /// let texts = model.transcribe(&["audio.wav"])?;
+/// # Ok(())
+/// # }
 /// ```
 pub struct EncDecRNNTModel {
     config: AsrModelConfig,
@@ -399,7 +407,9 @@ impl EncDecRNNTModel {
     ///
     /// # Example
     ///
-    /// ```rust,ignore
+    /// ```no_run
+    /// # fn main() -> mlx_nemo::Result<()> {
+    /// # use mlx_nemo::{asr::EncDecRNNTModel, WeightFormat};
     /// // Load with explicit format
     /// let model = EncDecRNNTModel::restore_safetensors(
     ///     "weights.safetensors",
@@ -415,6 +425,8 @@ impl EncDecRNNTModel {
     ///     Some("tokenizer.model"),
     ///     None,
     /// )?;
+    /// # Ok(())
+    /// # }
     /// ```
     pub fn restore_safetensors(
         weights_path: impl AsRef<Path>,
@@ -495,13 +507,17 @@ impl EncDecRNNTModel {
     ///
     /// # Example
     ///
-    /// ```rust,ignore
+    /// ```no_run
+    /// # fn main() -> mlx_nemo::Result<()> {
+    /// # use mlx_nemo::asr::EncDecRNNTModel;
     /// // Load from directory structure:
     /// // my_model/
     /// // ├── model.safetensors
     /// // ├── config.yaml
     /// // └── tokenizer.model
     /// let model = EncDecRNNTModel::restore_from_directory("my_model/")?;
+    /// # Ok(())
+    /// # }
     /// ```
     pub fn restore_from_directory(dir: impl AsRef<Path>) -> Result<Self> {
         use crate::core::checkpoint::SafetensorsLoader;

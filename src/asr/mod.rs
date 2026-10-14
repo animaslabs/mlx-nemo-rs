@@ -12,21 +12,27 @@
 //!
 //! # Example (CTC Model)
 //!
-//! ```rust,ignore
+//! ```no_run
+//! # fn main() -> mlx_nemo::Result<()> {
 //! use mlx_nemo::asr::EncDecCTCModel;
 //!
-//! let model = EncDecCTCModel::restore("parakeet-ctc-0.6b.nemo")?;
+//! let mut model = EncDecCTCModel::restore("parakeet-ctc-0.6b.nemo")?;
 //! let transcriptions = model.transcribe(&["audio.wav"])?;
+//! # Ok(())
+//! # }
 //! ```
 //!
 //! # Example (RNN-T Streaming Pipeline)
 //!
-//! ```rust,ignore
+//! ```no_run
+//! # fn main() -> mlx_nemo::Result<()> {
 //! use mlx_nemo::asr::CacheAwareRNNTPipeline;
 //!
 //! let mut pipeline = CacheAwareRNNTPipeline::restore("model.nemo", 0)?;
 //! pipeline.set_audio_file("audio.wav")?;
 //! let text = pipeline.run()?;
+//! # Ok(())
+//! # }
 //! ```
 
 pub mod config;

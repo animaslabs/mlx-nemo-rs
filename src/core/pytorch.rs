@@ -36,11 +36,14 @@ use crate::core::error::{Error, Result};
 ///
 /// # Example
 ///
-/// ```rust,ignore
+/// ```no_run
+/// # fn main() -> mlx_nemo::Result<()> {
 /// use mlx_nemo::core::pytorch;
 ///
 /// let weights = pytorch::load("model_weights.ckpt")?;
 /// println!("Loaded {} tensors", weights.len());
+/// # Ok(())
+/// # }
 /// ```
 pub fn load(path: impl AsRef<Path>) -> Result<HashMap<String, Array>> {
     let path = path.as_ref();

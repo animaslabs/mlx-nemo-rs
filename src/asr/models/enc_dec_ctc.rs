@@ -8,7 +8,10 @@
 //! For streaming-capable models (e.g., Nemotron), this module provides
 //! cache-aware streaming inference:
 //!
-//! ```rust,ignore
+//! ```no_run
+//! # fn main() -> mlx_nemo::Result<()> {
+//! # use mlx_nemo::asr::EncDecCTCModel;
+//! # let audio_chunks: Vec<Vec<f32>> = Vec::new();
 //! let mut model = EncDecCTCModel::restore("model.nemo")?;
 //!
 //! // Check streaming support and modes
@@ -21,8 +24,8 @@
 //!     let mut session = model.init_streaming(0, 1)?;
 //!
 //!     // Process audio chunks
-//!     while let Some(chunk) = audio_source.next_chunk() {
-//!         let output = model.process_chunk(&mut session, &chunk)?;
+//!     for chunk in &audio_chunks {
+//!         let output = model.process_chunk(&mut session, chunk)?;
 //!         print!("{}", output.text[0]);
 //!     }
 //!
@@ -30,6 +33,8 @@
 //!     let final_output = model.finalize_streaming(session)?;
 //!     println!("{}", final_output.text[0]);
 //! }
+//! # Ok(())
+//! # }
 //! ```
 
 use std::path::Path;
@@ -75,14 +80,17 @@ pub struct DebugOutput {
 ///
 /// # Example
 ///
-/// ```rust,ignore
+/// ```no_run
+/// # fn main() -> mlx_nemo::Result<()> {
 /// use mlx_nemo::asr::EncDecCTCModel;
 ///
 /// // Load from .nemo checkpoint
-/// let model = EncDecCTCModel::restore("model.nemo")?;
+/// let mut model = EncDecCTCModel::restore("model.nemo")?;
 ///
 /// // Transcribe audio files
 /// let texts = model.transcribe(&["audio.wav"])?;
+/// # Ok(())
+/// # }
 /// ```
 pub struct EncDecCTCModel {
     config: AsrModelConfig,
@@ -189,7 +197,9 @@ impl EncDecCTCModel {
     ///
     /// # Example
     ///
-    /// ```rust,ignore
+    /// ```no_run
+    /// # fn main() -> mlx_nemo::Result<()> {
+    /// # use mlx_nemo::{asr::EncDecCTCModel, WeightFormat};
     /// // Load with explicit format
     /// let model = EncDecCTCModel::restore_safetensors(
     ///     "weights.safetensors",
@@ -205,6 +215,8 @@ impl EncDecCTCModel {
     ///     Some("tokenizer.model"),
     ///     None,
     /// )?;
+    /// # Ok(())
+    /// # }
     /// ```
     pub fn restore_safetensors(
         weights_path: impl AsRef<Path>,
@@ -276,13 +288,17 @@ impl EncDecCTCModel {
     ///
     /// # Example
     ///
-    /// ```rust,ignore
+    /// ```no_run
+    /// # fn main() -> mlx_nemo::Result<()> {
+    /// # use mlx_nemo::asr::EncDecCTCModel;
     /// // Load from directory structure:
     /// // my_model/
     /// // ├── model.safetensors
     /// // ├── config.yaml
     /// // └── tokenizer.model
     /// let model = EncDecCTCModel::restore_from_directory("my_model/")?;
+    /// # Ok(())
+    /// # }
     /// ```
     pub fn restore_from_directory(dir: impl AsRef<Path>) -> Result<Self> {
         use crate::core::checkpoint::SafetensorsLoader;
