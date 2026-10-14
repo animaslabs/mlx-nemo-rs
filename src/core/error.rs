@@ -67,10 +67,6 @@ pub enum Error {
     #[error("Decoding error: {0}")]
     Decoding(String),
 
-    /// JSON parsing error.
-    #[error("JSON error: {0}")]
-    Json(#[from] serde_json::Error),
-
     /// Archive (TAR) error.
     #[error("Archive error: {0}")]
     Archive(String),

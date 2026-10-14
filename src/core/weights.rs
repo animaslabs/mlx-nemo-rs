@@ -254,7 +254,8 @@ pub fn read_safetensors_metadata(path: impl AsRef<Path>) -> Result<HashMap<Strin
     file.read_exact(&mut header_bytes)?;
 
     // Parse as JSON
-    let header: serde_json::Value = serde_json::from_slice(&header_bytes)?;
+    let header: serde_json::Value = serde_json::from_slice(&header_bytes)
+        .map_err(|e| Error::checkpoint(format!("Invalid safetensors header: {}", e)))?;
 
     // Extract metadata if present
     if let Some(metadata) = header.get("__metadata__") {
