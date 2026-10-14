@@ -1,9 +1,9 @@
-# mlx-nemo-rs Architecture Overview
+# mlx-voice-rs Architecture Overview
 
 ## High-Level Structure
 
 ```
-mlx-nemo-rs/
+mlx-voice-rs/
 ├── src/
 │   ├── lib.rs              # Entry point, re-exports Error/Result
 │   ├── core/               # Core utilities (always available)

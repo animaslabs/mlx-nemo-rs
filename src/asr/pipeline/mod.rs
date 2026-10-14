@@ -6,9 +6,9 @@
 //! # Example
 //!
 //! ```no_run
-//! # fn main() -> mlx_nemo::Result<()> {
+//! # fn main() -> mlx_voice::Result<()> {
 //! # let chunk1: Vec<f32> = Vec::new();
-//! use mlx_nemo::asr::pipeline::CacheAwareRNNTPipeline;
+//! use mlx_voice::asr::pipeline::CacheAwareRNNTPipeline;
 //!
 //! // Load model and create pipeline
 //! let mut pipeline = CacheAwareRNNTPipeline::restore("model.nemo", 0)?;

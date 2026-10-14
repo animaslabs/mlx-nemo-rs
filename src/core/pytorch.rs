@@ -37,8 +37,8 @@ use crate::core::error::{Error, Result};
 /// # Example
 ///
 /// ```no_run
-/// # fn main() -> mlx_nemo::Result<()> {
-/// use mlx_nemo::core::pytorch;
+/// # fn main() -> mlx_voice::Result<()> {
+/// use mlx_voice::core::pytorch;
 ///
 /// let weights = pytorch::load("model_weights.ckpt")?;
 /// println!("Loaded {} tensors", weights.len());

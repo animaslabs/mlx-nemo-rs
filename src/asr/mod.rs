@@ -13,8 +13,8 @@
 //! # Example (CTC Model)
 //!
 //! ```no_run
-//! # fn main() -> mlx_nemo::Result<()> {
-//! use mlx_nemo::asr::EncDecCTCModel;
+//! # fn main() -> mlx_voice::Result<()> {
+//! use mlx_voice::asr::EncDecCTCModel;
 //!
 //! let mut model = EncDecCTCModel::restore("parakeet-ctc-0.6b.nemo")?;
 //! let transcriptions = model.transcribe(&["audio.wav"])?;
@@ -25,8 +25,8 @@
 //! # Example (RNN-T Streaming Pipeline)
 //!
 //! ```no_run
-//! # fn main() -> mlx_nemo::Result<()> {
-//! use mlx_nemo::asr::CacheAwareRNNTPipeline;
+//! # fn main() -> mlx_voice::Result<()> {
+//! use mlx_voice::asr::CacheAwareRNNTPipeline;
 //!
 //! let mut pipeline = CacheAwareRNNTPipeline::restore("model.nemo", 0)?;
 //! pipeline.set_audio_file("audio.wav")?;

@@ -191,8 +191,8 @@ fn resample_audio(samples: &[f32], from_rate: u32, to_rate: u32) -> Result<Vec<f
 /// # Example
 ///
 /// ```no_run
-/// # fn main() -> mlx_nemo::Result<()> {
-/// # use mlx_nemo::asr::CacheAwareRNNTPipeline;
+/// # fn main() -> mlx_voice::Result<()> {
+/// # use mlx_voice::asr::CacheAwareRNNTPipeline;
 /// # let samples: Vec<f32> = Vec::new();
 /// let mut pipeline = CacheAwareRNNTPipeline::restore("model.nemo", 0)?;
 ///
@@ -434,8 +434,8 @@ impl CacheAwareRNNTPipeline {
     /// # Example
     ///
     /// ```no_run
-    /// # fn main() -> mlx_nemo::Result<()> {
-    /// # use mlx_nemo::{asr::CacheAwareRNNTPipeline, WeightFormat};
+    /// # fn main() -> mlx_voice::Result<()> {
+    /// # use mlx_voice::{asr::CacheAwareRNNTPipeline, WeightFormat};
     /// let pipeline = CacheAwareRNNTPipeline::restore_safetensors(
     ///     "weights.safetensors",
     ///     "config.yaml",
@@ -493,8 +493,8 @@ impl CacheAwareRNNTPipeline {
     /// # Example
     ///
     /// ```no_run
-    /// # fn main() -> mlx_nemo::Result<()> {
-    /// # use mlx_nemo::asr::CacheAwareRNNTPipeline;
+    /// # fn main() -> mlx_voice::Result<()> {
+    /// # use mlx_voice::asr::CacheAwareRNNTPipeline;
     /// let pipeline = CacheAwareRNNTPipeline::restore_from_directory("my_model/", 0)?;
     /// # Ok(())
     /// # }

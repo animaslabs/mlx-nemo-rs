@@ -2,10 +2,10 @@
 //!
 //! Run with: RUST_LOG=info cargo run --example trace_streaming --release
 
-use mlx_nemo::asr::CacheAwareRNNTPipeline;
+use mlx_voice::asr::CacheAwareRNNTPipeline;
 use tracing_subscriber::{fmt, EnvFilter};
 
-fn main() -> mlx_nemo::Result<()> {
+fn main() -> mlx_voice::Result<()> {
     // Initialize tracing
     fmt()
         .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
@@ -85,11 +85,11 @@ fn main() -> mlx_nemo::Result<()> {
     Ok(())
 }
 
-fn load_audio(path: &str) -> mlx_nemo::Result<(Vec<f32>, u32)> {
+fn load_audio(path: &str) -> mlx_voice::Result<(Vec<f32>, u32)> {
     use hound::WavReader;
 
     let reader = WavReader::open(path)
-        .map_err(|e| mlx_nemo::Error::audio(format!("Failed to open WAV file: {}", e)))?;
+        .map_err(|e| mlx_voice::Error::audio(format!("Failed to open WAV file: {}", e)))?;
 
     let spec = reader.spec();
     let sample_rate = spec.sample_rate;
@@ -100,7 +100,7 @@ fn load_audio(path: &str) -> mlx_nemo::Result<(Vec<f32>, u32)> {
             let samples: Vec<f32> = reader
                 .into_samples::<f32>()
                 .collect::<Result<Vec<_>, _>>()
-                .map_err(|e| mlx_nemo::Error::audio(format!("Failed to read samples: {}", e)))?;
+                .map_err(|e| mlx_voice::Error::audio(format!("Failed to read samples: {}", e)))?;
 
             if channels > 1 {
                 samples
@@ -118,7 +118,7 @@ fn load_audio(path: &str) -> mlx_nemo::Result<(Vec<f32>, u32)> {
             let samples: Vec<i32> = reader
                 .into_samples::<i32>()
                 .collect::<Result<Vec<_>, _>>()
-                .map_err(|e| mlx_nemo::Error::audio(format!("Failed to read samples: {}", e)))?;
+                .map_err(|e| mlx_voice::Error::audio(format!("Failed to read samples: {}", e)))?;
 
             if channels > 1 {
                 samples

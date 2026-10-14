@@ -8,8 +8,8 @@
 //! For streaming-capable models, this module provides cache-aware streaming:
 //!
 //! ```no_run
-//! # fn main() -> mlx_nemo::Result<()> {
-//! # use mlx_nemo::asr::EncDecRNNTModel;
+//! # fn main() -> mlx_voice::Result<()> {
+//! # use mlx_voice::asr::EncDecRNNTModel;
 //! # let audio_chunks: Vec<Vec<f32>> = Vec::new();
 //! let mut model = EncDecRNNTModel::restore("model.nemo")?;
 //!
@@ -228,8 +228,8 @@ impl PredictionNetwork {
 /// # Example
 ///
 /// ```no_run
-/// # fn main() -> mlx_nemo::Result<()> {
-/// use mlx_nemo::asr::EncDecRNNTModel;
+/// # fn main() -> mlx_voice::Result<()> {
+/// use mlx_voice::asr::EncDecRNNTModel;
 ///
 /// // Load from .nemo checkpoint
 /// let mut model = EncDecRNNTModel::restore("parakeet-rnnt-0.6b.nemo")?;
@@ -408,8 +408,8 @@ impl EncDecRNNTModel {
     /// # Example
     ///
     /// ```no_run
-    /// # fn main() -> mlx_nemo::Result<()> {
-    /// # use mlx_nemo::{asr::EncDecRNNTModel, WeightFormat};
+    /// # fn main() -> mlx_voice::Result<()> {
+    /// # use mlx_voice::{asr::EncDecRNNTModel, WeightFormat};
     /// // Load with explicit format
     /// let model = EncDecRNNTModel::restore_safetensors(
     ///     "weights.safetensors",
@@ -508,8 +508,8 @@ impl EncDecRNNTModel {
     /// # Example
     ///
     /// ```no_run
-    /// # fn main() -> mlx_nemo::Result<()> {
-    /// # use mlx_nemo::asr::EncDecRNNTModel;
+    /// # fn main() -> mlx_voice::Result<()> {
+    /// # use mlx_voice::asr::EncDecRNNTModel;
     /// // Load from directory structure:
     /// // my_model/
     /// // ├── model.safetensors

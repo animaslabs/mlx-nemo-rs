@@ -3,13 +3,13 @@
 //! Usage:
 //!   cargo run --release --example debug_encoder -- --model path/to/model.nemo audio.wav
 
-use mlx_nemo::asr::modules::{ConformerEncoder, MelSpectrogram, MelSpectrogramConfig};
-use mlx_nemo::asr::modules::encoders::DebugEncoderOutput;
-use mlx_nemo::asr::config::AsrModelConfig;
-use mlx_nemo::core::checkpoint::NemoCheckpoint;
+use mlx_voice::asr::modules::{ConformerEncoder, MelSpectrogram, MelSpectrogramConfig};
+use mlx_voice::asr::modules::encoders::DebugEncoderOutput;
+use mlx_voice::asr::config::AsrModelConfig;
+use mlx_voice::core::checkpoint::NemoCheckpoint;
 use mlx_rs::Array;
 
-fn main() -> mlx_nemo::Result<()> {
+fn main() -> mlx_voice::Result<()> {
     // Parse args
     let args: Vec<String> = std::env::args().collect();
     let mut model_path: Option<&str> = None;
@@ -34,7 +34,7 @@ fn main() -> mlx_nemo::Result<()> {
     let audio_path = audio_path.expect("Usage: --model <model.nemo> <audio.wav>");
 
     println!("=== Loading Audio: {} ===", audio_path);
-    let (samples, sr) = mlx_nemo::audio::load_wav(audio_path)?;
+    let (samples, sr) = mlx_voice::audio::load_wav(audio_path)?;
     println!("Audio: {} samples at {} Hz", samples.len(), sr);
 
     println!("\n=== Loading Model: {} ===", model_path);

@@ -1,9 +1,9 @@
 //! Debug decoder step by step to compare with Python.
 
-use mlx_nemo::asr::CacheAwareRNNTPipeline;
+use mlx_voice::asr::CacheAwareRNNTPipeline;
 use mlx_rs::Array;
 
-fn main() -> mlx_nemo::Result<()> {
+fn main() -> mlx_voice::Result<()> {
     // Initialize tracing
     tracing_subscriber::fmt()
         .with_env_filter(

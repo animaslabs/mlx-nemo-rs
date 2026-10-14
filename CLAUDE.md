@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-mlx-nemo-rs is a Rust implementation of NVIDIA NeMo speech AI models for Apple Silicon, built on the MLX framework. It provides ASR (Automatic Speech Recognition) capabilities including CTC and RNN-T/Transducer models with streaming support.
+mlx-voice-rs is a Rust implementation of NVIDIA NeMo speech AI models for Apple Silicon, built on the MLX framework. It provides ASR (Automatic Speech Recognition) capabilities including CTC and RNN-T/Transducer models with streaming support.
 
 ## Build Commands
 

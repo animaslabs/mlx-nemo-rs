@@ -10,8 +10,8 @@
 //! # Batch Processing Example
 //!
 //! ```no_run
-//! # fn main() -> mlx_nemo::Result<()> {
-//! # use mlx_nemo::{asr::{MelConfig, MelProcessor}, Array};
+//! # fn main() -> mlx_voice::Result<()> {
+//! # use mlx_voice::{asr::{MelConfig, MelProcessor}, Array};
 //! # let audio = Array::from_slice(&[0.0f32; 16000], &[1, 16000]);
 //! let config = MelConfig::default();
 //! let mel = MelProcessor::new(config)?;
@@ -26,8 +26,8 @@
 //! # Streaming Processing Example
 //!
 //! ```no_run
-//! # fn main() -> mlx_nemo::Result<()> {
-//! # use mlx_nemo::asr::{MelConfig, StreamingMel};
+//! # fn main() -> mlx_voice::Result<()> {
+//! # use mlx_voice::asr::{MelConfig, StreamingMel};
 //! # let config = MelConfig::default();
 //! # let audio_chunks: Vec<Vec<f32>> = Vec::new();
 //! # let (chunk_size, shift_size) = (16, 8);
@@ -472,8 +472,8 @@ impl MelStreamState {
 ///
 /// # Example
 /// ```
-/// # fn main() -> mlx_nemo::Result<()> {
-/// # use mlx_nemo::asr::modules::frames_available;
+/// # fn main() -> mlx_voice::Result<()> {
+/// # use mlx_voice::asr::modules::frames_available;
 /// // With 240 samples overlap and 1600 new samples:
 /// // Total = 1840, need 400 for first frame, then 160 per additional
 /// // frames = (1840 - 400) / 160 + 1 = 10 frames
@@ -524,11 +524,11 @@ pub fn frames_available(
 /// # Example
 ///
 /// ```no_run
-/// # fn main() -> mlx_nemo::Result<()> {
-/// # use mlx_nemo::asr::modules::{process_audio_streaming, MelConfig, MelProcessor, MelStreamState};
+/// # fn main() -> mlx_voice::Result<()> {
+/// # use mlx_voice::asr::modules::{process_audio_streaming, MelConfig, MelProcessor, MelStreamState};
 /// # let config = MelConfig::default();
 /// # let audio_chunks: Vec<Vec<f32>> = Vec::new();
-/// # fn process_mel_chunk(_mel: mlx_nemo::Array) {}
+/// # fn process_mel_chunk(_mel: mlx_voice::Array) {}
 /// let processor = MelProcessor::new(config)?;
 /// let mut state = MelStreamState::new(&processor);
 ///
@@ -852,8 +852,8 @@ impl StreamingMelConfig {
 /// # Example
 ///
 /// ```no_run
-/// # fn main() -> mlx_nemo::Result<()> {
-/// # use mlx_nemo::asr::{MelConfig, StreamingMel};
+/// # fn main() -> mlx_voice::Result<()> {
+/// # use mlx_voice::asr::{MelConfig, StreamingMel};
 /// # let config = MelConfig::default();
 /// # let audio_stream: Vec<Vec<f32>> = Vec::new();
 /// # let (chunk_size, overlap) = (16, 4);

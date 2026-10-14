@@ -7,8 +7,8 @@
 //! # Example
 //!
 //! ```no_run
-//! # fn main() -> mlx_nemo::Result<()> {
-//! # use mlx_nemo::asr::MultiTalkerPipeline;
+//! # fn main() -> mlx_voice::Result<()> {
+//! # use mlx_voice::asr::MultiTalkerPipeline;
 //! let mut pipeline = MultiTalkerPipeline::restore(
 //!     "nemotron-speech-streaming-en-0.6b.nemo",
 //!     "diar_streaming_sortformer_4spk-v2.1.nemo",

@@ -1,11 +1,11 @@
 //! Test mel spectrogram computation for comparison with Python NeMo.
 
-use mlx_nemo::asr::modules::{MelSpectrogram, MelSpectrogramConfig};
-use mlx_nemo::asr::streaming::StreamingMelBuffer;
+use mlx_voice::asr::modules::{MelSpectrogram, MelSpectrogramConfig};
+use mlx_voice::asr::streaming::StreamingMelBuffer;
 
-fn main() -> mlx_nemo::Result<()> {
+fn main() -> mlx_voice::Result<()> {
     // Load audio
-    let (samples, sr) = mlx_nemo::audio::load_wav("samples/2086-149220-0033.wav")?;
+    let (samples, sr) = mlx_voice::audio::load_wav("samples/2086-149220-0033.wav")?;
     println!("Audio: {} samples at {} Hz", samples.len(), sr);
     println!(
         "Audio stats: min={:.6}, max={:.6}, mean={:.6}",

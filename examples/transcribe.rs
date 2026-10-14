@@ -15,15 +15,15 @@
 //!   --format <fmt>    Weight format: "mlx" or "pytorch" (default: auto-detect)
 //!
 //! Environment:
-//!   RUST_LOG=mlx_nemo=debug   Enable debug logging
+//!   RUST_LOG=mlx_voice=debug   Enable debug logging
 
 use std::path::Path;
 use std::time::Instant;
 
-use mlx_nemo::asr::EncDecCTCModel;
-use mlx_nemo::WeightFormat;
+use mlx_voice::asr::EncDecCTCModel;
+use mlx_voice::WeightFormat;
 
-fn main() -> mlx_nemo::Result<()> {
+fn main() -> mlx_voice::Result<()> {
     // Parse command line arguments
     let args: Vec<String> = std::env::args().collect();
 
@@ -107,7 +107,7 @@ fn main() -> mlx_nemo::Result<()> {
 }
 
 /// Load model from various formats: .nemo, .safetensors, or directory
-fn load_model(model_path: &str, weight_format: Option<WeightFormat>) -> mlx_nemo::Result<EncDecCTCModel> {
+fn load_model(model_path: &str, weight_format: Option<WeightFormat>) -> mlx_voice::Result<EncDecCTCModel> {
     let path = Path::new(model_path);
 
     if path.is_dir() {
@@ -167,7 +167,7 @@ fn load_model(model_path: &str, weight_format: Option<WeightFormat>) -> mlx_nemo
 }
 
 /// Find config file in directory
-fn find_config_file(dir: &Path) -> mlx_nemo::Result<std::path::PathBuf> {
+fn find_config_file(dir: &Path) -> mlx_voice::Result<std::path::PathBuf> {
     let candidates = [
         "config.yaml",
         "model_config.yaml",
@@ -182,7 +182,7 @@ fn find_config_file(dir: &Path) -> mlx_nemo::Result<std::path::PathBuf> {
         }
     }
 
-    Err(mlx_nemo::Error::Checkpoint {
+    Err(mlx_voice::Error::Checkpoint {
         message: format!("No config file found in {}", dir.display()),
         path: Some(dir.to_path_buf()),
     })

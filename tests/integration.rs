@@ -7,7 +7,7 @@
 
 use std::path::Path;
 
-use mlx_nemo::asr::{
+use mlx_voice::asr::{
     CacheAwareRNNTPipeline, EncDecClassificationModel, EncDecRNNTModel, VadPostProcessConfig,
     VadPostProcessor,
 };

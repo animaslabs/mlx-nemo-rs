@@ -1,8 +1,8 @@
-# Architecture Comparison: mlx-nemo-rs vs NVIDIA NeMo Python
+# Architecture Comparison: mlx-voice-rs vs NVIDIA NeMo Python
 
 ## Overview
 
-| Aspect | **mlx-nemo-rs (Your Rust Implementation)** | **NVIDIA NeMo Python** |
+| Aspect | **mlx-voice-rs (Your Rust Implementation)** | **NVIDIA NeMo Python** |
 |--------|---------------------------------------------|------------------------|
 | Language | Rust | Python |
 | ML Backend | mlx-rs (Apple Silicon) | PyTorch + CUDA |
@@ -17,7 +17,7 @@
 
 ### High-Level Organization
 
-| Category | **mlx-nemo-rs** | **NeMo Python** |
+| Category | **mlx-voice-rs** | **NeMo Python** |
 |----------|-----------------|-----------------|
 | Entry point | `src/lib.rs` | `nemo/collections/asr/__init__.py` |
 | Models | `src/asr/models/` | `nemo/collections/asr/models/` |
@@ -55,7 +55,7 @@ nemo/collections/asr/
 
 ### CTC Models
 
-| Feature | **mlx-nemo-rs** | **NeMo Python** |
+| Feature | **mlx-voice-rs** | **NeMo Python** |
 |---------|-----------------|-----------------|
 | Main class | `EncDecCTCModel` | `EncDecCTCModel` / `EncDecCTCModelBPE` |
 | Location | `src/asr/models/enc_dec_ctc.rs:36` | `ctc_models.py` / `ctc_bpe_models.py` |
@@ -65,7 +65,7 @@ nemo/collections/asr/
 
 ### Key Method Comparison
 
-| Method | **mlx-nemo-rs** | **NeMo Python** |
+| Method | **mlx-voice-rs** | **NeMo Python** |
 |--------|-----------------|-----------------|
 | Load model | `EncDecCTCModel::restore(path)` | `ASRModel.from_pretrained(name)` / `.restore_from(path)` |
 | Transcribe | `model.transcribe(&paths)` | `model.transcribe(paths)` |
@@ -80,7 +80,7 @@ nemo/collections/asr/
 
 ### Conformer Encoder
 
-| Component | **mlx-nemo-rs** | **NeMo Python** |
+| Component | **mlx-voice-rs** | **NeMo Python** |
 |-----------|-----------------|-----------------|
 | Main struct/class | `ConformerEncoder` | `ConformerEncoder` |
 | Location | `src/asr/modules/encoders/conformer.rs:67` | `conformer_encoder.py` |
@@ -110,7 +110,7 @@ Output
 
 ### Attention Variants
 
-| Variant | **mlx-nemo-rs** | **NeMo Python** |
+| Variant | **mlx-voice-rs** | **NeMo Python** |
 |---------|-----------------|-----------------|
 | Absolute Position | Implemented | `MultiHeadAttention` |
 | Relative Position (XL) | Not implemented | `RelPositionMultiHeadAttention` |
@@ -123,7 +123,7 @@ Output
 
 ### CTC Decoder
 
-| Feature | **mlx-nemo-rs** | **NeMo Python** |
+| Feature | **mlx-voice-rs** | **NeMo Python** |
 |---------|-----------------|-----------------|
 | Class | `CTCDecoder` | `ConvASRDecoder` |
 | Location | `src/asr/modules/decoders/ctc.rs:15` | `conv_asr.py` |
@@ -132,7 +132,7 @@ Output
 
 ### Decoding Strategies
 
-| Strategy | **mlx-nemo-rs** | **NeMo Python** |
+| Strategy | **mlx-voice-rs** | **NeMo Python** |
 |----------|-----------------|-----------------|
 | Greedy | `greedy_decode()` | `CTCGreedyDecoding` |
 | Beam Search | Not implemented | `CTCBeamDecoding` (multiple variants) |
@@ -145,7 +145,7 @@ Output
 
 ### Mel Spectrogram
 
-| Feature | **mlx-nemo-rs** | **NeMo Python** |
+| Feature | **mlx-voice-rs** | **NeMo Python** |
 |---------|-----------------|-----------------|
 | Class | `MelSpectrogram` | `AudioToMelSpectrogramPreprocessor` |
 | Location | `preprocessors/mel_spectrogram.rs:15` | `features.py` |
@@ -159,7 +159,7 @@ Output
 
 ## Configuration System Comparison
 
-| Aspect | **mlx-nemo-rs** | **NeMo Python** |
+| Aspect | **mlx-voice-rs** | **NeMo Python** |
 |--------|-----------------|-----------------|
 | Format | YAML (yaml_serde) | YAML + OmegaConf |
 | Config struct | `AsrModelConfig` | `DictConfig` (dynamic) |
@@ -169,7 +169,7 @@ Output
 
 ### Config Structure Comparison
 
-**mlx-nemo-rs** (`src/asr/config.rs`):
+**mlx-voice-rs** (`src/asr/config.rs`):
 ```rust
 pub struct AsrModelConfig {
     pub preprocessor: PreprocessorConfig,
@@ -199,7 +199,7 @@ model:
 
 ## Checkpoint Handling Comparison
 
-| Feature | **mlx-nemo-rs** | **NeMo Python** |
+| Feature | **mlx-voice-rs** | **NeMo Python** |
 |---------|-----------------|-----------------|
 | Format | `.nemo` (TAR), `.ckpt`, `.safetensors` | `.nemo` (TAR), `.ckpt` |
 | Config extraction | `NemoCheckpoint::open()` | `restore_from()` |
@@ -215,7 +215,7 @@ A notable achievement in your implementation is the **native Rust pickle parser*
 
 ## Features Gap Analysis
 
-### What mlx-nemo-rs Has That Works Well
+### What mlx-voice-rs Has That Works Well
 
 | Feature | Status | Notes |
 |---------|--------|-------|
@@ -228,7 +228,7 @@ A notable achievement in your implementation is the **native Rust pickle parser*
 | SentencePiece tokenizer | ✅ Complete | |
 | Audio loading/resampling | ✅ Complete | hound + rubato |
 
-### What mlx-nemo-rs is Missing
+### What mlx-voice-rs is Missing
 
 | Feature | NeMo Python | Priority |
 |---------|-------------|----------|
@@ -259,7 +259,7 @@ A notable achievement in your implementation is the **native Rust pickle parser*
 
 ### Transcription API
 
-**mlx-nemo-rs:**
+**mlx-voice-rs:**
 ```rust
 let model = EncDecCTCModel::restore("path/to/model.nemo")?;
 let transcriptions = model.transcribe(&["audio.wav"])?;
@@ -277,7 +277,7 @@ Both are quite similar in API design, which is good for users transitioning betw
 
 ## Summary
 
-Your **mlx-nemo-rs** implementation is a solid foundation that correctly mirrors the core NeMo architecture for CTC-based ASR models. The key architectural decisions align well:
+Your **mlx-voice-rs** implementation is a solid foundation that correctly mirrors the core NeMo architecture for CTC-based ASR models. The key architectural decisions align well:
 
 1. **Module hierarchy** matches NeMo's `models/` → `modules/` → `decoding/` pattern
 2. **Configuration system** uses compatible YAML structure

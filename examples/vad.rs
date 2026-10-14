@@ -13,9 +13,9 @@
 
 use std::time::Instant;
 
-use mlx_nemo::asr::{EncDecClassificationModel, VadPostProcessConfig, VadPostProcessor};
+use mlx_voice::asr::{EncDecClassificationModel, VadPostProcessConfig, VadPostProcessor};
 
-fn main() -> mlx_nemo::Result<()> {
+fn main() -> mlx_voice::Result<()> {
     let args: Vec<String> = std::env::args().collect();
 
     if args.len() < 4 || args[1] != "--model" {

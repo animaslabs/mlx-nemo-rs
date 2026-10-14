@@ -1563,32 +1563,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "mlx-nemo"
-version = "0.1.0"
-dependencies = [
- "bytemuck",
- "cpal",
- "ctrlc",
- "flate2",
- "half",
- "hound",
- "mlx-rs",
- "ringbuf",
- "rubato",
- "sentencepiece",
- "serde",
- "serde_json",
- "tar",
- "tempfile",
- "thiserror 2.0.21",
- "tokio",
- "tracing",
- "tracing-subscriber",
- "yaml_serde",
- "zip",
-]
-
-[[package]]
 name = "mlx-rs"
 version = "0.32.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1623,6 +1597,32 @@ dependencies = [
  "bindgen",
  "cc",
  "cmake",
+]
+
+[[package]]
+name = "mlx-voice"
+version = "0.1.0"
+dependencies = [
+ "bytemuck",
+ "cpal",
+ "ctrlc",
+ "flate2",
+ "half",
+ "hound",
+ "mlx-rs",
+ "ringbuf",
+ "rubato",
+ "sentencepiece",
+ "serde",
+ "serde_json",
+ "tar",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "yaml_serde",
+ "zip",
 ]
 
 [[package]]

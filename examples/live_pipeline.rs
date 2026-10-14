@@ -39,10 +39,10 @@ use rubato::{
     SincInterpolationParameters, SincInterpolationType, WindowFunction,
 };
 
-use mlx_nemo::asr::{CacheAwareRNNTPipeline, StreamingModeInfo};
+use mlx_voice::asr::{CacheAwareRNNTPipeline, StreamingModeInfo};
 use tracing_subscriber::{EnvFilter, fmt};
 
-fn main() -> mlx_nemo::Result<()> {
+fn main() -> mlx_voice::Result<()> {
     // Initialize tracing subscriber
     fmt()
         .with_env_filter(
@@ -169,17 +169,17 @@ fn main() -> mlx_nemo::Result<()> {
     // Get input device
     let device = if let Some(name) = device_name {
         host.input_devices()
-            .map_err(|e| mlx_nemo::Error::audio(format!("Failed to enumerate devices: {}", e)))?
+            .map_err(|e| mlx_voice::Error::audio(format!("Failed to enumerate devices: {}", e)))?
             .find(|d| get_device_name(d).contains(name))
             .ok_or_else(|| {
-                mlx_nemo::Error::audio(format!(
+                mlx_voice::Error::audio(format!(
                     "Audio device '{}' not found. Use --list-devices to see available devices.",
                     name
                 ))
             })?
     } else {
         host.default_input_device().ok_or_else(|| {
-            mlx_nemo::Error::audio(
+            mlx_voice::Error::audio(
                 "No default audio input device available. Check microphone permissions.",
             )
         })?
@@ -225,7 +225,7 @@ fn main() -> mlx_nemo::Result<()> {
         println!("\n\nStopping...");
         running_clone.store(false, Ordering::SeqCst);
     })
-    .map_err(|e| mlx_nemo::Error::audio(format!("Failed to set Ctrl+C handler: {}", e)))?;
+    .map_err(|e| mlx_voice::Error::audio(format!("Failed to set Ctrl+C handler: {}", e)))?;
 
     // Build input stream
     let channels_clone = channels;
@@ -251,12 +251,12 @@ fn main() -> mlx_nemo::Result<()> {
             },
             None,
         )
-        .map_err(|e| mlx_nemo::Error::audio(format!("Failed to build input stream: {}", e)))?;
+        .map_err(|e| mlx_voice::Error::audio(format!("Failed to build input stream: {}", e)))?;
 
     // Start audio stream
     stream
         .play()
-        .map_err(|e| mlx_nemo::Error::audio(format!("Failed to start audio stream: {}", e)))?;
+        .map_err(|e| mlx_voice::Error::audio(format!("Failed to start audio stream: {}", e)))?;
 
     // Setup resampler if needed (using same approach as streaming.rs)
     let mut resampler: Option<Async<f32>> = if needs_resampling {
@@ -459,10 +459,10 @@ fn print_modes(modes: &[StreamingModeInfo]) {
 fn get_input_config(
     device: &cpal::Device,
     target_rate: u32,
-) -> mlx_nemo::Result<(StreamConfig, u32, u16)> {
+) -> mlx_voice::Result<(StreamConfig, u32, u16)> {
     let supported_configs = device
         .supported_input_configs()
-        .map_err(|e| mlx_nemo::Error::audio(format!("Failed to get supported configs: {}", e)))?;
+        .map_err(|e| mlx_voice::Error::audio(format!("Failed to get supported configs: {}", e)))?;
 
     // Collect all supported configs
     let configs: Vec<_> = supported_configs.collect();
@@ -494,7 +494,7 @@ fn get_input_config(
     // Fall back to default config (will need resampling)
     let default_config = device
         .default_input_config()
-        .map_err(|e| mlx_nemo::Error::audio(format!("Failed to get default config: {}", e)))?;
+        .map_err(|e| mlx_voice::Error::audio(format!("Failed to get default config: {}", e)))?;
 
     // For non-f32 formats, we need to handle conversion
     // For simplicity, try to find an f32 config at default rate
@@ -528,7 +528,7 @@ fn create_resampler(
     from_rate: u32,
     to_rate: u32,
     chunk_size: usize,
-) -> mlx_nemo::Result<Async<f32>> {
+) -> mlx_voice::Result<Async<f32>> {
     let params = SincInterpolationParameters {
         sinc_len: 256,
         f_cutoff: Some(0.95),
@@ -545,7 +545,7 @@ fn create_resampler(
         1, // mono
         FixedAsync::Input,
     )
-    .map_err(|e| mlx_nemo::Error::audio(format!("Failed to create resampler: {}", e)))?;
+    .map_err(|e| mlx_voice::Error::audio(format!("Failed to create resampler: {}", e)))?;
 
     Ok(resampler)
 }
@@ -554,16 +554,16 @@ fn create_resampler(
 fn resample_chunk(
     resampler: &mut Async<f32>,
     input: &[f32],
-) -> mlx_nemo::Result<Vec<f32>> {
+) -> mlx_voice::Result<Vec<f32>> {
     if input.is_empty() {
         return Ok(Vec::new());
     }
 
     let waves_in = InterleavedSlice::new(input, 1, input.len())
-        .map_err(|e| mlx_nemo::Error::audio(format!("Invalid resampler input: {}", e)))?;
+        .map_err(|e| mlx_voice::Error::audio(format!("Invalid resampler input: {}", e)))?;
     let waves_out = resampler
         .process(&waves_in, None)
-        .map_err(|e| mlx_nemo::Error::audio(format!("Resampling failed: {}", e)))?;
+        .map_err(|e| mlx_voice::Error::audio(format!("Resampling failed: {}", e)))?;
 
     Ok(waves_out.take_data())
 }

@@ -4,7 +4,7 @@ use hf_hub::{api::sync::ApiBuilder, Repo, RepoType};
 use std::{fs, path::PathBuf};
 
 #[derive(Parser)]
-#[command(name = "xtask", about = "Development tasks for mlx-nemo-rs")]
+#[command(name = "xtask", about = "Development tasks for mlx-voice-rs")]
 struct Cli {
     #[command(subcommand)]
     command: Commands,

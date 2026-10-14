@@ -1,6 +1,6 @@
 # Streaming ASR Data Flow: From Audio to Tokens
 
-This document provides a detailed walkthrough of how data flows through the mlx-nemo-rs streaming ASR pipeline, including tensor shapes, caching mechanisms, and the decoding loop.
+This document provides a detailed walkthrough of how data flows through the mlx-voice-rs streaming ASR pipeline, including tensor shapes, caching mechanisms, and the decoding loop.
 
 ## Table of Contents
 

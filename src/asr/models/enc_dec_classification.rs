@@ -6,8 +6,8 @@
 //! # Example
 //!
 //! ```no_run
-//! # fn main() -> mlx_nemo::Result<()> {
-//! use mlx_nemo::asr::EncDecClassificationModel;
+//! # fn main() -> mlx_voice::Result<()> {
+//! use mlx_voice::asr::EncDecClassificationModel;
 //!
 //! let mut model = EncDecClassificationModel::restore("vad_model.nemo")?;
 //! let probs = model.infer(&["audio.wav"])?;

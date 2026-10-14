@@ -1510,7 +1510,7 @@ impl Subsampling {
 
     fn forward(&mut self, x: &Array, lengths: &Array) -> Result<(Array, Array)> {
         // x: [B, T, F] where F is number of mel features (e.g., 80 or 128)
-        let debug_enabled = std::env::var("MLX_NEMO_DEBUG").is_ok();
+        let debug_enabled = std::env::var("MLX_VOICE_DEBUG").is_ok();
 
         tracing::debug!(
             input_shape = ?x.shape(),

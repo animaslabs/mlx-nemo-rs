@@ -12,7 +12,7 @@ fn test_load_parakeet_rnnt_checkpoint() {
         return;
     }
 
-    let weights = mlx_nemo::core::pytorch::load(path).expect("Failed to load checkpoint");
+    let weights = mlx_voice::core::pytorch::load(path).expect("Failed to load checkpoint");
 
     // Should have loaded tensors
     assert!(!weights.is_empty(), "No tensors loaded");
@@ -48,7 +48,7 @@ fn test_load_parakeet_rnnt_checkpoint() {
 #[ignore] // Requires model file to be present
 fn test_load_ctc_nemo() {
     // Load weights directly from the .nemo file to verify PyTorch checkpoint loading
-    use mlx_nemo::core::checkpoint::NemoCheckpoint;
+    use mlx_voice::core::checkpoint::NemoCheckpoint;
 
     let path = Path::new("models/nvidia/parakeet-ctc-0.6b/parakeet-ctc-0.6b.nemo");
 
@@ -75,14 +75,14 @@ fn test_load_ctc_nemo() {
 
 #[test]
 fn test_is_pytorch_zip_nonexistent() {
-    assert!(!mlx_nemo::core::pytorch::is_pytorch_zip(
+    assert!(!mlx_voice::core::pytorch::is_pytorch_zip(
         "/nonexistent/path.ckpt"
     ));
 }
 
 #[test]
 fn test_storage_type_parsing() {
-    use mlx_nemo::core::pytorch::StorageType;
+    use mlx_voice::core::pytorch::StorageType;
 
     assert_eq!(
         StorageType::from_class_name("FloatStorage"),
@@ -102,7 +102,7 @@ fn test_storage_type_parsing() {
 #[test]
 #[ignore] // Requires Nemotron model file to be present
 fn test_load_nemotron_checkpoint() {
-    use mlx_nemo::core::checkpoint::NemoCheckpoint;
+    use mlx_voice::core::checkpoint::NemoCheckpoint;
 
     let path = Path::new(
         "models/nvidia/nemotron-speech-streaming-en-0.6b/nemotron-speech-streaming-en-0.6b.nemo",
@@ -157,7 +157,7 @@ fn test_load_nemotron_checkpoint() {
 #[test]
 #[ignore] // Requires Nemotron model file to be present
 fn test_nemotron_weight_shapes() {
-    use mlx_nemo::core::checkpoint::NemoCheckpoint;
+    use mlx_voice::core::checkpoint::NemoCheckpoint;
 
     let path = Path::new(
         "models/nvidia/nemotron-speech-streaming-en-0.6b/nemotron-speech-streaming-en-0.6b.nemo",
@@ -197,8 +197,8 @@ fn test_nemotron_weight_shapes() {
 #[test]
 #[ignore] // Requires Nemotron model file to be present
 fn test_parse_nemotron_config() {
-    use mlx_nemo::asr::config::AsrModelConfig;
-    use mlx_nemo::core::checkpoint::NemoCheckpoint;
+    use mlx_voice::asr::config::AsrModelConfig;
+    use mlx_voice::core::checkpoint::NemoCheckpoint;
 
     let path = Path::new(
         "models/nvidia/nemotron-speech-streaming-en-0.6b/nemotron-speech-streaming-en-0.6b.nemo",

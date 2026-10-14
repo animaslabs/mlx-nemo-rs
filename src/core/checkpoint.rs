@@ -417,9 +417,9 @@ impl Default for NemoCheckpointWriter {
 /// # Example
 ///
 /// ```no_run
-/// # fn main() -> mlx_nemo::Result<()> {
-/// # use mlx_nemo::SafetensorsLoader;
-/// # use mlx_nemo::asr::AsrModelConfig;
+/// # fn main() -> mlx_voice::Result<()> {
+/// # use mlx_voice::SafetensorsLoader;
+/// # use mlx_voice::asr::AsrModelConfig;
 /// // Load from explicit paths
 /// let loader = SafetensorsLoader::new(
 ///     "weights.safetensors",

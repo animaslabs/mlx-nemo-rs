@@ -6,13 +6,13 @@ hf-hub = "0.4"
 anyhow = "1.0"
 
 [package]
-name = "mlx-nemo"
+name = "mlx-voice"
 version = "0.1.0"
 edition = "2021"
 description = "NeMo-compatible ASR and speech AI library for Apple Silicon, built on MLX"
 license = "Apache-2.0"
 readme = "README.md"
-repository = "https://github.com/animaslabs/mlx-nemo-rs"
+repository = "https://github.com/animaslabs/mlx-voice-rs"
 keywords = ["asr", "speech", "mlx", "nemo", "machine-learning"]
 categories = ["science", "multimedia::audio"]
 

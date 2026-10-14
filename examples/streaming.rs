@@ -25,13 +25,13 @@ use std::io::{self, Write};
 use std::path::Path;
 use std::time::Instant;
 
-use mlx_nemo::asr::{
+use mlx_voice::asr::{
     CacheAwareRNNTPipeline, EncDecClassificationModel, StreamingModeInfo, VadPostProcessConfig,
     VadPostProcessor,
 };
 use tracing_subscriber::{fmt, EnvFilter};
 
-fn main() -> mlx_nemo::Result<()> {
+fn main() -> mlx_voice::Result<()> {
     // Initialize tracing subscriber
     fmt()
         .with_env_filter(
@@ -194,7 +194,7 @@ fn main() -> mlx_nemo::Result<()> {
             "Resampling from {} Hz to {} Hz...",
             file_sample_rate, sample_rate
         );
-        mlx_nemo::audio::resample(&samples, file_sample_rate, sample_rate)?
+        mlx_voice::audio::resample(&samples, file_sample_rate, sample_rate)?
     } else {
         samples
     };
@@ -382,11 +382,11 @@ fn print_modes(modes: &[StreamingModeInfo]) {
 }
 
 /// Load audio from a WAV file.
-fn load_audio(path: &str) -> mlx_nemo::Result<(Vec<f32>, u32)> {
+fn load_audio(path: &str) -> mlx_voice::Result<(Vec<f32>, u32)> {
     use hound::WavReader;
 
     let reader = WavReader::open(path)
-        .map_err(|e| mlx_nemo::Error::audio(format!("Failed to open WAV file: {}", e)))?;
+        .map_err(|e| mlx_voice::Error::audio(format!("Failed to open WAV file: {}", e)))?;
 
     let spec = reader.spec();
     let sample_rate = spec.sample_rate;
@@ -397,7 +397,7 @@ fn load_audio(path: &str) -> mlx_nemo::Result<(Vec<f32>, u32)> {
             let samples: Vec<f32> = reader
                 .into_samples::<f32>()
                 .collect::<Result<Vec<_>, _>>()
-                .map_err(|e| mlx_nemo::Error::audio(format!("Failed to read samples: {}", e)))?;
+                .map_err(|e| mlx_voice::Error::audio(format!("Failed to read samples: {}", e)))?;
 
             if channels > 1 {
                 samples
@@ -415,7 +415,7 @@ fn load_audio(path: &str) -> mlx_nemo::Result<(Vec<f32>, u32)> {
             let samples: Vec<i32> = reader
                 .into_samples::<i32>()
                 .collect::<Result<Vec<_>, _>>()
-                .map_err(|e| mlx_nemo::Error::audio(format!("Failed to read samples: {}", e)))?;
+                .map_err(|e| mlx_voice::Error::audio(format!("Failed to read samples: {}", e)))?;
 
             if channels > 1 {
                 samples

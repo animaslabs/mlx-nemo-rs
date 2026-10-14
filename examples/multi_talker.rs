@@ -15,10 +15,10 @@ use std::io::{self, Write};
 use std::path::Path;
 use std::time::Instant;
 
-use mlx_nemo::asr::pipeline::MultiTalkerPipeline;
+use mlx_voice::asr::pipeline::MultiTalkerPipeline;
 use tracing_subscriber::{fmt, EnvFilter};
 
-fn main() -> mlx_nemo::Result<()> {
+fn main() -> mlx_voice::Result<()> {
     fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),

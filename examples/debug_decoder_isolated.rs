@@ -6,10 +6,10 @@
 //!
 //! Run with: cargo run --example debug_decoder_isolated
 
-use mlx_nemo::asr::CacheAwareRNNTPipeline;
+use mlx_voice::asr::CacheAwareRNNTPipeline;
 use mlx_rs::{Array, ops};
 
-fn main() -> mlx_nemo::Result<()> {
+fn main() -> mlx_voice::Result<()> {
     let model_path = "models/nvidia/nemotron-speech-streaming-en-0.6b/nemotron-speech-streaming-en-0.6b.nemo";
 
     println!("Loading pipeline from: {}", model_path);

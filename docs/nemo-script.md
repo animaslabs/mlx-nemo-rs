@@ -1,6 +1,6 @@
 # NeMo Verification Script
 
-This document describes the Python verification script used to run NVIDIA NeMo Parakeet CTC models and capture intermediate values for comparison with the mlx-nemo-rs Rust implementation.
+This document describes the Python verification script used to run NVIDIA NeMo Parakeet CTC models and capture intermediate values for comparison with the mlx-voice-rs Rust implementation.
 
 ## Overview
 

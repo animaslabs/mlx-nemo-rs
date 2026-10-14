@@ -1,4 +1,4 @@
-//! Core abstractions and utilities for mlx-nemo.
+//! Core abstractions and utilities for mlx-voice.
 //!
 //! This module provides the foundational types and traits used across
 //! all collections (ASR, TTS, LLM, etc.).

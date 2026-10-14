@@ -1,4 +1,4 @@
-//! Error types for mlx-nemo.
+//! Error types for mlx-voice.
 
 use std::path::PathBuf;
 use thiserror::Error;
@@ -6,7 +6,7 @@ use thiserror::Error;
 /// Result type alias using [`Error`].
 pub type Result<T> = std::result::Result<T, Error>;
 
-/// Main error type for mlx-nemo operations.
+/// Main error type for mlx-voice operations.
 #[derive(Debug, Error)]
 pub enum Error {
     /// I/O error during file operations.

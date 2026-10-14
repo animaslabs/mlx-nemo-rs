@@ -9,8 +9,8 @@
 //! cache-aware streaming inference:
 //!
 //! ```no_run
-//! # fn main() -> mlx_nemo::Result<()> {
-//! # use mlx_nemo::asr::EncDecCTCModel;
+//! # fn main() -> mlx_voice::Result<()> {
+//! # use mlx_voice::asr::EncDecCTCModel;
 //! # let audio_chunks: Vec<Vec<f32>> = Vec::new();
 //! let mut model = EncDecCTCModel::restore("model.nemo")?;
 //!
@@ -81,8 +81,8 @@ pub struct DebugOutput {
 /// # Example
 ///
 /// ```no_run
-/// # fn main() -> mlx_nemo::Result<()> {
-/// use mlx_nemo::asr::EncDecCTCModel;
+/// # fn main() -> mlx_voice::Result<()> {
+/// use mlx_voice::asr::EncDecCTCModel;
 ///
 /// // Load from .nemo checkpoint
 /// let mut model = EncDecCTCModel::restore("model.nemo")?;
@@ -198,8 +198,8 @@ impl EncDecCTCModel {
     /// # Example
     ///
     /// ```no_run
-    /// # fn main() -> mlx_nemo::Result<()> {
-    /// # use mlx_nemo::{asr::EncDecCTCModel, WeightFormat};
+    /// # fn main() -> mlx_voice::Result<()> {
+    /// # use mlx_voice::{asr::EncDecCTCModel, WeightFormat};
     /// // Load with explicit format
     /// let model = EncDecCTCModel::restore_safetensors(
     ///     "weights.safetensors",
@@ -289,8 +289,8 @@ impl EncDecCTCModel {
     /// # Example
     ///
     /// ```no_run
-    /// # fn main() -> mlx_nemo::Result<()> {
-    /// # use mlx_nemo::asr::EncDecCTCModel;
+    /// # fn main() -> mlx_voice::Result<()> {
+    /// # use mlx_voice::asr::EncDecCTCModel;
     /// // Load from directory structure:
     /// // my_model/
     /// // ├── model.safetensors

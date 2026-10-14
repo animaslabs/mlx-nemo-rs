@@ -1,4 +1,4 @@
-# AGENTS.md - AI Agent Guidelines for mlx-nemo-rs
+# AGENTS.md - AI Agent Guidelines for mlx-voice-rs
 
 Guidelines for AI coding agents working in this Rust implementation of NVIDIA NeMo for Apple Silicon (MLX).
 
@@ -159,7 +159,7 @@ error!(?err, "Failed to process");
 ## Project Structure
 
 ```
-mlx-nemo-rs/
+mlx-voice-rs/
 ├── src/
 │   ├── lib.rs              # Library entry point, re-exports
 │   ├── audio.rs            # Audio loading, resampling, preprocessing

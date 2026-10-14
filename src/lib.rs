@@ -1,4 +1,4 @@
-//! # mlx-nemo
+//! # mlx-voice
 //!
 //! A Rust implementation of NVIDIA NeMo for Apple Silicon, built on MLX.
 //!
@@ -10,8 +10,8 @@
 //! ## Quick Start
 //!
 //! ```no_run
-//! # fn main() -> mlx_nemo::Result<()> {
-//! use mlx_nemo::asr::EncDecCTCModel;
+//! # fn main() -> mlx_voice::Result<()> {
+//! use mlx_voice::asr::EncDecCTCModel;
 //!
 //! // Load a pretrained model from a .nemo file
 //! let mut model = EncDecCTCModel::restore("path/to/model.nemo")?;

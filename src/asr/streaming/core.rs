@@ -13,9 +13,9 @@
 //! # Example
 //!
 //! ```no_run
-//! # fn main() -> mlx_nemo::Result<()> {
+//! # fn main() -> mlx_voice::Result<()> {
 //! # let audio_chunks: Vec<Vec<f32>> = Vec::new();
-//! use mlx_nemo::asr::EncDecCTCModel;
+//! use mlx_voice::asr::EncDecCTCModel;
 //!
 //! let mut model = EncDecCTCModel::restore("model.nemo")?;
 //!
