@@ -3,6 +3,8 @@
 #
 # Based on NeMo's cache_aware_rnnt.yaml configuration
 # See: https://github.com/NVIDIA-NeMo/NeMo/blob/main/examples/asr/conf/asr_streaming_inference/cache_aware_rnnt.yaml
+# Copyright NVIDIA CORPORATION & AFFILIATES, licensed under the Apache License, Version 2.0.
+# Modified by The mlx-voice-rs Authors for use with streaming.py.
 
 # ================================
 # ASR Configuration

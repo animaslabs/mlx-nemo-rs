@@ -3,6 +3,7 @@
 !/samples/
 /samples/*
 !/samples/2086-149220-0033.wav
+!/samples/README.md
 /logs
 /docs/papers/
 .DS_Store

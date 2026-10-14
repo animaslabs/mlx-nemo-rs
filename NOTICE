@@ -1,0 +1,16 @@
+mlx-voice-rs
+Copyright 2026 The mlx-voice-rs Authors
+
+This product is licensed under the Apache License, Version 2.0.
+See the LICENSE file for the full license text and AUTHORS for the
+list of authors.
+
+This product includes software developed as part of NVIDIA NeMo
+(https://github.com/NVIDIA-NeMo/NeMo), Copyright NVIDIA CORPORATION &
+AFFILIATES, licensed under the Apache License, Version 2.0.
+
+This product includes an audio sample from the LibriSpeech ASR corpus
+(https://www.openslr.org/12) by Vassil Panayotov, Guoguo Chen, Daniel
+Povey and Sanjeev Khudanpur, licensed under the Creative Commons
+Attribution 4.0 International License
+(https://creativecommons.org/licenses/by/4.0/). See samples/README.md.

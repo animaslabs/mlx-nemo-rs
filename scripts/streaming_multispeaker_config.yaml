@@ -2,6 +2,8 @@
 # Used by streaming_multispeaker.py for real-time multi-speaker transcription
 #
 # Based on NeMo's SpeakerTaggedASR configuration
+# Copyright NVIDIA CORPORATION & AFFILIATES, licensed under the Apache License, Version 2.0.
+# Modified by The mlx-voice-rs Authors for use with streaming_multispeaker.py.
 # Models: nvidia/multitalker-parakeet-streaming-0.6b-v1 + nvidia/diar_streaming_sortformer_4spk-v2.1
 
 # ================================

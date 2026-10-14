@@ -170,4 +170,8 @@ The Python scripts in [`scripts/`](scripts/) compare intermediate outputs agains
 
 ## License
 
-Apache-2.0. Model weights are covered by their own licenses; check each model card on Hugging Face.
+Licensed under the [Apache License, Version 2.0](LICENSE). See [NOTICE](NOTICE) for attributions, including NVIDIA NeMo and the LibriSpeech sample in [`samples/`](samples/README.md).
+
+Unless you explicitly state otherwise, any contribution you intentionally submit for inclusion in this project is licensed under Apache-2.0, without any additional terms or conditions.
+
+Model weights are not part of this repository and are covered by their own licenses. Check each model card on Hugging Face.
