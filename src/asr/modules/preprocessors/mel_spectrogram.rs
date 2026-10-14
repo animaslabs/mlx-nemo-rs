@@ -672,7 +672,7 @@ impl MelProcessor {
         let audio_arr = if let Some(coef) = self.config.preemph {
             // For streaming preemphasis, we need to prepend the last_sample
             let last_arr = Array::from_slice(&[last_sample], &[1]);
-            let extended = ops::concatenate(&[&last_arr, &audio_arr])?;
+            let extended = ops::concatenate(&[&last_arr, &audio_arr], 0)?;
             let preemph = dsp::preemphasis(&extended, coef)?;
             // Remove the first sample (it was just for continuity)
             preemph.index(1..)

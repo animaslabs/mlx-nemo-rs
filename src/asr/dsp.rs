@@ -120,7 +120,7 @@ pub fn create_window_padded(window_type: &str, win_length: usize, n_fft: usize) 
     let left_zeros = Array::zeros::<f32>(&[left_pad as i32])?;
     let right_zeros = Array::zeros::<f32>(&[right_pad as i32])?;
 
-    ops::concatenate(&[&left_zeros, &window, &right_zeros])
+    ops::concatenate(&[&left_zeros, &window, &right_zeros], 0)
         .map_err(|e| Error::model(e.to_string()))
 }
 
@@ -250,7 +250,7 @@ pub fn preemphasis(audio: &Array, coef: f32) -> Result<Array> {
 
         // Shift audio by 1: [0, x[0], x[1], ..., x[n-2]]
         let zero = Array::zeros::<f32>(&[1])?;
-        let shifted = ops::concatenate(&[&zero, &audio.index(..(audio_len - 1))])?;
+        let shifted = ops::concatenate(&[&zero, &audio.index(..(audio_len - 1))], 0)?;
 
         // y = x - coef * shifted
         let coef_arr = Array::from_f32(coef);
