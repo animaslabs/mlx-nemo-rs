@@ -1,2 +1,173 @@
 # mlx-voice
-NeMo models for MLX in rust
+
+A Rust implementation of NVIDIA NeMo speech models for Apple Silicon, built on [MLX](https://github.com/ml-explore/mlx) via [`mlx-rs`](https://github.com/oxideai/mlx-rs).
+
+mlx-voice loads NeMo checkpoints (`.nemo` archives) or converted MLX safetensors directly and runs them on the GPU through Metal, with no Python at inference time.
+
+## Features
+
+- **CTC ASR**: `EncDecCTCModel` (e.g. `nvidia/parakeet-ctc-0.6b`)
+- **RNN-T / Transducer ASR**: `EncDecRNNTModel` with greedy or beam search decoding (e.g. `nvidia/parakeet-rnnt-0.6b`)
+- **Cache-aware streaming**: `CacheAwareRNNTPipeline` for low-latency incremental transcription with selectable latency modes (e.g. `nvidia/nemotron-speech-streaming-en-0.6b`)
+- **Voice activity detection**: `EncDecClassificationModel` with NeMo-style post-processing (e.g. `nvidia/Frame_VAD_Multilingual_MarbleNet_v2.0`)
+- **Multi-talker transcription**: `MultiTalkerPipeline` combines streaming ASR with Sortformer speaker diarization
+- **FastConformer encoder**, mel-spectrogram preprocessing, and SentencePiece tokenization matching NeMo
+- **Weight formats**: `.nemo` archives (PyTorch checkpoints), MLX safetensors, and 8-bit quantized MLX weights
+
+TTS and LLM support are planned.
+
+## Requirements
+
+- macOS on Apple Silicon (M1 or later)
+- A recent stable Rust toolchain
+- Xcode Command Line Tools (needed to build MLX)
+
+## Installation
+
+Add the crate from git:
+
+```toml
+[dependencies]
+mlx-voice = { git = "https://github.com/animaslabs/mlx-voice-rs" }
+```
+
+ASR support is behind the `asr` feature, which is on by default.
+
+## Getting models
+
+Download models from Hugging Face with the bundled `xtask`. Files go to `models/<org>/<name>/` by default.
+
+```bash
+cargo xtask download nvidia/parakeet-ctc-0.6b
+cargo xtask download nvidia/parakeet-rnnt-0.6b
+
+# Gated models need a Hugging Face token (or set HF_TOKEN)
+cargo xtask download nvidia/nemotron-speech-streaming-en-0.6b --token $HF_TOKEN
+
+# Download only specific files
+cargo xtask download nvidia/parakeet-ctc-0.6b --file parakeet-ctc-0.6b.nemo
+```
+
+Models can be loaded from:
+
+- a `.nemo` file (a TAR archive with `model_config.yaml`, `model_weights.ckpt` and the tokenizer)
+- a `.safetensors` file with `config.yaml` and a tokenizer next to it
+- a directory containing `model.safetensors`, a config, and `tokenizer.model`
+
+## Usage
+
+### Offline transcription (CTC)
+
+```rust
+use mlx_voice::asr::EncDecCTCModel;
+
+fn main() -> mlx_voice::Result<()> {
+    let mut model = EncDecCTCModel::restore("models/nvidia/parakeet-ctc-0.6b/parakeet-ctc-0.6b.nemo")?;
+    let transcriptions = model.transcribe(&["audio.wav"])?;
+    println!("{}", transcriptions[0]);
+    Ok(())
+}
+```
+
+`EncDecRNNTModel` has the same `restore` / `transcribe` API.
+
+### Streaming transcription
+
+`CacheAwareRNNTPipeline` takes audio incrementally and emits partial results as they become available. The second argument to `restore` picks the streaming mode (`0` is the lowest latency).
+
+```rust
+use mlx_voice::asr::CacheAwareRNNTPipeline;
+
+fn main() -> mlx_voice::Result<()> {
+    let mut pipeline = CacheAwareRNNTPipeline::restore(
+        "models/nvidia/nemotron-speech-streaming-en-0.6b/nemotron-speech-streaming-en-0.6b.nemo",
+        0,
+    )?;
+
+    // `chunks` yields Vec<f32> at pipeline.sample_rate()
+    for chunk in chunks {
+        pipeline.add_audio(&chunk);
+        while let Some(output) = pipeline.transcribe_step()? {
+            println!("{}", output.text);
+        }
+    }
+
+    pipeline.end_stream();
+    while let Some(output) = pipeline.transcribe_step()? {
+        if output.is_final {
+            println!("Final: {}", output.text);
+        }
+    }
+    Ok(())
+}
+```
+
+For a whole file, `pipeline.set_audio_file("audio.wav")?` followed by `pipeline.run()?` returns the full transcript.
+
+## Examples
+
+| Example | Description |
+| --- | --- |
+| `transcribe` | Offline transcription with a CTC model |
+| `transcribe_rnnt` | Offline transcription with an RNN-T model (`--beam <size>` for beam search) |
+| `streaming` | Streaming transcription of a file, fed in small chunks |
+| `live` / `live_pipeline` | Live microphone transcription |
+| `vad` | Voice activity detection on a file |
+| `multi_talker` | Streaming transcription with speaker labels |
+
+```bash
+cargo run --release --example transcribe -- \
+  --model models/nvidia/parakeet-ctc-0.6b/parakeet-ctc-0.6b.nemo samples/2086-149220-0033.wav
+
+cargo run --release --example transcribe_rnnt -- \
+  --model models/nvidia/parakeet-rnnt-0.6b/parakeet-rnnt-0.6b.nemo samples/2086-149220-0033.wav
+
+cargo run --release --example streaming -- \
+  --model models/nvidia/nemotron-speech-streaming-en-0.6b/nemotron-speech-streaming-en-0.6b.nemo \
+  samples/2086-149220-0033.wav
+
+# List the streaming latency modes a model supports
+cargo run --release --example streaming -- --model <model.nemo> --list-modes
+
+cargo run --release --example live -- \
+  --model models/nvidia/nemotron-speech-streaming-en-0.6b/nemotron-speech-streaming-en-0.6b.nemo
+```
+
+Each example documents its options at the top of its source file in [`examples/`](examples/). Set `RUST_LOG=mlx_voice=debug` for debug logging.
+
+## Architecture
+
+```
+audio (f32) → MelSpectrogram → ConformerEncoder → CTCDecoder | RNNTJoint + PredictionNetwork
+            → greedy / beam search → token IDs → SentencePiece tokenizer → text
+```
+
+- `src/core/`: `.nemo` archive loading, PyTorch pickle and safetensors weights, config parsing, quantization
+- `src/asr/models/`: CTC, RNN-T, classification (VAD) and Sortformer models
+- `src/asr/modules/`: mel preprocessing, FastConformer encoder, decoders and joint network
+- `src/asr/streaming/`: encoder attention/convolution caches, mel and feature buffers, streaming config
+- `src/asr/pipeline/`: the cache-aware RNN-T and multi-talker pipelines
+- `src/asr/decoding/`: greedy and beam search decoding, streaming token merging
+
+More detail is in [`docs/`](docs/), including [`lib-architecture.md`](docs/lib-architecture.md) and [`streaming-data-flow.md`](docs/streaming-data-flow.md).
+
+## Development
+
+```bash
+cargo build
+cargo test -- --test-threads=1
+```
+
+Run tests with `--test-threads=1`. Running several Metal workloads in parallel can crash the GPU command buffer.
+
+Most tests are `#[ignore]` by default because they need downloaded models in `models/`. Run them with:
+
+```bash
+cargo test -- --ignored --test-threads=1
+```
+
+The Python scripts in [`scripts/`](scripts/) compare intermediate outputs against the reference NeMo implementation.
+
+## License
+
+Apache-2.0. Model weights are covered by their own licenses; check each model card on Hugging Face.
