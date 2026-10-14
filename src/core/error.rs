@@ -67,10 +67,6 @@ pub enum Error {
     #[error("Decoding error: {0}")]
     Decoding(String),
 
-    /// YAML parsing error.
-    #[error("YAML error: {0}")]
-    Yaml(#[from] yaml_serde::Error),
-
     /// JSON parsing error.
     #[error("JSON error: {0}")]
     Json(#[from] serde_json::Error),

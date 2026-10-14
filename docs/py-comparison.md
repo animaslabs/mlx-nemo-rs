@@ -163,7 +163,7 @@ Output
 |--------|-----------------|-----------------|
 | Format | YAML (yaml_serde) | YAML + OmegaConf |
 | Config struct | `AsrModelConfig` | `DictConfig` (dynamic) |
-| Target resolution | `extract_target()` / `target_class_name()` | Hydra `_target_` field |
+| Target resolution | `target_class_name()` | Hydra `_target_` field |
 | Type safety | Compile-time (Rust structs) | Runtime (OmegaConf) |
 | Nested configs | `PreprocessorConfig`, `EncoderConfig`, etc. | Nested DictConfig |
 

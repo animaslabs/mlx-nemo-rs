@@ -103,11 +103,11 @@ pub struct AsrModelConfig {
 
     /// Spec augmentation (training only)
     #[serde(default)]
-    pub spec_augment: Option<yaml_serde::Value>,
+    spec_augment: Option<yaml_serde::Value>,
 
     /// Additional fields we don't need to parse
     #[serde(flatten)]
-    pub extra: std::collections::HashMap<String, yaml_serde::Value>,
+    extra: std::collections::HashMap<String, yaml_serde::Value>,
 }
 
 impl AsrModelConfig {
@@ -350,7 +350,7 @@ pub struct EncoderConfig {
 
     /// Additional fields
     #[serde(flatten)]
-    pub extra: std::collections::HashMap<String, yaml_serde::Value>,
+    extra: std::collections::HashMap<String, yaml_serde::Value>,
 }
 
 fn default_feat_out() -> i32 {
@@ -651,7 +651,7 @@ pub struct DecodingConfig {
 
     /// Additional fields
     #[serde(flatten)]
-    pub extra: std::collections::HashMap<String, yaml_serde::Value>,
+    extra: std::collections::HashMap<String, yaml_serde::Value>,
 }
 
 fn default_strategy() -> String {
@@ -859,7 +859,7 @@ pub struct ClassificationModelConfig {
 
     /// Additional fields we don't need to parse
     #[serde(flatten)]
-    pub extra: std::collections::HashMap<String, yaml_serde::Value>,
+    extra: std::collections::HashMap<String, yaml_serde::Value>,
 }
 
 /// Jasper/ConvASR encoder configuration.
@@ -882,7 +882,7 @@ pub struct JasperEncoderConfig {
 
     /// Additional fields
     #[serde(flatten)]
-    pub extra: std::collections::HashMap<String, yaml_serde::Value>,
+    extra: std::collections::HashMap<String, yaml_serde::Value>,
 }
 
 fn default_jasper_activation() -> String {
@@ -926,7 +926,7 @@ pub struct JasperBlockConfig {
 
     /// Additional fields
     #[serde(flatten)]
-    pub extra: std::collections::HashMap<String, yaml_serde::Value>,
+    extra: std::collections::HashMap<String, yaml_serde::Value>,
 }
 
 fn default_repeat() -> usize {
@@ -962,7 +962,7 @@ pub struct ClassificationDecoderConfig {
 
     /// Additional fields
     #[serde(flatten)]
-    pub extra: std::collections::HashMap<String, yaml_serde::Value>,
+    extra: std::collections::HashMap<String, yaml_serde::Value>,
 }
 
 fn default_num_classes_2() -> usize {
@@ -1012,7 +1012,7 @@ pub struct TransformerEncoderConfig {
 
     /// Additional fields
     #[serde(flatten)]
-    pub extra: std::collections::HashMap<String, yaml_serde::Value>,
+    extra: std::collections::HashMap<String, yaml_serde::Value>,
 }
 
 fn default_tf_num_layers() -> usize {
@@ -1069,7 +1069,7 @@ pub struct SortformerModulesConfig {
 
     /// Additional fields
     #[serde(flatten)]
-    pub extra: std::collections::HashMap<String, yaml_serde::Value>,
+    extra: std::collections::HashMap<String, yaml_serde::Value>,
 }
 
 fn default_num_spks() -> usize {
@@ -1135,7 +1135,7 @@ pub struct SortformerConfig {
 
     /// Additional fields
     #[serde(flatten)]
-    pub extra: std::collections::HashMap<String, yaml_serde::Value>,
+    extra: std::collections::HashMap<String, yaml_serde::Value>,
 }
 
 fn default_chunk_len() -> usize {
@@ -1147,6 +1147,41 @@ fn default_spkcache_len() -> usize {
 fn default_fifo_len() -> usize {
     50
 }
+
+/// Adds typed access to the config fields this crate does not model explicitly.
+macro_rules! impl_extra_accessor {
+    ($($ty:ty),* $(,)?) => {$(
+        impl $ty {
+            /// Deserialize an unmodeled config field by key.
+            ///
+            /// Returns `Ok(None)` if the key is absent, or an error if it cannot be
+            /// deserialized as `T`.
+            pub fn extra<T: serde::de::DeserializeOwned>(&self, key: &str) -> Result<Option<T>> {
+                self.extra
+                    .get(key)
+                    .map(|v| {
+                        yaml_serde::from_value(v.clone()).map_err(|e| {
+                            Error::config_with_source(format!("Invalid config field `{}`", key), e)
+                        })
+                    })
+                    .transpose()
+            }
+        }
+    )*};
+}
+
+impl_extra_accessor!(
+    AsrModelConfig,
+    EncoderConfig,
+    DecodingConfig,
+    ClassificationModelConfig,
+    JasperEncoderConfig,
+    JasperBlockConfig,
+    ClassificationDecoderConfig,
+    TransformerEncoderConfig,
+    SortformerModulesConfig,
+    SortformerConfig,
+);
 
 #[cfg(test)]
 mod tests {
@@ -1210,5 +1245,24 @@ mod tests {
             yaml_serde::from_str("tdt_durations: [0, 1, 2, 3, 4]").unwrap(),
         );
         assert!(tdt.validate().is_err());
+    }
+
+    #[test]
+    fn test_extra_accessor() {
+        let config: AsrModelConfig = crate::core::config::from_yaml_str(
+            "sample_rate: 16000\npreprocessor: {}\nencoder: {}\ndecoder: {}\n\
+             model_defaults:\n  tdt_durations: [0, 1, 2]\n",
+        )
+        .unwrap();
+
+        #[derive(Deserialize)]
+        struct ModelDefaults {
+            tdt_durations: Vec<u32>,
+        }
+        let defaults: ModelDefaults = config.extra("model_defaults").unwrap().unwrap();
+        assert_eq!(defaults.tdt_durations, vec![0, 1, 2]);
+
+        assert!(config.extra::<String>("missing").unwrap().is_none());
+        assert!(config.extra::<String>("model_defaults").is_err());
     }
 }

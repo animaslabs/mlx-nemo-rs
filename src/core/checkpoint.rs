@@ -334,7 +334,7 @@ impl NemoCheckpointWriter {
 
     /// Set the model configuration.
     pub fn config<T: serde::Serialize>(mut self, config: &T) -> Result<Self> {
-        self.config_yaml = Some(yaml_serde::to_string(config)?);
+        self.config_yaml = Some(crate::core::config::to_yaml_string(config)?);
         Ok(self)
     }
 

@@ -37,14 +37,6 @@ pub fn to_yaml_string<T: Serialize>(config: &T) -> Result<String> {
         .map_err(|e| Error::config_with_source("Failed to serialize YAML", e))
 }
 
-/// Helper to extract a nested value from a YAML structure.
-///
-/// This is useful for handling NeMo's `_target_` pattern where the type
-/// is specified in the configuration.
-pub fn extract_target(config: &yaml_serde::Value) -> Option<&str> {
-    config.get("_target_").and_then(|v| v.as_str())
-}
-
 /// Get the class name from a NeMo target string.
 ///
 /// For example, `"nemo.collections.asr.modules.ConformerEncoder"` returns `"ConformerEncoder"`.
