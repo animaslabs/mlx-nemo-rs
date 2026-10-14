@@ -173,48 +173,11 @@ fn load_wav(_path: &Path) -> Result<(Vec<f32>, u32)> {
 }
 
 /// Resample audio to target sample rate.
-#[cfg(feature = "asr")]
 fn resample_audio(samples: &[f32], from_rate: u32, to_rate: u32) -> Result<Vec<f32>> {
-    use rubato::{
-        Resampler, SincFixedIn, SincInterpolationParameters, SincInterpolationType, WindowFunction,
-    };
-
-    if from_rate == to_rate {
-        return Ok(samples.to_vec());
+    if from_rate != to_rate {
+        tracing::debug!(from_rate, to_rate, "Resampling audio");
     }
-
-    tracing::debug!(from_rate, to_rate, "Resampling audio");
-
-    let params = SincInterpolationParameters {
-        sinc_len: 256,
-        f_cutoff: 0.95,
-        interpolation: SincInterpolationType::Linear,
-        oversampling_factor: 256,
-        window: WindowFunction::BlackmanHarris2,
-    };
-
-    let mut resampler = SincFixedIn::<f32>::new(
-        to_rate as f64 / from_rate as f64,
-        2.0,
-        params,
-        samples.len(),
-        1,
-    )
-    .map_err(|e| Error::audio(format!("Failed to create resampler: {}", e)))?;
-
-    let waves_in = vec![samples.to_vec()];
-    let waves_out = resampler
-        .process(&waves_in, None)
-        .map_err(|e| Error::audio(format!("Resampling failed: {}", e)))?;
-
-    Ok(waves_out.into_iter().next().unwrap_or_default())
-}
-
-#[cfg(not(feature = "asr"))]
-fn resample_audio(_samples: &[f32], _from_rate: u32, _to_rate: u32) -> Result<Vec<f32>> {
-    Err(Error::not_implemented(
-        "Audio resampling requires the 'asr' feature",
-    ))
+    crate::audio::resample(samples, from_rate, to_rate)
 }
 
 /// Cache-aware RNN-T streaming pipeline.

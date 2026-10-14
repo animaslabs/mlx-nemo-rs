@@ -172,12 +172,9 @@ pub struct TensorInfo {
 
 /// Find the data.pkl file in the archive.
 fn find_pickle_file<R: Read + Seek>(archive: &mut ZipArchive<R>) -> Result<String> {
-    for i in 0..archive.len() {
-        if let Ok(entry) = archive.by_index_raw(i) {
-            let name = entry.name();
-            if name.ends_with("data.pkl") {
-                return Ok(name.to_string());
-            }
+    for name in archive.file_names().flatten() {
+        if name.ends_with("data.pkl") {
+            return Ok(name.into_owned());
         }
     }
     Err(Error::checkpoint("No data.pkl found in checkpoint archive"))

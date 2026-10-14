@@ -34,7 +34,10 @@ use ringbuf::{
     traits::{Consumer, Producer, Split},
     HeapRb,
 };
-use rubato::{Resampler, SincFixedIn, SincInterpolationParameters, SincInterpolationType, WindowFunction};
+use rubato::{
+    audioadapter_buffers::direct::InterleavedSlice, Async, FixedAsync, Resampler,
+    SincInterpolationParameters, SincInterpolationType, WindowFunction,
+};
 
 use mlx_nemo::asr::{CacheAwareRNNTPipeline, StreamingModeInfo};
 use tracing_subscriber::{EnvFilter, fmt};
@@ -228,7 +231,7 @@ fn main() -> mlx_nemo::Result<()> {
     let channels_clone = channels;
     let stream = device
         .build_input_stream(
-            &audio_config,
+            audio_config,
             move |data: &[f32], _: &cpal::InputCallbackInfo| {
                 // Convert to mono if stereo (average channels)
                 if channels_clone > 1 {
@@ -256,12 +259,12 @@ fn main() -> mlx_nemo::Result<()> {
         .map_err(|e| mlx_nemo::Error::audio(format!("Failed to start audio stream: {}", e)))?;
 
     // Setup resampler if needed (using same approach as streaming.rs)
-    let mut resampler: Option<SincFixedIn<f32>> = if needs_resampling {
+    let mut resampler: Option<Async<f32>> = if needs_resampling {
         let mut rs = create_resampler(source_rate, target_rate, source_chunk_samples)?;
         // Warm up the resampler with silence so the sinc filter is primed.
         // Without this, the first chunk output is shorter by ~sinc_len/2 * ratio samples.
-        let silence = vec![vec![0.0f32; source_chunk_samples]];
-        let _ = rs.process(&silence, None);
+        let silence = vec![0.0f32; source_chunk_samples];
+        let _ = resample_chunk(&mut rs, &silence);
         Some(rs)
     } else {
         None
@@ -512,10 +515,12 @@ fn get_input_config(
     Ok((default_config.config(), default_rate, default_channels))
 }
 
-/// Get device name, handling deprecated API gracefully.
+/// Get the device's human-readable name.
 fn get_device_name(device: &cpal::Device) -> String {
-    #[allow(deprecated)]
-    device.name().unwrap_or_else(|_| "<unknown>".to_string())
+    device
+        .description()
+        .map(|d| d.name().to_string())
+        .unwrap_or_else(|_| "<unknown>".to_string())
 }
 
 /// Create a resampler matching the streaming.rs approach.
@@ -523,21 +528,22 @@ fn create_resampler(
     from_rate: u32,
     to_rate: u32,
     chunk_size: usize,
-) -> mlx_nemo::Result<SincFixedIn<f32>> {
+) -> mlx_nemo::Result<Async<f32>> {
     let params = SincInterpolationParameters {
         sinc_len: 256,
-        f_cutoff: 0.95,
+        f_cutoff: Some(0.95),
         interpolation: SincInterpolationType::Linear,
         oversampling_factor: 256,
         window: WindowFunction::BlackmanHarris2,
     };
 
-    let resampler = SincFixedIn::<f32>::new(
+    let resampler = Async::<f32>::new_sinc(
         to_rate as f64 / from_rate as f64,
         2.0,
-        params,
+        &params,
         chunk_size,
         1, // mono
+        FixedAsync::Input,
     )
     .map_err(|e| mlx_nemo::Error::audio(format!("Failed to create resampler: {}", e)))?;
 
@@ -546,17 +552,18 @@ fn create_resampler(
 
 /// Resample a chunk of audio using the same approach as streaming.rs.
 fn resample_chunk(
-    resampler: &mut SincFixedIn<f32>,
+    resampler: &mut Async<f32>,
     input: &[f32],
 ) -> mlx_nemo::Result<Vec<f32>> {
     if input.is_empty() {
         return Ok(Vec::new());
     }
 
-    let waves_in = vec![input.to_vec()];
+    let waves_in = InterleavedSlice::new(input, 1, input.len())
+        .map_err(|e| mlx_nemo::Error::audio(format!("Invalid resampler input: {}", e)))?;
     let waves_out = resampler
         .process(&waves_in, None)
         .map_err(|e| mlx_nemo::Error::audio(format!("Resampling failed: {}", e)))?;
 
-    Ok(waves_out.into_iter().next().unwrap_or_default())
+    Ok(waves_out.take_data())
 }

@@ -37,30 +37,30 @@ thiserror = "2.0"
 
 # Archive handling (.nemo files are TAR archives)
 tar = "0.4"
-flate2 = "1.0"
-zip = "2.1"
+flate2 = "1.1"
+zip = "9.0"
 
 # Byte manipulation
-bytemuck = { version = "1.21", features = ["derive"] }
-half = "2.4"
+bytemuck = { version = "1.25", features = ["derive"] }
+half = "2.7"
 
 # Audio processing (for ASR feature)
 hound = { version = "3.5", optional = true }
-rubato = { version = "0.16", optional = true }
+rubato = { version = "5.0", optional = true }
 
 # Tokenization
-sentencepiece = "0.11"
+sentencepiece = "0.14"
 
 # Utilities
 tracing = "0.1"
-tempfile = "3.24.0"
+tempfile = "3.27.0"
 
 [dev-dependencies]
 # For examples and tests
-tokio = { version = "1.0", features = ["full"] }
+tokio = { version = "1.53", features = ["full"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # For live microphone example
-cpal = "0.17"       # Cross-platform audio I/O (microphone capture)
-ringbuf = "0.4"     # Lock-free SPSC ring buffer for audio thread communication
+cpal = "0.18"       # Cross-platform audio I/O (microphone capture)
+ringbuf = "0.5"     # Lock-free SPSC ring buffer for audio thread communication
 ctrlc = "3.5"       # Graceful Ctrl+C handling

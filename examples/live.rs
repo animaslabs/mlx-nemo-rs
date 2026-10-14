@@ -218,7 +218,7 @@ fn main() -> mlx_nemo::Result<()> {
     let channels_clone = channels;
     let stream = device
         .build_input_stream(
-            &config,
+            config,
             move |data: &[f32], _: &cpal::InputCallbackInfo| {
                 // Convert to mono if stereo (take first channel only)
                 if channels_clone > 1 {
@@ -439,21 +439,23 @@ fn get_input_config(
     Ok((default_config.config(), default_rate, default_channels))
 }
 
-/// Get device name, handling deprecated API gracefully.
+/// Get the device's human-readable name.
 fn get_device_name(device: &cpal::Device) -> String {
-    #[allow(deprecated)]
-    device.name().unwrap_or_else(|_| "<unknown>".to_string())
+    device
+        .description()
+        .map(|d| d.name().to_string())
+        .unwrap_or_else(|_| "<unknown>".to_string())
 }
 
 /// Create a resampler for converting from source to target sample rate.
-fn create_resampler(from_rate: u32, to_rate: u32) -> mlx_nemo::Result<rubato::FftFixedIn<f32>> {
+fn create_resampler(from_rate: u32, to_rate: u32) -> mlx_nemo::Result<rubato::Fft<f32>> {
     let chunk_size = 1024;
-    let resampler = rubato::FftFixedIn::<f32>::new(
+    let resampler = rubato::Fft::<f32>::new(
         from_rate as usize,
         to_rate as usize,
         chunk_size,
-        2, // sub_chunks
         1, // channels
+        rubato::FixedSync::Input,
     )
     .map_err(|e| mlx_nemo::Error::audio(format!("Failed to create resampler: {}", e)))?;
 
@@ -462,16 +464,16 @@ fn create_resampler(from_rate: u32, to_rate: u32) -> mlx_nemo::Result<rubato::Ff
 
 /// Resample a chunk of audio.
 fn resample_chunk(
-    resampler: &mut rubato::FftFixedIn<f32>,
+    resampler: &mut rubato::Fft<f32>,
     input: &[f32],
 ) -> mlx_nemo::Result<Vec<f32>> {
-    use rubato::Resampler;
+    use rubato::{audioadapter_buffers::direct::InterleavedSlice, Resampler};
 
     if input.is_empty() {
         return Ok(Vec::new());
     }
 
-    // FftFixedIn requires specific input sizes, so we may need to pad
+    // Fft with FixedSync::Input requires specific input sizes, so we may need to pad
     let input_frames_needed = resampler.input_frames_next();
 
     let mut padded_input = input.to_vec();
@@ -486,25 +488,19 @@ fn resample_chunk(
             // Pad the last chunk
             let mut padded = chunk.to_vec();
             padded.resize(input_frames_needed, 0.0);
-            let waves_in = vec![padded];
+            let waves_in = InterleavedSlice::new(&padded, 1, padded.len())
+                .map_err(|e| mlx_nemo::Error::audio(format!("Invalid resampler input: {}", e)))?;
             match resampler.process(&waves_in, None) {
-                Ok(waves_out) => {
-                    if let Some(out) = waves_out.into_iter().next() {
-                        output.extend(out);
-                    }
-                }
+                Ok(waves_out) => output.extend(waves_out.take_data()),
                 Err(e) => {
                     return Err(mlx_nemo::Error::audio(format!("Resampling failed: {}", e)));
                 }
             }
         } else {
-            let waves_in = vec![chunk.to_vec()];
+            let waves_in = InterleavedSlice::new(chunk, 1, chunk.len())
+                .map_err(|e| mlx_nemo::Error::audio(format!("Invalid resampler input: {}", e)))?;
             match resampler.process(&waves_in, None) {
-                Ok(waves_out) => {
-                    if let Some(out) = waves_out.into_iter().next() {
-                        output.extend(out);
-                    }
-                }
+                Ok(waves_out) => output.extend(waves_out.take_data()),
                 Err(e) => {
                     return Err(mlx_nemo::Error::audio(format!("Resampling failed: {}", e)));
                 }

@@ -83,31 +83,34 @@ pub fn load_wav(_path: impl AsRef<Path>) -> Result<(Vec<f32>, u32)> {
 #[cfg(feature = "asr")]
 pub fn resample(samples: &[f32], from_rate: u32, to_rate: u32) -> Result<Vec<f32>> {
     use rubato::{
-        Resampler, SincFixedIn, SincInterpolationParameters, SincInterpolationType, WindowFunction,
+        audioadapter_buffers::direct::InterleavedSlice, Async, FixedAsync, Resampler,
+        SincInterpolationParameters, SincInterpolationType, WindowFunction,
     };
 
-    if from_rate == to_rate {
+    if from_rate == to_rate || samples.is_empty() {
         return Ok(samples.to_vec());
     }
 
     let params = SincInterpolationParameters {
         sinc_len: 256,
-        f_cutoff: 0.95,
+        f_cutoff: Some(0.95),
         interpolation: SincInterpolationType::Linear,
         oversampling_factor: 256,
         window: WindowFunction::BlackmanHarris2,
     };
 
     let ratio = to_rate as f64 / from_rate as f64;
-    let mut resampler = SincFixedIn::<f32>::new(ratio, 2.0, params, samples.len(), 1)
+    let mut resampler = Async::<f32>::new_sinc(ratio, 2.0, &params, 1024, 1, FixedAsync::Input)
         .map_err(|e| Error::audio(format!("Failed to create resampler: {}", e)))?;
 
-    let waves_in = vec![samples.to_vec()];
-    let waves_out = resampler
-        .process(&waves_in, None)
+    let input = InterleavedSlice::new(samples, 1, samples.len())
+        .map_err(|e| Error::audio(format!("Invalid resampler input: {}", e)))?;
+    let output = resampler
+        .process_all(&input, samples.len(), None)
         .map_err(|e| Error::audio(format!("Resampling failed: {}", e)))?;
 
-    Ok(waves_out.into_iter().next().unwrap_or_default())
+    // Mono, so the interleaved buffer is the channel itself.
+    Ok(output.take_data())
 }
 
 #[cfg(not(feature = "asr"))]

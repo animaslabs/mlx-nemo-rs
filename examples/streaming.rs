@@ -194,7 +194,7 @@ fn main() -> mlx_nemo::Result<()> {
             "Resampling from {} Hz to {} Hz...",
             file_sample_rate, sample_rate
         );
-        resample_audio(&samples, file_sample_rate, sample_rate)?
+        mlx_nemo::audio::resample(&samples, file_sample_rate, sample_rate)?
     } else {
         samples
     };
@@ -433,37 +433,3 @@ fn load_audio(path: &str) -> mlx_nemo::Result<(Vec<f32>, u32)> {
     Ok((samples, sample_rate))
 }
 
-/// Resample audio to target sample rate.
-fn resample_audio(samples: &[f32], from_rate: u32, to_rate: u32) -> mlx_nemo::Result<Vec<f32>> {
-    use rubato::{
-        Resampler, SincFixedIn, SincInterpolationParameters, SincInterpolationType, WindowFunction,
-    };
-
-    if from_rate == to_rate {
-        return Ok(samples.to_vec());
-    }
-
-    let params = SincInterpolationParameters {
-        sinc_len: 256,
-        f_cutoff: 0.95,
-        interpolation: SincInterpolationType::Linear,
-        oversampling_factor: 256,
-        window: WindowFunction::BlackmanHarris2,
-    };
-
-    let mut resampler = SincFixedIn::<f32>::new(
-        to_rate as f64 / from_rate as f64,
-        2.0,
-        params,
-        samples.len(),
-        1,
-    )
-    .map_err(|e| mlx_nemo::Error::audio(format!("Failed to create resampler: {}", e)))?;
-
-    let waves_in = vec![samples.to_vec()];
-    let waves_out = resampler
-        .process(&waves_in, None)
-        .map_err(|e| mlx_nemo::Error::audio(format!("Resampling failed: {}", e)))?;
-
-    Ok(waves_out.into_iter().next().unwrap_or_default())
-}
