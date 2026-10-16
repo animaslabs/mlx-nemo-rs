@@ -181,6 +181,18 @@ impl RelPositionalEncoding {
     }
 }
 
+/// Largest per-block attention score matrix, in elements, for offline attention
+/// (2^26 f32 = 256 MiB). Sequences whose full score matrices fit run in one block.
+const MAX_SCORE_ELEMENTS: i64 = 1 << 26;
+
+/// Query rows per attention block so that a [batch*heads, rows, 2*seq_len] score
+/// matrix stays under `max_score_elements`.
+fn query_block_size(batch_heads: i32, seq_len: i32, max_score_elements: i64) -> i32 {
+    let per_row = batch_heads as i64 * 2 * seq_len as i64;
+    // Clamp before narrowing: a large budget would otherwise wrap past i32.
+    (max_score_elements / per_row.max(1)).clamp(1, seq_len.max(1) as i64) as i32
+}
+
 /// Relative position multi-head attention.
 ///
 /// Implements Transformer-XL style relative positional attention where:
@@ -283,6 +295,17 @@ impl RelPositionMultiHeadAttention {
     /// # Returns
     /// Output tensor [batch, seq_len, d_model]
     pub fn forward(&mut self, x: &Array, pos_emb: &Array) -> Result<Array> {
+        self.forward_blocked(x, pos_emb, MAX_SCORE_ELEMENTS)
+    }
+
+    /// `forward` with queries processed in blocks whose score matrices stay
+    /// under `max_score_elements`.
+    fn forward_blocked(
+        &mut self,
+        x: &Array,
+        pos_emb: &Array,
+        max_score_elements: i64,
+    ) -> Result<Array> {
         let batch_size = x.dim(0) as i32;
         let seq_len = x.dim(1) as i32;
         let n_heads = self.n_heads as i32;
@@ -327,30 +350,51 @@ impl RelPositionMultiHeadAttention {
         let q_with_bias_u = &q + &bias_u;
         let q_with_bias_v = &q + &bias_v;
 
-        // Content attention: (Q + u) @ K^T -> [batch, n_heads, seq_len, seq_len]
         let k_t = ops::transpose_axes(&k, &[0, 1, 3, 2])?;
-        let matrix_ac = ops::matmul(&q_with_bias_u, &k_t)?;
-
-        // Position attention: (Q + v) @ P^T -> [batch, n_heads, seq_len, 2*seq_len-1]
         let p_t = ops::transpose_axes(&p, &[0, 1, 3, 2])?;
-        let matrix_bd = ops::matmul(&q_with_bias_v, &p_t)?;
+        let scale = Array::from_f32((head_dim as f32).sqrt());
 
-        // Apply rel_shift to align relative positions
-        let matrix_bd = Self::rel_shift(&matrix_bd)?;
+        // Full attention over a long file needs [batch, n_heads, seq_len, 2*seq_len-1]
+        // position scores (tens of GB at ~10k frames), so queries are processed in
+        // blocks that keep each block's score matrix under max_score_elements. Every
+        // block still attends to all keys, so the result is exact full attention.
+        let block = query_block_size(batch_size * n_heads, seq_len, max_score_elements);
+        let mut contexts = Vec::new();
+        for start in (0..seq_len).step_by(block as usize) {
+            let end = (start + block).min(seq_len);
+            let q_u = q_with_bias_u.index((.., .., start..end, ..));
+            let q_v = q_with_bias_v.index((.., .., start..end, ..));
 
-        // Truncate to seq_len (take first seq_len columns)
-        // matrix_bd: [batch, n_heads, seq_len, 2*seq_len-1] -> [batch, n_heads, seq_len, seq_len]
-        let matrix_bd = matrix_bd.index((.., .., .., ..seq_len));
+            // Content attention: (Q + u) @ K^T -> [batch, n_heads, rows, seq_len]
+            let matrix_ac = ops::matmul(&q_u, &k_t)?;
 
-        // Combine and scale
-        let scale = (head_dim as f32).sqrt();
-        let scores = (&matrix_ac + &matrix_bd) / Array::from_f32(scale);
+            // Position attention: (Q + v) @ P^T. Row i of the full matrix only reads
+            // positions (seq_len-1-i)..(2*seq_len-1-i) after rel_shift, so rows
+            // start..end need p[seq_len-end .. 2*seq_len-1-start] (seq_len+rows-1
+            // columns). rel_shift on that slice yields the same alignment as on the
+            // full matrix: out[r][j] = x[r][j + rows-1-r].
+            let p_slice =
+                p_t.index((.., .., .., (seq_len - end)..(2 * seq_len - 1 - start)));
+            let matrix_bd = ops::matmul(&q_v, &p_slice)?;
+            let matrix_bd = Self::rel_shift(&matrix_bd)?;
+            let matrix_bd = matrix_bd.index((.., .., .., ..seq_len));
 
-        // Softmax
-        let attn_weights = ops::softmax_axis(&scores, -1, None)?;
-
-        // Apply attention to values: [batch, n_heads, seq_len, head_dim]
-        let context = ops::matmul(&attn_weights, &v)?;
+            // Combine, scale, softmax, and apply to values: [batch, n_heads, rows, head_dim]
+            let scores = (&matrix_ac + &matrix_bd) / &scale;
+            let attn_weights = ops::softmax_axis(&scores, -1, None)?;
+            let context = ops::matmul(&attn_weights, &v)?;
+            if block < seq_len {
+                // Materialize each block so its score matrices are freed before the
+                // next one is built; a lazy graph could otherwise hold several at once.
+                context.eval()?;
+            }
+            contexts.push(context);
+        }
+        let context = if contexts.len() == 1 {
+            contexts.pop().unwrap()
+        } else {
+            ops::concatenate(&contexts, 2)?
+        };
 
         // Transpose back: [batch, seq_len, n_heads, head_dim]
         let context = ops::transpose_axes(&context, &[0, 2, 1, 3])?;
@@ -842,6 +886,42 @@ mod tests {
             shifted_data[12], 12.0,
             "Row 2, col 2 should be pos_0 (value 12)"
         );
+    }
+
+    #[test]
+    fn test_blocked_attention_matches_full() {
+        // Query blocks (including a ragged last block) must reproduce one-block attention.
+        let (d_model, n_heads, seq_len) = (16usize, 2usize, 13i32);
+        let mut attn = RelPositionMultiHeadAttention::new(d_model, n_heads, true).unwrap();
+        let d = d_model as i32;
+        let w = |seed: u64| {
+            let key = mlx_rs::random::key(seed).unwrap();
+            mlx_rs::random::normal::<f32>(&[d, d], None, None, &key).unwrap() * 0.3
+        };
+        attn.linear_q = LinearLayer::standard(w(1), Some(w(2).index(0)));
+        attn.linear_k = LinearLayer::standard(w(3), Some(w(4).index(0)));
+        attn.linear_v = LinearLayer::standard(w(5), Some(w(6).index(0)));
+        attn.linear_out = LinearLayer::standard(w(7), None);
+        attn.linear_pos = LinearLayer::standard(w(8), None);
+        attn.pos_bias_u = w(9).index((..n_heads as i32, ..(d_model / n_heads) as i32));
+        attn.pos_bias_v = w(10).index((..n_heads as i32, ..(d_model / n_heads) as i32));
+
+        let key = mlx_rs::random::key(11).unwrap();
+        let x = mlx_rs::random::normal::<f32>(&[2, seq_len, d], None, None, &key).unwrap();
+        let pos_emb = RelPositionalEncoding::new(d_model, 64, false)
+            .unwrap()
+            .get_encoding(seq_len as usize)
+            .unwrap();
+
+        // i64::MAX: one block covering every query row (the unblocked computation).
+        let full = attn.forward_blocked(&x, &pos_emb, i64::MAX).unwrap();
+        // 2 batch * 2 heads * 2*13 per row: a budget of 5 rows gives blocks of 5, 5, 3.
+        let blocked = attn.forward_blocked(&x, &pos_emb, 2 * 2 * 2 * 13 * 5).unwrap();
+        assert_eq!(blocked.shape(), full.shape());
+        let a: Vec<f32> = full.to_vec_row_major().unwrap();
+        let b: Vec<f32> = blocked.to_vec_row_major().unwrap();
+        let max_diff = a.iter().zip(&b).map(|(x, y)| (x - y).abs()).fold(0.0, f32::max);
+        assert!(max_diff < 1e-5, "max diff {max_diff}");
     }
 
     #[test]

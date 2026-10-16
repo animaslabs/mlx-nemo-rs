@@ -1213,6 +1213,10 @@ fn load_conv2d(layer: &mut nn::Conv2d, weights: &HashMap<String, Array>, prefix:
     }
 }
 
+/// Mel frames per subsampling chunk for long inputs (~41 s at 10 ms hops).
+/// Shorter inputs run in one pass.
+const SUBSAMPLING_CHUNK_FRAMES: usize = 4096;
+
 /// Subsampling layer for reducing sequence length using depthwise striding.
 ///
 /// This implements the `dw_striding` subsampling method used in NeMo's Conformer encoder.
@@ -1434,12 +1438,95 @@ impl Subsampling {
     }
 
     fn forward(&mut self, x: &Array, lengths: &Array) -> Result<(Array, Array)> {
+        let frames = self.forward_frames_chunked(x, SUBSAMPLING_CHUNK_FRAMES)?;
+        Ok((frames, self.output_lengths(lengths)?))
+    }
+
+    /// Run the conv stack and projection over time chunks of `chunk_frames` mel
+    /// frames, so long inputs never hold the full-resolution conv activations
+    /// (several GB for a 20 min file) at once.
+    ///
+    /// The result is exact. Each output frame depends on only a few input frames
+    /// (15 for 8x subsampling). Every chunk starts on a multiple of the
+    /// subsampling factor, so its strides line up with the full computation, and
+    /// it runs with twice the receptive field of real neighbouring input on each
+    /// side. The outputs that see the chunk's own edge padding fall in that
+    /// context and are cropped. Chunks touching the true start or end pad
+    /// exactly as the full input does.
+    fn forward_frames_chunked(&mut self, x: &Array, chunk_frames: usize) -> Result<Array> {
+        let total = x.dim(1) as usize;
+        let factor = self.subsampling_factor;
+        let chunk = chunk_frames.max(factor) / factor * factor;
+        if total <= chunk {
+            return self.forward_frames(x);
+        }
+        // Receptive field of the stacked stride-2 convs, in input frames (15 for 8x),
+        // doubled and rounded up to a multiple of the factor to keep chunks aligned.
+        let receptive_field = 1 + (self.kernel_size - 1) * (factor - 1);
+        let context = (2 * receptive_field).div_ceil(factor) * factor;
+        let mut outputs = Vec::new();
+        let mut start = 0;
+        while start < total {
+            let end = (start + chunk).min(total);
+            let left = context.min(start);
+            let right = context.min(total - end);
+            let piece = x.index((.., (start - left) as i32..(end + right) as i32, ..));
+            let out = self.forward_frames(&piece)?;
+            let first = (left / factor) as i32;
+            let out = if end == total {
+                out.index((.., first.., ..))
+            } else {
+                out.index((.., first..first + ((end - start) / factor) as i32, ..))
+            };
+            // Materialize each chunk so its conv activations are freed before the next.
+            out.eval()?;
+            outputs.push(out);
+            start = end;
+        }
+        Ok(mlx_rs::ops::concatenate(&outputs, 1)?)
+    }
+
+    #[cfg(test)]
+    fn out_proj_in_features(&self) -> i32 {
+        match &self.out_proj {
+            LinearLayer::Standard { weight, .. } => weight.dim(1) as i32,
+            _ => unreachable!("test subsampling uses a standard projection"),
+        }
+    }
+
+    /// Output lengths after subsampling.
+    fn output_lengths(&self, lengths: &Array) -> Result<Array> {
+        let n_convs = self.depthwise_convs.len() + 1;
+        let mut new_lengths = lengths.as_dtype(mlx_rs::Dtype::Int32)?;
+        for _ in 0..n_convs {
+            new_lengths = if self.is_causal {
+                // CausalConv2D: left_pad=k-1, right_pad=s-1
+                Self::calc_conv_output_size(&new_lengths, self.kernel_size as i32, self.stride as i32)?
+            } else {
+                // Symmetric padding of 1 with kernel 3, stride 2 (NeMo's calc_length):
+                // out = floor((len + 2 - 3) / 2) + 1, which rounds odd lengths up
+                let shrunk = mlx_rs::ops::subtract(&new_lengths, &Array::from_int(1))?;
+                mlx_rs::ops::add(
+                    &mlx_rs::ops::floor_divide(&shrunk, &Array::from_int(2))?,
+                    &Array::from_int(1),
+                )?
+            };
+        }
+        if std::env::var("MLX_VOICE_DEBUG").is_ok() {
+            new_lengths.eval()?;
+            let len_data: Vec<i32> = new_lengths.to_vec_row_major()?;
+            tracing::info!("DEBUG subsampling: output_lengths={:?}", len_data);
+        }
+        Ok(new_lengths)
+    }
+
+    /// Conv stack and output projection: [B, T, F] mel features to [B, T', d_model].
+    fn forward_frames(&mut self, x: &Array) -> Result<Array> {
         // x: [B, T, F] where F is number of mel features (e.g., 80 or 128)
         let debug_enabled = std::env::var("MLX_VOICE_DEBUG").is_ok();
 
         tracing::debug!(
             input_shape = ?x.shape(),
-            lengths_shape = ?lengths.shape(),
             is_causal = self.is_causal,
             "subsampling forward start"
         );
@@ -1458,9 +1545,6 @@ impl Subsampling {
         // Add channel dimension: [B, T, F] -> [B, T, F, 1] for MLX Conv2d
         // MLX Conv2d expects (N, H, W, C) format
         let mut x = x.reshape(&[-1, x.dim(1) as i32, x.dim(2) as i32, 1])?;
-
-        // Track current lengths for masking (convert to float for calculations)
-        let mut current_lengths = lengths.as_dtype(mlx_rs::Dtype::Float32)?;
 
         if debug_enabled {
             tracing::info!("DEBUG subsampling: after reshape to [B,T,F,1]: {:?}", x.shape());
@@ -1487,18 +1571,6 @@ impl Subsampling {
         if debug_enabled {
             tracing::info!("DEBUG subsampling: after first_conv + ReLU: {:?}", x.shape());
             Self::debug_print_array("after_first_conv", &x, 5);
-        }
-
-        // Update lengths after stride operation (CausalConv2D: left_pad=k-1, right_pad=s-1)
-        if self.is_causal {
-            current_lengths = Self::calc_conv_output_size(
-                &current_lengths.as_dtype(mlx_rs::Dtype::Int32)?,
-                self.kernel_size as i32,
-                self.stride as i32,
-            )?.as_dtype(mlx_rs::Dtype::Float32)?;
-            if debug_enabled {
-                tracing::info!("DEBUG subsampling: updated lengths after first conv: {:?}", current_lengths.to_vec_row_major::<f32>()?);
-            }
         }
 
         // Get parameters for loop since we need to avoid borrow issues
@@ -1532,18 +1604,6 @@ impl Subsampling {
             if debug_enabled {
                 tracing::info!("DEBUG subsampling: after dw_conv_{} + pw_conv + ReLU: {:?}", i, x.shape());
                 Self::debug_print_array(&format!("after_conv_pair_{}", i), &x, 5);
-            }
-
-            // Update lengths after stride operation
-            if is_causal {
-                current_lengths = Self::calc_conv_output_size(
-                    &current_lengths.as_dtype(mlx_rs::Dtype::Int32)?,
-                    kernel_size as i32,
-                    stride as i32,
-                )?.as_dtype(mlx_rs::Dtype::Float32)?;
-                if debug_enabled {
-                    tracing::info!("DEBUG subsampling: updated lengths after dw_conv_{}: {:?}", i, current_lengths.to_vec_row_major::<f32>()?);
-                }
             }
         }
 
@@ -1587,37 +1647,9 @@ impl Subsampling {
             Self::debug_print_array("after_out_proj", &x, 5);
         }
 
-        // Use the lengths we've been tracking (for causal) or compute new ones
-        let new_lengths = if is_causal {
-            current_lengths.as_dtype(mlx_rs::Dtype::Int32)?
-        } else {
-            // Symmetric padding of 1 with kernel 3, stride 2 (NeMo's calc_length):
-            // out = floor((len + 2 - 3) / 2) + 1, which rounds odd lengths up
-            let mut new_lengths = lengths.as_dtype(mlx_rs::Dtype::Int32)?;
-            let n_convs = self.depthwise_convs.len() + 1;
-            for _ in 0..n_convs {
-                let shrunk = mlx_rs::ops::subtract(&new_lengths, &Array::from_int(1))?;
-                new_lengths = mlx_rs::ops::add(
-                    &mlx_rs::ops::floor_divide(&shrunk, &Array::from_int(2))?,
-                    &Array::from_int(1),
-                )?;
-            }
-            new_lengths
-        };
+        tracing::trace!(output_shape = ?x.shape(), "subsampling forward complete");
 
-        if debug_enabled {
-            new_lengths.eval()?;
-            let len_data: Vec<i32> = new_lengths.to_vec_row_major()?;
-            tracing::info!("DEBUG subsampling: output_lengths={:?}", len_data);
-        }
-
-        tracing::trace!(
-            output_shape = ?x.shape(),
-            output_lengths_shape = ?new_lengths.shape(),
-            "subsampling forward complete"
-        );
-
-        Ok((x, new_lengths))
+        Ok(x)
     }
 
     fn load_weights(
@@ -2415,5 +2447,50 @@ impl ConvolutionModule {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Chunked subsampling must reproduce the single-pass result exactly,
+    /// including a ragged final chunk, for both padding styles.
+    #[test]
+    fn test_chunked_subsampling_matches_single_pass() {
+        for causal in [false, true] {
+            let mut config = EncoderConfig::default();
+            config.feat_in = 16;
+            config.d_model = 8;
+            config.subsampling_factor = 8;
+            config.subsampling_conv_channels = Some(4);
+            config.causal_downsampling = Some(causal);
+            let mut sub = Subsampling::new(&config).unwrap();
+            // Constructor weights are placeholders until a checkpoint loads; give the
+            // depthwise convs the real [channels, k, k, 1] shape.
+            for (i, dw) in sub.depthwise_convs.iter_mut().enumerate() {
+                let key = mlx_rs::random::key(100 + i as u64).unwrap();
+                dw.weight.value =
+                    mlx_rs::random::normal::<f32>(&[4, 3, 3, 1], None, None, &key).unwrap() * 0.5;
+            }
+            let key = mlx_rs::random::key(7).unwrap();
+            let linear_in = sub.out_proj_in_features();
+            sub.out_proj = LinearLayer::standard(
+                mlx_rs::random::normal::<f32>(&[8, linear_in], None, None, &key).unwrap(),
+                None,
+            );
+
+            let key = mlx_rs::random::key(3).unwrap();
+            let x = mlx_rs::random::normal::<f32>(&[1, 203, 16], None, None, &key).unwrap();
+            let single = sub.forward_frames(&x).unwrap();
+            let chunked = sub.forward_frames_chunked(&x, 40).unwrap();
+            assert_eq!(chunked.shape(), single.shape(), "causal={causal}");
+
+            let a: Vec<f32> = single.to_vec_row_major().unwrap();
+            let b: Vec<f32> = chunked.to_vec_row_major().unwrap();
+            assert!(a.iter().any(|v| v.abs() > 1e-3), "degenerate output (causal={causal})");
+            let max_diff = a.iter().zip(&b).map(|(x, y)| (x - y).abs()).fold(0.0, f32::max);
+            assert!(max_diff < 1e-5, "causal={causal}: max diff {max_diff}");
+        }
     }
 }
