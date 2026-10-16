@@ -34,12 +34,14 @@ pub mod audio;
 pub use core::error::{Error, Result};
 pub use core::weights::WeightFormat;
 pub use core::checkpoint::SafetensorsLoader;
+#[doc(no_inline)]
 pub use mlx_rs::Array;
-/// Re-export of [`mod@mlx_rs::fft`] (module only; the `fft!` macro is deprecated).
-pub mod fft {
-    pub use mlx_rs::fft::*;
-}
-pub use mlx_rs::ops;
+
+/// The `mlx-rs` version this crate is built against, for working with [`Array`]
+/// directly (e.g. `mlx_voice::mlx_rs::ops`) without a separate, possibly
+/// mismatched, `mlx-rs` dependency.
+#[doc(no_inline)]
+pub use mlx_rs;
 
 /// Prelude module for convenient imports
 pub mod prelude {
