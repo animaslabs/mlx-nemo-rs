@@ -123,12 +123,19 @@ impl RelPositionalEncoding {
     /// pos_emb = self.pe[:, start_pos:end_pos]
     /// ```
     /// This extracts positions centered at 0, giving 2*input_len-1 positions.
+    ///
+    /// Sequences longer than `max_len` get a table built at their own length,
+    /// matching NeMo, whose `ConformerEncoder.update_max_seq_length` calls
+    /// `extend_pe` to regenerate the table for long inputs. The values are the
+    /// same sinusoids, so `max_len` (`pos_emb_max_len`) only sets what's cached.
     pub fn get_encoding(&self, seq_len: usize) -> Result<Array> {
+        if seq_len == 0 {
+            return Err(Error::model("positional encoding requested for an empty sequence"));
+        }
         if seq_len > self.max_len {
-            return Err(Error::model(format!(
-                "Sequence length {} exceeds maximum positional encoding length {}",
-                seq_len, self.max_len
-            )));
+            tracing::debug!(seq_len, max_len = self.max_len, "extending positional encoding");
+            // A table of exactly seq_len covers (seq_len-1)..=-(seq_len-1): the whole slice.
+            return Self::create_pe(self.d_model, seq_len);
         }
 
         // Calculate slice indices to extract the relevant portion
@@ -835,6 +842,21 @@ mod tests {
             shifted_data[12], 12.0,
             "Row 2, col 2 should be pos_0 (value 12)"
         );
+    }
+
+    #[test]
+    fn test_rel_positional_encoding_extends_past_max_len() {
+        // Past max_len the table is regenerated (NeMo's extend_pe), and it
+        // must match what a large enough precomputed table would return.
+        let short = RelPositionalEncoding::new(16, 10, false).unwrap();
+        let long = RelPositionalEncoding::new(16, 40, false).unwrap();
+        let extended = short.get_encoding(25).unwrap();
+        let reference = long.get_encoding(25).unwrap();
+        assert_eq!(extended.shape(), &[1, 49, 16]);
+        let a: Vec<f32> = extended.to_vec_row_major().unwrap();
+        let b: Vec<f32> = reference.to_vec_row_major().unwrap();
+        let max_diff = a.iter().zip(&b).map(|(x, y)| (x - y).abs()).fold(0.0, f32::max);
+        assert!(max_diff < 1e-6, "max diff {max_diff}");
     }
 
     #[test]
