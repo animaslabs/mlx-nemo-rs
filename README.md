@@ -10,7 +10,7 @@ mlx-voice loads NeMo checkpoints (`.nemo` archives) or converted MLX safetensors
 - **RNN-T / Transducer ASR**: `EncDecRNNTModel` with greedy or beam search decoding (e.g. `nvidia/parakeet-rnnt-0.6b`)
 - **Cache-aware streaming**: `CacheAwareRNNTPipeline` for low-latency incremental transcription with selectable latency modes (e.g. `nvidia/nemotron-speech-streaming-en-0.6b`)
 - **Voice activity detection**: `EncDecClassificationModel` with NeMo-style post-processing (e.g. `nvidia/Frame_VAD_Multilingual_MarbleNet_v2.0`)
-- **Multi-talker transcription**: `MultiTalkerPipeline` combines streaming ASR with Sortformer speaker diarization
+- **Multi-talker transcription**: `MultiTalkerPipeline` combines streaming ASR with streaming Sortformer diarization (e.g. `nvidia/diar_streaming_sortformer_4spk-v2.1`). With a multitalker model (`nvidia/multitalker-parakeet-streaming-0.6b-v1`) it runs one speaker-conditioned ASR instance per speaker and transcribes overlapping speech; with an ordinary streaming model it attributes a single transcript to speakers
 - **FastConformer encoder**, mel-spectrogram preprocessing, and SentencePiece tokenization matching NeMo
 - **Weight formats**: `.nemo` archives (PyTorch checkpoints), MLX safetensors, and 8-bit quantized MLX weights
 
@@ -104,6 +104,36 @@ fn main() -> mlx_voice::Result<()> {
 
 For a whole file, `pipeline.set_audio_file("audio.wav")?` followed by `pipeline.run()?` returns the full transcript.
 
+### Multi-talker transcription
+
+`MultiTalkerPipeline` pairs a streaming ASR model with a streaming Sortformer diarizer. The diarizer runs on the same audio chunks as the ASR model, so its speaker activity lines up frame by frame with the encoder output.
+
+With `nvidia/multitalker-parakeet-streaming-0.6b-v1`, each of up to four speakers gets its own ASR instance on the shared audio. The diarizer output conditions each instance's encoder through learned speaker kernels. The instances run as one batched encoder call, so each speaker is transcribed separately even while people talk over each other.
+
+```rust
+use mlx_voice::asr::MultiTalkerPipeline;
+
+fn main() -> mlx_voice::Result<()> {
+    let mut pipeline = MultiTalkerPipeline::restore(
+        "models/nvidia/multitalker-parakeet-streaming-0.6b-v1/multitalker-parakeet-streaming-0.6b-v1.nemo",
+        "models/nvidia/diar_streaming_sortformer_4spk-v2.1/diar_streaming_sortformer_4spk-v2.1.nemo",
+        0,
+    )?;
+    pipeline.set_audio_file("meeting.wav")?;
+    while let Some(output) = pipeline.transcribe_step()? {
+        for word in &output.new_words {
+            println!("[{:.2}s] speaker_{}: {}", word.start_time, word.speaker, word.text);
+        }
+    }
+    for segment in pipeline.segments() {
+        println!("speaker_{}: {}", segment.speaker, segment.text);
+    }
+    Ok(())
+}
+```
+
+With an ordinary streaming model the pipeline runs in serial mode instead. Each word of a single transcript goes to the most active speaker, and speech that overlaps another speaker is lost.
+
 ## Examples
 
 | Example | Description |
@@ -131,6 +161,9 @@ cargo run --release --example streaming -- --model <model.nemo> --list-modes
 
 cargo run --release --example live -- \
   --model models/nvidia/nemotron-speech-streaming-en-0.6b/nemotron-speech-streaming-en-0.6b.nemo
+
+# Speaker-attributed transcription (models auto-detected under models/)
+cargo run --release --example multi_talker -- --output segments.json meeting.wav
 ```
 
 Each example documents its options at the top of its source file in [`examples/`](examples/). Set `RUST_LOG=mlx_voice=debug` for debug logging.

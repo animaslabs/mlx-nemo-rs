@@ -597,8 +597,9 @@ impl RelPositionMultiHeadAttention {
 
         // Apply attention mask if provided
         let mask_expanded = if let Some(mask) = att_mask {
-            // mask: [batch, seq_len, total_len] -> [batch, 1, seq_len, total_len]
-            let mask = mask.reshape(&[batch_size, 1, seq_len, total_len])?;
+            // mask: [batch or 1, seq_len, total_len] -> [batch or 1, 1, seq_len, total_len]
+            // A batch-1 mask is shared by every row (streaming masks are)
+            let mask = mask.reshape(&[mask.dim(0), 1, seq_len, total_len])?;
             tracing::trace!(
                 mask_shape = ?mask.shape(),
                 "applying attention mask"

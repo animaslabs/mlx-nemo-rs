@@ -163,9 +163,10 @@ pub struct TensorInfo {
     pub shape: Vec<i64>,
     /// Tensor strides
     pub stride: Vec<i64>,
-    /// Number of elements
+    /// Number of elements in the underlying storage (which may be shared by
+    /// several tensors)
     pub numel: usize,
-    /// Byte offset into storage (usually 0)
+    /// Offset into the storage, in elements (usually 0)
     pub offset: usize,
 }
 
@@ -194,20 +195,76 @@ fn read_zip_entry<R: Read + Seek>(archive: &mut ZipArchive<R>, name: &str) -> Re
     Ok(data)
 }
 
-/// Load a tensor from raw storage bytes.
-fn load_tensor(data: &[u8], info: &TensorInfo) -> Result<Array> {
-    let elem_size = info.storage_type.byte_size();
-    let expected_bytes = info.numel * elem_size;
+/// Extract a tensor's bytes, in row-major order, from its storage.
+///
+/// Tensors can be views into a shared storage (e.g. cuDNN-flattened LSTM
+/// weights), so this honors the storage offset and strides.
+fn gather_tensor_bytes(data: &[u8], info: &TensorInfo, elem_size: usize) -> Result<Vec<u8>> {
+    let numel: usize = info.shape.iter().map(|&d| d.max(0) as usize).product();
+    if numel == 0 {
+        return Ok(Vec::new());
+    }
 
-    if data.len() < info.offset + expected_bytes {
+    // Row-major strides for this shape
+    let mut contiguous = vec![1i64; info.shape.len()];
+    for i in (0..info.shape.len().saturating_sub(1)).rev() {
+        contiguous[i] = contiguous[i + 1] * info.shape[i + 1];
+    }
+    let stride = if info.stride.len() == info.shape.len() {
+        info.stride.clone()
+    } else {
+        contiguous.clone()
+    };
+
+    // Last element touched, to bounds-check the storage
+    let max_index = info.offset
+        + info
+            .shape
+            .iter()
+            .zip(&stride)
+            .map(|(&d, &s)| (d.max(1) - 1) as usize * s.max(0) as usize)
+            .sum::<usize>();
+    if data.len() < (max_index + 1) * elem_size {
         return Err(Error::checkpoint(format!(
             "Storage too small: expected {} bytes, got {}",
-            info.offset + expected_bytes,
+            (max_index + 1) * elem_size,
             data.len()
         )));
     }
 
-    let storage_bytes = &data[info.offset..info.offset + expected_bytes];
+    let is_contiguous = info
+        .shape
+        .iter()
+        .zip(stride.iter().zip(&contiguous))
+        .all(|(&d, (&s, &c))| d == 1 || s == c);
+    if is_contiguous {
+        let start = info.offset * elem_size;
+        return Ok(data[start..start + numel * elem_size].to_vec());
+    }
+
+    let mut out = Vec::with_capacity(numel * elem_size);
+    let mut index = vec![0i64; info.shape.len()];
+    for _ in 0..numel {
+        let elem = info.offset as i64 + index.iter().zip(&stride).map(|(&i, &s)| i * s).sum::<i64>();
+        let start = elem as usize * elem_size;
+        out.extend_from_slice(&data[start..start + elem_size]);
+        // Advance the multi-dimensional index
+        for dim in (0..index.len()).rev() {
+            index[dim] += 1;
+            if index[dim] < info.shape[dim] {
+                break;
+            }
+            index[dim] = 0;
+        }
+    }
+    Ok(out)
+}
+
+/// Load a tensor from raw storage bytes.
+fn load_tensor(data: &[u8], info: &TensorInfo) -> Result<Array> {
+    let elem_size = info.storage_type.byte_size();
+    let gathered = gather_tensor_bytes(data, info, elem_size)?;
+    let storage_bytes: &[u8] = &gathered;
 
     // Convert shape to i32 for mlx-rs
     let shape: Vec<i32> = info.shape.iter().map(|&d| d as i32).collect();
@@ -852,6 +909,44 @@ mod pickle {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn info(shape: Vec<i64>, stride: Vec<i64>, offset: usize) -> TensorInfo {
+        TensorInfo {
+            storage_key: "0".to_string(),
+            storage_type: StorageType::Float32,
+            shape,
+            stride,
+            numel: 12,
+            offset,
+        }
+    }
+
+    fn storage() -> Vec<u8> {
+        (0..12).flat_map(|i| (i as f32).to_le_bytes()).collect()
+    }
+
+    fn values(bytes: &[u8]) -> Vec<f32> {
+        bytes.chunks(4).map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect()
+    }
+
+    #[test]
+    fn test_gather_view_into_shared_storage() {
+        // A [2, 2] tensor starting at element 4 of a 12-element storage
+        let bytes = gather_tensor_bytes(&storage(), &info(vec![2, 2], vec![2, 1], 4), 4).unwrap();
+        assert_eq!(values(&bytes), vec![4.0, 5.0, 6.0, 7.0]);
+    }
+
+    #[test]
+    fn test_gather_transposed_view() {
+        // Transpose of a [2, 3] tensor: shape [3, 2], strides [1, 3]
+        let bytes = gather_tensor_bytes(&storage(), &info(vec![3, 2], vec![1, 3], 0), 4).unwrap();
+        assert_eq!(values(&bytes), vec![0.0, 3.0, 1.0, 4.0, 2.0, 5.0]);
+    }
+
+    #[test]
+    fn test_gather_rejects_short_storage() {
+        assert!(gather_tensor_bytes(&storage(), &info(vec![4], vec![1], 10), 4).is_err());
+    }
 
     #[test]
     fn test_storage_type_from_name() {

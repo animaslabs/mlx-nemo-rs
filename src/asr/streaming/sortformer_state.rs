@@ -1,352 +1,374 @@
 //! Streaming state for SortFormer diarization model.
 //!
-//! Manages the speaker cache, FIFO buffer, and silence embedding
-//! used for streaming diarization inference.
+//! Manages the speaker cache, FIFO buffer, and silence embedding used for
+//! streaming diarization inference. This follows NeMo's synchronous
+//! `SortformerModules.streaming_update()` and `_compress_spkcache()`.
+//!
+//! The speaker cache and FIFO hold *pre-encode* embeddings (the output of the
+//! conformer subsampling stage). Every step re-runs the conformer over
+//! `[spkcache, fifo, chunk]`, which is what keeps speaker indices stable
+//! across chunks.
 
 use mlx_rs::ops;
 use mlx_rs::ops::indexing::IndexOp;
 use mlx_rs::Array;
 
+use crate::asr::config::SortformerModulesConfig;
 use crate::core::ArrayExt;
 use crate::core::error::Result;
 
-/// Streaming state for the SortFormer diarizer.
+/// Streaming state for the SortFormer diarizer (batch size 1).
 pub struct StreamingSortformerState {
-    /// Long-term speaker memory [batch, spkcache_len, fc_d_model]
+    /// Long-term speaker memory [1, spkcache frames, d_model]
     pub spkcache: Array,
-    /// Speaker predictions for cached frames [batch, spkcache_len, num_spks]
-    pub spkcache_preds: Array,
-    /// Recent embeddings FIFO [batch, fifo_len, fc_d_model]
+    /// Speaker predictions for cached frames [1, spkcache frames, num_spks]
+    pub spkcache_preds: Option<Array>,
+    /// Recent embeddings FIFO [1, fifo frames, d_model]
     pub fifo: Array,
-    /// Speaker predictions for FIFO frames [batch, fifo_len, num_spks]
+    /// Speaker predictions for FIFO frames [1, fifo frames, num_spks]
     pub fifo_preds: Array,
-    /// Running mean silence embedding [batch, fc_d_model]
+    /// Running mean silence embedding [1, d_model]
     pub mean_sil_emb: Array,
-    /// Count of silence frames seen [batch]
-    pub n_sil_frames: Array,
+    /// Count of silence frames seen
+    pub n_sil_frames: usize,
+    /// Whether the speaker cache has been compressed at least once
+    pub spkcache_compressed: bool,
 
-    /// Maximum FIFO length
-    fifo_len: usize,
-    /// Maximum speaker cache length
-    spkcache_len: usize,
-    /// Number of speakers
-    num_spks: usize,
-    /// Conformer output dimension
-    fc_d_model: usize,
-    /// Number of frames currently filled in the FIFO
-    fifo_filled: usize,
-    /// Number of frames currently filled in the speaker cache
-    spkcache_filled: usize,
+    params: SortformerModulesConfig,
+    d_model: usize,
 }
 
 impl StreamingSortformerState {
-    /// Create a new streaming state with zero-initialized buffers.
-    pub fn new(
-        batch_size: usize,
-        fc_d_model: usize,
-        num_spks: usize,
-        spkcache_len: usize,
-        fifo_len: usize,
-    ) -> Result<Self> {
-        let b = batch_size as i32;
-        let d = fc_d_model as i32;
-        let s = num_spks as i32;
-        let sc = spkcache_len as i32;
-        let fl = fifo_len as i32;
-
+    /// Create an empty streaming state.
+    ///
+    /// `d_model` is the pre-encode embedding dimension (the conformer `d_model`).
+    pub fn new(params: SortformerModulesConfig, d_model: usize) -> Result<Self> {
+        let d = d_model as i32;
+        let s = params.num_spks as i32;
         Ok(Self {
-            spkcache: ops::zeros::<f32>(&[b, sc, d])?,
-            spkcache_preds: ops::zeros::<f32>(&[b, sc, s])?,
-            fifo: ops::zeros::<f32>(&[b, fl, d])?,
-            fifo_preds: ops::zeros::<f32>(&[b, fl, s])?,
-            mean_sil_emb: ops::zeros::<f32>(&[b, d])?,
-            n_sil_frames: ops::zeros::<f32>(&[b])?,
-            fifo_len,
-            spkcache_len,
-            num_spks,
-            fc_d_model,
-            fifo_filled: 0,
-            spkcache_filled: 0,
+            spkcache: ops::zeros::<f32>(&[1, 0, d])?,
+            spkcache_preds: None,
+            fifo: ops::zeros::<f32>(&[1, 0, d])?,
+            fifo_preds: ops::zeros::<f32>(&[1, 0, s])?,
+            mean_sil_emb: ops::zeros::<f32>(&[1, d])?,
+            n_sil_frames: 0,
+            spkcache_compressed: false,
+            params,
+            d_model,
         })
     }
 
-    /// Update the streaming state with a new chunk of embeddings and predictions.
+    /// Number of frames currently in the speaker cache.
+    pub fn spkcache_len(&self) -> usize {
+        self.spkcache.dim(1) as usize
+    }
+
+    /// Number of frames currently in the FIFO.
+    pub fn fifo_len(&self) -> usize {
+        self.fifo.dim(1) as usize
+    }
+
+    /// Concatenate `[spkcache, fifo, chunk]` along time.
+    pub fn concat_with_chunk(&self, chunk: &Array) -> Result<Array> {
+        ops::concatenate_axis(&[&self.spkcache, &self.fifo, chunk], 1).map_err(Into::into)
+    }
+
+    /// Update the state with a new chunk and return the chunk's predictions.
     ///
-    /// This implements NeMo's `_streaming_update()`:
-    /// 1. Append new chunk to FIFO
-    /// 2. If FIFO overflows, move oldest frames to speaker cache
-    /// 3. If speaker cache overflows, compress using importance scoring
-    /// 4. Update the silence embedding
+    /// Port of NeMo's synchronous `streaming_update()`.
     ///
     /// # Arguments
-    /// * `chunk_embs` - New chunk embeddings [batch, chunk_len, fc_d_model]
-    /// * `chunk_preds` - New chunk predictions [batch, chunk_len, num_spks]
+    /// * `chunk` - Pre-encode embeddings of the chunk [1, lc + chunk_len + rc, d_model]
+    /// * `preds` - Predictions for `[spkcache, fifo, chunk]` [1, total, num_spks]
+    /// * `lc`, `rc` - Left/right context frames in `chunk` excluded from the update
     ///
     /// # Returns
-    /// Ok(()) - state is updated in place
-    pub fn update(
-        &mut self,
-        chunk_embs: &Array,
-        chunk_preds: &Array,
-    ) -> Result<()> {
-        let chunk_len = chunk_embs.dim(1) as usize;
+    /// Speaker probabilities for the central chunk frames [1, chunk_len, num_spks]
+    pub fn update(&mut self, chunk: &Array, preds: &Array, lc: usize, rc: usize) -> Result<Array> {
+        let spkcache_len = self.spkcache_len();
+        let fifo_len = self.fifo_len();
+        let chunk_len = (chunk.dim(1) as usize).saturating_sub(lc + rc);
 
-        // Update silence embedding: frames where all speakers are below 0.5
-        self.update_silence_embedding(chunk_embs, chunk_preds)?;
+        let (sc, fl, l) = (spkcache_len as i32, fifo_len as i32, lc as i32);
+        let cl = chunk_len as i32;
+
+        self.fifo_preds = preds.index((.., sc..sc + fl, ..));
+        let chunk = chunk.index((.., l..l + cl, ..));
+        let chunk_preds = preds.index((.., sc + fl + l..sc + fl + l + cl, ..));
 
         // Append chunk to FIFO
-        let new_fifo_len = self.fifo_filled + chunk_len;
+        self.fifo = ops::concatenate_axis(&[&self.fifo, &chunk], 1)?;
+        self.fifo_preds = ops::concatenate_axis(&[&self.fifo_preds, &chunk_preds], 1)?;
 
-        if new_fifo_len <= self.fifo_len {
-            // FIFO has room, just append
-            // Place chunk_embs at fifo[fifo_filled:fifo_filled+chunk_len]
-            let start = self.fifo_filled as i32;
-            let end = new_fifo_len as i32;
+        if fifo_len + chunk_len > self.params.fifo_len {
+            // Pop the oldest frames out of the FIFO into the speaker cache
+            let pop_out_len = self
+                .params
+                .spkcache_update_period
+                .max((chunk_len + fifo_len).saturating_sub(self.params.fifo_len))
+                .min(fifo_len + chunk_len) as i32;
 
-            // Build new FIFO by concatenating: fifo[:start], chunk, fifo[end:]
-            let before = self.fifo.index((.., ..start, ..));
-            let after = self.fifo.index((.., end.., ..));
-            self.fifo = ops::concatenate_axis(&[&before, chunk_embs, &after], 1)?;
+            let pop_out_embs = self.fifo.index((.., ..pop_out_len, ..));
+            let pop_out_preds = self.fifo_preds.index((.., ..pop_out_len, ..));
+            self.update_silence_profile(&pop_out_embs, &pop_out_preds)?;
 
-            let before_p = self.fifo_preds.index((.., ..start, ..));
-            let after_p = self.fifo_preds.index((.., end.., ..));
-            self.fifo_preds = ops::concatenate_axis(&[&before_p, chunk_preds, &after_p], 1)?;
+            self.fifo = self.fifo.index((.., pop_out_len.., ..));
+            self.fifo_preds = self.fifo_preds.index((.., pop_out_len.., ..));
 
-            self.fifo_filled = new_fifo_len;
-        } else {
-            // FIFO overflows: move oldest frames to speaker cache
-            let overflow = new_fifo_len - self.fifo_len;
+            self.spkcache = ops::concatenate_axis(&[&self.spkcache, &pop_out_embs], 1)?;
+            let spkcache_preds = match (&self.spkcache_preds, self.spkcache_compressed) {
+                (Some(cached), true) => ops::concatenate_axis(&[cached, &pop_out_preds], 1)?,
+                // Before the first compression, use fresh predictions for every cache frame
+                _ => {
+                    let fresh = preds.index((.., ..sc, ..));
+                    ops::concatenate_axis(&[&fresh, &pop_out_preds], 1)?
+                }
+            };
+            self.spkcache_preds = Some(spkcache_preds);
 
-            // Frames to move to speaker cache: fifo[:overflow]
-            let overflow_embs = self.fifo.index((.., ..overflow as i32, ..));
-            let overflow_preds = self.fifo_preds.index((.., ..overflow as i32, ..));
-
-            // Update speaker cache with overflow frames
-            self.update_spkcache(&overflow_embs, &overflow_preds)?;
-
-            // Shift FIFO left and append new chunk
-            let remaining = self.fifo.index((.., overflow as i32.., ..));
-            let remaining_p = self.fifo_preds.index((.., overflow as i32.., ..));
-
-            self.fifo = ops::concatenate_axis(&[&remaining, chunk_embs], 1)?;
-            self.fifo_preds = ops::concatenate_axis(&[&remaining_p, chunk_preds], 1)?;
-
-            // Trim to fifo_len if needed
-            if self.fifo.dim(1) as usize > self.fifo_len {
-                let fl = self.fifo_len as i32;
-                self.fifo = self.fifo.index((.., ..fl, ..));
-                self.fifo_preds = self.fifo_preds.index((.., ..fl, ..));
-            }
-
-            self.fifo_filled = self.fifo_len;
-        }
-
-        Ok(())
-    }
-
-    /// Update speaker cache with new frames.
-    fn update_spkcache(&mut self, embs: &Array, preds: &Array) -> Result<()> {
-        let new_frames = embs.dim(1) as usize;
-        let new_total = self.spkcache_filled + new_frames;
-
-        if new_total <= self.spkcache_len {
-            // Cache has room, just append
-            let start = self.spkcache_filled as i32;
-            let end = new_total as i32;
-
-            let before = self.spkcache.index((.., ..start, ..));
-            let after = self.spkcache.index((.., end.., ..));
-            self.spkcache = ops::concatenate_axis(&[&before, embs, &after], 1)?;
-
-            let before_p = self.spkcache_preds.index((.., ..start, ..));
-            let after_p = self.spkcache_preds.index((.., end.., ..));
-            self.spkcache_preds = ops::concatenate_axis(&[&before_p, preds, &after_p], 1)?;
-
-            self.spkcache_filled = new_total;
-        } else {
-            // Cache overflows: compress by keeping most important frames
-            // First, fill remaining slots
-            let remaining_slots = self.spkcache_len - self.spkcache_filled;
-            if remaining_slots > 0 {
-                let start = self.spkcache_filled as i32;
-                let fill_embs = embs.index((.., ..remaining_slots as i32, ..));
-                let fill_preds = preds.index((.., ..remaining_slots as i32, ..));
-
-                let before = self.spkcache.index((.., ..start, ..));
-                self.spkcache = ops::concatenate_axis(&[&before, &fill_embs], 1)?;
-
-                let before_p = self.spkcache_preds.index((.., ..start, ..));
-                self.spkcache_preds = ops::concatenate_axis(&[&before_p, &fill_preds], 1)?;
-
-                self.spkcache_filled = self.spkcache_len;
-            }
-
-            // Now compress
-            self.compress_spkcache()?;
-
-            // Add remaining overflow frames
-            if remaining_slots < new_frames {
-                let remaining_embs = embs.index((.., remaining_slots as i32.., ..));
-                let remaining_preds = preds.index((.., remaining_slots as i32.., ..));
-                // Recursive call for remaining frames
-                self.update_spkcache(&remaining_embs, &remaining_preds)?;
+            if self.spkcache_len() > self.params.spkcache_len {
+                self.compress_spkcache()?;
+                self.spkcache_compressed = true;
             }
         }
 
-        Ok(())
+        Ok(chunk_preds)
     }
 
-    /// Compress the speaker cache by keeping the most important frames per speaker.
+    /// Update the running mean silence embedding from popped-out frames.
     ///
-    /// Importance is scored using max speaker probability per frame.
-    /// Low-importance frames are replaced with the mean silence embedding.
+    /// A frame is silence if the sum of its speaker probabilities is below
+    /// `sil_threshold`.
+    fn update_silence_profile(&mut self, embs: &Array, preds: &Array) -> Result<()> {
+        let n_frames = preds.dim(1) as usize;
+        let n_spk = preds.dim(2) as usize;
+        let preds_data: Vec<f32> = preds.to_vec_row_major()?;
+
+        let sil_mask: Vec<f32> = (0..n_frames)
+            .map(|t| {
+                let sum: f32 = preds_data[t * n_spk..(t + 1) * n_spk].iter().sum();
+                if sum < self.params.sil_threshold { 1.0 } else { 0.0 }
+            })
+            .collect();
+        let sil_count = sil_mask.iter().filter(|&&m| m > 0.0).count();
+        if sil_count == 0 {
+            return Ok(());
+        }
+
+        let mask = Array::from_slice(&sil_mask, &[1, n_frames as i32, 1]);
+        let sil_sum = ops::multiply(embs, &mask)?.sum_axis(1, false)?; // [1, d_model]
+        let old_sum = ops::multiply(&self.mean_sil_emb, Array::from_f32(self.n_sil_frames as f32))?;
+        self.n_sil_frames += sil_count;
+        self.mean_sil_emb = ops::divide(
+            &ops::add(&old_sum, &sil_sum)?,
+            Array::from_f32(self.n_sil_frames as f32),
+        )?;
+        Ok(())
+    }
+
+    /// Compress the speaker cache down to `spkcache_len` frames.
+    ///
+    /// Port of NeMo's `_compress_spkcache()` (inference path, no speaker
+    /// permutation). Frames are scored per speaker, boosted so every speaker
+    /// keeps some frames, and the top `spkcache_len` (speaker, frame) pairs are
+    /// kept. The result is ordered by speaker, then by time. Unused slots, and
+    /// `spkcache_sil_frames_per_spk` slots per speaker, hold the mean silence
+    /// embedding with zero predictions.
     fn compress_spkcache(&mut self) -> Result<()> {
-        if self.spkcache_filled == 0 {
-            return Ok(());
+        let p = &self.params;
+        let preds = self
+            .spkcache_preds
+            .as_ref()
+            .expect("speaker cache predictions are set before compression");
+        let n_frames = preds.dim(1) as usize;
+        let n_spk = preds.dim(2) as usize;
+        let preds_data: Vec<f32> = preds.to_vec_row_major()?;
+
+        let per_spk = (p.spkcache_len / n_spk).saturating_sub(p.spkcache_sil_frames_per_spk);
+        let strong_boost = (per_spk as f32 * p.strong_boost_rate).floor() as usize;
+        let weak_boost = (per_spk as f32 * p.weak_boost_rate).floor() as usize;
+        let min_pos_scores = (per_spk as f32 * p.min_pos_scores_rate).floor() as usize;
+
+        // scores[s][t]
+        let mut scores = log_pred_scores(&preds_data, n_frames, n_spk, p.pred_score_threshold);
+        disable_low_scores(&preds_data, &mut scores, n_frames, n_spk, min_pos_scores);
+
+        if p.scores_boost_latest > 0.0 {
+            for spk_scores in scores.iter_mut() {
+                for score in spk_scores.iter_mut().skip(p.spkcache_len) {
+                    *score += p.scores_boost_latest;
+                }
+            }
         }
 
-        let filled = self.spkcache_filled as i32;
-
-        // Get filled portion
-        let embs = self.spkcache.index((.., ..filled, ..));
-        let preds = self.spkcache_preds.index((.., ..filled, ..));
-
-        // Score each frame by its maximum speaker probability
-        // Higher max prob = more important (more likely to be a speaker turn)
-        preds.eval()?;
-        let max_probs = preds.max_axis(-1, false)?; // [batch, filled]
-        max_probs.eval()?;
-
-        // Keep top half of frames by importance
-        let keep_count = self.spkcache_len / 2;
-        let keep_count = keep_count.max(1).min(self.spkcache_filled);
-
-        // For simplicity, sort by importance and keep top-K
-        // We operate on batch=0 (single batch for streaming)
-        let scores = max_probs.index(0); // [filled]
-        scores.eval()?;
-        let scores_data: Vec<f32> = scores.to_vec_row_major()?;
-
-        // Get indices sorted by score (descending)
-        let mut indices: Vec<(usize, f32)> = scores_data.iter().copied().enumerate().collect();
-        indices.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-
-        // Keep top-K indices, sorted by original position to maintain temporal order
-        let mut keep_indices: Vec<usize> = indices[..keep_count].iter().map(|(i, _)| *i).collect();
-        keep_indices.sort();
-
-        // Build kept embeddings and predictions
-        let keep_idx_arr = Array::from_slice(
-            &keep_indices.iter().map(|&i| i as i32).collect::<Vec<_>>(),
-            &[keep_count as i32],
-        );
-
-        let kept_embs = ops::indexing::take_axis(&embs.index(0), &keep_idx_arr, 0)?;
-        let kept_preds = ops::indexing::take_axis(&preds.index(0), &keep_idx_arr, 0)?;
-
-        // Add batch dimension back
-        let kept_embs = kept_embs.reshape(&[1, keep_count as i32, self.fc_d_model as i32])?;
-        let kept_preds = kept_preds.reshape(&[1, keep_count as i32, self.num_spks as i32])?;
-
-        // Pad with silence embedding to fill remaining slots
-        let pad_count = self.spkcache_len - keep_count;
-        if pad_count > 0 {
-            let sil = self.mean_sil_emb.reshape(&[1, 1, self.fc_d_model as i32])?;
-            let sil_pad = ops::broadcast_to(&sil, &[1, pad_count as i32, self.fc_d_model as i32])?;
-            let sil_preds = ops::zeros::<f32>(&[1, pad_count as i32, self.num_spks as i32])?;
-
-            self.spkcache = ops::concatenate_axis(&[&kept_embs, &sil_pad], 1)?;
-            self.spkcache_preds = ops::concatenate_axis(&[&kept_preds, &sil_preds], 1)?;
-        } else {
-            self.spkcache = kept_embs;
-            self.spkcache_preds = kept_preds;
+        // Strong boost so each speaker keeps some frames, weak boost to keep
+        // any one speaker from dominating
+        let ln_half = 0.5f32.ln();
+        for spk_scores in scores.iter_mut() {
+            boost_topk(spk_scores, strong_boost, -2.0 * ln_half);
+            boost_topk(spk_scores, weak_boost, -ln_half);
         }
 
-        self.spkcache_filled = keep_count;
+        // Append reserved silence slots per speaker
+        let sil = p.spkcache_sil_frames_per_spk;
+        for spk_scores in scores.iter_mut() {
+            spk_scores.extend(std::iter::repeat(f32::INFINITY).take(sil));
+        }
+        let padded_frames = n_frames + sil;
+
+        // Top spkcache_len over the speaker-major flattened scores
+        let mut flat: Vec<(usize, f32)> = scores
+            .iter()
+            .flatten()
+            .copied()
+            .enumerate()
+            .collect();
+        flat.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        let mut topk: Vec<Option<usize>> = flat
+            .iter()
+            .take(p.spkcache_len)
+            .map(|&(idx, val)| (val != f32::NEG_INFINITY).then_some(idx))
+            .collect();
+        // Valid indices in original order, disabled placeholders last
+        topk.sort_by_key(|idx| idx.unwrap_or(usize::MAX));
+
+        let mut gather_idx = Vec::with_capacity(p.spkcache_len);
+        let mut disabled = Vec::with_capacity(p.spkcache_len);
+        for idx in topk {
+            match idx.map(|i| i % padded_frames) {
+                Some(frame) if frame < n_frames => {
+                    gather_idx.push(frame as i32);
+                    disabled.push(0.0f32);
+                }
+                _ => {
+                    gather_idx.push(0);
+                    disabled.push(1.0);
+                }
+            }
+        }
+
+        let k = gather_idx.len() as i32;
+        let idx_arr = Array::from_slice(&gather_idx, &[k]);
+        let disabled_arr = Array::from_slice(&disabled, &[1, k, 1]);
+        let enabled_arr = ops::subtract(Array::from_f32(1.0), &disabled_arr)?;
+
+        let embs = ops::indexing::take_axis(&self.spkcache, &idx_arr, 1)?;
+        let sil_emb = self.mean_sil_emb.reshape(&[1, 1, self.d_model as i32])?;
+        self.spkcache = ops::add(
+            &ops::multiply(&embs, &enabled_arr)?,
+            &ops::multiply(&sil_emb, &disabled_arr)?,
+        )?;
+
+        let gathered_preds = ops::indexing::take_axis(preds, &idx_arr, 1)?;
+        self.spkcache_preds = Some(ops::multiply(&gathered_preds, &enabled_arr)?);
 
         Ok(())
     }
+}
 
-    /// Update the running mean silence embedding.
-    ///
-    /// Silence frames are those where all speaker probabilities are below 0.5.
-    fn update_silence_embedding(&mut self, embs: &Array, preds: &Array) -> Result<()> {
-        // Find silence frames: max(preds, axis=-1) < 0.5
-        let max_probs = preds.max_axis(-1, false)?; // [batch, time]
-        let threshold = Array::from_f32(0.5);
-        let is_silence = ops::lt(&max_probs, &threshold)?; // [batch, time]
-
-        is_silence.eval()?;
-        let sil_mask = is_silence.index(0); // [time]
-        sil_mask.eval()?;
-        let sil_data: Vec<bool> = sil_mask.to_vec_row_major()?;
-
-        let n_new_sil = sil_data.iter().filter(|&&b| b).count();
-        if n_new_sil == 0 {
-            return Ok(());
+/// Per-frame speaker scores, high for confident non-overlapped speech.
+///
+/// Returns `scores[speaker][frame]`.
+fn log_pred_scores(preds: &[f32], n_frames: usize, n_spk: usize, threshold: f32) -> Vec<Vec<f32>> {
+    let ln_half = 0.5f32.ln();
+    let mut scores = vec![vec![0.0f32; n_frames]; n_spk];
+    for t in 0..n_frames {
+        let row = &preds[t * n_spk..(t + 1) * n_spk];
+        let log_1_sum: f32 = row.iter().map(|&p| (1.0 - p).max(threshold).ln()).sum();
+        for (s, &prob) in row.iter().enumerate() {
+            let log_p = prob.max(threshold).ln();
+            let log_1_p = (1.0 - prob).max(threshold).ln();
+            scores[s][t] = log_p - log_1_p + log_1_sum - ln_half;
         }
+    }
+    scores
+}
 
-        // Sum silence embeddings
-        let is_silence_expanded = is_silence.reshape(&[1, embs.dim(1), 1])?;
-        let zero = Array::from_f32(0.0);
-        let sil_embs = ops::r#where(&is_silence_expanded, embs, &zero)?;
-        let sil_sum = sil_embs.sum_axis(1, false)?; // [batch, fc_d_model]
+/// Disable non-speech frames, and overlapped frames for speakers that have
+/// enough clean frames.
+fn disable_low_scores(
+    preds: &[f32],
+    scores: &mut [Vec<f32>],
+    n_frames: usize,
+    n_spk: usize,
+    min_pos_scores: usize,
+) {
+    for s in 0..n_spk {
+        for t in 0..n_frames {
+            if preds[t * n_spk + s] <= 0.5 {
+                scores[s][t] = f32::NEG_INFINITY;
+            }
+        }
+        let n_pos = scores[s].iter().filter(|&&v| v > 0.0).count();
+        if n_pos >= min_pos_scores {
+            for t in 0..n_frames {
+                let is_speech = preds[t * n_spk + s] > 0.5;
+                if is_speech && scores[s][t] <= 0.0 {
+                    scores[s][t] = f32::NEG_INFINITY;
+                }
+            }
+        }
+    }
+}
 
-        // Update running mean: new_mean = (old_mean * old_count + new_sum) / (old_count + new_count)
-        let old_count = &self.n_sil_frames;
-        let new_count = Array::from_f32(n_new_sil as f32);
-        let total_count = ops::add(old_count, &new_count)?;
+/// Add `amount` to the `k` highest scores (scores at -inf stay -inf).
+fn boost_topk(scores: &mut [f32], k: usize, amount: f32) {
+    let mut order: Vec<usize> = (0..scores.len()).collect();
+    order.sort_by(|&a, &b| {
+        scores[b]
+            .partial_cmp(&scores[a])
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    for &i in order.iter().take(k) {
+        scores[i] += amount;
+    }
+}
 
-        let weighted_old = ops::multiply(&self.mean_sil_emb, &old_count.reshape(&[1, 1])?)?;
-        let total_sum = ops::add(&weighted_old, &sil_sum)?;
-        let total_count_expanded = total_count.reshape(&[1, 1])?;
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-        // Avoid division by zero
-        let eps = Array::from_f32(1e-8);
-        let safe_count = ops::add(&total_count_expanded, &eps)?;
-        self.mean_sil_emb = ops::divide(&total_sum, &safe_count)?;
-        self.n_sil_frames = total_count;
+    #[test]
+    fn test_boost_topk_keeps_neg_inf() {
+        let mut scores = vec![1.0, f32::NEG_INFINITY, 3.0];
+        boost_topk(&mut scores, 3, 1.0);
+        assert_eq!(scores, vec![2.0, f32::NEG_INFINITY, 4.0]);
+    }
 
+    #[test]
+    fn test_disable_low_scores_drops_silence() {
+        // 2 frames, 2 speakers: frame 0 speaker 0 only, frame 1 silence
+        let preds = vec![0.9, 0.1, 0.1, 0.1];
+        let mut scores = log_pred_scores(&preds, 2, 2, 0.25);
+        disable_low_scores(&preds, &mut scores, 2, 2, 1);
+        assert!(scores[0][0] > 0.0);
+        assert_eq!(scores[0][1], f32::NEG_INFINITY);
+        assert_eq!(scores[1][0], f32::NEG_INFINITY);
+    }
+
+    #[test]
+    fn test_streaming_update_compresses_to_spkcache_len() -> Result<()> {
+        let mut params = SortformerModulesConfig::default();
+        params.num_spks = 2;
+        params.spkcache_len = 8;
+        params.fifo_len = 4;
+        params.spkcache_update_period = 4;
+        params.spkcache_sil_frames_per_spk = 1;
+        let mut state = StreamingSortformerState::new(params, 3)?;
+        for step in 0..6 {
+            let chunk = ops::ones::<f32>(&[1, 4, 3])?;
+            let total = (state.spkcache_len() + state.fifo_len() + 4) as i32;
+            // Alternate which speaker is active
+            let row = if step % 2 == 0 { [0.9f32, 0.1] } else { [0.1, 0.9] };
+            let data: Vec<f32> = (0..total).flat_map(|_| row).collect();
+            let preds = Array::from_slice(&data, &[1, total, 2]);
+            let chunk_preds = state.update(&chunk, &preds, 0, 0)?;
+            assert_eq!(chunk_preds.shape(), &[1, 4, 2]);
+            assert!(state.spkcache_len() <= 8);
+            assert!(state.fifo_len() <= 4);
+        }
+        assert!(state.spkcache_compressed);
+        assert_eq!(state.spkcache_len(), 8);
         Ok(())
-    }
-
-    /// Get the concatenated context for the conformer encoder.
-    ///
-    /// Returns [spkcache_filled, fifo_filled] concatenated as [batch, total, fc_d_model].
-    /// Only includes filled portions.
-    pub fn get_context(&self) -> Result<Array> {
-        let sc_filled = self.spkcache_filled as i32;
-        let fifo_filled = self.fifo_filled as i32;
-
-        if sc_filled == 0 && fifo_filled == 0 {
-            // Return empty tensor
-            return ops::zeros::<f32>(&[1, 0, self.fc_d_model as i32]).map_err(Into::into);
-        }
-
-        let parts: Vec<Array> = Vec::new();
-        let mut refs: Vec<&Array> = Vec::new();
-        let sc_part;
-        let fifo_part;
-
-        if sc_filled > 0 {
-            sc_part = self.spkcache.index((.., ..sc_filled, ..));
-            refs.push(&sc_part);
-        }
-        if fifo_filled > 0 {
-            fifo_part = self.fifo.index((.., ..fifo_filled, ..));
-            refs.push(&fifo_part);
-        }
-
-        if refs.is_empty() {
-            return ops::zeros::<f32>(&[1, 0, self.fc_d_model as i32]).map_err(Into::into);
-        }
-
-        let _ = parts;
-        ops::concatenate_axis(&refs, 1).map_err(Into::into)
-    }
-
-    /// Get the total number of context frames (spkcache + fifo filled).
-    pub fn context_len(&self) -> usize {
-        self.spkcache_filled + self.fifo_filled
     }
 }

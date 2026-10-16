@@ -1,8 +1,19 @@
 //! Multi-talker streaming pipeline.
 //!
-//! Combines a streaming ASR pipeline with a SortFormer diarization model
-//! to produce speaker-tagged transcriptions. Uses a serial approach:
-//! single ASR instance + diarization tagging.
+//! Combines a cache-aware streaming RNN-T model with a streaming SortFormer
+//! diarizer to produce speaker-attributed transcripts. The diarizer runs on
+//! the same mel chunk as the ASR model, so both share one 80 ms frame grid.
+//!
+//! Two modes are selected from the ASR checkpoint:
+//!
+//! - **Parallel** (multitalker models such as
+//!   `nvidia/multitalker-parakeet-streaming-0.6b-v1`): one ASR instance per
+//!   speaker. The instances run as a single batched encoder call, each
+//!   conditioned on its speaker's diarizer activity through the encoder's
+//!   speaker kernels, so overlapping speech is transcribed for every speaker.
+//! - **Serial** (ordinary streaming ASR models): a single transcript whose
+//!   words are attributed to the most active speaker over each word's frames.
+//!   Overlapping speech can't be separated in this mode.
 //!
 //! # Example
 //!
@@ -10,16 +21,19 @@
 //! # fn main() -> mlx_voice::Result<()> {
 //! # use mlx_voice::asr::MultiTalkerPipeline;
 //! let mut pipeline = MultiTalkerPipeline::restore(
-//!     "nemotron-speech-streaming-en-0.6b.nemo",
+//!     "multitalker-parakeet-streaming-0.6b-v1.nemo",
 //!     "diar_streaming_sortformer_4spk-v2.1.nemo",
 //!     0, // streaming mode
 //! )?;
 //!
 //! pipeline.set_audio_file("meeting.wav")?;
 //! while let Some(output) = pipeline.transcribe_step()? {
-//!     for segment in &output.segments {
-//!         println!("[Speaker {}] {}", segment.speaker, segment.text);
+//!     for word in &output.new_words {
+//!         println!("[{:.2}s speaker {}] {}", word.start_time, word.speaker, word.text);
 //!     }
+//! }
+//! for segment in pipeline.segments() {
+//!     println!("[Speaker {}] {}", segment.speaker, segment.text);
 //! }
 //! # Ok(())
 //! # }
@@ -27,375 +41,688 @@
 
 use std::path::Path;
 
+use mlx_rs::ops;
+use mlx_rs::ops::indexing::IndexOp;
 use mlx_rs::Array;
 
-use super::cache_aware_rnnt::{CacheAwareRNNTPipeline, TranscribeOutput};
-use crate::asr::models::SortformerEncLabelModel;
-use crate::asr::streaming::StreamingSortformerState;
+use super::cache_aware_rnnt::CacheAwareRNNTPipeline;
+use crate::asr::models::{DecoderState, SortformerEncLabelModel};
+use crate::asr::modules::SpeakerTargets;
+use crate::asr::streaming::{EncoderCache, FeatureBuffer, StreamingSortformerState};
 use crate::core::ArrayExt;
 use crate::core::error::Result;
 
-/// A segment of text attributed to a specific speaker.
+/// Log-mel value of digital silence (matches NeMo's log_zero_guard).
+const LOG_MEL_ZERO: f32 = -16.635532;
+
+/// Speaker activity threshold.
+const ACTIVITY_THRESHOLD: f32 = 0.5;
+
+/// Multi-talker pipeline settings.
+///
+/// Defaults follow NeMo's `MultitalkerTranscriptionConfig`.
+#[derive(Debug, Clone)]
+pub struct MultiTalkerConfig {
+    /// Binarize diarizer outputs at 0.5 before using them as speaker targets
+    pub binary_diar_preds: bool,
+    /// If at most one speaker is active in a chunk, transcribe it all as speaker 0
+    pub single_speaker_mode: bool,
+    /// Only decode speakers that were active within this many recent chunks
+    /// (0 decodes every speaker on every chunk)
+    pub cache_gating_chunks: usize,
+    /// Start a new segment when a speaker pauses longer than this (seconds)
+    pub sent_break_sec: f32,
+    /// Diarizer FIFO length in encoder frames
+    pub diar_fifo_len: usize,
+    /// Diarizer speaker cache update period in encoder frames
+    pub diar_spkcache_update_period: usize,
+}
+
+impl Default for MultiTalkerConfig {
+    fn default() -> Self {
+        Self {
+            binary_diar_preds: true,
+            single_speaker_mode: false,
+            cache_gating_chunks: 2,
+            sent_break_sec: 1.0,
+            diar_fifo_len: 188,
+            diar_spkcache_update_period: 144,
+        }
+    }
+}
+
+/// A word attributed to a speaker.
+#[derive(Debug, Clone)]
+pub struct SpeakerWord {
+    /// Speaker index (0-based)
+    pub speaker: usize,
+    /// Word text
+    pub text: String,
+    /// Start time in seconds
+    pub start_time: f32,
+    /// End time in seconds
+    pub end_time: f32,
+}
+
+/// A run of words from one speaker (a SegLST entry).
 #[derive(Debug, Clone)]
 pub struct SpeakerSegment {
     /// Speaker index (0-based, up to max_num_spks - 1)
     pub speaker: usize,
     /// Text content for this segment
     pub text: String,
-    /// Start time in seconds (approximate)
+    /// Start time in seconds
     pub start_time: f32,
-    /// End time in seconds (approximate)
+    /// End time in seconds
     pub end_time: f32,
 }
 
 /// Output from a multi-talker transcription step.
 #[derive(Debug, Clone)]
 pub struct MultiTalkerOutput {
-    /// Speaker-tagged text segments
-    pub segments: Vec<SpeakerSegment>,
-    /// Raw ASR output (without speaker tagging)
-    pub asr_output: TranscribeOutput,
+    /// Words completed during this step, ordered by start time
+    pub new_words: Vec<SpeakerWord>,
+    /// Speaker activity for this chunk's encoder frames [frames][speakers]
+    pub speaker_activity: Vec<Vec<f32>>,
     /// Whether this is the final output
     pub is_final: bool,
 }
 
+/// How the ASR model is shared between speakers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MultiTalkerMode {
+    /// One speaker-conditioned ASR instance per speaker
+    Parallel,
+    /// A single ASR instance whose words are attributed afterwards
+    Serial,
+}
+
+/// Decoding state for one ASR instance.
+struct Instance {
+    decoder_state: DecoderState,
+    last_token: Option<usize>,
+    /// Tokens of the word in progress, with their encoder frame
+    pending: Vec<(usize, usize)>,
+}
+
 /// Multi-talker streaming pipeline.
-///
-/// Combines `CacheAwareRNNTPipeline` (ASR) with `SortformerEncLabelModel` (diarization)
-/// to produce speaker-attributed transcription.
 pub struct MultiTalkerPipeline {
-    /// ASR streaming pipeline
-    asr_pipeline: CacheAwareRNNTPipeline,
+    /// ASR model, audio buffering and mel streaming
+    asr: CacheAwareRNNTPipeline,
     /// Diarization model
     diar_model: SortformerEncLabelModel,
     /// Diarization streaming state
     diar_state: StreamingSortformerState,
-    /// Accumulated diarization predictions (per-frame speaker probs)
+    config: MultiTalkerConfig,
+    mode: MultiTalkerMode,
+    num_spks: usize,
+    /// Encoder cache with one batch row per instance
+    encoder_cache: EncoderCache,
+    instances: Vec<Instance>,
+    /// Diarizer predictions per encoder frame [frame][speaker]
     diar_preds: Vec<Vec<f32>>,
-    /// Number of speakers
-    max_num_spks: usize,
-    /// Seconds per diarization frame (after encoder subsampling)
-    diar_frame_sec: f32,
-    /// Sample rate
-    sample_rate: u32,
-    /// Audio samples accumulated for diarization
-    diar_audio_buffer: Vec<f32>,
-    /// Diarization chunk size in samples
-    diar_chunk_samples: usize,
-    /// Total diarization frames processed
-    total_diar_frames: usize,
+    /// Encoder frames processed so far
+    frame_offset: usize,
+    /// Seconds per encoder frame
+    frame_sec: f32,
+    /// Chunks since each speaker was last active
+    chunks_since_active: Vec<usize>,
+    /// Whether each token id starts a new word
+    word_start: Vec<bool>,
+    /// All completed words
+    words: Vec<SpeakerWord>,
 }
 
 impl MultiTalkerPipeline {
     /// Create a multi-talker pipeline from ASR and diarization model paths.
     ///
     /// # Arguments
-    /// * `asr_path` - Path to the streaming ASR .nemo model
-    /// * `diar_path` - Path to the SortFormer diarization .nemo model
+    /// * `asr_path` - Path to a streaming ASR .nemo model or MLX model directory.
+    ///   A multitalker model (with speaker kernels) runs in parallel mode, any
+    ///   other in serial mode.
+    /// * `diar_path` - Path to the streaming SortFormer diarization .nemo model
     /// * `mode_idx` - Streaming mode index for the ASR model
     pub fn restore(
         asr_path: impl AsRef<Path>,
         diar_path: impl AsRef<Path>,
         mode_idx: usize,
     ) -> Result<Self> {
-        // Load ASR pipeline
-        let asr_pipeline = CacheAwareRNNTPipeline::restore(asr_path, mode_idx)?;
+        Self::restore_with_config(asr_path, diar_path, mode_idx, MultiTalkerConfig::default())
+    }
 
-        // Load diarization model
-        let diar_model = SortformerEncLabelModel::restore(diar_path)?;
+    /// Like [`Self::restore`], with explicit settings.
+    pub fn restore_with_config(
+        asr_path: impl AsRef<Path>,
+        diar_path: impl AsRef<Path>,
+        mode_idx: usize,
+        config: MultiTalkerConfig,
+    ) -> Result<Self> {
+        let asr_path = asr_path.as_ref();
+        let asr = if asr_path.is_dir() {
+            CacheAwareRNNTPipeline::restore_from_directory(asr_path, mode_idx)?
+        } else {
+            CacheAwareRNNTPipeline::restore(asr_path, mode_idx)?
+        };
+        let mut diar_model = SortformerEncLabelModel::restore(diar_path)?;
 
-        let sample_rate = asr_pipeline.sample_rate();
-        let max_num_spks = diar_model.max_num_spks();
+        // Drive the diarizer with the ASR chunk geometry, as NeMo's
+        // multitalker inference does
+        let streaming = &asr.streaming_config;
+        let params = diar_model.streaming_params_mut();
+        params.chunk_len = streaming.valid_out_len + streaming.cache_drop_size;
+        params.chunk_left_context = 0;
+        params.chunk_right_context = 0;
+        params.fifo_len = config.diar_fifo_len;
+        params.spkcache_update_period = config.diar_spkcache_update_period;
+        let diar_state = diar_model.create_streaming_state()?;
 
-        // Create diarization streaming state
-        let diar_state = diar_model.create_streaming_state(1)?;
+        let mode = if asr.encoder.has_speaker_kernels() {
+            MultiTalkerMode::Parallel
+        } else {
+            MultiTalkerMode::Serial
+        };
+        let num_spks = diar_model.max_num_spks();
+        let frame_sec = asr.encoder.subsampling_factor() as f32 * asr.mel_stream_config.mel.window_stride;
 
-        // Compute diarization frame duration
-        // The conformer subsamples by subsampling_factor, with window_stride of 0.01s
-        let subsampling_factor = diar_model.subsampling_factor();
-        let window_stride = 0.01; // Default NeMo window_stride
-        let diar_frame_sec = window_stride * subsampling_factor as f32;
-
-        // Diarization chunk size: use the config chunk_len * subsampling_factor * stride * sample_rate
-        let chunk_len = diar_model.config().chunk_len;
-        let diar_chunk_samples = (chunk_len as f32 * diar_frame_sec * sample_rate as f32) as usize;
+        let word_start = match &asr.tokenizer {
+            Some(tokenizer) => (0..tokenizer.len())
+                .map(|id| {
+                    // A piece with a leading "▁" decodes with a space between copies
+                    let id = id as u32;
+                    let one = tokenizer.decode_piece_ids(&[id]).unwrap_or_default();
+                    let two = tokenizer.decode_piece_ids(&[id, id]).unwrap_or_default();
+                    two.len() > 2 * one.len()
+                })
+                .collect(),
+            None => Vec::new(),
+        };
 
         tracing::info!(
-            max_num_spks,
-            subsampling_factor,
-            diar_frame_sec,
-            diar_chunk_samples,
+            ?mode,
+            num_spks,
+            diar_chunk_len = diar_model.config().sortformer_modules.chunk_len,
             "Multi-talker pipeline initialized"
         );
 
-        Ok(Self {
-            asr_pipeline,
+        let mut pipeline = Self {
+            encoder_cache: Self::new_encoder_cache(&asr, 1)?,
+            asr,
             diar_model,
             diar_state,
+            config,
+            mode,
+            num_spks,
+            instances: Vec::new(),
             diar_preds: Vec::new(),
-            max_num_spks,
-            diar_frame_sec,
-            sample_rate,
-            diar_audio_buffer: Vec::new(),
-            diar_chunk_samples,
-            total_diar_frames: 0,
-        })
+            frame_offset: 0,
+            frame_sec,
+            chunks_since_active: Vec::new(),
+            word_start,
+            words: Vec::new(),
+        };
+        pipeline.reset_state()?;
+        Ok(pipeline)
+    }
+
+    fn new_encoder_cache(asr: &CacheAwareRNNTPipeline, batch_size: usize) -> Result<EncoderCache> {
+        EncoderCache::new(
+            asr.encoder.num_layers(),
+            batch_size,
+            asr.streaming_config.last_channel_cache_size,
+            asr.streaming_config.last_time_cache_size,
+            asr.encoder.d_model(),
+        )
+    }
+
+    fn reset_state(&mut self) -> Result<()> {
+        let n_instances = match self.mode {
+            MultiTalkerMode::Parallel => self.num_spks,
+            MultiTalkerMode::Serial => 1,
+        };
+        self.encoder_cache = Self::new_encoder_cache(&self.asr, n_instances)?;
+        self.instances = (0..n_instances)
+            .map(|_| {
+                Ok(Instance {
+                    decoder_state: self.asr.decoder.initialize_state(1)?,
+                    last_token: None,
+                    pending: Vec::new(),
+                })
+            })
+            .collect::<Result<_>>()?;
+        self.diar_state = self.diar_model.create_streaming_state()?;
+        self.diar_preds.clear();
+        self.frame_offset = 0;
+        self.chunks_since_active = vec![usize::MAX; self.num_spks];
+        self.words.clear();
+        self.asr.encoder.clear_speaker_targets();
+        Ok(())
+    }
+
+    /// The mode selected from the ASR checkpoint.
+    pub fn mode(&self) -> MultiTalkerMode {
+        self.mode
     }
 
     /// Set audio from a WAV file.
     pub fn set_audio_file(&mut self, path: impl AsRef<Path>) -> Result<()> {
-        self.asr_pipeline.set_audio_file(&path)?;
-
-        // Also load audio for diarization
-        let (samples, file_sr) = crate::audio::load_wav(path.as_ref())?;
-        let samples = if file_sr != self.sample_rate {
-            crate::audio::resample(&samples, file_sr, self.sample_rate)?
-        } else {
-            samples
-        };
-        self.diar_audio_buffer = samples;
-
-        Ok(())
+        self.asr.set_audio_file(path)
     }
 
     /// Add live audio samples.
     pub fn add_audio(&mut self, samples: &[f32]) {
-        self.asr_pipeline.add_audio(samples);
-        self.diar_audio_buffer.extend_from_slice(samples);
+        self.asr.add_audio(samples);
     }
 
     /// Signal end of audio stream.
     pub fn end_stream(&mut self) {
-        self.asr_pipeline.end_stream();
+        self.asr.end_stream();
     }
 
     /// Reset the pipeline for new audio.
-    pub fn reset(&mut self) {
-        self.asr_pipeline.reset();
-        self.diar_preds.clear();
-        self.diar_audio_buffer.clear();
-        self.total_diar_frames = 0;
-
-        // Recreate streaming state
-        if let Ok(state) = self.diar_model.create_streaming_state(1) {
-            self.diar_state = state;
-        }
+    pub fn reset(&mut self) -> Result<()> {
+        self.asr.reset();
+        self.reset_state()
     }
 
-    /// Process one transcription step, returning speaker-tagged output.
+    /// Process one chunk, returning the words completed in it.
+    ///
+    /// Returns `None` if not enough audio is buffered yet.
     pub fn transcribe_step(&mut self) -> Result<Option<MultiTalkerOutput>> {
-        // Run ASR step
-        let asr_output = match self.asr_pipeline.transcribe_step()? {
-            Some(out) => out,
+        let fb = match self.asr.try_extract_next()? {
+            Some(fb) => fb,
             None => return Ok(None),
         };
-
-        // Process any pending diarization audio
-        self.process_diarization()?;
-
-        // Tag the ASR output with speaker information
-        let segments = self.tag_with_speakers(&asr_output);
-        let is_final = asr_output.is_final;
-
-        Ok(Some(MultiTalkerOutput {
-            segments,
-            asr_output,
-            is_final,
-        }))
+        self.process_chunk(fb).map(Some)
     }
 
-    /// Run full transcription on loaded audio.
+    /// Run transcription over all loaded audio and return the segments.
     pub fn run(&mut self) -> Result<Vec<SpeakerSegment>> {
-        let mut all_segments = Vec::new();
-
-        // Run diarization on all available audio first
-        self.run_diarization()?;
-
-        // Run ASR
         while let Some(output) = self.transcribe_step()? {
-            all_segments.extend(output.segments);
             if output.is_final {
                 break;
             }
         }
-
-        // Merge consecutive segments from same speaker
-        Ok(merge_segments(all_segments))
+        Ok(self.segments())
     }
 
-    /// Run diarization on all buffered audio (batch mode).
-    pub fn run_diarization(&mut self) -> Result<()> {
-        if self.diar_audio_buffer.is_empty() {
-            return Ok(());
-        }
-
-        let audio = std::mem::take(&mut self.diar_audio_buffer);
-
-        // Process audio → mel → diarization
-        let audio_arr = Array::from_slice(&audio, &[1, audio.len() as i32]);
-        let audio_len = Array::from_slice(&[audio.len() as i32], &[1]);
-
-        let preds = self.diar_model.forward(&audio_arr, &audio_len)?;
-        preds.eval()?;
-
-        // Store per-frame predictions
-        let n_frames = preds.dim(1) as usize;
-        let preds_flat = preds.reshape(&[-1])?;
-        preds_flat.eval()?;
-        let preds_data: Vec<f32> = preds_flat.to_vec_row_major()?;
-
-        for frame_idx in 0..n_frames {
-            let start = frame_idx * self.max_num_spks;
-            let end = start + self.max_num_spks;
-            self.diar_preds.push(preds_data[start..end].to_vec());
-        }
-        self.total_diar_frames += n_frames;
-
-        Ok(())
+    /// All completed words so far, ordered by start time.
+    pub fn words(&self) -> &[SpeakerWord] {
+        &self.words
     }
 
-    /// Process pending diarization audio in chunks.
-    fn process_diarization(&mut self) -> Result<()> {
-        // Process complete chunks of audio for diarization using batch forward
-        while self.diar_audio_buffer.len() >= self.diar_chunk_samples {
-            let chunk: Vec<f32> = self.diar_audio_buffer.drain(..self.diar_chunk_samples).collect();
-
-            let audio_arr = Array::from_slice(&chunk, &[1, chunk.len() as i32]);
-            let audio_len = Array::from_slice(&[chunk.len() as i32], &[1]);
-
-            // Run diarization on chunk (non-streaming for now)
-            let preds = self.diar_model.forward(&audio_arr, &audio_len)?;
-            preds.eval()?;
-
-            // Store predictions
-            let n_frames = preds.dim(1) as usize;
-            let preds_flat = preds.reshape(&[-1])?;
-            preds_flat.eval()?;
-            let preds_data: Vec<f32> = preds_flat.to_vec_row_major()?;
-
-            for frame_idx in 0..n_frames {
-                let start = frame_idx * self.max_num_spks;
-                let end = start + self.max_num_spks;
-                self.diar_preds.push(preds_data[start..end].to_vec());
-            }
-            self.total_diar_frames += n_frames;
-        }
-
-        Ok(())
-    }
-
-    /// Tag ASR output tokens with speaker IDs based on diarization predictions.
-    fn tag_with_speakers(&self, asr_output: &TranscribeOutput) -> Vec<SpeakerSegment> {
-        if asr_output.text.is_empty() || self.diar_preds.is_empty() {
-            if !asr_output.text.is_empty() {
-                return vec![SpeakerSegment {
-                    speaker: 0,
-                    text: asr_output.text.clone(),
-                    start_time: 0.0,
-                    end_time: 0.0,
-                }];
-            }
-            return Vec::new();
-        }
-
-        // Simple approach: split text into words, assign each word to a speaker
-        // based on its approximate timestamp in the diarization output
-        let words: Vec<&str> = asr_output.text.split_whitespace().collect();
-        if words.is_empty() {
-            return Vec::new();
-        }
-
-        let total_diar_time = self.total_diar_frames as f32 * self.diar_frame_sec;
-
-        let mut segments = Vec::new();
-        let mut current_speaker = None;
-        let mut current_text = String::new();
-        let mut segment_start = 0.0f32;
-
-        for (word_idx, word) in words.iter().enumerate() {
-            // Estimate time position for this word
-            let word_time = (word_idx as f32 / words.len() as f32) * total_diar_time;
-
-            // Find the corresponding diarization frame
-            let diar_frame_idx = (word_time / self.diar_frame_sec) as usize;
-            let diar_frame_idx = diar_frame_idx.min(self.diar_preds.len().saturating_sub(1));
-
-            // Get the dominant speaker for this frame
-            let speaker = if diar_frame_idx < self.diar_preds.len() {
-                let probs = &self.diar_preds[diar_frame_idx];
-                probs
-                    .iter()
-                    .enumerate()
-                    .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
-                    .map(|(idx, _)| idx)
-                    .unwrap_or(0)
-            } else {
-                0
-            };
-
-            // Check if speaker changed
-            if current_speaker != Some(speaker) {
-                // Emit previous segment if any
-                if !current_text.is_empty() {
-                    segments.push(SpeakerSegment {
-                        speaker: current_speaker.unwrap_or(0),
-                        text: current_text.trim().to_string(),
-                        start_time: segment_start,
-                        end_time: word_time,
-                    });
-                }
-                current_speaker = Some(speaker);
-                current_text = String::new();
-                segment_start = word_time;
-            }
-
-            if !current_text.is_empty() {
-                current_text.push(' ');
-            }
-            current_text.push_str(word);
-        }
-
-        // Emit final segment
-        if !current_text.is_empty() {
-            segments.push(SpeakerSegment {
-                speaker: current_speaker.unwrap_or(0),
-                text: current_text.trim().to_string(),
-                start_time: segment_start,
-                end_time: total_diar_time,
-            });
-        }
-
-        segments
+    /// Group the completed words into speaker segments (SegLST style).
+    ///
+    /// A speaker's segment ends when they pause for longer than
+    /// `sent_break_sec`. Segments are ordered by start time and can overlap.
+    pub fn segments(&self) -> Vec<SpeakerSegment> {
+        build_segments(&self.words, self.num_spks, self.config.sent_break_sec)
     }
 
     /// Get the sample rate.
     pub fn sample_rate(&self) -> u32 {
-        self.sample_rate
+        self.asr.sample_rate()
+    }
+
+    fn process_chunk(&mut self, fb: FeatureBuffer) -> Result<MultiTalkerOutput> {
+        let n_mels = self.asr.n_mels as i32;
+        let chunk_frames = fb.features.dim(1);
+        let features = fb.features.reshape(&[1, n_mels, chunk_frames])?;
+        let drop_extra = self.asr.streaming_config.drop_extra_pre_encoded;
+
+        // Diarize the same chunk the ASR model sees. Its valid frames include
+        // the pre-encode cache at the front of the chunk.
+        let diar_valid = (fb.pre_encode_cache + fb.valid_size).min(chunk_frames as usize);
+        let chunk_preds = self.diar_model.forward_streaming_step(
+            &features,
+            diar_valid,
+            &mut self.diar_state,
+            drop_extra,
+            0,
+            0,
+        )?;
+        let n_diar_frames = chunk_preds.dim(1) as usize;
+        tracing::debug!(
+            mel_frames = chunk_frames,
+            pre_encode_cache = fb.pre_encode_cache,
+            valid_size = fb.valid_size,
+            n_diar_frames,
+            "diarized chunk"
+        );
+        let preds_flat: Vec<f32> = chunk_preds.to_vec_row_major()?;
+        let preds: Vec<Vec<f32>> = preds_flat
+            .chunks(self.num_spks)
+            .take(n_diar_frames)
+            .map(|row| row.to_vec())
+            .collect();
+        self.update_gating(&preds);
+
+        let targets = match self.mode {
+            MultiTalkerMode::Parallel => Some(self.speaker_targets(&preds)?),
+            MultiTalkerMode::Serial => None,
+        };
+        if let Some(targets) = &targets {
+            self.asr.encoder.set_speaker_targets(targets.clone());
+        }
+
+        let pre_silence_cache = fb.is_last.then(|| self.encoder_cache.clone());
+        let n_instances = self.instances.len() as i32;
+        let features = ops::broadcast_to(&features, &[n_instances, n_mels, chunk_frames])?;
+        let lengths = Array::from_slice(&vec![fb.valid_size as i32; n_instances as usize], &[n_instances]);
+        let (encoded, enc_len) = self.run_encoder(&features, &lengths)?;
+        let enc_seq_len = if self.asr.encoder.is_chunked_limited() || fb.is_last {
+            enc_len
+        } else {
+            enc_len.min(self.asr.streaming_config.valid_out_len)
+        };
+
+        // Record diarizer output on the encoder frame grid (aligned at the end,
+        // like the speaker kernel masks)
+        let chunk_activity = align_rows(&preds, enc_seq_len, self.num_spks);
+        self.diar_preds.extend(chunk_activity.iter().cloned());
+
+        let mut tokens = self.decode(&encoded, enc_seq_len, self.frame_offset)?;
+        self.frame_offset += enc_seq_len;
+
+        if let Some(speech_cache) = pre_silence_cache {
+            // Flush deferred tokens (e.g. final punctuation) with a silent chunk
+            // on top of the speech cache, as the single-talker pipeline does
+            self.encoder_cache = speech_cache;
+            let chunk_size = self.asr.mel_stream_config.chunk_size;
+            let total = chunk_size + self.asr.mel_stream_config.pre_encode_cache;
+            let silence = ops::full::<f32>(&[n_instances, n_mels, total as i32], Array::from_f32(LOG_MEL_ZERO))?;
+            let lengths = Array::from_slice(&vec![chunk_size as i32; n_instances as usize], &[n_instances]);
+            let (encoded, enc_len) = self.run_encoder(&silence, &lengths)?;
+            // Flushed tokens are pinned to the last real frame
+            let last_frame = self.frame_offset.saturating_sub(1);
+            for (instance, mut toks) in self.decode(&encoded, enc_len, last_frame)?.into_iter().enumerate() {
+                toks.iter_mut().for_each(|(_, frame)| *frame = last_frame);
+                tokens[instance].extend(toks);
+            }
+        }
+
+        let mut new_words = self.collect_words(tokens, fb.is_last);
+        new_words.sort_by(|a, b| a.start_time.total_cmp(&b.start_time));
+        self.words.extend(new_words.iter().cloned());
+        if !new_words.is_empty() {
+            self.words.sort_by(|a, b| a.start_time.total_cmp(&b.start_time));
+        }
+
+        Ok(MultiTalkerOutput {
+            new_words,
+            speaker_activity: chunk_activity,
+            is_final: fb.is_last,
+        })
+    }
+
+    /// Run the encoder on [instances, n_mels, frames] and update the cache.
+    ///
+    /// Returns the encoder output [instances, frames, d_model] and its length.
+    fn run_encoder(&mut self, features: &Array, lengths: &Array) -> Result<(Array, usize)> {
+        let (encoded, encoded_lengths, cache_channel, cache_time, cache_len) =
+            self.asr.encoder.forward_streaming(
+                features,
+                lengths,
+                &self.encoder_cache.last_channel,
+                &self.encoder_cache.last_time,
+                &self.encoder_cache.last_channel_len,
+                self.asr.streaming_config.drop_extra_pre_encoded,
+            )?;
+        self.encoder_cache.last_channel = cache_channel;
+        self.encoder_cache.last_time = cache_time;
+        self.encoder_cache.last_channel_len = cache_len;
+
+        let encoded = ops::transpose_axes(&encoded, &[0, 2, 1])?;
+        encoded.eval()?;
+        let enc_len = (encoded_lengths.to_vec_row_major::<i32>()?[0].max(0) as usize).min(encoded.dim(1) as usize);
+        Ok((encoded, enc_len))
+    }
+
+    /// Build per-instance speaker targets from this chunk's diarizer output.
+    fn speaker_targets(&self, preds: &[Vec<f32>]) -> Result<SpeakerTargets> {
+        let s = self.num_spks;
+        let t = preds.len();
+        let mut preds: Vec<Vec<f32>> = preds.to_vec();
+        if self.config.binary_diar_preds {
+            for row in preds.iter_mut() {
+                row.iter_mut()
+                    .for_each(|p| *p = if *p > ACTIVITY_THRESHOLD { 1.0 } else { 0.0 });
+            }
+        }
+        if self.config.single_speaker_mode {
+            let n_active = (0..s)
+                .filter(|&spk| preds.iter().any(|row| row[spk] > ACTIVITY_THRESHOLD))
+                .count();
+            if n_active <= 1 {
+                for row in preds.iter_mut() {
+                    row.iter_mut().enumerate().for_each(|(spk, p)| *p = if spk == 0 { 1.0 } else { 0.0 });
+                }
+            }
+        }
+
+        let mut spk = vec![0.0f32; s * t];
+        let mut bg = vec![0.0f32; s * t];
+        for target in 0..s {
+            for (frame, row) in preds.iter().enumerate() {
+                spk[target * t + frame] = row[target];
+                let others_active = row
+                    .iter()
+                    .enumerate()
+                    .any(|(other, &p)| other != target && p > ACTIVITY_THRESHOLD);
+                bg[target * t + frame] = if others_active { 1.0 } else { 0.0 };
+            }
+        }
+        let shape = [s as i32, t as i32];
+        Ok(SpeakerTargets {
+            spk: Array::from_slice(&spk, &shape),
+            bg: Array::from_slice(&bg, &shape),
+        })
+    }
+
+    fn update_gating(&mut self, preds: &[Vec<f32>]) {
+        for (spk, since) in self.chunks_since_active.iter_mut().enumerate() {
+            if preds.iter().any(|row| row[spk] > ACTIVITY_THRESHOLD) {
+                *since = 0;
+            } else {
+                *since = since.saturating_add(1);
+            }
+        }
+    }
+
+    /// Whether instance `idx` should be decoded this chunk.
+    fn is_decoded(&self, idx: usize) -> bool {
+        if self.mode == MultiTalkerMode::Serial
+            || self.config.cache_gating_chunks == 0
+            || (self.config.single_speaker_mode && idx == 0)
+        {
+            return true;
+        }
+        self.chunks_since_active[idx] < self.config.cache_gating_chunks
+    }
+
+    /// Greedy-decode each instance's encoder output.
+    ///
+    /// Returns `(token, global encoder frame)` pairs per instance.
+    fn decode(
+        &mut self,
+        encoded: &Array,
+        valid_frames: usize,
+        frame_offset: usize,
+    ) -> Result<Vec<Vec<(usize, usize)>>> {
+        let masked_ids = self
+            .asr
+            .suppress_punctuation
+            .then_some(self.asr.punctuation_token_ids.as_slice());
+        let mut tokens = Vec::with_capacity(self.instances.len());
+        for idx in 0..self.instances.len() {
+            if !self.is_decoded(idx) {
+                tokens.push(Vec::new());
+                continue;
+            }
+            let row = encoded.index((idx as i32..idx as i32 + 1, .., ..));
+            let instance = &mut self.instances[idx];
+            let output = self.asr.streaming_decoder.decode_frames(
+                &row,
+                valid_frames,
+                &self.asr.decoder,
+                &mut instance.decoder_state,
+                &self.asr.joint,
+                &mut instance.last_token,
+                masked_ids,
+            )?;
+            tokens.push(
+                output
+                    .new_tokens
+                    .into_iter()
+                    .zip(output.timesteps.into_iter().map(|t| frame_offset + t))
+                    .collect(),
+            );
+        }
+        Ok(tokens)
+    }
+
+    /// Group new tokens into words, completing a word when the next one starts.
+    fn collect_words(&mut self, tokens: Vec<Vec<(usize, usize)>>, is_final: bool) -> Vec<SpeakerWord> {
+        let mut words = Vec::new();
+        for (idx, new_tokens) in tokens.into_iter().enumerate() {
+            for (token, frame) in new_tokens {
+                let starts_word = self.word_start.get(token).copied().unwrap_or(false);
+                if starts_word && !self.instances[idx].pending.is_empty() {
+                    let pending = std::mem::take(&mut self.instances[idx].pending);
+                    words.extend(self.make_word(idx, &pending));
+                }
+                self.instances[idx].pending.push((token, frame));
+            }
+            if is_final && !self.instances[idx].pending.is_empty() {
+                let pending = std::mem::take(&mut self.instances[idx].pending);
+                words.extend(self.make_word(idx, &pending));
+            }
+        }
+        words
+    }
+
+    fn make_word(&self, instance: usize, tokens: &[(usize, usize)]) -> Option<SpeakerWord> {
+        let tokenizer = self.asr.tokenizer.as_ref()?;
+        let ids: Vec<u32> = tokens.iter().map(|&(t, _)| t as u32).collect();
+        let text = tokenizer.decode_piece_ids(&ids).ok()?.trim().to_string();
+        if text.is_empty() {
+            return None;
+        }
+        let first = tokens.first()?.1;
+        let last = tokens.last()?.1;
+        let speaker = match self.mode {
+            MultiTalkerMode::Parallel => instance,
+            MultiTalkerMode::Serial => self.dominant_speaker(first, last),
+        };
+        Some(SpeakerWord {
+            speaker,
+            text,
+            start_time: first as f32 * self.frame_sec,
+            end_time: (last + 1) as f32 * self.frame_sec,
+        })
+    }
+
+    /// The speaker with the highest mean activity over `first..=last`.
+    fn dominant_speaker(&self, first: usize, last: usize) -> usize {
+        let end = (last + 1).min(self.diar_preds.len());
+        let start = first.min(end.saturating_sub(1));
+        let frames = &self.diar_preds[start..end];
+        (0..self.num_spks)
+            .max_by(|&a, &b| {
+                let mean_a: f32 = frames.iter().map(|row| row[a]).sum();
+                let mean_b: f32 = frames.iter().map(|row| row[b]).sum();
+                mean_a.total_cmp(&mean_b)
+            })
+            .unwrap_or(0)
     }
 }
 
-/// Merge consecutive segments from the same speaker.
-fn merge_segments(segments: Vec<SpeakerSegment>) -> Vec<SpeakerSegment> {
-    if segments.is_empty() {
-        return segments;
+/// Take the last `n` rows of `rows`, left-padding with zero rows if short.
+fn align_rows(rows: &[Vec<f32>], n: usize, width: usize) -> Vec<Vec<f32>> {
+    if rows.len() >= n {
+        rows[rows.len() - n..].to_vec()
+    } else {
+        let mut out = vec![vec![0.0; width]; n - rows.len()];
+        out.extend(rows.iter().cloned());
+        out
     }
+}
 
-    let mut merged = Vec::new();
-    let mut current = segments[0].clone();
-
-    for segment in segments.into_iter().skip(1) {
-        if segment.speaker == current.speaker {
-            // Same speaker - merge
-            current.text.push(' ');
-            current.text.push_str(&segment.text);
-            current.end_time = segment.end_time;
-        } else {
-            // Different speaker - emit and start new
-            merged.push(current);
-            current = segment;
+/// Group time-ordered words into per-speaker segments split at long pauses.
+fn build_segments(words: &[SpeakerWord], num_spks: usize, sent_break_sec: f32) -> Vec<SpeakerSegment> {
+    let mut open: Vec<Option<SpeakerSegment>> = vec![None; num_spks.max(1)];
+    let mut segments = Vec::new();
+    for word in words {
+        if word.speaker >= open.len() {
+            open.resize(word.speaker + 1, None);
+        }
+        let slot = &mut open[word.speaker];
+        match slot {
+            Some(seg) if word.start_time <= seg.end_time + sent_break_sec => {
+                if !is_punctuation(&word.text) {
+                    seg.text.push(' ');
+                }
+                seg.text.push_str(&word.text);
+                seg.end_time = seg.end_time.max(word.end_time);
+            }
+            _ => {
+                if let Some(seg) = slot.take() {
+                    segments.push(seg);
+                }
+                *slot = Some(SpeakerSegment {
+                    speaker: word.speaker,
+                    text: word.text.clone(),
+                    start_time: word.start_time,
+                    end_time: word.end_time,
+                });
+            }
         }
     }
-    merged.push(current);
+    segments.extend(open.into_iter().flatten());
+    segments.sort_by(|a, b| a.start_time.total_cmp(&b.start_time));
+    segments
+}
 
-    merged
+fn is_punctuation(text: &str) -> bool {
+    text.chars().all(|c| c.is_ascii_punctuation())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn word(speaker: usize, text: &str, start: f32, end: f32) -> SpeakerWord {
+        SpeakerWord {
+            speaker,
+            text: text.to_string(),
+            start_time: start,
+            end_time: end,
+        }
+    }
+
+    #[test]
+    fn test_build_segments_overlapping_speakers() {
+        let words = vec![
+            word(0, "hello", 0.0, 0.4),
+            word(1, "hi", 0.2, 0.5),
+            word(0, "there", 0.5, 0.9),
+            word(0, "again", 3.0, 3.4),
+        ];
+        let segments = build_segments(&words, 2, 1.0);
+        let summary: Vec<(usize, &str)> = segments.iter().map(|s| (s.speaker, s.text.as_str())).collect();
+        assert_eq!(summary, vec![(0, "hello there"), (1, "hi"), (0, "again")]);
+    }
+
+    #[test]
+    fn test_build_segments_attaches_punctuation() {
+        let words = vec![word(0, "done", 0.0, 0.4), word(0, ".", 0.4, 0.5)];
+        let segments = build_segments(&words, 1, 1.0);
+        assert_eq!(segments[0].text, "done.");
+    }
+
+    #[test]
+    fn test_align_rows() {
+        let rows = vec![vec![1.0], vec![2.0], vec![3.0]];
+        assert_eq!(align_rows(&rows, 2, 1), vec![vec![2.0], vec![3.0]]);
+        assert_eq!(align_rows(&rows, 4, 1), vec![vec![0.0], vec![1.0], vec![2.0], vec![3.0]]);
+    }
 }

@@ -1067,9 +1067,96 @@ pub struct SortformerModulesConfig {
     #[serde(default)]
     pub dropout_rate: Option<f32>,
 
+    /// Speaker cache length in encoder frames
+    #[serde(default = "default_spkcache_len")]
+    pub spkcache_len: usize,
+
+    /// FIFO buffer length in encoder frames
+    #[serde(default)]
+    pub fifo_len: usize,
+
+    /// Streaming chunk length in encoder frames
+    #[serde(default = "default_chunk_len")]
+    pub chunk_len: usize,
+
+    /// Number of frames popped from the FIFO into the speaker cache per update
+    #[serde(default = "default_spkcache_update_period")]
+    pub spkcache_update_period: usize,
+
+    /// Left context of each chunk in encoder frames
+    #[serde(default = "default_chunk_context")]
+    pub chunk_left_context: usize,
+
+    /// Right context of each chunk in encoder frames
+    #[serde(default = "default_chunk_context")]
+    pub chunk_right_context: usize,
+
+    /// Silence frames reserved per speaker in the compressed speaker cache
+    #[serde(default = "default_spkcache_sil_frames_per_spk")]
+    pub spkcache_sil_frames_per_spk: usize,
+
+    /// Probability floor used when scoring frames for the speaker cache
+    #[serde(default = "default_pred_score_threshold")]
+    pub pred_score_threshold: f32,
+
+    /// Score bonus for frames newly added to the speaker cache
+    #[serde(default = "default_scores_boost_latest")]
+    pub scores_boost_latest: f32,
+
+    /// Frames whose summed speaker probability is below this count as silence
+    #[serde(default = "default_sil_threshold")]
+    pub sil_threshold: f32,
+
+    /// Fraction of per-speaker cache slots that get a strong score boost
+    #[serde(default = "default_strong_boost_rate")]
+    pub strong_boost_rate: f32,
+
+    /// Fraction of per-speaker cache slots that get a weak score boost
+    #[serde(default = "default_weak_boost_rate")]
+    pub weak_boost_rate: f32,
+
+    /// Fraction of per-speaker cache slots that must score positively before
+    /// overlapped frames are dropped
+    #[serde(default = "default_min_pos_scores_rate")]
+    pub min_pos_scores_rate: f32,
+
     /// Additional fields
     #[serde(flatten)]
     extra: std::collections::HashMap<String, yaml_serde::Value>,
+}
+
+fn default_spkcache_len() -> usize {
+    188
+}
+fn default_chunk_len() -> usize {
+    188
+}
+fn default_spkcache_update_period() -> usize {
+    188
+}
+fn default_chunk_context() -> usize {
+    1
+}
+fn default_spkcache_sil_frames_per_spk() -> usize {
+    3
+}
+fn default_pred_score_threshold() -> f32 {
+    0.25
+}
+fn default_scores_boost_latest() -> f32 {
+    0.05
+}
+fn default_sil_threshold() -> f32 {
+    0.2
+}
+fn default_strong_boost_rate() -> f32 {
+    0.75
+}
+fn default_weak_boost_rate() -> f32 {
+    1.5
+}
+fn default_min_pos_scores_rate() -> f32 {
+    0.5
 }
 
 fn default_num_spks() -> usize {
@@ -1089,6 +1176,19 @@ impl Default for SortformerModulesConfig {
             fc_d_model: 512,
             tf_d_model: 192,
             dropout_rate: None,
+            spkcache_len: default_spkcache_len(),
+            fifo_len: 0,
+            chunk_len: default_chunk_len(),
+            spkcache_update_period: default_spkcache_update_period(),
+            chunk_left_context: default_chunk_context(),
+            chunk_right_context: default_chunk_context(),
+            spkcache_sil_frames_per_spk: default_spkcache_sil_frames_per_spk(),
+            pred_score_threshold: default_pred_score_threshold(),
+            scores_boost_latest: default_scores_boost_latest(),
+            sil_threshold: default_sil_threshold(),
+            strong_boost_rate: default_strong_boost_rate(),
+            weak_boost_rate: default_weak_boost_rate(),
+            min_pos_scores_rate: default_min_pos_scores_rate(),
             extra: std::collections::HashMap::new(),
         }
     }
@@ -1118,35 +1218,14 @@ pub struct SortformerConfig {
     /// Transformer encoder configuration
     pub transformer_encoder: TransformerEncoderConfig,
 
-    /// SortFormer modules (speaker head) configuration
+    /// SortFormer modules (speaker head and streaming) configuration
     pub sortformer_modules: SortformerModulesConfig,
-
-    /// Streaming chunk length in encoder frames
-    #[serde(default = "default_chunk_len")]
-    pub chunk_len: usize,
-
-    /// Speaker cache length in encoder frames
-    #[serde(default = "default_spkcache_len")]
-    pub spkcache_len: usize,
-
-    /// FIFO buffer length in encoder frames
-    #[serde(default = "default_fifo_len")]
-    pub fifo_len: usize,
 
     /// Additional fields
     #[serde(flatten)]
     extra: std::collections::HashMap<String, yaml_serde::Value>,
 }
 
-fn default_chunk_len() -> usize {
-    50
-}
-fn default_spkcache_len() -> usize {
-    100
-}
-fn default_fifo_len() -> usize {
-    50
-}
 
 /// Adds typed access to the config fields this crate does not model explicitly.
 macro_rules! impl_extra_accessor {

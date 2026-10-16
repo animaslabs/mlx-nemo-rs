@@ -14,6 +14,7 @@ use mlx_rs::Array;
 
 use super::attention::{RelPositionMultiHeadAttention, RelPositionalEncoding};
 use crate::asr::config::EncoderConfig;
+use crate::asr::modules::speaker_kernel::{SpeakerKernels, SpeakerTargets};
 use crate::core::ArrayExt;
 use crate::core::error::Result;
 use crate::core::quantization::{LinearLayer, QuantizationConfig, load_linear_layer};
@@ -449,6 +450,21 @@ fn create_chunked_limited_mask(
     Ok(mask.reshape(&[1, max_audio_length, max_audio_length])?)
 }
 
+/// Apply speaker kernels before `layer_idx`, if the model has them and targets are set.
+fn apply_speaker_kernels(
+    kernels: Option<&SpeakerKernels>,
+    targets: Option<&SpeakerTargets>,
+    layer_idx: usize,
+    x: Array,
+) -> Result<Array> {
+    match (kernels, targets) {
+        (Some(kernels), Some(targets)) if kernels.applies_to(layer_idx) => {
+            kernels.apply(layer_idx, &x, targets)
+        }
+        _ => Ok(x),
+    }
+}
+
 /// Conformer encoder for ASR.
 ///
 /// This implements the Conformer architecture as used in NeMo's ASR models,
@@ -474,6 +490,12 @@ pub struct ConformerEncoder {
 
     /// Attention context style ("regular" or "chunked_limited")
     att_context_style: String,
+
+    /// Speaker kernels (multitalker ASR models only)
+    speaker_kernels: Option<SpeakerKernels>,
+
+    /// Speaker targets used by the speaker kernels on the next forward pass
+    speaker_targets: Option<SpeakerTargets>,
 }
 
 impl ConformerEncoder {
@@ -521,6 +543,8 @@ impl ConformerEncoder {
             final_norm,
             att_context_size,
             att_context_style,
+            speaker_kernels: None,
+            speaker_targets: None,
         })
     }
 
@@ -618,7 +642,13 @@ impl ConformerEncoder {
         let pos_emb = self.pos_enc.get_encoding(seq_len)?;
 
         // Process through conformer blocks with positional info
-        for layer in &mut self.layers {
+        for (layer_idx, layer) in self.layers.iter_mut().enumerate() {
+            x = apply_speaker_kernels(
+                self.speaker_kernels.as_ref(),
+                self.speaker_targets.as_ref(),
+                layer_idx,
+                x,
+            )?;
             x = layer.forward(&x, &pos_emb)?;
         }
 
@@ -666,7 +696,28 @@ impl ConformerEncoder {
         // Load final norm weights (not quantized)
         load_layer_norm(&mut self.final_norm, weights, "encoder.final_norm");
 
+        // Speaker kernels live at the model root (spk_kernels.*, bg_spk_kernels.*)
+        self.speaker_kernels = SpeakerKernels::load(weights, quant);
+
         Ok(())
+    }
+
+    /// Whether this encoder has speaker kernels (a multitalker ASR model).
+    pub fn has_speaker_kernels(&self) -> bool {
+        self.speaker_kernels.is_some()
+    }
+
+    /// Set the speaker targets used by the speaker kernels.
+    ///
+    /// Masks are [batch, time] at encoder frame rate and apply to subsequent
+    /// forward passes until cleared. Ignored by models without speaker kernels.
+    pub fn set_speaker_targets(&mut self, targets: SpeakerTargets) {
+        self.speaker_targets = Some(targets);
+    }
+
+    /// Clear the speaker targets.
+    pub fn clear_speaker_targets(&mut self) {
+        self.speaker_targets = None;
     }
 
     // ==================== Streaming Support ====================
@@ -1067,6 +1118,13 @@ impl ConformerEncoder {
 
         // Process through conformer blocks with cache
         for (layer_idx, layer) in self.layers.iter_mut().enumerate() {
+            x = apply_speaker_kernels(
+                self.speaker_kernels.as_ref(),
+                self.speaker_targets.as_ref(),
+                layer_idx,
+                x,
+            )?;
+
             // Extract per-layer cache: [batch, cache_size, d_model] and [batch, d_model, time_cache]
             let layer_cache_channel_full = cache_last_channel.index((layer_idx as i32, .., .., ..));
             let layer_cache_time = cache_last_time.index((layer_idx as i32, .., .., ..));
@@ -1697,11 +1755,16 @@ impl Subsampling {
         let new_lengths = if is_causal {
             current_lengths.as_dtype(mlx_rs::Dtype::Int32)?
         } else {
-            // Standard: each stride just halves the length (with symmetric padding preserving dims)
-            let mut new_lengths = lengths.clone();
+            // Symmetric padding of 1 with kernel 3, stride 2 (NeMo's calc_length):
+            // out = floor((len + 2 - 3) / 2) + 1, which rounds odd lengths up
+            let mut new_lengths = lengths.as_dtype(mlx_rs::Dtype::Int32)?;
             let n_convs = self.depthwise_convs.len() + 1;
             for _ in 0..n_convs {
-                new_lengths = mlx_rs::ops::floor_divide(&new_lengths, &Array::from_int(2))?;
+                let shrunk = mlx_rs::ops::subtract(&new_lengths, &Array::from_int(1))?;
+                new_lengths = mlx_rs::ops::add(
+                    &mlx_rs::ops::floor_divide(&shrunk, &Array::from_int(2))?,
+                    &Array::from_int(1),
+                )?;
             }
             new_lengths
         };

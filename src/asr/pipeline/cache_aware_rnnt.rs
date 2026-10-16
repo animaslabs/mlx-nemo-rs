@@ -213,18 +213,18 @@ pub struct CacheAwareRNNTPipeline {
     // Model components
     config: AsrModelConfig,
     preprocessor: MelProcessor,
-    encoder: ConformerEncoder,
-    decoder: PredictionNetwork,
-    joint: crate::asr::modules::RNNTJoint,
-    tokenizer: Option<SentencePieceProcessor>,
+    pub(super) encoder: ConformerEncoder,
+    pub(super) decoder: PredictionNetwork,
+    pub(super) joint: crate::asr::modules::RNNTJoint,
+    pub(super) tokenizer: Option<SentencePieceProcessor>,
 
     // Streaming components
-    streaming_decoder: RnntStreamingDecoder,
-    streaming_config: StreamingConfig,
+    pub(super) streaming_decoder: RnntStreamingDecoder,
+    pub(super) streaming_config: StreamingConfig,
     encoder_cache: EncoderCache,
 
     // Mel streaming
-    mel_stream_config: StreamingMelConfig,
+    pub(super) mel_stream_config: StreamingMelConfig,
     streaming_mel: StreamingMel,
     is_first_chunk: bool,
 
@@ -239,11 +239,11 @@ pub struct CacheAwareRNNTPipeline {
     // State
     state: StreamingState,
     blank_id: usize,
-    n_mels: usize,
+    pub(super) n_mels: usize,
 
     // Punctuation suppression
-    suppress_punctuation: bool,
-    punctuation_token_ids: Vec<usize>,
+    pub(super) suppress_punctuation: bool,
+    pub(super) punctuation_token_ids: Vec<usize>,
 
     // Blank threshold
     blank_threshold: f32,
@@ -1157,7 +1157,7 @@ impl CacheAwareRNNTPipeline {
     }
 
     /// Try to extract the next feature buffer.
-    fn try_extract_next(&mut self) -> Result<Option<FeatureBuffer>> {
+    pub(super) fn try_extract_next(&mut self) -> Result<Option<FeatureBuffer>> {
         tracing::trace!(
             is_done = self.is_done,
             stream_ended = self.stream_ended,

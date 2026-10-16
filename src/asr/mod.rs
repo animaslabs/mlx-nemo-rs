@@ -55,7 +55,10 @@ pub use vad::{SpeechSegment, VadPostProcessConfig, VadPostProcessor};
 pub use modules::{MelConfig, MelProcessor, SpectrumTransform, StreamingMel};
 // Backwards-compatible alias
 pub use modules::MelSpectrogram;
-pub use pipeline::{CacheAwareRNNTPipeline, MultiTalkerOutput, MultiTalkerPipeline, SpeakerSegment, TranscribeOutput};
+pub use pipeline::{
+    CacheAwareRNNTPipeline, MultiTalkerConfig, MultiTalkerMode, MultiTalkerOutput, MultiTalkerPipeline,
+    SpeakerSegment, SpeakerWord, TranscribeOutput,
+};
 pub use streaming::{
     EncoderCache, FeatureBuffer, StreamingConfig, StreamingMelBuffer, StreamingModeInfo,
     StreamingOutput, StreamingSortformerState,

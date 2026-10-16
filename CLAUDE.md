@@ -25,10 +25,16 @@ cargo test test_load_parakeet_rnnt_checkpoint -- --ignored
 # Run an example
 cargo run --example transcribe_rnnt -- --model models/nvidia/parakeet-rnnt-0.6b/parakeet-rnnt-0.6b.nemo samples/christmas2025_nightbeforechristmas_kri_64kb.wav
 cargo run --example streaming -- --model models/nvidia/nemotron-speech-streaming-en-0.6b/nemotron-speech-streaming-en-0.6b.nemo samples/Speaker26_004_16k.wav
+cargo run --release --example multi_talker -- samples/Speaker26_004_16k.wav  # auto-detects models in models/
+
+# Multi-talker model tests (need the two models below)
+cargo test --release --test multitalker -- --ignored --test-threads=1 --nocapture
 
 # Download models from Hugging Face
 cargo xtask download nvidia/parakeet-ctc-0.6b
 cargo xtask download nvidia/nemotron-speech-streaming-en-0.6b --token $HF_TOKEN
+cargo xtask download nvidia/multitalker-parakeet-streaming-0.6b-v1
+cargo xtask download nvidia/diar_streaming_sortformer_4spk-v2.1
 ```
 
 ## Architecture
@@ -50,15 +56,19 @@ cargo xtask download nvidia/nemotron-speech-streaming-en-0.6b --token $HF_TOKEN
 - `ConformerEncoder`: FastConformer encoder with multi-head attention and convolution
 - `CTCDecoder`: CTC output projection layer
 - `RNNTJoint`: Joint network for RNN-T
+- `SpeakerKernels`: Multitalker speaker kernels, applied by `ConformerEncoder` before selected layers when speaker targets are set
+- `SortformerModules`: SortFormer speaker head (diarization)
 - `PredictionNetwork`: RNN-T decoder/prediction network
 
 **Pipeline** (`pipeline/`):
 - `CacheAwareRNNTPipeline`: Main streaming pipeline for RNN-T models, handles audio buffering, cache-aware encoder processing, and incremental decoding
+- `MultiTalkerPipeline`: Wraps `CacheAwareRNNTPipeline` with a streaming SortFormer diarizer fed the same mel chunks. With a multitalker checkpoint (has `spk_kernels.*` weights) it runs one ASR instance per speaker as a batched encoder call (parallel mode); otherwise it attributes one transcript to speakers (serial mode)
 
 **Streaming** (`streaming/`):
 - `EncoderCache`: Manages attention and convolution caches for streaming
 - `MelBuffer`/`FeatureBuffer`: Audio chunk buffering
 - `StreamingConfig`: Streaming mode configuration (chunk sizes, context windows)
+- `StreamingSortformerState`: SortFormer speaker cache / FIFO of pre-encode embeddings (port of NeMo's `streaming_update` and `_compress_spkcache`)
 
 **Decoding** (`decoding/`):
 - `greedy.rs`: Greedy CTC decoding
@@ -83,6 +93,8 @@ Models are stored in `models/nvidia/` and downloaded via xtask:
 - `parakeet-ctc-0.6b/`: Non-streaming CTC model
 - `parakeet-rnnt-0.6b/`: Non-streaming RNN-T model
 - `nemotron-speech-streaming-en-0.6b/`: Streaming RNN-T model (gated, requires HF token)
+- `multitalker-parakeet-streaming-0.6b-v1/`: Streaming multitalker RNN-T (Nemotron streaming + speaker kernels)
+- `diar_streaming_sortformer_4spk-v2.1/`: Streaming SortFormer diarizer (up to 4 speakers)
 
 `.nemo` files are uncompressed TAR archives containing:
 - `model_config.yaml`: Full model configuration
