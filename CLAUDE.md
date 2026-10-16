@@ -35,7 +35,14 @@ cargo xtask download nvidia/parakeet-ctc-0.6b
 cargo xtask download nvidia/nemotron-speech-streaming-en-0.6b --token $HF_TOKEN
 cargo xtask download nvidia/multitalker-parakeet-streaming-0.6b-v1
 cargo xtask download nvidia/diar_streaming_sortformer_4spk-v2.1
+
+# WER eval: shared private dataset animaslabs/asr-eval → samples/eval/, scored in ../mlx-models
+cargo xtask download-eval
+cargo run --release --example eval -- --model <model.nemo> --out hypotheses.jsonl
+(cd ../mlx-models && uv run samples/score.py ../mlx-voice-rs/hypotheses.jsonl)
 ```
+
+The eval dataset revision is pinned in both `xtask/src/main.rs` and mlx-models `samples/score.py` (`EVAL_REVISION`); bump both together.
 
 ## Architecture
 

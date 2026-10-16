@@ -144,6 +144,7 @@ With an ordinary streaming model the pipeline runs in serial mode instead. Each 
 | `live` / `live_pipeline` | Live microphone transcription |
 | `vad` | Voice activity detection on a file |
 | `multi_talker` | Streaming transcription with speaker labels |
+| `eval` | Transcribe the shared eval set to a hypotheses JSONL for WER scoring |
 
 ```bash
 cargo run --release --example transcribe -- \
@@ -197,6 +198,17 @@ Most tests are `#[ignore]` by default because they need downloaded models in `mo
 
 ```bash
 cargo test -- --ignored --test-threads=1
+```
+
+### Word error rate
+
+The eval set (13 clips: 7 languages from Multilingual LibriSpeech, long-form TED talks, multi-speaker earnings calls and podcasts; about 88 minutes) lives in a private Hugging Face dataset shared with the mlx-models repo. Some clips can't be redistributed, so the audio is never committed here. Scoring is done by mlx-models' `samples/score.py`, so WER is normalized identically across ports:
+
+```bash
+cargo xtask download-eval          # to samples/eval/, at the pinned revision
+cargo run --release --example eval -- \
+  --model models/nvidia/nemotron-speech-streaming-en-0.6b/nemotron-speech-streaming-en-0.6b.nemo
+(cd ../mlx-models && uv run samples/score.py ../mlx-voice-rs/hypotheses.jsonl)
 ```
 
 The Python scripts in [`scripts/`](scripts/) compare intermediate outputs against the reference NeMo implementation.
