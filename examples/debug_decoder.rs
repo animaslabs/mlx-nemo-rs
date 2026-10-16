@@ -1,7 +1,6 @@
 //! Debug decoder step by step to compare with Python.
 
 use mlx_voice::asr::CacheAwareRNNTPipeline;
-use mlx_rs::Array;
 
 fn main() -> mlx_voice::Result<()> {
     // Initialize tracing

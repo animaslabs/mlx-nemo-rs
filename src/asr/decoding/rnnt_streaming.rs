@@ -359,7 +359,7 @@ impl RnntStreamingDecoder {
 
         // Build a compact representation of what happened at each frame
         // B = blank, T<id> = token with id
-        let frame_summary: String = output.labels.iter().enumerate().map(|(i, &label)| {
+        let frame_summary: String = output.labels.iter().map(|&label| {
             if label == self.blank_id {
                 "B".to_string()
             } else {

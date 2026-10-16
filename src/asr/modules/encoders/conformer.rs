@@ -153,27 +153,19 @@ fn causal_pad_2d(x: &Array, kernel_size: usize, stride: usize) -> Result<Array> 
     // NeMo's CausalConv2D padding formula:
     // left_pad = kernel_size - 1
     // right_pad = stride - 1
-    let left_pad = ((kernel_size - 1) / 2 + (stride - 1)) as i32;
+    let left_pad = (kernel_size - 1) as i32;
     let right_pad = (stride - 1) as i32;
-    // JJK test
-    // let left_pad = (kernel_size - 1) as i32;
 
     // Step 1: Pad time dimension (axis 1): [B, T, F, C] -> [B, T+left_pad+right_pad, F, C]
-    // (kernel_size - 1) as i32; // (kernel_size - 1) as i32;
-    let left_pad_time = 2; // if time % 2 == 0 { 1 } else { 0 };
-    let right_pad_time = 1; // ((kernel_size - 1) / 2) as i32;
-    let time_zeros_left = mlx_rs::ops::zeros::<f32>(&[batch, left_pad_time, freq, channels])?;
-    let time_zeros_right = mlx_rs::ops::zeros::<f32>(&[batch, right_pad_time, freq, channels])?;
-    let x = mlx_rs::ops::concatenate_axis(&[&time_zeros_left, x, &time_zeros_right], 1)?;
-    // JJK test
-    // let x = mlx_rs::ops::concatenate_axis(&[&time_zeros_left, x], 1)?;
+    let time_zeros_left = mlx_rs::ops::zeros::<f32>(&[batch, left_pad, freq, channels])?;
+    let time_zeros_right = mlx_rs::ops::zeros::<f32>(&[batch, right_pad, freq, channels])?;
+    let x = mlx_rs::ops::concatenate(&[&time_zeros_left, x, &time_zeros_right], 1)?;
 
     // Step 2: Pad frequency dimension (axis 2)
-    // let new_time = time + left_pad_time + right_pad_time;
-    let new_time = time + left_pad_time + right_pad_time;
+    let new_time = time + left_pad + right_pad;
     let freq_zeros_left = mlx_rs::ops::zeros::<f32>(&[batch, new_time, left_pad, channels])?;
     let freq_zeros_right = mlx_rs::ops::zeros::<f32>(&[batch, new_time, right_pad, channels])?;
-    let x = mlx_rs::ops::concatenate_axis(&[&freq_zeros_left, &x, &freq_zeros_right], 2)?;
+    let x = mlx_rs::ops::concatenate(&[&freq_zeros_left, &x, &freq_zeros_right], 2)?;
 
     Ok(x)
 }
@@ -238,7 +230,6 @@ fn create_attention_mask(
 
             // Create chunk-based visibility mask
             att_mask = create_chunked_limited_mask(max_audio_length, chunk_size, left_chunks_num)?;
-            // att_mask = apply_triu(&att_mask, -filled_cache_len)?;
         }
     } else {
         // Regular style - simple triangular masking
@@ -314,36 +305,8 @@ fn create_attention_mask(
         att_mask = att_mask.logical_and(&row_valid)?;
     }
 
-    // // Always mask out the last column (last key position in the current input).
-    // {
-    //     let total_cols = cache_len + tensor_seq_len;
-    //     let col_indices: Vec<i32> = (0..total_cols).collect();
-    //     let col_indices = Array::from_slice(&col_indices, &[total_cols]);
-    //     let last_col = Array::from_int(total_cols - 1);
-    //     let col_valid = col_indices.lt(&last_col)?; // True for all cols except last
-    //     let col_valid = col_valid.reshape(&[1, 1, total_cols])?;
-    //     att_mask = att_mask.logical_and(&col_valid)?;
-    // }
-
     // No inversion needed: mask is True where attention is ALLOWED
     // The attention layer will use: where(mask, scores, -inf) to keep scores where mask=True
-
-    // {
-    //     att_mask.eval()?;
-    //     // Count how many positions are visible (True = visible)
-    //     let flat = att_mask.reshape(&[-1])?;
-    //     flat.eval()?;
-    //     let flat_slice: &[bool] = flat.as_slice();
-    //     let visible_count = flat_slice.iter().filter(|&&x| x).count();
-    //     let total = flat_slice.len();
-    //     tracing::trace!(
-    //         shape = ?att_mask.shape(),
-    //         visible_count,
-    //         total,
-    //         visible_percent = 100.0 * visible_count as f64 / total as f64,
-    //         "mask output stats"
-    //     );
-    // }
 
     Ok(att_mask)
 }
@@ -512,8 +475,6 @@ impl ConformerEncoder {
         let subsampling = Subsampling::new(&config)?;
 
         // Create relative positional encoding
-        // let pos_enc = RelPositionalEncoding::new(d_model, pos_emb_max_len, xscaling)?;
-        // JJK 70 length
         let pos_enc = RelPositionalEncoding::new(d_model, pos_emb_max_len, xscaling)?;
 
         // Create conformer blocks
@@ -615,7 +576,7 @@ impl ConformerEncoder {
             );
         }
 
-        x = mlx_rs::ops::r#where(&mel_mask, &mlx_rs::Array::from_f32(0.0), &x)?;
+        x = mlx_rs::ops::select(&mel_mask, &mlx_rs::Array::from_f32(0.0), &x)?;
 
         if debug_mask {
             x.eval()?;
@@ -828,7 +789,7 @@ impl ConformerEncoder {
         let mel_lengths_expanded = lengths.reshape(&[-1, 1])?;
         let mel_mask = mlx_rs::ops::ge(&mel_indices, &mel_lengths_expanded)?;
         let mel_mask = mel_mask.reshape(&[x.dim(0) as i32, mel_time, 1])?;
-        x = mlx_rs::ops::r#where(&mel_mask, &mlx_rs::Array::from_f32(0.0), &x)?;
+        x = mlx_rs::ops::select(&mel_mask, &mlx_rs::Array::from_f32(0.0), &x)?;
 
         // Subsampling
         let (mut x, lengths) = self.subsampling.forward(&x, &lengths)?;
@@ -935,7 +896,7 @@ impl ConformerEncoder {
         let x = mlx_rs::ops::transpose_axes(features, &[0, 2, 1])?;
 
         // Subsampling
-        let (mut x, mut lengths) = self.subsampling.forward(&x, lengths)?;
+        let (mut x, lengths) = self.subsampling.forward(&x, lengths)?;
 
         // Drop extra pre-encoded frames for streaming
         // This is needed because the subsampling convolutions produce extra frames
@@ -947,16 +908,10 @@ impl ConformerEncoder {
             tracing::trace!(
                 enc_call,
                 drop_extra_pre_encoded,
-                "dropping extra pre-encoded frames from end"
+                "dropping extra pre-encoded frames from start"
             );
-            let x_len = lengths.to_vec_row_major::<i32>()?[0];
-            // x = x.index((.., ..(x_len-drop), ..));
-            // JJK test
+            // Unlike NeMo, `lengths` is not reduced by `drop` here.
             x = x.index((.., drop.., ..));
-            // lengths = mlx_rs::ops::clip(
-            //     &(&lengths - &Array::from_int(drop)),
-            //     (&Array::from_int(0), ()),
-            // )?;
         }
 
         // Scale input by sqrt(d_model) if xscaling is enabled
@@ -978,8 +933,6 @@ impl ConformerEncoder {
 
         // Total length for K/V needs to cover all tensor frames for pos_emb
         // Use tensor dimension, not valid length, to avoid pos_emb size mismatch
-        // let total_len = cache_size + tensor_seq_len;
-        // JJK test
         let total_len = cache_size + tensor_seq_len;
         // Valid length is used for masking
         let seq_len = cache_size + valid_seq_len;
@@ -1004,7 +957,6 @@ impl ConformerEncoder {
         //
         // The positional encoding covers relative positions from +(total_len-1) to -(total_len-1).
         // After rel_shift in attention, these align correctly with K/V positions 0..total_len.
-        // JJK trying to adjust size
         let pos_emb = self.pos_enc.get_encoding(total_len as usize)?;
 
         tracing::trace!(
@@ -1026,8 +978,7 @@ impl ConformerEncoder {
                 cache_size,       // Full cache buffer size (for slicing)
                 filled_cache_len, // How much is filled (for offset masking)
                 tensor_seq_len,   // Tensor dimension for mask row count
-                // valid_seq_len,    // Valid frames for query row masking
-                valid_seq_len - 1,    // JJK test 
+                valid_seq_len - 1, // Valid frames for query row masking
             )?)
         } else {
             None
@@ -1103,7 +1054,6 @@ impl ConformerEncoder {
         } else {
             None
         };
-        // let pad_mask = None;
 
         tracing::trace!(
             enc_call,
@@ -1146,24 +1096,6 @@ impl ConformerEncoder {
 
             x = x_out;
 
-            // // Trace layer 0 output for chunk 0 debugging
-            // if enc_call == 0 && layer_idx == 0 {
-            //     x.eval()?;
-            //     let seq = x.dim(1);
-            //     if seq > 4 {
-            //         let x_frame4 = x.index((0, 4, ..));
-            //         x_frame4.eval()?;
-            //         let x4_slice: Vec<f32> = x_frame4.as_slice::<f32>()[..10].to_vec();
-            //         let x4_norm = {
-            //             let sq = mlx_rs::ops::square(&x_frame4)?;
-            //             let sum = mlx_rs::ops::sum(&sq, None)?;
-            //             sum.eval()?;
-            //             sum.as_slice::<f32>()[0].sqrt()
-            //         };
-            //         tracing::info!(layer_idx, x4_norm, ?x4_slice, "chunk0 layer0 OUTPUT [0,4]");
-            //     }
-            // }
-
             // Update cache: the attention layer returns new_cache from sliding window
             // We need to store it properly in the full cache buffer
             //
@@ -1177,7 +1109,7 @@ impl ConformerEncoder {
                     let batch = nc.dim(0) as i32;
                     let d_model = nc.dim(2) as i32;
                     let zeros = mlx_rs::ops::zeros::<f32>(&[batch, pad_size, d_model])?;
-                    mlx_rs::ops::concatenate_axis(&[&zeros, &nc], 1)?
+                    mlx_rs::ops::concatenate(&[&zeros, &nc], 1)?
                 } else if nc_len > cache_size {
                     // Truncate from the left (keep newest)
                     let start = nc_len - cache_size;
@@ -1199,14 +1131,14 @@ impl ConformerEncoder {
         // Stack caches: [num_layers, batch, ...]
         let cache_channel_next = if !cache_channel_next.is_empty() {
             let refs: Vec<&Array> = cache_channel_next.iter().collect();
-            mlx_rs::ops::stack_axis(&refs, 0)?
+            mlx_rs::ops::stack(&refs, 0)?
         } else {
             cache_last_channel.clone()
         };
 
         let cache_time_next = if !cache_time_next.is_empty() {
             let refs: Vec<&Array> = cache_time_next.iter().collect();
-            mlx_rs::ops::stack_axis(&refs, 0)?
+            mlx_rs::ops::stack(&refs, 0)?
         } else {
             cache_last_time.clone()
         };
@@ -1335,10 +1267,6 @@ impl Subsampling {
         // Kernel size is 3x3 and stride is 2 for FastConformer
         let kernel_size: usize = 3;
         let stride: usize = 2;
-
-        // For causal: no padding in conv (we'll pad manually with asymmetric padding)
-        // For non-causal: symmetric padding
-        let padding = if is_causal { 0 } else { 1 }; // (kernel_size - 1) / 2
 
         // First conv: 1 input channel (mono spectrogram) -> conv_channels
         // For causal: padding=0 (manual causal padding applied before each conv)
@@ -1495,74 +1423,13 @@ impl Subsampling {
         }
     }
 
-    /// Create a time mask for the given tensor and lengths.
-    /// Returns a mask tensor where positions < lengths are 1.0, positions >= lengths are 0.0.
-    /// Shape: [B, T, F, C] matching the input tensor.
-    fn create_time_mask(tensor: &Array, lengths: &Array) -> Result<Array> {
-        // tensor: [B, T, F, C]
-        let batch_size = tensor.dim(0) as i32;
-        let time_dim = tensor.dim(1) as i32;
-        let freq_dim = tensor.dim(2) as i32;
-        let channels = tensor.dim(3) as i32;
-        
-        tracing::debug!(
-            batch_size,
-            time_dim,
-            freq_dim,
-            channels,
-            "create_time_mask"
-        );
-
-        // Create time indices: [1, T]
-        let time_indices_data: Vec<i32> = (0..time_dim).collect();
-        let time_indices = Array::from_slice(&time_indices_data, &[1, time_dim]);
-
-        // Expand lengths to [B, 1] for broadcasting
-        let lengths_expanded = lengths.reshape(&[batch_size, 1])?;
-
-        // Create mask: time_indices < lengths -> [B, T]
-        let time_mask = mlx_rs::ops::lt(&time_indices, &lengths_expanded)?;
-
-        // Expand to [B, T, 1, 1] and broadcast to [B, T, F, C]
-        let time_mask = time_mask.reshape(&[batch_size, time_dim, 1, 1])?;
-        let time_mask = mlx_rs::ops::broadcast_to(&time_mask, &[batch_size, time_dim, freq_dim, channels])?;
-
-        // Convert to float (1.0 for valid, 0.0 for padding)
-        let time_mask = time_mask.as_dtype(mlx_rs::Dtype::Float32)?;
-
-        Ok(time_mask)
-    }
-
-    /// Calculate conv output size (matching NeMo's calculate_conv_output_size)
+    /// Calculate the output length of one causal subsampling conv.
+    ///
+    /// Computes `floor((input + 2 - kernel + 1) / stride)` elementwise.
     fn calc_conv_output_size(input_size: &Array, kernel_size: i32, stride: i32) -> Result<Array> {
-        // output = (input + left_pad + right_pad - kernel) / stride + 1
-        let total_pad = Array::from_int(2); // JJK Array::from_int(left_pad + right_pad);
-        let kernel_arr = Array::from_int(kernel_size);
-        let stride_arr = Array::from_int(stride);
-        // JJK
-        let one = Array::from_int(1);
-
-        let padded = input_size + &total_pad;
-        let after_kernel = &padded - &kernel_arr + &one;
-        let divided = mlx_rs::ops::floor_divide(&after_kernel, &stride_arr)?;
-        // let result = &divided;
-
-        // Debug logging for all local variables
-        tracing::trace!(
-            input_size = ?input_size.item::<i32>(),
-            kernel_size = kernel_size,
-            stride = stride,
-            // left_pad = left_pad,
-            // right_pad = right_pad,
-            total_pad = ?total_pad.item::<i32>(),
-            padded = ?padded.item::<i32>(),
-            after_kernel = ?after_kernel.item::<i32>(),
-            divided = ?divided.item::<i32>(),
-            // result = ?result.item::<i32>(),
-            "calc_conv_output_size"
-        );
-
-        // Ok(result)
+        let after_kernel = input_size + Array::from_int(2 - kernel_size + 1);
+        let divided = mlx_rs::ops::floor_divide(&after_kernel, &Array::from_int(stride))?;
+        tracing::trace!(kernel_size, stride, ?divided, "calc_conv_output_size");
         Ok(divided)
     }
 
@@ -1599,14 +1466,6 @@ impl Subsampling {
             tracing::info!("DEBUG subsampling: after reshape to [B,T,F,1]: {:?}", x.shape());
         }
 
-        // // Apply mask before first conv (NeMo's MaskedConvSequential behavior)
-        // if self.is_causal {
-        //     let mask = Self::create_time_mask(&x, &current_lengths.as_dtype(mlx_rs::Dtype::Int32)?)?;
-        //     x = mlx_rs::ops::multiply(&x, &mask)?;
-        //     if debug_enabled {
-        //         tracing::info!("DEBUG subsampling: applied mask before first conv, lengths={:?}", current_lengths.as_slice::<f32>());
-        //     }
-        // }
 
         // Apply causal padding if needed before first conv
         if self.is_causal {
@@ -1632,9 +1491,6 @@ impl Subsampling {
 
         // Update lengths after stride operation (CausalConv2D: left_pad=k-1, right_pad=s-1)
         if self.is_causal {
-            // let left_pad = 1; // (self.kernel_size - 1) as i32;
-            // let right_pad = 1; // JJK (self.stride - 1) as i32;
-            // let right_pad = (self.stride - 1) as i32;
             current_lengths = Self::calc_conv_output_size(
                 &current_lengths.as_dtype(mlx_rs::Dtype::Int32)?,
                 self.kernel_size as i32,
@@ -1657,14 +1513,6 @@ impl Subsampling {
             .zip(self.pointwise_convs.iter_mut())
             .enumerate()
         {
-            // // Apply mask before depthwise conv (NeMo's MaskedConvSequential behavior)
-            // if is_causal {
-            //     let mask = Self::create_time_mask(&x, &current_lengths.as_dtype(mlx_rs::Dtype::Int32)?)?;
-            //     x = mlx_rs::ops::multiply(&x, &mask)?;
-            //     if debug_enabled {
-            //         tracing::info!("DEBUG subsampling: applied mask before dw_conv_{}, lengths={:?}", i, current_lengths.as_slice::<f32>());
-            //     }
-            // }
 
             // Apply causal padding before each depthwise conv
             if is_causal {
@@ -1688,14 +1536,10 @@ impl Subsampling {
 
             // Update lengths after stride operation
             if is_causal {
-                // let left_pad = 1; // JJK (kernel_size - 1) as i32;
-                // let right_pad = 1; // JJK (stride - 1) as i32;
                 current_lengths = Self::calc_conv_output_size(
                     &current_lengths.as_dtype(mlx_rs::Dtype::Int32)?,
                     kernel_size as i32,
                     stride as i32,
-                    // left_pad,
-                    // right_pad,
                 )?.as_dtype(mlx_rs::Dtype::Float32)?;
                 if debug_enabled {
                     tracing::info!("DEBUG subsampling: updated lengths after dw_conv_{}: {:?}", i, current_lengths.to_vec_row_major::<f32>()?);
@@ -1703,14 +1547,6 @@ impl Subsampling {
             }
         }
 
-        // // Apply final masking (NeMo's MaskedConvSequential applies mask at end too)
-        // if is_causal {
-        //     let mask = Self::create_time_mask(&x, &current_lengths.as_dtype(mlx_rs::Dtype::Int32)?)?;
-        //     x = mlx_rs::ops::multiply(&x, &mask)?;
-        //     if debug_enabled {
-        //         tracing::info!("DEBUG subsampling: applied final mask, lengths={:?}", current_lengths.as_slice::<f32>());
-        //     }
-        // }
 
         // x is now [B, T', F', C] where T' = T/subsampling_factor, F' = F/subsampling_factor
         // In MLX (N, H, W, C), H=T', W=F', C=conv_channels
@@ -2390,7 +2226,7 @@ impl ConvolutionModule {
 
             // Create zero padding: [B, pad_size, D]
             let zeros = mlx_rs::ops::zeros::<f32>(&[batch as i32, pad_size as i32, d as i32])?;
-            mlx_rs::ops::concatenate_axis(&[&zeros, &x], 1)?
+            mlx_rs::ops::concatenate(&[&zeros, &x], 1)?
         } else {
             x
         };
@@ -2487,7 +2323,7 @@ impl ConvolutionModule {
             // Expand mask to [batch, seq_len, 1] for broadcasting
             let mask_expanded = mask.reshape(&[mask.dim(0) as i32, mask.dim(1) as i32, 1])?;
             // Where mask is True (padding), set to 0.0
-            x = mlx_rs::ops::r#where(&mask_expanded, &Array::from_f32(0.0), &x)?;
+            x = mlx_rs::ops::select(&mask_expanded, &Array::from_f32(0.0), &x)?;
         }
 
         // For streaming: use cache instead of padding
@@ -2498,7 +2334,7 @@ impl ConvolutionModule {
             let x_transposed = mlx_rs::ops::transpose_axes(&x, &[0, 2, 1])?;
 
             // Concatenate: [batch, d_model, cache_len + seq_len]
-            let x_with_cache = mlx_rs::ops::concatenate_axis(&[cache_tensor, &x_transposed], 2)?;
+            let x_with_cache = mlx_rs::ops::concatenate(&[cache_tensor, &x_transposed], 2)?;
 
             // Update cache: keep the last (kernel_size - 1) frames
             let cache_size = self.kernel_size - 1;
@@ -2516,7 +2352,7 @@ impl ConvolutionModule {
             let batch = x.dim(0);
             let d = x.dim(2);
             let zeros = mlx_rs::ops::zeros::<f32>(&[batch as i32, pad_size as i32, d as i32])?;
-            let x_padded = mlx_rs::ops::concatenate_axis(&[&zeros, &x], 1)?;
+            let x_padded = mlx_rs::ops::concatenate(&[&zeros, &x], 1)?;
             (x_padded, None)
         } else {
             (x, None)

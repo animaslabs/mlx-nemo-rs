@@ -224,7 +224,7 @@ impl SortformerEncLabelModel {
         let preds = if valid_len < total_len {
             let positions = ops::arange::<_, i32>(0, total_len, 1)?.reshape(&[1, total_len, 1])?;
             let valid = ops::lt(&positions, Array::from_int(valid_len))?;
-            ops::r#where(&valid, &preds, Array::from_f32(0.0))?
+            ops::select(&valid, &preds, Array::from_f32(0.0))?
         } else {
             preds
         };
@@ -277,7 +277,7 @@ impl SortformerEncLabelModel {
             stt = end;
         }
 
-        let preds = ops::concatenate_axis(&chunk_preds.iter().collect::<Vec<_>>(), 1)?;
+        let preds = ops::concatenate(&chunk_preds.iter().collect::<Vec<_>>(), 1)?;
         let output_frames = feat_len.div_ceil(sub) as i32;
         Ok(preds.index((.., ..output_frames.min(preds.dim(1)), ..)))
     }

@@ -1090,7 +1090,7 @@ impl CacheAwareRNNTPipeline {
             let real_frames = self
                 .streaming_mel
                 .get_frames_padded(0, chunk_size + LOOKAHEAD_FRAMES, LOG_MEL_ZERO)?;
-            mlx_rs::ops::concatenate_axis(&[&silence, &real_frames], 1)?
+            mlx_rs::ops::concatenate(&[&silence, &real_frames], 1)?
         } else if self.is_first_chunk {
             // First chunk, no pre_encode_cache
             self.streaming_mel
@@ -1119,8 +1119,6 @@ impl CacheAwareRNNTPipeline {
             // Subsequent: we had pre_encode_cache + chunk_size frames, advance by shift_size
             shift_size
         };
-        // JJK
-        // let trim_amount = shift_size - pre_encode_cache;
         self.streaming_mel.trim(trim_amount);
 
         let is_first = self.is_first_chunk;
@@ -1322,8 +1320,6 @@ impl CacheAwareRNNTPipeline {
         // Python uses mel_len (valid_size) for the lengths parameter, not tensor dimension.
         // The tensor has chunk_len frames, but only valid_len are considered valid.
         // The encoder uses lengths for attention masking.
-        // JJK try chunk_len
-        // let lengths = Array::from_slice(&[chunk_len as i32], &[1]);
         let lengths = Array::from_slice(&[valid_len as i32], &[1]);
 
         // Calculate audio time position based on mel frames processed
@@ -1349,32 +1345,6 @@ impl CacheAwareRNNTPipeline {
             audio_time_end = %format!("{:.3}s", audio_time_end),
             "PIPELINE: received feature buffer"
         );
-
-        // // Log encoder cache state BEFORE processing
-        // {
-        //     self.encoder_cache.last_channel_len.eval().ok();
-        //     let cache_len_before = self.encoder_cache.last_channel_len.as_slice::<i64>()[0];
-
-        //     // Compute cache channel norm (sample first layer)
-        //     let cache_channel_norm: f32 = {
-        //         self.encoder_cache.last_channel.eval().ok();
-        //         let data = self.encoder_cache.last_channel.as_slice::<f32>();
-        //         if !data.is_empty() {
-        //             // Just sample first 100 values for efficiency
-        //             let sample_len = data.len().min(100);
-        //             data[..sample_len].iter().map(|v| v * v).sum::<f32>().sqrt()
-        //         } else {
-        //             0.0
-        //         }
-        //     };
-
-        //     tracing::debug!(
-        //         step = self.state.step_count,
-        //         cache_len_before,
-        //         cache_channel_norm = %format!("{:.6}", cache_channel_norm),
-        //         "ENCODER CACHE: state before forward"
-        //     );
-        // }
 
         // Save the encoder cache before processing the last chunk.
         // flush_decode_with_silence needs the speech-context cache (not the
@@ -1482,17 +1452,6 @@ impl CacheAwareRNNTPipeline {
             "processing feature buffer"
         );
 
-        // // Log decoder state before decoding
-        // {
-        //     let decoder_state_norm = self.state.decoder_state.compute_norm();
-        //     tracing::debug!(
-        //         step = self.state.step_count,
-        //         decoder_state_norm = %format!("{:.6}", decoder_state_norm),
-        //         last_token = ?self.state.last_token,
-        //         "DECODER STATE: before decoding"
-        //     );
-        // }
-
         // Decode with optional punctuation masking
         let masked_ids = if self.suppress_punctuation {
             Some(self.punctuation_token_ids.as_slice())
@@ -1508,18 +1467,6 @@ impl CacheAwareRNNTPipeline {
             &mut self.state.last_token,
             masked_ids,
         )?;
-
-        // // Log decoder state after decoding
-        // {
-        //     let decoder_state_norm = self.state.decoder_state.compute_norm();
-        //     tracing::debug!(
-        //         step = self.state.step_count,
-        //         decoder_state_norm = %format!("{:.6}", decoder_state_norm),
-        //         last_token = ?self.state.last_token,
-        //         new_tokens = decode_output.new_tokens.len(),
-        //         "DECODER STATE: after decoding"
-        //     );
-        // }
 
         // Update cumulative statistics
         self.state.cumulative_stats.total_audio_samples += audio_samples_this_chunk;

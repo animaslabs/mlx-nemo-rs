@@ -295,20 +295,6 @@ fn main() -> mlx_voice::Result<()> {
     let mut transcribe_steps = 0;
 
     for (chunk_idx, chunk) in samples.chunks(chunk_samples).enumerate() {
-        // Log chunk info with first few samples
-        let preview: Vec<String> = chunk.iter().take(5).map(|s| format!("{:.6}", s)).collect();
-        let max_abs = chunk.iter().map(|s| s.abs()).fold(0.0f32, f32::max);
-        let time_offset = (chunk_idx * chunk_samples) as f32 / sample_rate as f32;
-        // eprintln!(
-        //     "CHUNK {} @ {:.2}s len={} max_abs={:.6} samples=[{}{}]",
-        //     chunk_idx,
-        //     time_offset,
-        //     chunk.len(),
-        //     max_abs,
-        //     preview.join(", "),
-        //     if chunk.len() > 5 { ", ..." } else { "" }
-        // );
-
         // Feed audio chunk to pipeline
         pipeline.add_audio(chunk);
         chunks_fed += 1;

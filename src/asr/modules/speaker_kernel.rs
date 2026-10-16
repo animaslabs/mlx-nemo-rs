@@ -141,7 +141,7 @@ fn align_mask(mask: &Array, time: i32, pad_value: f32) -> Result<Array> {
     let mask_time = mask.dim(1);
     let mask = if mask_time < time {
         let pad = ops::full::<f32>(&[mask.dim(0), time - mask_time], Array::from_f32(pad_value))?;
-        ops::concatenate_axis(&[&pad, mask], 1)?
+        ops::concatenate(&[&pad, mask], 1)?
     } else if mask_time > time {
         mask.index((.., mask_time - time..))
     } else {

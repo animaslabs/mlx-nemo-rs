@@ -8,7 +8,6 @@ use std::f32::consts::PI;
 use mlx_rs::ops::indexing::IndexOp;
 use mlx_rs::{ops, Array};
 
-use crate::core::ArrayExt;
 use crate::core::error::{Error, Result};
 
 // ============================================================================
@@ -268,7 +267,7 @@ pub fn preemphasis(audio: &Array, coef: f32) -> Result<Array> {
 
         // Shift audio by 1: [zeros, x[:, :-1]]
         let zeros = Array::zeros::<f32>(&[batch_size, 1])?;
-        let shifted = ops::concatenate_axis(&[&zeros, &audio.index((.., ..(audio_len - 1)))], 1)?;
+        let shifted = ops::concatenate(&[&zeros, &audio.index((.., ..(audio_len - 1)))], 1)?;
 
         // y = x - coef * shifted
         let coef_arr = Array::from_f32(coef);
@@ -443,6 +442,7 @@ pub fn overlap_size(window_len: usize, hop_len: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::ArrayExt;
 
     fn approx_eq(a: f32, b: f32, tol: f32) -> bool {
         (a - b).abs() <= tol

@@ -36,7 +36,7 @@ fn main() -> mlx_voice::Result<()> {
     println!("  preemph: {:?}", config.preemph);
     println!("  dither: {}", config.dither);
 
-    let mut mel_proc = MelSpectrogram::new(config)?;
+    let mel_proc = MelSpectrogram::new(config)?;
 
     // Process first chunk (same as Python streaming: 19360 samples for 121 mel frames)
     let chunk_samples = 19360;

@@ -94,7 +94,7 @@ impl MultiHeadAttention {
             // mask shape: [B, 1, seq_q, seq_k] or [1, 1, seq_q, seq_k]
             // True = attend, False = mask out
             let neg_inf = Array::from_f32(f32::NEG_INFINITY);
-            scores = ops::r#where(mask, &scores, &neg_inf)?;
+            scores = ops::select(mask, &scores, &neg_inf)?;
         }
 
         // Softmax

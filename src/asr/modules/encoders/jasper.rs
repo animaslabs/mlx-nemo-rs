@@ -94,7 +94,7 @@ impl SubBlock {
 
             // NeMo uses eps=1e-3 for Jasper BatchNorm
             let bn = nn::BatchNormBuilder::new(out_channels as i32)
-                .eps(1e-3)
+                .eps(1e-3_f32)
                 .build()?;
 
             Ok(Self {
@@ -117,7 +117,7 @@ impl SubBlock {
 
             // NeMo uses eps=1e-3 for Jasper BatchNorm
             let bn = nn::BatchNormBuilder::new(out_channels as i32)
-                .eps(1e-3)
+                .eps(1e-3_f32)
                 .build()?;
 
             Ok(Self {
@@ -153,7 +153,7 @@ impl ResidualBranch {
                 .build()?;
         // NeMo uses eps=1e-3 for Jasper BatchNorm
         let bn = nn::BatchNormBuilder::new(out_channels as i32)
-            .eps(1e-3)
+            .eps(1e-3_f32)
             .build()?;
         Ok(Self { conv, bn })
     }

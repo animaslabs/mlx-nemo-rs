@@ -35,7 +35,10 @@ pub use core::error::{Error, Result};
 pub use core::weights::WeightFormat;
 pub use core::checkpoint::SafetensorsLoader;
 pub use mlx_rs::Array;
-pub use mlx_rs::fft;
+/// Re-export of [`mod@mlx_rs::fft`] (module only; the `fft!` macro is deprecated).
+pub mod fft {
+    pub use mlx_rs::fft::*;
+}
 pub use mlx_rs::ops;
 
 /// Prelude module for convenient imports

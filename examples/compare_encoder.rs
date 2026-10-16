@@ -6,7 +6,6 @@
 //! Run with: cargo run --example compare_encoder
 
 use mlx_voice::asr::CacheAwareRNNTPipeline;
-use mlx_rs::Array;
 
 fn main() -> mlx_voice::Result<()> {
     let model_path = "models/nvidia/nemotron-speech-streaming-en-0.6b/nemotron-speech-streaming-en-0.6b.nemo";

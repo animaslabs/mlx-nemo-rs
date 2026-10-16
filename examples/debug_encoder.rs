@@ -4,7 +4,6 @@
 //!   cargo run --release --example debug_encoder -- --model path/to/model.nemo audio.wav
 
 use mlx_voice::asr::modules::{ConformerEncoder, MelSpectrogram, MelSpectrogramConfig};
-use mlx_voice::asr::modules::encoders::DebugEncoderOutput;
 use mlx_voice::asr::config::AsrModelConfig;
 use mlx_voice::core::checkpoint::NemoCheckpoint;
 use mlx_rs::Array;
@@ -44,7 +43,7 @@ fn main() -> mlx_voice::Result<()> {
     // Create preprocessor
     let mut preproc_config: MelSpectrogramConfig = config.preprocessor.clone().into();
     preproc_config.dither = 0.0;
-    let mut mel_proc = MelSpectrogram::new(preproc_config.clone())?;
+    let mel_proc = MelSpectrogram::new(preproc_config.clone())?;
 
     // Create encoder
     let mut encoder = ConformerEncoder::new(config.encoder.clone())?;

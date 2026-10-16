@@ -43,7 +43,6 @@
 use mlx_rs::Array;
 
 use crate::asr::config::EncoderConfig;
-use crate::core::ArrayExt;
 use crate::core::error::{Error, Result};
 
 /// Streaming configuration computed from model config.
@@ -374,7 +373,7 @@ impl StreamingMelBuffer {
 
         // Concatenate with existing buffer
         self.mel_buffer = match &self.mel_buffer {
-            Some(existing) => Some(mlx_rs::ops::concatenate_axis(&[existing, mel], 1)?),
+            Some(existing) => Some(mlx_rs::ops::concatenate(&[existing, mel], 1)?),
             None => Some(mel.clone()),
         };
 
@@ -458,10 +457,6 @@ impl StreamingMelBuffer {
         let frames_required = chunk_size;
 
         if frames_available < frames_required {
-            // // Not enough frames for a full chunk
-            // if self.buffer_idx >= self.total_frames {
-            //     return None;
-            // }
             tracing::warn!("PARTIAL CHUNK!!");
             // Handle partial final chunk
             let remaining = frames_available;
@@ -646,7 +641,6 @@ pub fn compute_streaming_config(
 
     // Compute sampling frames from subsampling
     // NeMo's ConvSubsampling.get_sampling_frames() returns [1, subsampling_factor]
-    // JJK what to do with chunk 0?
     let sampling_frames = (subsampling_factor, subsampling_factor);
 
     // Chunk size in pre-subsampled frames
@@ -656,20 +650,12 @@ pub fn compute_streaming_config(
         sampling_frames.1 + subsampling_factor * lookahead_steps,
         sampling_frames.1 + subsampling_factor * lookahead_steps,
     );
-    // JJK: for chunk aware streaming, make chunk size = shift size
-    // let chunk_size = (
-    //     subsampling_factor * (lookahead_steps + 1),
-    //     subsampling_factor * (lookahead_steps + 1),
-    // );
-
 
     // Shift size - how many pre-subsampled frames to advance each step
     let shift_size = (
         sampling_frames.1 + subsampling_factor * lookahead_steps.saturating_sub(cache_drop_size),
         sampling_frames.1 + subsampling_factor * lookahead_steps.saturating_sub(cache_drop_size),
     );
-    // JJK hardcode them to equal for chunk aware streaming
-    // let shift_size = chunk_size;
 
     // Valid output length - how many OUTPUT frames are valid per chunk
     let valid_out_len = if sampling_frames.1 > 0 {
@@ -682,23 +668,12 @@ pub fn compute_streaming_config(
     // NeMo's dw_striding subsampling.get_streaming_cache_size() returns [0, subsampling_factor + 1]
     // For 8x subsampling: [0, 9]
     // For 4x subsampling: [0, 5]
-    // let pre_encode_cache = (subsampling_factor + 1, subsampling_factor + 1);
-    // let pre_encode_cache = (subsampling_factor + 1, subsampling_factor + 1);
     let pre_encode_cache = (subsampling_factor + 1, subsampling_factor + 1);
 
     // Drop extra pre-encoded frames after subsampling
     // NeMo: drop_extra_pre_encoded = 1 + (pre_encode_cache_size[1] - 1) // subsampling_factor
     // For 9 frames with 8x subsampling: 1 + (9-1)//8 = 1 + 1 = 2
-    // let drop_extra = 1;
     let drop_extra = 2;
-    // if pre_encode_cache.1 >= 1 {
-    //     // 1 + (pre_encode_cache.1 - 1) / subsampling_factor
-    //     // JJK test - just drop one
-    //     // (pre_encode_cache.1 + 1) / subsampling_factor
-    //     1
-    // } else {
-    //     0
-    // };
 
     tracing::debug!(
         "Streaming config: mode={}, style={}, lookahead_steps={}, cache_drop={}, \
@@ -760,6 +735,7 @@ pub fn get_streaming_modes(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::ArrayExt;
 
     #[test]
     fn test_encoder_cache_creation() {

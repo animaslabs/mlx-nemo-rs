@@ -31,7 +31,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use mlx_rs::ops::indexing::{argmax_axis, IndexOp};
+use mlx_rs::ops::indexing::argmax_axis;
 use mlx_rs::Array;
 use sentencepiece::SentencePieceProcessor;
 
@@ -1088,15 +1088,8 @@ impl EncDecRNNTModel {
             let pre_encode_cache = session
                 .config
                 .pre_encode_cache_for_step(session.is_first_chunk);
-            // NeMo applies drop_extra_pre_encoded on subsequent chunks only (not the first).
-            // The Python streaming script passes drop_extra_pre_encoded=0 for step_num=0.
-            // This is because the first chunk doesn't have pre_encode_cache overlap.
-            // let drop_extra = if session.is_first_chunk {
-            //     0 // Don't drop on first chunk
-            // } else {
-            //     session.config.drop_extra_pre_encoded
-            // };
-            // JJK test
+            // NeMo drops drop_extra_pre_encoded frames on subsequent chunks only;
+            // this path always drops a single frame instead.
             let drop_extra = 1;
 
             // Check if we have enough mel frames
@@ -1369,8 +1362,6 @@ impl EncDecRNNTModel {
 
         // High-level debug: show progress summary
         {
-            let total_audio_sec = session.mel_buffer.total_audio_samples as f32
-                / session.mel_buffer.sample_rate as f32;
             let total_mel_frames = session.mel_buffer.total_frames;
             let mel_idx = session.mel_buffer.buffer_idx;
             let tokens = session

@@ -12,7 +12,6 @@ use std::collections::HashMap;
 use mlx_rs::ops::{self, indexing};
 use mlx_rs::Array;
 
-use crate::core::ArrayExt;
 use crate::core::error::Result;
 
 /// Quantization configuration from model config.json.
@@ -394,6 +393,7 @@ pub fn load_embedding_layer(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::ArrayExt;
 
     #[test]
     fn test_standard_linear_forward() {

@@ -8,7 +8,6 @@ use std::collections::HashMap;
 use mlx_rs::ops::indexing::IndexOp;
 use mlx_rs::{ops, Array};
 
-use crate::core::ArrayExt;
 use crate::core::error::{Error, Result};
 use crate::core::quantization::{LinearLayer, QuantizationConfig, load_linear_layer};
 
@@ -86,7 +85,7 @@ impl RelPositionalEncoding {
         // NeMo interleaving: pe[:, 0::2] = sin, pe[:, 1::2] = cos
         // Stack along last axis then reshape to interleave: [sin0, cos0, sin1, cos1, ...]
         // This gives the same result as NeMo's indexing pattern.
-        let pe_stacked = ops::stack_axis(&[pe_sin, pe_cos], -1)?;
+        let pe_stacked = ops::stack(&[pe_sin, pe_cos], -1)?;
         let pe = pe_stacked.reshape(&[pe_len as i32, d_model as i32])?;
 
         // Add batch dimension: [1, pe_len, d_model]
@@ -437,7 +436,7 @@ impl RelPositionMultiHeadAttention {
 
             // NeMo's update_cache: key = value = concat(cache, input)
             // Use FULL cache buffer, not just filled portion
-            let kv_input = ops::concatenate_axis(&[cache_tensor, x], 1)?;
+            let kv_input = ops::concatenate(&[cache_tensor, x], 1)?;
             let total = cache_size + seq_len;
 
             tracing::trace!(
@@ -452,9 +451,6 @@ impl RelPositionMultiHeadAttention {
             // q_keep_size = seq_len - cache_drop_size (frames to keep from input)
             // The cache stores values at the END of the buffer
             // new_cache = concat(old_cache[q_keep_size:], x[:q_keep_size])
-            // let q_keep_size = (seq_len - self.cache_drop_size as i32).max(0);
-            // let q_keep_size = (seq_len - self.cache_drop_size as i32).max(0);
-            // JJK test
             let q_keep_size = (seq_len - self.cache_drop_size as i32).max(0);
 
             // For the new cache, we slide the window:
@@ -463,7 +459,7 @@ impl RelPositionMultiHeadAttention {
             let new_cache = if q_keep_size > 0 {
                 let cache_keep = cache_tensor.index((.., q_keep_size.., ..));
                 let x_keep = x.index((.., ..q_keep_size, ..));
-                let nc = ops::concatenate_axis(&[&cache_keep, &x_keep], 1)?;
+                let nc = ops::concatenate(&[&cache_keep, &x_keep], 1)?;
                 tracing::trace!(
                     q_keep_size,
                     cache_keep_shape = ?cache_keep.shape(),
@@ -607,7 +603,7 @@ impl RelPositionMultiHeadAttention {
             // NeMo convention: mask=True means VALID (can attend), False means MASKED
             // where(mask, scores, -inf) keeps scores where mask=True, sets -inf where mask=False
             let neg_inf = Array::from_f32(f32::NEG_INFINITY);
-            scores = ops::r#where(&mask, &scores, &neg_inf)?;
+            scores = ops::select(&mask, &scores, &neg_inf)?;
             Some(mask)
         } else {
             None
@@ -621,7 +617,7 @@ impl RelPositionMultiHeadAttention {
         // and ensures masked positions don't contribute to the output
         if let Some(mask) = mask_expanded {
             let zero = Array::from_f32(0.0);
-            attn_weights = ops::r#where(&mask, &attn_weights, &zero)?;
+            attn_weights = ops::select(&mask, &attn_weights, &zero)?;
         }
 
         tracing::trace!(
@@ -679,7 +675,7 @@ impl RelPositionMultiHeadAttention {
         // Step 1: Pad with zeros on the left of last dimension
         // [batch, n_heads, seq_len, pos_len] -> [batch, n_heads, seq_len, pos_len+1]
         let zeros = ops::zeros::<f32>(&[batch, n_heads, seq_len, 1])?;
-        let x_padded = ops::concatenate_axis(&[&zeros, x], -1)?;
+        let x_padded = ops::concatenate(&[&zeros, x], -1)?;
 
         // Step 2: Reshape to [batch, n_heads, pos_len+1, seq_len]
         // This is a transposition-via-reshape that shifts positions
@@ -740,6 +736,7 @@ impl RelPositionMultiHeadAttention {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::ArrayExt;
 
     #[test]
     fn test_rel_positional_encoding_creation() {

@@ -44,7 +44,7 @@ fn main() -> mlx_voice::Result<()> {
     // Create preprocessor
     let mut preproc_config: MelSpectrogramConfig = config.preprocessor.clone().into();
     preproc_config.dither = 0.0;  // Disable dither for inference
-    let mut mel_proc = MelSpectrogram::new(preproc_config.clone())?;
+    let mel_proc = MelSpectrogram::new(preproc_config.clone())?;
 
     // Create encoder (has subsampling layer)
     let mut encoder = ConformerEncoder::new(config.encoder.clone())?;

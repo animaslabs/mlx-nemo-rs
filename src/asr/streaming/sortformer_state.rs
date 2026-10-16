@@ -70,7 +70,7 @@ impl StreamingSortformerState {
 
     /// Concatenate `[spkcache, fifo, chunk]` along time.
     pub fn concat_with_chunk(&self, chunk: &Array) -> Result<Array> {
-        ops::concatenate_axis(&[&self.spkcache, &self.fifo, chunk], 1).map_err(Into::into)
+        ops::concatenate(&[&self.spkcache, &self.fifo, chunk], 1).map_err(Into::into)
     }
 
     /// Update the state with a new chunk and return the chunk's predictions.
@@ -97,8 +97,8 @@ impl StreamingSortformerState {
         let chunk_preds = preds.index((.., sc + fl + l..sc + fl + l + cl, ..));
 
         // Append chunk to FIFO
-        self.fifo = ops::concatenate_axis(&[&self.fifo, &chunk], 1)?;
-        self.fifo_preds = ops::concatenate_axis(&[&self.fifo_preds, &chunk_preds], 1)?;
+        self.fifo = ops::concatenate(&[&self.fifo, &chunk], 1)?;
+        self.fifo_preds = ops::concatenate(&[&self.fifo_preds, &chunk_preds], 1)?;
 
         if fifo_len + chunk_len > self.params.fifo_len {
             // Pop the oldest frames out of the FIFO into the speaker cache
@@ -115,13 +115,13 @@ impl StreamingSortformerState {
             self.fifo = self.fifo.index((.., pop_out_len.., ..));
             self.fifo_preds = self.fifo_preds.index((.., pop_out_len.., ..));
 
-            self.spkcache = ops::concatenate_axis(&[&self.spkcache, &pop_out_embs], 1)?;
+            self.spkcache = ops::concatenate(&[&self.spkcache, &pop_out_embs], 1)?;
             let spkcache_preds = match (&self.spkcache_preds, self.spkcache_compressed) {
-                (Some(cached), true) => ops::concatenate_axis(&[cached, &pop_out_preds], 1)?,
+                (Some(cached), true) => ops::concatenate(&[cached, &pop_out_preds], 1)?,
                 // Before the first compression, use fresh predictions for every cache frame
                 _ => {
                     let fresh = preds.index((.., ..sc, ..));
-                    ops::concatenate_axis(&[&fresh, &pop_out_preds], 1)?
+                    ops::concatenate(&[&fresh, &pop_out_preds], 1)?
                 }
             };
             self.spkcache_preds = Some(spkcache_preds);

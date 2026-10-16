@@ -49,7 +49,7 @@
 use std::sync::Arc;
 
 use mlx_rs::ops::indexing::IndexOp;
-use mlx_rs::{fft, ops, Array};
+use mlx_rs::{ops, Array};
 
 use crate::asr::config::PreprocessorConfig;
 use crate::asr::dsp;
@@ -369,7 +369,7 @@ impl MelProcessor {
         let windowed = ops::multiply(&frames, &self.window)?;
 
         // Compute FFT along last axis
-        let fft_result = fft::rfft(&windowed, Some(n_fft as i32), Some(2))?;
+        let fft_result = mlx_rs::fft::rfft(&windowed, Some(n_fft as i32), Some(2))?;
 
         // Transpose to [batch, freq_bins, frames]
         ops::transpose_axes(&fft_result, &[0, 2, 1]).map_err(|e| Error::model(e.to_string()))
@@ -719,7 +719,7 @@ impl MelProcessor {
         let windowed = ops::multiply(&frames, &self.window)?;
 
         // Compute FFT along last axis
-        let fft_result = fft::rfft(&windowed, Some(n_fft as i32), Some(1))?;
+        let fft_result = mlx_rs::fft::rfft(&windowed, Some(n_fft as i32), Some(1))?;
 
         // Compute power spectrum
         let power = self.power_spectrum(&fft_result)?;

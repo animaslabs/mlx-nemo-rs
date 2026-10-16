@@ -159,7 +159,7 @@ impl StatelessTransducerDecoder {
             if add_sos {
                 // Prepend SOS (zero vector)
                 let sos = Array::zeros::<f32>(&[batch as i32, 1, self.pred_hidden as i32])?;
-                let output = ops::concatenate_axis(&[&sos, &zeros], 1)?;
+                let output = ops::concatenate(&[&sos, &zeros], 1)?;
                 trace!(output_shape = ?output.shape(), "Output with SOS prepended");
                 Ok((output, new_state))
             } else {
@@ -193,7 +193,7 @@ impl StatelessTransducerDecoder {
 
         // Build context by concatenating state and input
         // context: [batch, context_size - 1 + seq_len]
-        let context = ops::concatenate_axis(&[&prev_state, &y.as_type::<i32>()?], 1)?;
+        let context = ops::concatenate(&[&prev_state, &y.as_type::<i32>()?], 1)?;
 
         // For each output position, we need embeddings of context_size tokens
         let mut outputs = Vec::with_capacity(seq_len);
@@ -214,7 +214,7 @@ impl StatelessTransducerDecoder {
         }
 
         // Stack outputs: [batch, seq_len, pred_hidden]
-        let output = ops::stack_axis(&outputs.iter().collect::<Vec<_>>(), 1)?;
+        let output = ops::stack(&outputs.iter().collect::<Vec<_>>(), 1)?;
 
         // Update state: last context_size - 1 tokens from context
         let state_start = seq_len;
@@ -224,7 +224,7 @@ impl StatelessTransducerDecoder {
         if add_sos {
             // Prepend SOS (zero vector)
             let sos = Array::zeros::<f32>(&[batch as i32, 1, self.pred_hidden as i32])?;
-            let output = ops::concatenate_axis(&[&sos, &output], 1)?;
+            let output = ops::concatenate(&[&sos, &output], 1)?;
             Ok((output, new_state))
         } else {
             Ok((output, new_state))
@@ -255,7 +255,7 @@ impl StatelessTransducerDecoder {
 
             // Build full context: [state, y]
             let y_i32 = y.as_type::<i32>()?;
-            let context = ops::concatenate_axis(&[state, &y_i32], 1)?;
+            let context = ops::concatenate(&[state, &y_i32], 1)?;
 
             // Get embeddings of last context_size tokens
             let ctx_start = 0;
@@ -544,8 +544,8 @@ impl RNNTDecoder {
         }
 
         // Stack states: [num_layers, batch, hidden_size]
-        let new_hidden = ops::stack_axis(&new_hiddens.iter().collect::<Vec<_>>(), 0)?;
-        let new_cell = ops::stack_axis(&new_cells.iter().collect::<Vec<_>>(), 0)?;
+        let new_hidden = ops::stack(&new_hiddens.iter().collect::<Vec<_>>(), 0)?;
+        let new_cell = ops::stack(&new_cells.iter().collect::<Vec<_>>(), 0)?;
 
         let new_state = LstmState {
             hidden: new_hidden,
