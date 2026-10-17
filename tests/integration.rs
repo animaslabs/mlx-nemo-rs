@@ -232,6 +232,47 @@ fn test_tokenizer_round_trip() {
 
 #[test]
 #[ignore]
+fn test_tdt_transcription() {
+    let model_path = "models/nvidia/parakeet-tdt-0.6b-v3/parakeet-tdt-0.6b-v3.nemo";
+    if !require_model(model_path) {
+        return;
+    }
+    let mut model = EncDecRnntModel::from_pretrained(model_path).expect("Failed to load TDT model");
+    assert!(model.is_tdt());
+    assert!(!model.is_multilingual());
+
+    let transcript = model.transcribe_one(TEST_AUDIO).unwrap();
+    println!("TDT: {transcript}");
+    let wer = word_error_rate(EXPECTED_TEXT, &normalize_text(&transcript.text));
+    assert!(wer < 0.10, "WER {wer:.3}: {transcript}");
+
+    // Words span their tokens' predicted durations, and punctuation sits at
+    // the end of the word before it (NeMo: "Well," 0.32-0.56 s,
+    // "portrait." 6.64-7.20 s)
+    let words: Vec<&str> = transcript.words.iter().map(|w| w.text.as_str()).collect();
+    assert_eq!(words.join(" "), transcript.text.trim());
+    for pair in transcript.words.windows(2) {
+        assert!(pair[0].end <= pair[1].start + 1e-3, "{:?}", pair);
+    }
+    let close = |a: f32, b: f32| (a - b).abs() < 0.01;
+    let first = transcript.words.first().unwrap();
+    let last = transcript.words.last().unwrap();
+    assert_eq!(first.text, "Well,");
+    assert!(
+        close(first.start, 0.32) && close(first.end, 0.56),
+        "{first:?}"
+    );
+    assert_eq!(last.text, "portrait.");
+    assert!(close(last.start, 6.64) && close(last.end, 7.2), "{last:?}");
+
+    // TDT decodes greedily and offline only
+    let beam = TranscribeOptions::default().beam_search(4);
+    assert!(model.transcribe_with([TEST_AUDIO], &beam).is_err());
+    assert!(model.stream(StreamingOptions::default()).is_err());
+}
+
+#[test]
+#[ignore]
 fn test_multilingual_offline_transcription() {
     let model_path =
         "models/nvidia/nemotron-3.5-asr-streaming-0.6b/nemotron-3.5-asr-streaming-0.6b.nemo";

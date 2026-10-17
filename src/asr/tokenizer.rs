@@ -5,7 +5,9 @@ use std::path::Path;
 
 use sentencepiece::SentencePieceProcessor;
 
-use crate::asr::decoding::{decode_text, lang_tag_table, last_lang_tag, word_start_table};
+use crate::asr::decoding::{
+    decode_text, lang_tag_table, last_lang_tag, punctuation_table, word_start_table,
+};
 use crate::core::error::{Error, Result};
 
 /// A model's SentencePiece tokenizer, for turning token ids into text.
@@ -20,6 +22,8 @@ pub struct Tokenizer {
     word_start: Vec<bool>,
     /// For each token id, whether it is a language tag such as `<en-US>`
     lang_tags: Vec<bool>,
+    /// For each token id, whether it decodes to a single punctuation mark
+    punctuation: Vec<bool>,
 }
 
 impl Tokenizer {
@@ -30,6 +34,7 @@ impl Tokenizer {
         Ok(Self {
             word_start: word_start_table(&processor),
             lang_tags: lang_tag_table(&processor),
+            punctuation: punctuation_table(&processor),
             processor,
         })
     }
@@ -74,6 +79,11 @@ impl Tokenizer {
     /// prompt-conditioned models emit after each utterance.
     pub fn is_lang_tag(&self, id: usize) -> bool {
         self.lang_tags.get(id).copied().unwrap_or(false)
+    }
+
+    /// Whether token `id` decodes to a single punctuation mark such as `,`.
+    pub fn is_punctuation(&self, id: usize) -> bool {
+        self.punctuation.get(id).copied().unwrap_or(false)
     }
 
     /// The language named by the last language tag in `ids`, e.g. `"en-US"`.

@@ -368,19 +368,64 @@ impl AsrModelConfig {
             ));
         }
 
-        let has_tdt_durations = self
-            .extra
-            .get("model_defaults")
-            .and_then(|d| d.get("tdt_durations"))
-            .and_then(|d| d.as_sequence())
-            .is_some_and(|d| !d.is_empty());
-        if has_tdt_durations {
-            return Err(Error::not_implemented(
-                "TDT (token-and-duration transducer) models",
-            ));
+        // TDT joints emit one logit per duration after the token logits
+        let extra_outputs = self
+            .joint
+            .as_ref()
+            .and_then(|j| j.num_extra_outputs)
+            .unwrap_or(0);
+        match self.tdt_durations() {
+            Some(durations) if extra_outputs != 0 && extra_outputs != durations.len() => {
+                return Err(Error::config(format!(
+                    "joint.num_extra_outputs is {extra_outputs} but there are {} TDT durations",
+                    durations.len()
+                )));
+            }
+            None if extra_outputs != 0 => {
+                return Err(Error::not_implemented(format!(
+                    "joint with {extra_outputs} extra outputs and no TDT durations"
+                )));
+            }
+            _ => {}
         }
 
         Ok(())
+    }
+
+    /// Frame advances a TDT (token-and-duration transducer) joint predicts,
+    /// or `None` for a plain RNN-T model.
+    ///
+    /// Read from `model_defaults.tdt_durations`, else `decoding.durations`.
+    pub fn tdt_durations(&self) -> Option<Vec<usize>> {
+        let durations = |v: &yaml_serde::Value| -> Option<Vec<usize>> {
+            v.as_sequence()?
+                .iter()
+                .map(|d| d.as_u64().map(|d| d as usize))
+                .collect()
+        };
+        self.extra
+            .get("model_defaults")
+            .and_then(|d| d.get("tdt_durations"))
+            .and_then(durations)
+            .or_else(|| {
+                self.decoding
+                    .as_ref()
+                    .and_then(|d| d.extra.get("durations"))
+                    .and_then(durations)
+            })
+            .filter(|d| !d.is_empty())
+    }
+
+    /// `decoding.greedy.max_symbols`: the most tokens greedy decoding emits per
+    /// encoder frame.
+    pub fn greedy_max_symbols(&self) -> Option<usize> {
+        self.decoding
+            .as_ref()?
+            .extra
+            .get("greedy")?
+            .get("max_symbols")?
+            .as_u64()
+            .map(|n| n as usize)
     }
 }
 
@@ -747,6 +792,10 @@ pub struct JointConfig {
     /// Nested jointnet config (NeMo style)
     #[serde(default)]
     pub jointnet: Option<JointNetConfig>,
+
+    /// Outputs after the token logits (the duration logits of a TDT joint)
+    #[serde(default)]
+    pub num_extra_outputs: Option<usize>,
 }
 
 /// Nested joint network config (inside joint.jointnet in NeMo config).
@@ -837,6 +886,7 @@ impl Default for JointConfig {
             fused_batch_size: None,
             experimental_fuse_loss_wer: None,
             jointnet: None,
+            num_extra_outputs: None,
         }
     }
 }
@@ -1632,7 +1682,29 @@ mod tests {
             "model_defaults".to_string(),
             yaml_serde::from_str("tdt_durations: [0, 1, 2, 3, 4]").unwrap(),
         );
+        tdt.joint = Some(yaml_serde::from_str("num_extra_outputs: 5").unwrap());
+        assert!(tdt.validate().is_ok());
+        assert_eq!(tdt.tdt_durations(), Some(vec![0, 1, 2, 3, 4]));
+
+        // Duration logits must match the durations
+        tdt.joint = Some(yaml_serde::from_str("num_extra_outputs: 4").unwrap());
         assert!(tdt.validate().is_err());
+        tdt.extra.clear();
+        assert_eq!(tdt.tdt_durations(), None);
+        assert!(tdt.validate().is_err());
+    }
+
+    #[test]
+    fn test_tdt_decoding_config() {
+        let config: AsrModelConfig = crate::core::config::from_yaml_str(
+            "sample_rate: 16000\npreprocessor: {}\nencoder: {}\ndecoder: {}\n\
+             decoding: {strategy: greedy_batch, model_type: tdt, durations: [0, 2], \
+             greedy: {max_symbols: 7}}\n",
+        )
+        .unwrap();
+        assert_eq!(config.tdt_durations(), Some(vec![0, 2]));
+        assert_eq!(config.greedy_max_symbols(), Some(7));
+        assert_eq!(asr_config("EncDecRNNTBPEModel").greedy_max_symbols(), None);
     }
 
     #[test]

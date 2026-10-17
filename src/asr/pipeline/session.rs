@@ -361,6 +361,11 @@ impl<M: BorrowMut<EncDecRnntModel>> StreamingSession<M> {
     pub fn new(mut model: M, options: StreamingOptions) -> Result<Self> {
         let m = model.borrow_mut();
         let decoder_type = m.resolve_decoder_type(options.decoder_type)?;
+        if decoder_type == DecoderType::Rnnt && m.is_tdt() {
+            return Err(Error::not_implemented(
+                "streaming TDT models (transcribe offline instead)",
+            ));
+        }
         let mode_idx = options.mode.resolve(&m.streaming_modes())?;
         m.encoder.set_streaming_mode(mode_idx);
         let streaming_config = compute_streaming_config(m.encoder.config(), mode_idx, 10000)?;

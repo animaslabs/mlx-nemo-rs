@@ -19,6 +19,31 @@ pub fn word_start_table(tokenizer: &SentencePieceProcessor) -> Vec<bool> {
         .collect()
 }
 
+/// Whether `c` is a punctuation mark (Unicode general category P): ASCII,
+/// Latin-1, General Punctuation and CJK punctuation.
+pub fn is_punctuation_char(c: char) -> bool {
+    match c {
+        '$' | '+' | '<' | '=' | '>' | '^' | '`' | '|' | '~' => false,
+        _ if c.is_ascii_punctuation() => true,
+        '¡' | '§' | '«' | '¶' | '·' | '»' | '¿' => true,
+        '\u{2010}'..='\u{2027}' | '\u{2030}'..='\u{2043}' | '\u{2045}'..='\u{2051}' => true,
+        '\u{2053}'..='\u{205E}' | '\u{3001}'..='\u{3003}' | '\u{3008}'..='\u{3011}' => true,
+        _ => false,
+    }
+}
+
+/// For each token id, whether it decodes to a single punctuation mark (see
+/// [`is_punctuation_char`]).
+pub fn punctuation_table(tokenizer: &SentencePieceProcessor) -> Vec<bool> {
+    (0..tokenizer.len())
+        .map(|id| {
+            let text = tokenizer.decode_piece_ids(&[id as u32]).unwrap_or_default();
+            let mut chars = text.chars();
+            matches!((chars.next(), chars.next()), (Some(c), None) if is_punctuation_char(c))
+        })
+        .collect()
+}
+
 /// Whether `piece` is a language tag such as `<en-US>`, which prompt-conditioned
 /// models emit after the terminal punctuation (NeMo's `<[a-z]{2}-[A-Z]{2}>`).
 pub fn is_lang_tag(piece: &str) -> bool {
@@ -162,6 +187,16 @@ mod tests {
         assert_eq!(strip_lang_tags(" <en-US>"), "");
         assert_eq!(strip_lang_tags("a <b> <unk> 1<2"), "a <b> <unk> 1<2");
         assert_eq!(strip_lang_tags("trailing <"), "trailing <");
+    }
+
+    #[test]
+    fn test_is_punctuation_char() {
+        for c in [',', '.', '?', '!', '\'', '-', '%', '/', '¿', '¡', '«', '…', '—', '。'] {
+            assert!(is_punctuation_char(c), "{c}");
+        }
+        for c in ['a', 'é', '1', ' ', '$', '+', '<', '~', '€'] {
+            assert!(!is_punctuation_char(c), "{c}");
+        }
     }
 
     #[test]

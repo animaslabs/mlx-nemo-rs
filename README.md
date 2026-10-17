@@ -8,6 +8,7 @@ mlx-voice loads NeMo checkpoints (`.nemo` archives) or converted MLX safetensors
 
 - **CTC ASR**: `EncDecCtcModel` (e.g. `nvidia/parakeet-ctc-0.6b`)
 - **RNN-T / Transducer ASR**: `EncDecRnntModel` with greedy or beam search decoding (e.g. `nvidia/parakeet-rnnt-0.6b`)
+- **TDT (token-and-duration transducer) ASR**: greedy offline decoding with predicted token durations, including the multilingual `nvidia/parakeet-tdt-0.6b-v3` (25 European languages, detected automatically)
 - **Cache-aware streaming**: `StreamingSession` for low-latency incremental transcription with selectable latency modes (e.g. `nvidia/nemotron-speech-streaming-en-0.6b`)
 - **Hybrid RNN-T/CTC models**: decode with either head, offline or streaming (e.g. `nvidia/stt_en_fastconformer_hybrid_large_streaming_multi`)
 - **Multilingual streaming**: language-ID prompt conditioning for `nvidia/nemotron-3.5-asr-streaming-0.6b` (40 language-locales), with a chosen target language or automatic language detection
@@ -42,6 +43,7 @@ Download models from Hugging Face with the bundled `xtask`. Files go to `models/
 ```bash
 cargo xtask download nvidia/parakeet-ctc-0.6b
 cargo xtask download nvidia/parakeet-rnnt-0.6b
+cargo xtask download nvidia/parakeet-tdt-0.6b-v3 --file parakeet-tdt-0.6b-v3.nemo
 
 # Gated models need a Hugging Face token (or set HF_TOKEN)
 cargo xtask download nvidia/nemotron-speech-streaming-en-0.6b --token $HF_TOKEN
@@ -176,7 +178,7 @@ For live audio, `push_audio` / `next_update` / `finish` work as on a `StreamingS
 | Example | Description |
 | --- | --- |
 | `transcribe` | Offline transcription with a CTC model |
-| `transcribe_rnnt` | Offline transcription with an RNN-T model (`--beam <size>` for beam search) |
+| `transcribe_rnnt` | Offline transcription with an RNN-T or TDT model (`--beam <size>` for beam search, RNN-T only) |
 | `streaming` | Streaming transcription of a file, fed in small chunks |
 | `live` | Live microphone transcription |
 | `vad` | Voice activity detection on a file |
@@ -218,7 +220,7 @@ audio (f32) → MelSpectrogram → ConformerEncoder → CtcDecoder | RnntJoint +
 - `src/asr/modules/`: mel preprocessing, FastConformer encoder, decoders and joint network
 - `src/asr/streaming/`: encoder attention/convolution caches, mel and feature buffers, streaming config
 - `src/asr/pipeline/`: the cache-aware RNN-T and multi-talker pipelines
-- `src/asr/decoding/`: greedy and beam search decoding, streaming token merging
+- `src/asr/decoding/`: greedy and beam search decoding, TDT greedy decoding, streaming token merging
 
 More detail is in [`docs/`](docs/), including [`lib-architecture.md`](docs/lib-architecture.md) and [`streaming-data-flow.md`](docs/streaming-data-flow.md).
 
