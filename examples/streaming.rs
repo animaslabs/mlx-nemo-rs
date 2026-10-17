@@ -16,6 +16,7 @@
 //!   --no-punctuation     Strip punctuation from output
 //!   --language <lang>    Target language of a multilingual model, e.g. en-US, de, auto (default)
 //!   --keep-lang-tags     Keep the detected-language tags (e.g. <en-US>) in the text
+//!   --ctc                Decode with a hybrid RNN-T/CTC model's CTC decoder
 //!   --blank-threshold <f>  Blank probability threshold (0.0 = disabled, try 0.5-2.0)
 //!   --list-modes         List available streaming modes and exit
 //!   --vad <path>         VAD model (.nemo) to suppress non-speech audio
@@ -27,7 +28,7 @@ use std::io::{self, Write};
 use std::time::Instant;
 
 use mlx_voice::asr::{
-    EncDecClassificationModel, EncDecRnntModel, StreamingModeInfo, StreamingOptions,
+    DecoderType, EncDecClassificationModel, EncDecRnntModel, StreamingModeInfo, StreamingOptions,
     VadPostProcessConfig, VadPostProcessor,
 };
 use tracing_subscriber::{EnvFilter, fmt};
@@ -51,6 +52,7 @@ fn main() -> mlx_voice::Result<()> {
     let mut no_punctuation = false;
     let mut language: Option<&str> = None;
     let mut keep_lang_tags = false;
+    let mut ctc = false;
     let mut blank_threshold: f32 = 0.0;
     let mut vad_model_path: Option<&str> = None;
     let mut vad_onset: f32 = 0.5;
@@ -105,6 +107,9 @@ fn main() -> mlx_voice::Result<()> {
             "--keep-lang-tags" => {
                 keep_lang_tags = true;
             }
+            "--ctc" => {
+                ctc = true;
+            }
             arg if !arg.starts_with('-') => {
                 audio_path = Some(arg);
             }
@@ -126,6 +131,7 @@ fn main() -> mlx_voice::Result<()> {
         eprintln!("  --no-punctuation     Strip punctuation from output");
         eprintln!("  --language <lang>    Target language of a multilingual model (default: auto)");
         eprintln!("  --keep-lang-tags     Keep detected-language tags (e.g. <en-US>) in the text");
+        eprintln!("  --ctc                Decode with a hybrid model's CTC decoder");
         eprintln!("  --blank-threshold <f>  Blank probability threshold (default: 0.0 = disabled)");
         eprintln!("                         Try 0.5-2.0 to reduce missed sentences");
         eprintln!("  --list-modes         List available streaming modes and exit");
@@ -148,11 +154,15 @@ fn main() -> mlx_voice::Result<()> {
         println!("Target language: {language}");
     }
 
-    let options = StreamingOptions::default()
+    let mut options = StreamingOptions::default()
         .mode(mode_idx)
         .strip_lang_tags(!keep_lang_tags)
         .suppress_punctuation(no_punctuation)
         .blank_threshold(blank_threshold);
+    if ctc {
+        println!("Decoder: CTC");
+        options = options.decoder_type(DecoderType::Ctc);
+    }
     if blank_threshold > 0.0 {
         println!("Blank threshold: {:.2}", blank_threshold);
     }

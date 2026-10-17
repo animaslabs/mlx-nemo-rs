@@ -16,6 +16,7 @@
 //!   --format <fmt>    Weight format: "mlx" or "pytorch" (default: auto-detect)
 //!   --language <lang> Target language of a multilingual model, e.g. en-US, de, auto (default)
 //!   --keep-lang-tags  Keep the detected-language tags (e.g. <en-US>) in the text
+//!   --ctc             Decode with a hybrid RNN-T/CTC model's CTC decoder
 //!   --words           Print each word with its start and end time
 //!
 //! Environment:
@@ -25,7 +26,7 @@ use std::path::Path;
 use std::time::Instant;
 
 use mlx_voice::WeightFormat;
-use mlx_voice::asr::{EncDecRnntModel, TranscribeOptions};
+use mlx_voice::asr::{DecoderType, EncDecRnntModel, TranscribeOptions};
 use tracing_subscriber::EnvFilter;
 
 fn main() -> mlx_voice::Result<()> {
@@ -52,6 +53,7 @@ fn main() -> mlx_voice::Result<()> {
         eprintln!("  --format <fmt>    Weight format: mlx or pytorch (default: auto)");
         eprintln!("  --language <lang> Target language of a multilingual model (default: auto)");
         eprintln!("  --keep-lang-tags  Keep detected-language tags (e.g. <en-US>) in the text");
+        eprintln!("  --ctc             Decode with a hybrid model's CTC decoder");
         std::process::exit(1);
     }
 
@@ -62,6 +64,7 @@ fn main() -> mlx_voice::Result<()> {
     let mut weight_format: Option<WeightFormat> = None;
     let mut language: Option<String> = None;
     let mut keep_lang_tags = false;
+    let mut ctc = false;
     let mut print_words = false;
     let mut audio_start_idx = 3;
 
@@ -105,6 +108,11 @@ fn main() -> mlx_voice::Result<()> {
                 i += 1;
                 audio_start_idx = i;
             }
+            "--ctc" => {
+                ctc = true;
+                i += 1;
+                audio_start_idx = i;
+            }
             _ => break,
         }
     }
@@ -140,6 +148,10 @@ fn main() -> mlx_voice::Result<()> {
     }
     if let Some(language) = options.language.as_deref().or(model.language()) {
         println!("Target language: {language}");
+    }
+    if ctc {
+        println!("Decoder: CTC");
+        options = options.decoder_type(DecoderType::Ctc);
     }
     if let Some(beam) = beam_size {
         println!("Decoding strategy: Beam search (beam_size={})", beam);

@@ -5,15 +5,18 @@ use std::borrow::BorrowMut;
 use std::sync::Arc;
 
 use mlx_rs::Array;
+use mlx_rs::ops::indexing::IndexOp;
 
 use crate::asr::Tokenizer;
-use crate::asr::decoding::{IncrementalDetokenizer, RnntStreamingDecoder, TimedToken};
+use crate::asr::decoding::{
+    IncrementalDetokenizer, RnntStreamingDecoder, TimedToken, ctc_collapse, ctc_frame_labels,
+};
 use crate::asr::models::EncDecRnntModel;
 use crate::asr::modules::{DecoderState, SpectrumTransform, StreamingMel, StreamingMelConfig};
 use crate::asr::streaming::{
     EncoderCache, FeatureBuffer, StreamingConfig, compute_streaming_config,
 };
-use crate::asr::transcript::{Token, Transcript};
+use crate::asr::transcript::{DecoderType, Token, Transcript};
 use crate::audio::StreamResampler;
 use crate::core::ArrayExt;
 use crate::core::error::{Error, Result};
@@ -32,6 +35,9 @@ pub struct StreamingOptions {
     /// NeMo checkpoints list modes from most to least lookahead, so mode 0,
     /// the default, has the highest latency and accuracy.
     pub mode: usize,
+    /// Decoder to use; `None` uses RNN-T. [`DecoderType::Ctc`] needs a hybrid
+    /// RNN-T/CTC model (see [`EncDecRnntModel::has_ctc_decoder`]).
+    pub decoder_type: Option<DecoderType>,
     /// Leave language tags such as `<en-US>` out of text (the default).
     pub strip_lang_tags: bool,
     /// Never emit punctuation tokens.
@@ -49,6 +55,7 @@ impl Default for StreamingOptions {
     fn default() -> Self {
         Self {
             mode: 0,
+            decoder_type: None,
             strip_lang_tags: true,
             suppress_punctuation: false,
             blank_threshold: 0.0,
@@ -61,6 +68,12 @@ impl StreamingOptions {
     /// Use streaming mode `mode`.
     pub fn mode(mut self, mode: usize) -> Self {
         self.mode = mode;
+        self
+    }
+
+    /// Decode with `decoder_type`, e.g. a hybrid model's CTC decoder.
+    pub fn decoder_type(mut self, decoder_type: DecoderType) -> Self {
+        self.decoder_type = Some(decoder_type);
         self
     }
 
@@ -109,6 +122,8 @@ pub struct StreamUpdate {
 struct DecodeState {
     decoder_state: DecoderState,
     last_token: Option<usize>,
+    /// CTC label of the last decoded frame
+    ctc_prev: Option<usize>,
     /// Every token so far, with absolute encoder frames
     tokens: Vec<TimedToken>,
     /// Encoder frames decoded so far
@@ -219,6 +234,7 @@ fn appended_text(old: &str, new: &str) -> String {
 pub struct StreamingSession<M: BorrowMut<EncDecRnntModel> = EncDecRnntModel> {
     pub(crate) model: M,
     options: StreamingOptions,
+    decoder_type: DecoderType,
 
     pub(crate) streaming_decoder: RnntStreamingDecoder,
     pub(crate) streaming_config: StreamingConfig,
@@ -247,6 +263,7 @@ impl<M: BorrowMut<EncDecRnntModel>> StreamingSession<M> {
     /// session owns it) or a mutable reference to it.
     pub fn new(mut model: M, options: StreamingOptions) -> Result<Self> {
         let m = model.borrow_mut();
+        let decoder_type = m.resolve_decoder_type(options.decoder_type)?;
         m.encoder.set_streaming_mode(options.mode);
         let streaming_config = compute_streaming_config(m.encoder.config(), options.mode, 10000)?;
         m.encoder.setup_streaming(streaming_config.cache_drop_size);
@@ -278,6 +295,7 @@ impl<M: BorrowMut<EncDecRnntModel>> StreamingSession<M> {
         Ok(Self {
             model,
             options,
+            decoder_type,
             streaming_decoder,
             streaming_config,
             encoder_cache,
@@ -294,6 +312,7 @@ impl<M: BorrowMut<EncDecRnntModel>> StreamingSession<M> {
             state: DecodeState {
                 decoder_state,
                 last_token: None,
+                ctc_prev: None,
                 tokens: Vec::new(),
                 frame_offset: 0,
                 detokenizer: IncrementalDetokenizer::default(),
@@ -321,6 +340,11 @@ impl<M: BorrowMut<EncDecRnntModel>> StreamingSession<M> {
     /// The session's options.
     pub fn options(&self) -> &StreamingOptions {
         &self.options
+    }
+
+    /// The decoder the session decodes with.
+    pub fn decoder_type(&self) -> DecoderType {
+        self.decoder_type
     }
 
     /// The sample rate the model expects; [`push_audio`](Self::push_audio)
@@ -465,6 +489,7 @@ impl<M: BorrowMut<EncDecRnntModel>> StreamingSession<M> {
         self.state = DecodeState {
             decoder_state: model.decoder.initialize_state(1)?,
             last_token: None,
+            ctc_prev: None,
             tokens: Vec::new(),
             frame_offset: 0,
             detokenizer: IncrementalDetokenizer::default(),
@@ -652,29 +677,57 @@ impl<M: BorrowMut<EncDecRnntModel>> StreamingSession<M> {
             .options
             .suppress_punctuation
             .then_some(self.punctuation_token_ids.as_slice());
-        let decoded = self.streaming_decoder.decode_frames(
-            &encoded,
-            enc_seq_len,
-            &model.decoder,
-            &mut self.state.decoder_state,
-            &model.joint,
-            &mut self.state.last_token,
-            masked_ids,
-        )?;
-
         let frame_offset = self.state.frame_offset;
-        let new_tokens: Vec<TimedToken> = decoded
-            .new_tokens
-            .iter()
-            .zip(&decoded.timesteps)
-            .map(|(&id, &t)| TimedToken {
-                id,
-                start_frame: frame_offset + t,
-                end_frame: frame_offset + t + 1,
-            })
-            .collect();
+        let new_tokens: Vec<TimedToken> = match (self.decoder_type, &model.ctc_decoder) {
+            (DecoderType::Ctc, _) if enc_seq_len == 0 => Vec::new(),
+            (DecoderType::Ctc, Some(ctc_decoder)) => {
+                // Greedy labels per frame, collapsed with the previous chunk's
+                // last label, like NeMo's concatenated streaming predictions
+                let frames = encoded.index((.., ..enc_seq_len as i32, ..));
+                let log_probs = ctc_decoder
+                    .log_probs(&frames)?
+                    .reshape(&[enc_seq_len as i32, -1])?;
+                let labels = ctc_frame_labels(
+                    &log_probs,
+                    model.blank_id,
+                    self.options.blank_threshold,
+                    masked_ids,
+                )?;
+                let decoded_before = self.state.tokens.len();
+                ctc_collapse(
+                    &labels,
+                    model.blank_id,
+                    frame_offset,
+                    &mut self.state.ctc_prev,
+                    &mut self.state.tokens,
+                );
+                self.state.tokens[decoded_before..].to_vec()
+            }
+            _ => {
+                let decoded = self.streaming_decoder.decode_frames(
+                    &encoded,
+                    enc_seq_len,
+                    &model.decoder,
+                    &mut self.state.decoder_state,
+                    &model.joint,
+                    &mut self.state.last_token,
+                    masked_ids,
+                )?;
+                let new_tokens: Vec<TimedToken> = decoded
+                    .new_tokens
+                    .iter()
+                    .zip(&decoded.timesteps)
+                    .map(|(&id, &t)| TimedToken {
+                        id,
+                        start_frame: frame_offset + t,
+                        end_frame: frame_offset + t + 1,
+                    })
+                    .collect();
+                self.state.tokens.extend(&new_tokens);
+                new_tokens
+            }
+        };
         self.state.frame_offset += enc_seq_len;
-        self.state.tokens.extend(&new_tokens);
 
         let model = self.model.borrow();
         let frame_sec = self.frame_sec();
@@ -739,9 +792,11 @@ mod tests {
     fn test_options_builder() {
         let options = StreamingOptions::default()
             .mode(2)
+            .decoder_type(DecoderType::Ctc)
             .blank_threshold(0.5)
             .suppress_punctuation(true);
         assert_eq!(options.mode, 2);
+        assert_eq!(options.decoder_type, Some(DecoderType::Ctc));
         assert_eq!(options.blank_threshold, 0.5);
         assert!(options.suppress_punctuation);
         assert!(options.strip_lang_tags);

@@ -9,6 +9,7 @@ mlx-voice loads NeMo checkpoints (`.nemo` archives) or converted MLX safetensors
 - **CTC ASR**: `EncDecCtcModel` (e.g. `nvidia/parakeet-ctc-0.6b`)
 - **RNN-T / Transducer ASR**: `EncDecRnntModel` with greedy or beam search decoding (e.g. `nvidia/parakeet-rnnt-0.6b`)
 - **Cache-aware streaming**: `StreamingSession` for low-latency incremental transcription with selectable latency modes (e.g. `nvidia/nemotron-speech-streaming-en-0.6b`)
+- **Hybrid RNN-T/CTC models**: decode with either head, offline or streaming (e.g. `nvidia/stt_en_fastconformer_hybrid_large_streaming_multi`)
 - **Multilingual streaming**: language-ID prompt conditioning for `nvidia/nemotron-3.5-asr-streaming-0.6b` (40 language-locales), with a chosen target language or automatic language detection
 - **Voice activity detection**: `EncDecClassificationModel` with NeMo-style post-processing (e.g. `nvidia/Frame_VAD_Multilingual_MarbleNet_v2.0`)
 - **Multi-talker transcription**: `MultiTalkerPipeline` combines streaming ASR with streaming Sortformer diarization (e.g. `nvidia/diar_streaming_sortformer_4spk-v2.1`). With a multitalker model (`nvidia/multitalker-parakeet-streaming-0.6b-v1`) it runs one speaker-conditioned ASR instance per speaker and transcribes overlapping speech; with an ordinary streaming model it attributes a single transcript to speakers
@@ -118,6 +119,18 @@ fn main() -> mlx_voice::Result<()> {
 ```
 
 For a whole file, `model.transcribe_streaming("audio.wav", options)?` returns the transcript the stream would produce. A session borrows its model; `StreamingSession::new(model, options)` gives one that owns it. Offline `transcribe` on the same model is unaffected by the session's mode.
+
+NVIDIA's streaming CTC models are hybrid RNN-T/CTC models, such as `nvidia/stt_en_fastconformer_hybrid_large_streaming_multi`. They load as an `EncDecRnntModel` and decode with the RNN-T decoder by default. `DecoderType::Ctc` switches to their CTC decoder, which is faster and keeps no decoder state:
+
+```rust
+use mlx_voice::asr::{DecoderType, StreamingOptions, TranscribeOptions};
+
+let ctc = TranscribeOptions::default().decoder_type(DecoderType::Ctc);
+let transcripts = model.transcribe_with(["audio.wav"], &ctc)?;
+let stream = model.stream(StreamingOptions::default().decoder_type(DecoderType::Ctc))?;
+```
+
+The `transcribe_rnnt`, `streaming` and `eval` examples take `--ctc`.
 
 ### Multilingual transcription
 

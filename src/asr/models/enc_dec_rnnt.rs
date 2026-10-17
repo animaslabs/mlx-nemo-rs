@@ -31,14 +31,16 @@ use std::path::Path;
 use crate::asr::Tokenizer;
 use crate::asr::config::{AsrModelConfig, DecodingAlgorithm, JointConfig};
 use crate::asr::decoding::TimedToken;
-use crate::asr::decoding::{RnntStreamingDecoder, rnnt_beam_decode};
+use crate::asr::decoding::{RnntStreamingDecoder, greedy_decode, rnnt_beam_decode};
 use crate::asr::modules::{
-    ConformerEncoder, LanguagePrompt, MelConfig, MelProcessor, PredictionNetwork, RnntDecoder,
-    RnntJoint, StatelessTransducerDecoder,
+    ConformerEncoder, CtcDecoder, LanguagePrompt, MelConfig, MelProcessor, PredictionNetwork,
+    RnntDecoder, RnntJoint, StatelessTransducerDecoder,
 };
 use crate::asr::pipeline::{StreamingOptions, StreamingSession};
 use crate::asr::streaming::{StreamingModeInfo, get_streaming_modes};
-use crate::asr::transcript::{AudioInput, DecodingStrategy, TranscribeOptions, Transcript};
+use crate::asr::transcript::{
+    AudioInput, DecoderType, DecodingStrategy, TranscribeOptions, Transcript,
+};
 use crate::core::ArrayExt;
 use crate::core::checkpoint::NemoCheckpoint;
 use crate::core::error::{Error, Result};
@@ -77,6 +79,8 @@ pub struct EncDecRnntModel {
     pub(crate) encoder: ConformerEncoder,
     pub(crate) decoder: PredictionNetwork,
     pub(crate) joint: RnntJoint,
+    /// The auxiliary CTC decoder of a hybrid RNN-T/CTC model
+    pub(crate) ctc_decoder: Option<CtcDecoder>,
     pub(crate) tokenizer: Option<Tokenizer>,
     /// Blank token ID (typically vocab_size, last token)
     pub(crate) blank_id: usize,
@@ -90,6 +94,7 @@ impl std::fmt::Debug for EncDecRnntModel {
             .field("sample_rate", &self.sample_rate())
             .field("encoder_layers", &self.encoder.num_layers())
             .field("lstm_decoder", &self.is_lstm_decoder())
+            .field("ctc_decoder", &self.has_ctc_decoder())
             .field("blank_id", &self.blank_id)
             .field("decoding_strategy", &self.decoding_strategy)
             .field("tokenizer", &self.tokenizer)
@@ -156,6 +161,8 @@ impl EncDecRnntModel {
             vocab_size + 1,
         )?;
 
+        let ctc_decoder = Self::new_ctc_decoder(&config, encoder_hidden, vocab_size)?;
+
         // Blank is typically the last token (vocab_size)
         let blank_id = vocab_size;
 
@@ -177,10 +184,26 @@ impl EncDecRnntModel {
             encoder,
             decoder,
             joint,
+            ctc_decoder,
             tokenizer: None,
             blank_id,
             decoding_strategy,
         })
+    }
+
+    /// The auxiliary CTC decoder of a hybrid model, with `vocab_size` tokens
+    /// plus blank.
+    fn new_ctc_decoder(
+        config: &AsrModelConfig,
+        encoder_hidden: usize,
+        vocab_size: usize,
+    ) -> Result<Option<CtcDecoder>> {
+        config
+            .aux_ctc
+            .as_ref()
+            .filter(|_| config.is_hybrid())
+            .map(|aux| CtcDecoder::new(aux.decoder.clone(), encoder_hidden, vocab_size + 1))
+            .transpose()
     }
 
     /// Load a model from a `.nemo` archive, a model directory or a Hugging
@@ -457,6 +480,7 @@ impl EncDecRnntModel {
             pred_hidden,
             vocab_size + 1,
         )?;
+        self.ctc_decoder = Self::new_ctc_decoder(&self.config, encoder_hidden, vocab_size)?;
 
         self.tokenizer = Some(tokenizer);
         Ok(())
@@ -502,11 +526,22 @@ impl EncDecRnntModel {
         // Load joint network weights (linear layers may be quantized)
         self.joint.load_weights(&weights, "joint", quant)?;
 
+        // Auxiliary CTC decoder (hybrid models only)
+        if let Some(ctc_decoder) = &mut self.ctc_decoder {
+            ctc_decoder.load_weights(&weights, "ctc_decoder", quant)?;
+        }
+
         // Language-ID prompt (prompt-conditioned models only)
         self.joint
             .set_prompt(LanguagePrompt::from_config(&self.config, &weights, quant)?);
 
         Ok(weights.report())
+    }
+
+    /// Whether this is a hybrid RNN-T/CTC model with an auxiliary CTC decoder,
+    /// selected with [`DecoderType::Ctc`].
+    pub fn has_ctc_decoder(&self) -> bool {
+        self.ctc_decoder.is_some()
     }
 
     /// Whether the model takes a target language (prompt-conditioned models
@@ -590,8 +625,19 @@ impl EncDecRnntModel {
         Ok(self.transcribe([input.into()])?.remove(0))
     }
 
-    /// Transcribe with explicit options (decoding strategy, language, batch
-    /// size).
+    /// Transcribe with explicit options (decoding strategy, decoder type,
+    /// language, batch size).
+    ///
+    /// ```no_run
+    /// # fn main() -> mlx_voice::Result<()> {
+    /// # use mlx_voice::asr::{DecoderType, EncDecRnntModel, TranscribeOptions};
+    /// // A hybrid RNN-T/CTC model can decode with either decoder
+    /// let mut model = EncDecRnntModel::from_pretrained("hybrid.nemo")?;
+    /// let options = TranscribeOptions::default().decoder_type(DecoderType::Ctc);
+    /// let transcripts = model.transcribe_with(["a.wav"], &options)?;
+    /// # Ok(())
+    /// # }
+    /// ```
     pub fn transcribe_with<'a, I>(
         &mut self,
         inputs: I,
@@ -606,7 +652,14 @@ impl EncDecRnntModel {
                 "No tokenizer loaded. Call load_tokenizer first.",
             ));
         }
-        let decoding = options.decoding.unwrap_or(self.decoding_strategy);
+        let decoder_type = self.resolve_decoder_type(options.decoder_type)?;
+        let decoding = match decoder_type {
+            DecoderType::Ctc => match options.decoding {
+                None | Some(DecodingStrategy::Greedy) => DecodingStrategy::Greedy,
+                Some(_) => return Err(Error::not_implemented("beam search for CTC decoding")),
+            },
+            DecoderType::Rnnt => options.decoding.unwrap_or(self.decoding_strategy),
+        };
 
         // Switch language for this call only
         let previous_language = match &options.language {
@@ -619,7 +672,7 @@ impl EncDecRnntModel {
         };
         let sample_rate = self.sample_rate();
         let decoded = super::decode_in_batches(inputs, sample_rate, options.batch_size, |clips| {
-            self.decode_clips(clips, decoding)
+            self.decode_clips(clips, decoder_type, decoding)
         });
         if let Some(language) = previous_language {
             self.set_language(&language)?;
@@ -635,6 +688,20 @@ impl EncDecRnntModel {
             .collect())
     }
 
+    /// The decoder `requested`, or RNN-T; fails for CTC without a CTC decoder.
+    pub(crate) fn resolve_decoder_type(
+        &self,
+        requested: Option<DecoderType>,
+    ) -> Result<DecoderType> {
+        let decoder_type = requested.unwrap_or_default();
+        if decoder_type == DecoderType::Ctc && !self.has_ctc_decoder() {
+            return Err(Error::config(
+                "this model has no CTC decoder (only hybrid RNN-T/CTC models do)",
+            ));
+        }
+        Ok(decoder_type)
+    }
+
     /// Seconds per encoder frame.
     fn frame_sec(&self) -> f32 {
         self.config.preprocessor.window_stride * self.encoder.subsampling_factor() as f32
@@ -644,11 +711,16 @@ impl EncDecRnntModel {
     fn decode_clips(
         &mut self,
         clips: &[Vec<f32>],
+        decoder_type: DecoderType,
         decoding: DecodingStrategy,
     ) -> Result<Vec<Vec<TimedToken>>> {
         let (audio, lengths) = super::pad_batch(clips);
         let (encoder_output, encoder_lengths) = self.forward(&audio, Some(&lengths))?;
 
+        if let (DecoderType::Ctc, Some(ctc_decoder)) = (decoder_type, &self.ctc_decoder) {
+            let log_probs = ctc_decoder.log_probs(&encoder_output)?;
+            return greedy_decode(&log_probs, &encoder_lengths, self.blank_id);
+        }
         match decoding {
             DecodingStrategy::Greedy => self.greedy_decode(&encoder_output, &encoder_lengths),
             DecodingStrategy::BeamSearch { beam_size } => rnnt_beam_decode(

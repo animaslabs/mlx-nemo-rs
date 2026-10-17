@@ -9,8 +9,8 @@ mod sortformer_state;
 
 // Re-export core types
 pub use self::core::{
-    EncoderCache, StreamingConfig, StreamingMelBuffer, StreamingModeInfo, StreamingOutput,
-    compute_streaming_config, get_streaming_modes,
+    EncoderCache, StreamingConfig, StreamingModeInfo, compute_streaming_config,
+    get_streaming_modes,
 };
 
 // Re-export request types

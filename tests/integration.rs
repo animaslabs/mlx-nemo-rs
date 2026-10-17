@@ -8,8 +8,8 @@
 use std::path::Path;
 
 use mlx_voice::asr::{
-    AudioInput, EncDecClassificationModel, EncDecRnntModel, StreamingOptions, StreamingSession,
-    TranscribeOptions, Transcript, VadPostProcessConfig, VadPostProcessor,
+    AudioInput, DecoderType, EncDecClassificationModel, EncDecRnntModel, StreamingOptions,
+    StreamingSession, TranscribeOptions, Transcript, VadPostProcessConfig, VadPostProcessor,
 };
 
 // ---------------------------------------------------------------------------
@@ -418,6 +418,75 @@ fn test_streaming_modes_are_independent() {
     // An owned session hands its model back
     let session = StreamingSession::new(fresh, StreamingOptions::default()).unwrap();
     let _model: EncDecRnntModel = session.into_model();
+}
+
+#[test]
+#[ignore]
+fn test_hybrid_ctc_decoder() {
+    let model_path = "models/nvidia/stt_en_fastconformer_hybrid_large_streaming_multi/\
+                      stt_en_fastconformer_hybrid_large_streaming_multi.nemo";
+    if !require_model(model_path) {
+        return;
+    }
+    let mut model = EncDecRnntModel::from_pretrained(model_path).expect("Failed to load model");
+    assert!(model.has_ctc_decoder());
+    let reference = normalize_text(EXPECTED_TEXT);
+    let check = |label: &str, transcript: &Transcript| {
+        let wer = word_error_rate(&reference, &normalize_text(&transcript.text));
+        println!("{label:>12}: {transcript}");
+        assert!(wer < 0.10, "{label}: WER {:.1}%", wer * 100.0);
+        let starts: Vec<f32> = transcript.tokens.iter().map(|t| t.start).collect();
+        assert!(
+            starts.windows(2).all(|w| w[0] <= w[1]),
+            "{label}: {starts:?}"
+        );
+        assert!(transcript.tokens.iter().all(|t| t.start < t.end));
+    };
+
+    let ctc = TranscribeOptions::default().decoder_type(DecoderType::Ctc);
+    check("rnnt", &model.transcribe_one(TEST_AUDIO).unwrap());
+    check(
+        "ctc",
+        &model.transcribe_with([TEST_AUDIO], &ctc).unwrap()[0],
+    );
+    assert!(
+        model
+            .transcribe_with([TEST_AUDIO], &ctc.clone().beam_search(4))
+            .is_err()
+    );
+
+    for mode in [0, 3] {
+        let options = StreamingOptions::default()
+            .mode(mode)
+            .decoder_type(DecoderType::Ctc);
+        let mut stream = model.stream(options).unwrap();
+        assert_eq!(stream.decoder_type(), DecoderType::Ctc);
+        let (samples, sample_rate) = mlx_voice::audio::load_wav(TEST_AUDIO).unwrap();
+        let mut deltas = String::new();
+        for chunk in samples.chunks(1600) {
+            stream.push_audio(chunk, sample_rate).unwrap();
+            while let Some(update) = stream.next_update().unwrap() {
+                deltas.push_str(&update.delta);
+            }
+        }
+        stream.end_audio().unwrap();
+        while let Some(update) = stream.next_update().unwrap() {
+            deltas.push_str(&update.delta);
+        }
+        let transcript = stream.finish().unwrap();
+        assert_eq!(deltas, transcript.text);
+        check(&format!("ctc mode {mode}"), &transcript);
+    }
+
+    // Nemotron keeps an aux_ctc config section but has no CTC decoder
+    let rnnt_path = "models/animaslabs/nemotron-speech-streaming-en-0.6b-mlx-8bit";
+    if require_model(rnnt_path) {
+        let mut rnnt = EncDecRnntModel::from_pretrained(rnnt_path).unwrap();
+        assert!(!rnnt.has_ctc_decoder());
+        assert!(rnnt.transcribe_with([TEST_AUDIO], &ctc).is_err());
+        let options = StreamingOptions::default().decoder_type(DecoderType::Ctc);
+        assert!(rnnt.stream(options).is_err());
+    }
 }
 
 #[test]
