@@ -11,6 +11,7 @@ use mlx_rs::Array;
 use mlx_rs::ops::indexing::IndexOp;
 
 use crate::asr::modules::{DecoderState, PredictionNetwork};
+use super::TimedToken;
 use crate::asr::modules::RNNTJoint;
 use crate::core::ArrayExt;
 use crate::core::error::{Error, Result};
@@ -26,6 +27,8 @@ const MAX_EXPANSIONS_PER_BEAM: usize = 10;
 struct Hypothesis {
     /// Token sequence so far
     tokens: Vec<usize>,
+    /// Encoder frame each token was emitted on
+    frames: Vec<usize>,
     /// Log probability score
     score: f32,
     /// Decoder state before the last token in `tokens` was consumed
@@ -47,7 +50,7 @@ struct Hypothesis {
 ///
 /// # Returns
 /// * The best hypothesis for each batch item, chosen by length-normalized
-///   score as in NeMo (`score_norm: true`)
+///   score as in NeMo (`score_norm: true`), with the frame of each token
 pub fn rnnt_beam_decode(
     encoder_output: &Array,
     encoder_lengths: &Array,
@@ -55,7 +58,7 @@ pub fn rnnt_beam_decode(
     joint: &RNNTJoint,
     blank_id: usize,
     beam_size: usize,
-) -> Result<Vec<Vec<usize>>> {
+) -> Result<Vec<Vec<TimedToken>>> {
     if beam_size == 0 {
         return Err(Error::decoding("beam size must be at least 1"));
     }
@@ -85,12 +88,13 @@ fn beam_search_single(
     joint: &RNNTJoint,
     blank_id: usize,
     beam_size: usize,
-) -> Result<Vec<usize>> {
+) -> Result<Vec<TimedToken>> {
     let beam_k = beam_size.min(joint.vocab_size().saturating_sub(1)).max(1);
     let max_expansions = beam_size * MAX_EXPANSIONS_PER_BEAM;
 
     let mut kept = vec![Hypothesis {
         tokens: Vec::new(),
+        frames: Vec::new(),
         score: 0.0,
         state: decoder.initialize_state(1)?,
         prediction: None,
@@ -116,8 +120,11 @@ fn beam_search_single(
             for (token, log_prob) in top_k_non_blank(&log_probs, blank_id, beam_k) {
                 let mut tokens = best.tokens.clone();
                 tokens.push(token);
+                let mut frames = best.frames.clone();
+                frames.push(t);
                 hyps.push(Hypothesis {
                     tokens,
+                    frames,
                     score: best.score + log_prob,
                     state: next_state.clone(),
                     prediction: None,
@@ -156,7 +163,17 @@ fn beam_search_single(
             let norm = |h: &Hypothesis| h.score / (h.tokens.len() + 1) as f32;
             norm(a).total_cmp(&norm(b))
         })
-        .map(|h| h.tokens.clone())
+        .map(|h| {
+            h.tokens
+                .iter()
+                .zip(&h.frames)
+                .map(|(&id, &t)| TimedToken {
+                    id,
+                    start_frame: t,
+                    end_frame: t + 1,
+                })
+                .collect()
+        })
         .unwrap_or_default();
     Ok(best)
 }

@@ -73,13 +73,22 @@ fn main() -> mlx_voice::Result<()> {
 }
 ```
 
-`EncDecRNNTModel` has the same `from_pretrained` / `transcribe` API. Both also take audio already in memory, resampling it to the model's rate, and expose the tokenizer for turning token ids into text:
+`EncDecRNNTModel` has the same `from_pretrained` / `transcribe` API. `transcribe` takes WAV paths or in-memory audio and returns a `Transcript` per input, with the text plus per-token and per-word timestamps in seconds. `TranscribeOptions` selects beam search, a language and the batch size:
 
 ```rust
-let text = model.transcribe_samples(&samples, 48_000)?;
-let tokenizer = model.tokenizer().expect("loaded with the model");
-println!("{}", tokenizer.decode(&token_ids, true));
+use mlx_voice::asr::{EncDecRNNTModel, TranscribeOptions};
+
+let mut model = EncDecRNNTModel::from_pretrained("nvidia/parakeet-rnnt-0.6b")?; // `hub` feature
+let transcript = model.transcribe_one((&samples[..], 48_000))?; // resampled to 16 kHz
+for word in &transcript.words {
+    println!("{:6.2}-{:6.2} {}", word.start, word.end, word.text);
+}
+
+let options = TranscribeOptions::default().beam_search(4).batch_size(8);
+let transcripts = model.transcribe_with(["a.wav", "b.wav"], &options)?;
 ```
+
+`model.tokenizer()` turns token ids back into text.
 
 ### Streaming transcription
 
@@ -128,7 +137,7 @@ pipeline.set_audio_file("audio.wav")?;
 let text = pipeline.run()?;
 ```
 
-`set_strip_lang_tags(false)` keeps the tags in the text, and `detected_language(&output.tokens)` returns the last detected language. `EncDecRNNTModel` has the same `set_language` / `set_strip_lang_tags` / `detected_language` methods. The `streaming`, `transcribe_rnnt` and `eval` examples take `--language` (`--target-lang` for `eval`).
+`set_strip_lang_tags(false)` keeps the tags in the text, and `detected_language(&output.tokens)` returns the last detected language. For offline transcription with `EncDecRNNTModel`, `TranscribeOptions::language` and `strip_lang_tags` set the same per call, and `Transcript::language` holds the detected language. The `streaming`, `transcribe_rnnt` and `eval` examples take `--language` (`--target-lang` for `eval`).
 
 ### Multi-talker transcription
 

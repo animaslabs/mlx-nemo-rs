@@ -49,7 +49,7 @@ use crate::asr::streaming::{
     EncoderCache, StreamingConfig, StreamingModeInfo, StreamingOutput, compute_streaming_config,
     get_streaming_modes,
 };
-use crate::audio::resample;
+use crate::asr::transcript::{AudioInput, DecodingStrategy, TranscribeOptions, Transcript};
 use crate::core::checkpoint::NemoCheckpoint;
 use crate::core::error::{Error, Result};
 use crate::core::loading::{LoadOptions, LoadReport, Weights};
@@ -396,42 +396,60 @@ impl EncDecCTCModel {
         Ok(weights.report())
     }
 
-    /// Transcribe audio files.
-    ///
-    /// # Arguments
-    /// * `paths` - Paths to audio files (WAV format)
-    ///
-    /// # Returns
-    /// * Vector of transcribed text strings
-    pub fn transcribe(&mut self, paths: &[impl AsRef<Path>]) -> Result<Vec<String>> {
-        let clips = super::load_clips(paths, self.sample_rate())?;
-        self.transcribe_clips(&clips)
+    /// Transcribe WAV files or in-memory audio (see [`AudioInput`]) with the
+    /// default [`TranscribeOptions`].
+    pub fn transcribe<'a, I>(&mut self, inputs: I) -> Result<Vec<Transcript>>
+    where
+        I: IntoIterator,
+        I::Item: Into<AudioInput<'a>>,
+    {
+        self.transcribe_with(inputs, &TranscribeOptions::default())
     }
 
-    /// Transcribe mono audio samples (in `[-1, 1]`) recorded at
-    /// `sample_rate`, resampling them to the model's rate if needed.
-    pub fn transcribe_samples(&mut self, samples: &[f32], sample_rate: u32) -> Result<String> {
-        if samples.is_empty() {
-            return Ok(String::new());
+    /// Transcribe one WAV file or in-memory clip.
+    pub fn transcribe_one<'a>(&mut self, input: impl Into<AudioInput<'a>>) -> Result<Transcript> {
+        Ok(self.transcribe([input.into()])?.remove(0))
+    }
+
+    /// Transcribe with explicit options. CTC models decode greedily and have
+    /// no language prompt, so beam search and a language are errors.
+    pub fn transcribe_with<'a, I>(
+        &mut self,
+        inputs: I,
+        options: &TranscribeOptions,
+    ) -> Result<Vec<Transcript>>
+    where
+        I: IntoIterator,
+        I::Item: Into<AudioInput<'a>>,
+    {
+        if !matches!(options.decoding, None | Some(DecodingStrategy::Greedy)) {
+            return Err(Error::not_implemented("beam search for CTC models"));
         }
-        let clip = resample(samples, sample_rate, self.sample_rate())?;
-        Ok(self.transcribe_clips(&[clip])?.remove(0))
-    }
+        if options.language.is_some() {
+            return Err(Error::config("this model has no language prompt"));
+        }
+        if self.tokenizer.is_none() {
+            return Err(Error::tokenizer(
+                "No tokenizer loaded. Call load_tokenizer first.",
+            ));
+        }
 
-    /// Transcribe clips already at the model's sample rate.
-    fn transcribe_clips(&mut self, clips: &[Vec<f32>]) -> Result<Vec<String>> {
-        let (audio, lengths) = super::pad_batch(clips);
+        let sample_rate = self.sample_rate();
+        let decoded = super::decode_in_batches(inputs, sample_rate, options.batch_size, |clips| {
+            let (audio, lengths) = super::pad_batch(clips);
+            let (log_probs, lengths) = self.forward(&audio, Some(&lengths))?;
+            greedy_decode(&log_probs, &lengths, self.blank_id)
+        })?;
 
-        // Run inference
-        let (log_probs, lengths) = self.forward(&audio, Some(&lengths))?;
-
-        // Decode
-        let token_sequences = greedy_decode(&log_probs, &lengths, self.blank_id)?;
-
-        // Convert tokens to text
-        let texts = self.decode_tokens(&token_sequences)?;
-
-        Ok(texts)
+        let frame_sec =
+            self.config.preprocessor.window_stride * self.encoder.subsampling_factor() as f32;
+        let tokenizer = self.tokenizer.as_ref().expect("checked above");
+        Ok(decoded
+            .iter()
+            .map(|tokens| {
+                Transcript::from_tokens(tokenizer, tokens, frame_sec, options.strip_lang_tags)
+            })
+            .collect())
     }
 
     /// Run forward pass on preprocessed audio.
@@ -454,19 +472,6 @@ impl EncDecCTCModel {
         let log_probs = self.decoder.forward(&encoded)?;
 
         Ok((log_probs, encoded_lengths))
-    }
-
-    /// Decode token sequences to text.
-    fn decode_tokens(&self, token_sequences: &[Vec<usize>]) -> Result<Vec<String>> {
-        let tokenizer = self
-            .tokenizer
-            .as_ref()
-            .ok_or_else(|| Error::tokenizer("No tokenizer loaded. Call load_tokenizer first."))?;
-
-        Ok(token_sequences
-            .iter()
-            .map(|tokens| tokenizer.decode(tokens, false))
-            .collect())
     }
 
     /// Get the model configuration.
@@ -623,7 +628,11 @@ impl EncDecCTCModel {
         let log_probs = self.decoder.forward(&encoded)?;
 
         // Greedy decode
-        let token_sequences = greedy_decode(&log_probs, &encoded_lengths, self.blank_id)?;
+        let token_sequences: Vec<Vec<usize>> =
+            greedy_decode(&log_probs, &encoded_lengths, self.blank_id)?
+                .into_iter()
+                .map(|tokens| tokens.into_iter().map(|t| t.id).collect())
+                .collect();
         tracing::debug!(?token_sequences, "decoded token sequences");
 
         // Merge with previous tokens using LCS

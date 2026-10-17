@@ -255,7 +255,7 @@ impl Model {
     ) -> Result<(String, Vec<f64>), Box<dyn std::error::Error>> {
         match self {
             Model::Offline(model) => {
-                let text = model.transcribe(&[audio])?.pop().unwrap_or_default();
+                let text = model.transcribe_one(audio)?.text;
                 Ok((text, Vec::new()))
             }
             Model::Streaming(pipeline) => {

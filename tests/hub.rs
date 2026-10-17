@@ -29,13 +29,12 @@ fn test_hub_safetensors_directory() {
         HubRepo::new("animaslabs/nemotron-speech-streaming-en-0.6b-mlx-8bit").revision("main"),
     )
     .expect("Failed to load RNN-T model from the Hub");
-    let text = model
-        .transcribe(&[TEST_AUDIO])
+    let transcript = model
+        .transcribe_one(TEST_AUDIO)
         .expect("Transcription failed");
     assert!(
-        text[0].to_lowercase().contains("observed phoebe"),
-        "unexpected transcript: {}",
-        text[0]
+        transcript.text.to_lowercase().contains("observed phoebe"),
+        "unexpected transcript: {transcript}"
     );
 }
 

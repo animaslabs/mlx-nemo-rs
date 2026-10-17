@@ -273,9 +273,9 @@ let model = mlx_voice::asr::load("model.nemo")?;   // -> AnyAsrModel, which impl
 
 ## 3. Offline inference
 
-### 3.1 Accept audio, not only paths (partly done)
+### 3.1 Accept audio, not only paths (done)
 
-**Done:** `EncDecCTCModel` and `EncDecRNNTModel` have `transcribe_samples(&[f32], sample_rate) -> String`, which resamples to the model's rate. The `AudioInput` design below, which would unify paths and samples in `transcribe`, is still open.
+**Done:** `transcribe`, `transcribe_with` and `transcribe_one` on `EncDecCTCModel` and `EncDecRNNTModel` take anything that converts into `AudioInput`: any `&impl AsRef<Path>`, `(&[f32], rate)` or `(&Vec<f32>, rate)`. Samples are resampled to the model's rate, and empty audio gives an empty `Transcript` without running the model. This replaces the interim `transcribe_samples`.
 
 `EncDecCTCModel::transcribe` and `EncDecRNNTModel::transcribe` only take file
 paths (`&[impl AsRef<Path>]`). There's no supported way to transcribe samples
@@ -305,7 +305,16 @@ Resampling happens inside, as it already does for files. Requiring the sample
 rate with `Samples` removes the most common bug: feeding 44.1 kHz or 48 kHz audio
 to a 16 kHz model.
 
-### 3.2 Return structured results
+### 3.2 Return structured results (done)
+
+**Done:** `transcribe` returns `Vec<Transcript>`. Each has `text`, `tokens`
+(`Token { id, text, start, end }`), `words` (`Word { text, start, end }`, built
+at SentencePiece word starts, without language tags when they're stripped)
+and `language` (the last language tag for prompt models). `Display` prints the
+text. Times come from the encoder frame each token was emitted on (80 ms
+frames), from greedy and beam search RNN-T and from CTC (a token spans the
+frames it repeats on). Still open: `confidence`, `sentences()`/segments, and
+moving the multi-talker types onto `Word`/`Segment`.
 
 `transcribe` returns `Vec<String>`. Token ids, timestamps and confidences are
 all computed or computable (`DecodeStepOutput::timesteps` already tracks frame
@@ -337,7 +346,15 @@ impl Display for Transcript { /* writes text */ }
 `SpeakerWord`/`SpeakerSegment` can then become `Word`/`Segment` with
 `speaker: Option<usize>`, so both pipelines share one result vocabulary.
 
-### 3.3 Inference options
+### 3.3 Inference options (done)
+
+**Done:** `TranscribeOptions` (with builder methods) holds `decoding`
+(`None` uses the model's configured `DecodingStrategy`), `language` (switched
+for the call only), `strip_lang_tags` and `batch_size` (default 4, as in NeMo).
+`RnntDecodingStrategy` became the shared `DecodingStrategy`; CTC models reject
+beam search and a language. `set_decoding_strategy` and the model-level
+`set_strip_lang_tags` are gone. `set_language` stays as the model's default and
+streaming setting.
 
 Per-call knobs are currently setters on the model (`set_decoding_strategy`,
 `set_strip_lang_tags`, `set_language`, `set_encoder_dtype`). Setters that
@@ -889,7 +906,7 @@ release happens.
    `pub(crate)` or put them behind `internals` (§8). Remove the legacy aliases
    and the stateless mel API.~~ Done.
 4. ~~Add `from_pretrained` + `LoadOptions`, and replace `restore*` (§2).~~ Done.
-5. Add `Transcript`/`Token`/`Word` results and `TranscribeOptions` (§3.2–3.3).
+5. ~~Add `Transcript`/`Token`/`Word` results and `TranscribeOptions` (§3.2–3.3).~~ Done, with `AudioInput` (§3.1).
 6. Add one `StreamingSession` built from a model, and turn
    `CacheAwareRNNTPipeline` into a thin wrapper or remove it (§4). Remove
    `init_streaming`/`process_chunk`/`finalize_streaming`.

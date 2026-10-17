@@ -11,29 +11,45 @@ mod sortformer_enc_label;
 
 pub use enc_dec_classification::EncDecClassificationModel;
 pub use enc_dec_ctc::{CtcStreamingSession, EncDecCTCModel};
-pub use enc_dec_rnnt::{EncDecRNNTModel, RnntDecodingStrategy, RnntStreamingSession};
+pub use enc_dec_rnnt::{EncDecRNNTModel, RnntStreamingSession};
 pub use sortformer_enc_label::SortformerEncLabelModel;
-
-use std::path::Path;
 
 use mlx_rs::Array;
 
-use crate::audio::{load_wav, resample};
+use crate::asr::decoding::TimedToken;
+use crate::asr::transcript::AudioInput;
 use crate::core::error::Result;
 
-/// Load WAV files as mono audio at `sample_rate`.
-fn load_clips(paths: &[impl AsRef<Path>], sample_rate: u32) -> Result<Vec<Vec<f32>>> {
-    paths
-        .iter()
-        .map(|path| {
-            let (samples, file_sample_rate) = load_wav(path.as_ref())?;
-            if file_sample_rate == sample_rate {
-                Ok(samples)
-            } else {
-                resample(&samples, file_sample_rate, sample_rate)
-            }
-        })
-        .collect()
+/// Decode `inputs` at `sample_rate` in batches of `batch_size` clips, with
+/// `decode` mapping one batch of clips to each clip's tokens. Empty clips
+/// decode to no tokens without running the model.
+fn decode_in_batches<'a, I>(
+    inputs: I,
+    sample_rate: u32,
+    batch_size: usize,
+    mut decode: impl FnMut(&[Vec<f32>]) -> Result<Vec<Vec<TimedToken>>>,
+) -> Result<Vec<Vec<TimedToken>>>
+where
+    I: IntoIterator,
+    I::Item: Into<AudioInput<'a>>,
+{
+    let inputs: Vec<AudioInput<'a>> = inputs.into_iter().map(Into::into).collect();
+    let mut results = vec![Vec::new(); inputs.len()];
+    for (batch_idx, batch) in inputs.chunks(batch_size.max(1)).enumerate() {
+        let clips = batch
+            .iter()
+            .map(|input| input.load(sample_rate))
+            .collect::<Result<Vec<_>>>()?;
+        let nonempty: Vec<usize> = (0..clips.len()).filter(|&i| !clips[i].is_empty()).collect();
+        if nonempty.is_empty() {
+            continue;
+        }
+        let to_decode: Vec<Vec<f32>> = nonempty.iter().map(|&i| clips[i].clone()).collect();
+        for (i, tokens) in nonempty.into_iter().zip(decode(&to_decode)?) {
+            results[batch_idx * batch_size.max(1) + i] = tokens;
+        }
+    }
+    Ok(results)
 }
 
 /// Zero-pad clips into a `[batch, samples]` array, with their lengths `[batch]`.

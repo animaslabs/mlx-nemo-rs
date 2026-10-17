@@ -31,3 +31,15 @@ pub use merge::{LcsAlignmentResult, greedy_ctc_merge, lcs_merge_buffer};
 pub use rnnt_beam::rnnt_beam_decode;
 pub use rnnt_greedy::{rnnt_greedy_decode, rnnt_greedy_decode_batched};
 pub use rnnt_streaming::{DecodeStepOutput, RnntStreamingDecoder};
+
+/// A decoded token and the encoder frames `[start_frame, end_frame)` it was
+/// emitted on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TimedToken {
+    /// Token id
+    pub id: usize,
+    /// First encoder frame
+    pub start_frame: usize,
+    /// One past the last encoder frame
+    pub end_frame: usize,
+}

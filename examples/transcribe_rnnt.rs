@@ -16,6 +16,7 @@
 //!   --format <fmt>    Weight format: "mlx" or "pytorch" (default: auto-detect)
 //!   --language <lang> Target language of a multilingual model, e.g. en-US, de, auto (default)
 //!   --keep-lang-tags  Keep the detected-language tags (e.g. <en-US>) in the text
+//!   --words           Print each word with its start and end time
 //!
 //! Environment:
 //!   RUST_LOG=mlx_voice=debug   Enable debug logging
@@ -24,7 +25,7 @@ use std::path::Path;
 use std::time::Instant;
 
 use mlx_voice::WeightFormat;
-use mlx_voice::asr::{EncDecRNNTModel, RnntDecodingStrategy};
+use mlx_voice::asr::{EncDecRNNTModel, TranscribeOptions};
 use tracing_subscriber::EnvFilter;
 
 fn main() -> mlx_voice::Result<()> {
@@ -61,6 +62,7 @@ fn main() -> mlx_voice::Result<()> {
     let mut weight_format: Option<WeightFormat> = None;
     let mut language: Option<String> = None;
     let mut keep_lang_tags = false;
+    let mut print_words = false;
     let mut audio_start_idx = 3;
 
     let mut i = 3;
@@ -98,6 +100,11 @@ fn main() -> mlx_voice::Result<()> {
                 i += 1;
                 audio_start_idx = i;
             }
+            "--words" => {
+                print_words = true;
+                i += 1;
+                audio_start_idx = i;
+            }
             _ => break,
         }
     }
@@ -127,18 +134,16 @@ fn main() -> mlx_voice::Result<()> {
         }
     );
 
-    if let Some(language) = &language {
-        model.set_language(language)?;
+    let mut options = TranscribeOptions::default().strip_lang_tags(!keep_lang_tags);
+    if let Some(language) = language {
+        options = options.language(language);
     }
-    if let Some(language) = model.language() {
+    if let Some(language) = options.language.as_deref().or(model.language()) {
         println!("Target language: {language}");
     }
-    model.set_strip_lang_tags(!keep_lang_tags);
-
-    // Set decoding strategy
     if let Some(beam) = beam_size {
         println!("Decoding strategy: Beam search (beam_size={})", beam);
-        model.set_decoding_strategy(RnntDecodingStrategy::BeamSearch { beam_size: beam });
+        options = options.beam_search(beam);
     } else {
         println!("Decoding strategy: Greedy");
     }
@@ -148,16 +153,24 @@ fn main() -> mlx_voice::Result<()> {
     println!("Transcribing {} file(s)...", audio_paths.len());
     let start = Instant::now();
 
-    let transcriptions = model.transcribe(&audio_paths)?;
+    let transcriptions = model.transcribe_with(&audio_paths, &options)?;
 
     let elapsed = start.elapsed().as_secs_f32();
     println!("Transcription completed in {:.2}s", elapsed);
     println!();
 
     // Print results
-    for (path, text) in audio_paths.iter().zip(transcriptions.iter()) {
+    for (path, transcript) in audio_paths.iter().zip(transcriptions.iter()) {
         println!("File: {}", path);
-        println!("Text: {}", text);
+        println!("Text: {}", transcript);
+        if let Some(language) = &transcript.language {
+            println!("Detected language: {language}");
+        }
+        if print_words {
+            for word in &transcript.words {
+                println!("  {:7.2} {:7.2}  {}", word.start, word.end, word.text);
+            }
+        }
         println!();
     }
 

@@ -55,13 +55,14 @@ internal_mod!(
     streaming
 );
 pub mod tokenizer;
+pub mod transcript;
 pub mod vad;
 
 // Re-exports
 pub use config::AsrModelConfig;
 pub use models::{
     CtcStreamingSession, EncDecCTCModel, EncDecClassificationModel, EncDecRNNTModel,
-    RnntDecodingStrategy, RnntStreamingSession, SortformerEncLabelModel,
+    RnntStreamingSession, SortformerEncLabelModel,
 };
 pub use modules::{MelConfig, MelProcessor, SpectrumTransform, StreamingMel};
 pub use pipeline::{
@@ -70,12 +71,14 @@ pub use pipeline::{
 };
 pub use streaming::{StreamingConfig, StreamingModeInfo, StreamingOutput};
 pub use tokenizer::Tokenizer;
+pub use transcript::{AudioInput, DecodingStrategy, Token, TranscribeOptions, Transcript, Word};
 pub use vad::{SpeechSegment, VadPostProcessConfig, VadPostProcessor};
 
 /// Prelude for convenient imports.
 pub mod prelude {
     pub use super::config::AsrModelConfig;
-    pub use super::models::{EncDecCTCModel, EncDecRNNTModel, RnntDecodingStrategy};
+    pub use super::models::{EncDecCTCModel, EncDecRNNTModel};
     pub use super::pipeline::CacheAwareRNNTPipeline;
     pub use super::tokenizer::Tokenizer;
+    pub use super::transcript::{AudioInput, DecodingStrategy, TranscribeOptions, Transcript};
 }
