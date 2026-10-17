@@ -662,7 +662,7 @@ mod pickle {
                 .pop()
                 .ok_or_else(|| Error::pickle("Stack underflow in SETITEM"))?;
 
-            if let Some(Value::Dict(ref mut dict)) = self.stack.last_mut() {
+            if let Some(Value::Dict(dict)) = self.stack.last_mut() {
                 if let Value::String(k) = key {
                     dict.push((k, value));
                 }
@@ -691,7 +691,7 @@ mod pickle {
             }
 
             // The dict should be on top now
-            if let Some(Value::Dict(ref mut dict)) = self.stack.last_mut() {
+            if let Some(Value::Dict(dict)) = self.stack.last_mut() {
                 pairs.reverse();
                 dict.extend(pairs);
             }
@@ -703,7 +703,7 @@ mod pickle {
                 .stack
                 .pop()
                 .ok_or_else(|| Error::pickle("Stack underflow in APPEND"))?;
-            if let Some(Value::List(ref mut list)) = self.stack.last_mut() {
+            if let Some(Value::List(list)) = self.stack.last_mut() {
                 list.push(value);
             }
             Ok(())
@@ -723,7 +723,7 @@ mod pickle {
             }
             items.reverse();
 
-            if let Some(Value::List(ref mut list)) = self.stack.last_mut() {
+            if let Some(Value::List(list)) = self.stack.last_mut() {
                 list.extend(items);
             }
             Ok(())
