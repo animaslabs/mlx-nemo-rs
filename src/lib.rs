@@ -9,19 +9,30 @@
 //!
 //! ## Quick Start
 //!
+//! With the `hub` feature, `from_pretrained` downloads a model from the
+//! Hugging Face Hub into the local Hugging Face cache:
+//!
+//! ```toml
+//! [dependencies]
+//! mlx-voice = { version = "0.2", features = ["hub"] }
+//! ```
+//!
 //! ```no_run
 //! # fn main() -> mlx_voice::Result<()> {
-//! use mlx_voice::asr::EncDecCtcModel;
+//! use mlx_voice::asr::EncDecRnntModel;
 //!
-//! // Load a pretrained model from a .nemo file
-//! let mut model = EncDecCtcModel::from_pretrained("path/to/model.nemo")?;
-//!
-//! // Transcribe audio
-//! let transcriptions = model.transcribe(&["audio.wav"])?;
-//! println!("{}", transcriptions[0]);
+//! let mut model = EncDecRnntModel::from_pretrained("nvidia/parakeet-rnnt-0.6b")?;
+//! let transcript = model.transcribe_one("audio.wav")?;
+//! println!("{transcript}");
+//! for word in &transcript.words {
+//!     println!("{:6.2}-{:6.2} {}", word.start, word.end, word.text);
+//! }
 //! # Ok(())
 //! # }
 //! ```
+//!
+//! `from_pretrained` also takes a local `.nemo` file or model directory,
+//! which needs no `hub` feature.
 
 #![warn(missing_docs, missing_debug_implementations)]
 
