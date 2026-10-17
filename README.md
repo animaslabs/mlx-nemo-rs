@@ -24,11 +24,11 @@ TTS and LLM support are planned.
 
 ## Installation
 
-Add the crate from git:
+Add the crate from crates.io:
 
 ```toml
 [dependencies]
-mlx-voice = { git = "https://github.com/animaslabs/mlx-voice-rs" }
+mlx-voice = "0.1"
 ```
 
 ASR support is behind the `asr` feature, which is on by default.
