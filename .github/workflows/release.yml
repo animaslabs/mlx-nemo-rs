@@ -23,6 +23,10 @@ on:
 permissions:
   contents: read
 
+env:
+  # Same as ci.yml, so the publish job can restore main's CI build cache
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
+
 jobs:
   ci:
     uses: ./.github/workflows/ci.yml
@@ -38,6 +42,10 @@ jobs:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: macos
+          cache-directories: ~/.mlx
+          save-if: false
 
       - name: Check tag, Cargo.toml version and CHANGELOG agree
         id: version

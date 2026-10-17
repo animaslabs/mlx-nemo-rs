@@ -9,18 +9,25 @@ on:
 permissions:
   contents: read
 
+# Cancel superseded PR runs, but let every push to main finish: main's runs
+# save the build cache that PRs restore.
 concurrency:
   group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   CARGO_TERM_COLOR: always
-  RUSTFLAGS: -D warnings
-  RUSTDOCFLAGS: -D warnings
+  # Smaller target dir (and cache) and faster links; panics still show
+  # file and line. pages.yml sets the same so it can reuse this cache.
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
 
-# MLX builds with Metal, so everything that compiles the crate runs on macOS
-# arm64. Tests run one at a time (RUST_TEST_THREADS in .cargo/config.toml);
-# tests that need downloaded models are #[ignore] and don't run here.
+# Building MLX (C++ and Metal shaders, in mlx-sys) is nearly all of the cost,
+# so one macOS job builds it once and runs every check against that build.
+#
+# The cache is saved from main only: a PR can restore main's cache but not
+# another PR's, so caches saved from PRs only use up the 10 GB quota. It
+# includes ~/.mlx because mlx-sys writes mlx.metallib there, outside target/,
+# and a restored build skips the build script that would recreate it.
 jobs:
   fmt:
     runs-on: ubuntu-latest
@@ -31,7 +38,7 @@ jobs:
           components: rustfmt
       - run: cargo fmt --all --check
 
-  clippy:
+  check:
     runs-on: macos-15
     steps:
       - uses: actions/checkout@v7
@@ -39,41 +46,40 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
-      - run: cargo clippy --workspace --all-targets --all-features --locked
-      - run: cargo clippy --workspace --all-targets --locked
-
-  test:
-    runs-on: macos-15
-    steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo test --workspace --all-features --locked
-
-  features:
-    runs-on: macos-15
-    steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: macos
+          cache-directories: ~/.mlx
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+          cache-on-failure: true
       - uses: taiki-e/install-action@cargo-hack
-      # Each feature on its own, and none, to catch cfg mistakes the default
-      # build never sees
-      - run: cargo hack check --package mlx-voice --each-feature --no-dev-deps
 
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+      # Default features, no features, and each feature on its own, to catch
+      # cfg mistakes the all-features build never sees
+      - name: Clippy, per feature
+        run: cargo hack clippy --package mlx-voice --each-feature --lib --locked -- -D warnings
+      # One test at a time (RUST_TEST_THREADS in .cargo/config.toml); tests
+      # that need downloaded models are #[ignore]
+      - name: Test
+        run: cargo test --workspace --all-features --locked
+      - name: Docs
+        run: cargo doc --package mlx-voice --no-deps --all-features --locked
+        env:
+          RUSTDOCFLAGS: -D warnings
+
+  # A second toolchain means a second MLX build, so the MSRV check skips PRs
+  # and runs on pushes to main and in release.yml.
   msrv:
+    if: github.event_name != 'pull_request'
     runs-on: macos-15
     steps:
       - uses: actions/checkout@v7
       # Keep in sync with rust-version in Cargo.toml
       - uses: dtolnay/rust-toolchain@1.88
       - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: msrv
+          cache-directories: ~/.mlx
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo check --package mlx-voice --all-features --locked
-
-  docs:
-    runs-on: macos-15
-    steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo doc --package mlx-voice --no-deps --all-features --locked
