@@ -170,17 +170,12 @@ Pin third-party actions to commit SHAs (see [§7](#7-supply-chain-and-semver)).
 The crate only builds on macOS (MLX with Metal), so every job except docs
 deployment runs on macOS arm64.
 
-- **GitHub-hosted `macos-15` (arm64)** is free for public repos and fine for
-  build, fmt, clippy, docs and unit tests. The first MLX build is slow; cache
-  `target/` with `Swatinem/rust-cache`.
-- **Metal on hosted runners is uncertain.** They are VMs on M1 hosts, and
-  GitHub's docs list Metal Performance Shaders as unsupported on the larger
-  macOS runners. Some users report Metal/MPS errors on the standard ones too.
-  Try the unit tests there first. If GPU tests crash, either run them on CPU
-  (see whether `mlx-rs` can set the default device to CPU for tests) or move
-  them to real Apple Silicon. `mlx-rs` itself runs CI on Blacksmith macOS
-  runners (`blaze/macos-latest`). A self-hosted Mac mini also works and can
-  keep the models on disk.
+- **GitHub-hosted `macos-15` (arm64)** runs build, clippy, docs and the unit
+  tests, Metal included. The first CI runs confirmed the Metal tests pass
+  there. The MLX build is slow, so caching matters ([§2.3](#23-jobs)).
+- **Model tests need more.** They need GBs of models, so a self-hosted Mac
+  mini (models kept on disk) or Blacksmith macOS runners (which `mlx-rs` uses)
+  suit them better ([§5.3](#53-model-tests)).
 
 ### 2.2 Make single-threaded tests the default
 
@@ -198,92 +193,47 @@ output and retries, but it's another tool for contributors to install.
 
 ### 2.3 Jobs
 
-```yaml
-# .github/workflows/ci.yml
-name: CI
-on:
-  push: { branches: [main] }
-  pull_request:
-  workflow_call:
+Building MLX (the C++ library and its Metal shaders, in `mlx-sys`) takes 7–9
+minutes on a 3-core hosted runner and is nearly all of CI's cost. The first
+version of `ci.yml` ran five macOS jobs that each built it, and none of their
+caches were usable (see below), so every run cost about 40 macOS-minutes.
+[`ci.yml`](../.github/workflows/ci.yml) is now laid out around that build:
 
-concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+- **`fmt`** on Ubuntu, since rustfmt doesn't compile anything.
+- **`check`**, one macOS job that builds MLX once and runs, in order:
+  - clippy on all targets and features
+  - clippy for each feature on its own (`cargo hack --each-feature`), to
+    catch cfg mistakes
+  - the tests
+  - rustdoc
 
-env:
-  CARGO_TERM_COLOR: always
-  RUSTFLAGS: -D warnings
-  RUSTDOCFLAGS: -D warnings
+  Everything uses `-D warnings`.
+- **`msrv`**: `cargo check` on 1.88. A second toolchain means a second MLX
+  build, so it skips PRs and runs on pushes to `main` and in releases.
 
-jobs:
-  fmt:
-    runs-on: ubuntu-latest       # rustfmt doesn't need to compile MLX
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with: { components: rustfmt }
-      - run: cargo fmt --all --check
+What makes the cache work:
 
-  clippy:
-    runs-on: macos-15
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with: { components: clippy }
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo clippy --workspace --all-targets --all-features
+- **Save from `main` only** (`save-if`), under one shared key. A PR can
+  restore `main`'s cache but not another PR's, so caches saved from PRs
+  only use up the 10 GB repository quota.
+- **Don't cancel runs on `main`.** `cancel-in-progress` applies to PRs only.
+  Before, each merge cancelled the previous `main` run, so `main` never
+  saved a cache.
+- **Cache `~/.mlx` too.** `mlx-sys` writes `mlx.metallib` to
+  `~/.mlx/lib/<hash>/`, outside `target/`. A restored build skips the build
+  script that would recreate it.
+- **No global `RUSTFLAGS`.** It's part of every crate's fingerprint, so
+  `pages.yml` and `release.yml` couldn't reuse the cache without the same
+  value. `-D warnings` goes to clippy and rustdoc directly.
+- **`CARGO_PROFILE_DEV_DEBUG=line-tables-only`**, the same in every workflow,
+  for a smaller cache and faster links.
 
-  test:
-    runs-on: macos-15
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo test --workspace --all-features   # RUST_TEST_THREADS=1 from .cargo/config.toml
+Restoring a cache doesn't rebuild MLX: cargo treats `mlx-sys` as fresh even
+after rust-cache re-extracts the crate sources (checked locally with a
+separate `CARGO_HOME`).
 
-  features:
-    runs-on: macos-15
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - uses: taiki-e/install-action@cargo-hack
-      - run: cargo hack check --package mlx-voice --each-feature --no-dev-deps
-
-  msrv:
-    runs-on: macos-15
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.88   # keep in sync with rust-version
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo check --package mlx-voice --all-features
-
-  docs:
-    runs-on: macos-15
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@nightly
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo doc --no-deps --all-features --package mlx-voice
-        env: { RUSTDOCFLAGS: "-D warnings --cfg docsrs" }
-
-  deny:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: EmbarkStudios/cargo-deny-action@v2
-```
-
-Before turning this on:
-
-- **Fix the 86 clippy errors.** `cargo clippy --fix --all-targets
-  --all-features` handles most of them. The three `too_many_arguments` cases
-  need a decision: an options struct, or an `#[expect]` with a reason.
-- Add a branch ruleset on `main` that requires `fmt`, `clippy`, `test`, `docs`
-  and `deny` to pass, and blocks force pushes.
-- One job that might surprise you: `features` runs `cargo check` with only
-  `internals`, only `hub`, and with no features at all. That catches
-  `#[cfg(feature = ...)]` mistakes the default build never sees.
+Still to do: require `fmt` and `check` in a branch ruleset on `main`, and add
+a `deny` job once there's a `deny.toml` (P1).
 
 ---
 
@@ -672,7 +622,7 @@ watch for regressions. Publish real-time factors in the README.
 - [x] `.cargo/config.toml`: `[env] RUST_TEST_THREADS = "1"`
 - [x] `.github/workflows/ci.yml`: fmt, clippy, test, features, msrv, docs
 - [ ] `deny` job (needs a `deny.toml`, see P1)
-- [ ] Branch ruleset on `main` requiring CI
+- [ ] Branch ruleset on `main` requiring `fmt` and `check`
 - [x] `.github/workflows/release.yml`
 - [ ] crates.io Trusted Publishing and the `release` environment (repo
   settings)

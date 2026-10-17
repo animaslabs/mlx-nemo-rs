@@ -20,9 +20,10 @@ cargo build --release
 # .cargo/config.toml sets RUST_TEST_THREADS=1, so plain `cargo test` is safe
 cargo test
 
-# CI (.github/workflows/ci.yml) runs these with RUSTFLAGS/RUSTDOCFLAGS="-D warnings"
-cargo clippy --workspace --all-targets --all-features
-cargo doc --package mlx-voice --no-deps --all-features
+# What CI (.github/workflows/ci.yml) runs, besides fmt and the tests
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo hack clippy --package mlx-voice --each-feature --lib -- -D warnings   # cargo install cargo-hack
+RUSTDOCFLAGS="-D warnings" cargo doc --package mlx-voice --no-deps --all-features
 
 # Run a specific ignored test (requires model files in models/)
 cargo test --features internals test_load_parakeet_rnnt_checkpoint -- --ignored

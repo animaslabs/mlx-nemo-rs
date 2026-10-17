@@ -21,6 +21,10 @@ on:
 permissions:
   contents: read
 
+env:
+  # Same as ci.yml, so this restores main's CI build cache
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
+
 concurrency:
   group: pages
   cancel-in-progress: false
@@ -34,6 +38,10 @@ jobs:
           ref: ${{ inputs.ref || github.ref }}
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: macos
+          cache-directories: ~/.mlx
+          save-if: false
       - run: cargo doc --package mlx-voice --no-deps --all-features --locked
       - run: echo '<meta http-equiv="refresh" content="0; url=mlx_voice/">' > target/doc/index.html
       - uses: actions/upload-pages-artifact@v5
