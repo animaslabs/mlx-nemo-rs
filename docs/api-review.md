@@ -388,6 +388,44 @@ many requests behind an `Arc` (with a `Mutex` only where MLX requires it; see
 
 ## 4. Streaming
 
+**Done (§4.1–4.3 and most of §4.5):** `CacheAwareRNNTPipeline` and the RNN-T
+model's `init_streaming`/`process_chunk`/`finalize_streaming` (with
+`RnntStreamingSession` and `TranscribeOutput`) are replaced by one
+`StreamingSession<M: BorrowMut<EncDecRNNTModel>>`. `model.stream(options)`
+borrows the model, and `StreamingSession::new(model, options)` owns it and
+gives it back through `into_model`. The session:
+
+- takes audio with `push_audio(samples, rate)`, using a stateful
+  `audio::StreamResampler` for other rates, and `end_audio()`;
+- returns `StreamUpdate { tokens, delta, is_final }` from `next_update()`, with
+  token times from the start of the stream;
+- returns a `Transcript` from `finish()` or `transcript()`, and the text so far
+  from `text()`;
+- takes its settings as `StreamingOptions` (`mode`, `strip_lang_tags`,
+  `suppress_punctuation`, `blank_threshold`, `silence_threshold`) in place of
+  setters;
+- reports its backlog through `buffered_samples()` (audio pushed but not yet
+  decoded), so a worker thread can tell when decoding falls behind real time.
+  Its docs show the usual production setup: the audio callback does a
+  non-blocking write to a queue, and a worker thread drains it into the
+  session.
+
+`model.transcribe_streaming(input, options)` streams a whole file.
+`MultiTalkerPipeline` owns a session and takes `push_audio`/`end_audio`/
+`next_update`/`finish`/`transcribe(input)`. Its ASR options move into
+`MultiTalkerConfig::streaming`, so `from_pretrained(asr, diar)` lost its mode
+argument. The `live` and `live_pipeline` examples are merged into one `live`
+example, which no longer carries its own resampler.
+
+Two bugs fixed along the way: offline `forward` used the encoder's current
+streaming mode for its attention context, so streaming in another mode changed
+later offline results; and changing the streaming mode didn't clear the cached
+streaming attention masks.
+
+Still open: CTC models keep their old `init_streaming` API (no cache-aware CTC
+checkpoint was available to test a port), and §4.4 (`StreamingMode` as a type).
+`mode` stays an index.
+
 ### 4.1 Two streaming APIs
 
 | | `EncDecRNNTModel` + `RnntStreamingSession` | `CacheAwareRNNTPipeline` |
@@ -665,6 +703,12 @@ the logic internal.
 
 ### 7.3 Threading and devices
 
+**Partly done:** `asr/mod.rs` asserts at compile time that the models,
+`StreamingSession` (owned and borrowed), `MultiTalkerPipeline`, `StreamUpdate`,
+`Transcript`, `Tokenizer` and `StreamResampler` are `Send`, and the
+`StreamingSession` docs describe the worker-thread pattern. Per-call devices or
+streams and memory controls are still open.
+
 `mlx_rs::Array` is `Send` but not `Sync`, and MLX's default stream is global.
 The crate doesn't say which of its types are `Send` or `Sync`, and the live
 examples work around that with a manual audio thread plus a `ringbuf`. Suggestions:
@@ -907,9 +951,10 @@ release happens.
    and the stateless mel API.~~ Done.
 4. ~~Add `from_pretrained` + `LoadOptions`, and replace `restore*` (§2).~~ Done.
 5. ~~Add `Transcript`/`Token`/`Word` results and `TranscribeOptions` (§3.2–3.3).~~ Done, with `AudioInput` (§3.1).
-6. Add one `StreamingSession` built from a model, and turn
+6. ~~Add one `StreamingSession` built from a model, and turn
    `CacheAwareRNNTPipeline` into a thin wrapper or remove it (§4). Remove
-   `init_streaming`/`process_chunk`/`finalize_streaming`.
+   `init_streaming`/`process_chunk`/`finalize_streaming`.~~ Done for RNN-T
+   (the pipeline is removed); CTC streaming is still the old API.
 7. Add typed config enums (§5) and Rust-cased type names with
    `#[doc(alias)]` (§6.2).
 

@@ -11,7 +11,7 @@ mod sortformer_enc_label;
 
 pub use enc_dec_classification::EncDecClassificationModel;
 pub use enc_dec_ctc::{CtcStreamingSession, EncDecCTCModel};
-pub use enc_dec_rnnt::{EncDecRNNTModel, RnntStreamingSession};
+pub use enc_dec_rnnt::EncDecRNNTModel;
 pub use sortformer_enc_label::SortformerEncLabelModel;
 
 use mlx_rs::Array;

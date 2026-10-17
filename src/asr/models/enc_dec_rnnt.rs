@@ -3,27 +3,24 @@
 //! This model implements the RNN-T (Transducer) ASR architecture used by
 //! NeMo's EncDecRNNTModel and EncDecRNNTBPEModel (Parakeet RNNT models).
 //!
-//! # Streaming Support
+//! # Streaming
 //!
-//! For streaming-capable models, this module provides cache-aware streaming:
+//! Streaming-capable models transcribe incrementally through a
+//! [`StreamingSession`](crate::asr::StreamingSession):
 //!
 //! ```no_run
 //! # fn main() -> mlx_voice::Result<()> {
-//! # use mlx_voice::asr::EncDecRNNTModel;
+//! # use mlx_voice::asr::{EncDecRNNTModel, StreamingOptions};
 //! # let audio_chunks: Vec<Vec<f32>> = Vec::new();
 //! let mut model = EncDecRNNTModel::from_pretrained("model.nemo")?;
-//!
-//! // Initialize streaming
-//! let mut session = model.init_streaming(0, 1)?;
-//!
-//! // Process audio chunks
+//! let mut stream = model.stream(StreamingOptions::default())?;
 //! for chunk in &audio_chunks {
-//!     let output = model.process_chunk(&mut session, chunk)?;
-//!     print!("{}", output.text[0]);
+//!     stream.push_audio(chunk, 16_000)?;
+//!     while let Some(update) = stream.next_update()? {
+//!         print!("{}", update.delta);
+//!     }
 //! }
-//!
-//! // Finalize
-//! let final_output = model.finalize_streaming(session)?;
+//! let transcript = stream.finish()?;
 //! # Ok(())
 //! # }
 //! ```
@@ -36,13 +33,11 @@ use crate::asr::config::{AsrModelConfig, JointConfig};
 use crate::asr::decoding::TimedToken;
 use crate::asr::decoding::{RnntStreamingDecoder, rnnt_beam_decode};
 use crate::asr::modules::{
-    ConformerEncoder, DecoderState, LanguagePrompt, MelConfig, MelProcessor, PredictionNetwork,
-    RNNTDecoder, RNNTJoint, StatelessTransducerDecoder,
+    ConformerEncoder, LanguagePrompt, MelConfig, MelProcessor, PredictionNetwork, RNNTDecoder,
+    RNNTJoint, StatelessTransducerDecoder,
 };
-use crate::asr::streaming::{
-    EncoderCache, StreamingConfig, StreamingMelBuffer, StreamingModeInfo, StreamingOutput,
-    compute_streaming_config, get_streaming_modes,
-};
+use crate::asr::pipeline::{StreamingOptions, StreamingSession};
+use crate::asr::streaming::{StreamingModeInfo, get_streaming_modes};
 use crate::asr::transcript::{AudioInput, DecodingStrategy, TranscribeOptions, Transcript};
 use crate::core::ArrayExt;
 use crate::core::checkpoint::NemoCheckpoint;
@@ -76,26 +71,16 @@ use mlx_rs::ops::indexing::IndexOp;
 /// # }
 /// ```
 pub struct EncDecRNNTModel {
-    config: AsrModelConfig,
-    preprocessor: MelProcessor,
-    encoder: ConformerEncoder,
-    decoder: PredictionNetwork,
-    joint: RNNTJoint,
-    tokenizer: Option<Tokenizer>,
+    pub(crate) config: AsrModelConfig,
+    pub(crate) preprocessor: MelProcessor,
+    pub(crate) encoder: ConformerEncoder,
+    pub(crate) decoder: PredictionNetwork,
+    pub(crate) joint: RNNTJoint,
+    pub(crate) tokenizer: Option<Tokenizer>,
     /// Blank token ID (typically vocab_size, last token)
-    blank_id: usize,
-    /// Decoding strategy
+    pub(crate) blank_id: usize,
+    /// Decoding strategy from the config
     decoding_strategy: DecodingStrategy,
-    chunk_count: usize,
-    /// Leave language tags out of transcribed text
-    strip_lang_tags: bool,
-}
-
-impl RnntStreamingSession {
-    /// The session's streaming configuration (chunk and cache sizes).
-    pub fn config(&self) -> &StreamingConfig {
-        &self.config
-    }
 }
 
 impl std::fmt::Debug for EncDecRNNTModel {
@@ -198,8 +183,6 @@ impl EncDecRNNTModel {
             tokenizer: None,
             blank_id,
             decoding_strategy,
-            chunk_count: 0,
-            strip_lang_tags: true,
         })
     }
 
@@ -565,11 +548,6 @@ impl EncDecRNNTModel {
         self.tokenizer.as_ref()?.detected_language(tokens)
     }
 
-    /// Text of `tokens`, without language tags unless they are kept.
-    fn tokens_to_text(&self, tokenizer: &Tokenizer, tokens: &[usize]) -> String {
-        tokenizer.decode(tokens, self.strip_lang_tags)
-    }
-
     /// Run the encoder in `dtype` instead of float32, e.g. `Dtype::Bfloat16`.
     ///
     /// Roughly halves encoder time on Apple Silicon for a small accuracy
@@ -814,419 +792,26 @@ impl EncDecRNNTModel {
         get_streaming_modes(self.encoder.config(), frame_duration_ms)
     }
 
-    /// Initialize a streaming session.
+    /// Start a [`StreamingSession`] that borrows this model.
     ///
-    /// # Arguments
-    /// * `mode_idx` - Streaming mode index into the checkpoint's `att_context_size` list (see
-    ///   `streaming_modes()` for each mode's latency). NeMo checkpoints list modes
-    ///   from most to least lookahead, so mode 0, the model's default, has the
-    ///   highest latency and accuracy
-    /// * `batch_size` - Number of independent audio streams
-    pub fn init_streaming(
-        &mut self,
-        mode_idx: usize,
-        batch_size: usize,
-    ) -> Result<RnntStreamingSession> {
-        if !self.supports_streaming() {
-            return Err(Error::config(
-                "Model does not support streaming. Use a streaming-capable model.",
-            ));
-        }
-
-        // Compute streaming configuration
-        let config = compute_streaming_config(self.encoder.config(), mode_idx, 10000)?;
-
-        tracing::debug!(
-            mode_idx,
-            chunk_size_first = config.chunk_size.0,
-            chunk_size_subsequent = config.chunk_size.1,
-            shift_size_first = config.shift_size.0,
-            shift_size_subsequent = config.shift_size.1,
-            pre_encode_cache_first = config.pre_encode_cache_size.0,
-            pre_encode_cache_subsequent = config.pre_encode_cache_size.1,
-            valid_out_len = config.valid_out_len,
-            drop_extra_pre_encoded = config.drop_extra_pre_encoded,
-            cache_drop_size = config.cache_drop_size,
-            last_channel_cache_size = config.last_channel_cache_size,
-            last_time_cache_size = config.last_time_cache_size,
-            "init_streaming configuration"
-        );
-
-        // Setup encoder
-        self.encoder.setup_streaming(config.cache_drop_size);
-
-        // Note: preprocessor is stateless, no reset needed
-
-        // Create encoder cache
-        let encoder_cache = EncoderCache::new(
-            self.encoder.num_layers(),
-            batch_size,
-            config.last_channel_cache_size,
-            config.last_time_cache_size,
-            self.encoder.d_model(),
-        )?;
-
-        // Create mel buffer
-        let preprocessor_config = self.preprocessor.config();
-        let n_mels = preprocessor_config.features;
-        let mel_buffer = StreamingMelBuffer::new(
-            preprocessor_config.sample_rate,
-            preprocessor_config.window_size,
-            preprocessor_config.window_stride,
-            n_mels,
-            preprocessor_config.n_fft,
-        );
-
-        tracing::debug!(
-            window_samples = mel_buffer.window_samples,
-            hop_samples = mel_buffer.hop_samples,
-            n_mels,
-            subsampling_factor = self.encoder.subsampling_factor(),
-            "mel_buffer configuration"
-        );
-
-        // Initialize decoder state for each batch sample
-        let mut decoder_states = Vec::with_capacity(batch_size);
-        for _ in 0..batch_size {
-            decoder_states.push(self.decoder.initialize_state(1)?);
-        }
-
-        Ok(RnntStreamingSession {
-            config,
-            encoder_cache,
-            mel_buffer,
-            decoder_states,
-            last_tokens: vec![None; batch_size],
-            accumulated_tokens: vec![Vec::new(); batch_size],
-            is_first_chunk: true,
-            blank_id: self.blank_id,
-            n_mels,
-        })
+    /// Use [`StreamingSession::new`] with the model itself for a session that
+    /// owns it. Offline [`transcribe`](Self::transcribe) is unaffected by the
+    /// session's streaming mode.
+    pub fn stream(&mut self, options: StreamingOptions) -> Result<StreamingSession<&mut Self>> {
+        StreamingSession::new(self, options)
     }
 
-    /// Process an audio chunk and return partial transcription.
-    ///
-    /// This follows NeMo's streaming approach:
-    /// 1. Convert audio to mel spectrogram using the streaming mel API
-    /// 2. Append mel frames to the buffer for chunked extraction
-    /// 3. Extract mel chunks with pre_encode_cache overlap
-    /// 4. Process through encoder and decoder
-    ///
-    /// The preprocessor maintains preemphasis state and audio remainder buffer
-    /// internally for seamless chunk boundaries.
-    pub fn process_chunk(
+    /// Transcribe a whole WAV file or clip by streaming it, as a live stream
+    /// would see it (e.g. to measure streaming accuracy).
+    pub fn transcribe_streaming<'a>(
         &mut self,
-        session: &mut RnntStreamingSession,
-        audio_chunk: &[f32],
-    ) -> Result<StreamingOutput> {
-        use mlx_rs::ops::indexing::IndexOp;
-        let batch_size = session.encoder_cache.batch_size();
-
-        // Step 1: Use the stateless mel spectrogram API
-        // Only process if we have audio samples
-        let _n_frames = if !audio_chunk.is_empty() {
-            let audio_array = Array::from_slice(audio_chunk, &[1, audio_chunk.len() as i32]);
-            let (mel_features, _) = self.preprocessor.forward(&audio_array, None)?;
-            // mel_features is [batch=1, n_mels, frames]
-            // Remove batch dimension: [n_mels, frames]
-            let mel_features = mel_features.index(0);
-
-            tracing::debug!(
-                "PROCESS CHUNK #{} len({}) Got mel_features {:?}",
-                self.chunk_count,
-                audio_chunk.len(),
-                mel_features.shape()
-            );
-            self.chunk_count += 1;
-
-            // Track total audio samples for logging
-            session.mel_buffer.total_audio_samples += audio_chunk.len();
-
-            let n_frames = mel_features.dim(1) as usize;
-            if n_frames > 0 {
-                // Step 2: Append mel frames to the buffer
-                // mel_features is [n_mels, time], append directly as Array
-                session.mel_buffer.append_mel(&mel_features)?;
-
-                tracing::debug!(
-                    frames_appended = n_frames,
-                    audio_samples = audio_chunk.len(),
-                    total_frames = session.mel_buffer.total_frames,
-                    "appended mel frames from audio"
-                );
-            }
-            n_frames
-        } else {
-            // Empty chunk is ok, just process any buffered mel frames
-            0
-        };
-
-        // Step 3: Process all complete mel chunks
-        let mut all_new_tokens: Vec<Vec<usize>> = vec![Vec::new(); batch_size];
-        let mut chunks_processed = 0;
-        let mut total_encoder_frames_this_call = 0usize;
-
-        loop {
-            // Get chunk parameters for current step
-            let chunk_size = session.config.chunk_size_for_step(session.is_first_chunk);
-            let shift_size = session.config.shift_size_for_step(session.is_first_chunk);
-            let pre_encode_cache = session
-                .config
-                .pre_encode_cache_for_step(session.is_first_chunk);
-            // NeMo drops drop_extra_pre_encoded frames on subsequent chunks only
-            let drop_extra = session.config.drop_extra_for_step(session.is_first_chunk);
-
-            // Check if we have enough mel frames
-            let remaining = session.mel_buffer.remaining_frames();
-            if remaining < chunk_size {
-                if chunks_processed == 0 {
-                    tracing::trace!(
-                        chunk_size_needed = chunk_size,
-                        frames_remaining = remaining,
-                        "need more mel frames for chunk"
-                    );
-                }
-                break;
-            }
-            tracing::debug!(
-                chunk_size,
-                shift_size,
-                pre_encode_cache,
-                drop_extra,
-                buffer_idx = session.mel_buffer.buffer_idx,
-                total_frames = session.mel_buffer.total_frames,
-                "extracting mel chunk"
-            );
-
-            // Extract mel chunk with pre_encode_cache overlap
-            // Returns (mel_array, total_frames, valid_frames)
-            let (mel_chunk, _total_frames, chunk_len) = session
-                .mel_buffer
-                .extract_chunk(chunk_size, shift_size, pre_encode_cache)
-                .ok_or_else(|| crate::core::error::Error::model("Failed to extract mel chunk"))?;
-
-            // Add batch dimension: [n_mels, time] -> [1, n_mels, time]
-            let features = mel_chunk.reshape(&[1, session.n_mels as i32, chunk_len as i32])?;
-
-            // Get lengths for encoder
-            let lengths = Array::from_slice(&[chunk_len as i32], &[1]);
-
-            // Run encoder with cache
-            let (encoded, encoded_lengths, cache_channel_next, cache_time_next, cache_len_next) =
-                self.encoder.forward_streaming(
-                    &features,
-                    &lengths,
-                    &session.encoder_cache.last_channel,
-                    &session.encoder_cache.last_time,
-                    &session.encoder_cache.last_channel_len,
-                    drop_extra,
-                )?;
-
-            // Update encoder cache
-            session.encoder_cache.last_channel = cache_channel_next;
-            session.encoder_cache.last_time = cache_time_next;
-            session.encoder_cache.last_channel_len = cache_len_next;
-
-            // Transpose encoder output from [B, D, T] to [B, T, D]
-            let encoded = mlx_rs::ops::transpose_axes(&encoded, &[0, 2, 1])?;
-            // A host array, so this doesn't wait on the GPU
-            let raw_enc_len = encoded_lengths.to_vec_row_major::<i32>()?[0].max(0) as usize;
-
-            // Truncate to valid_out_len, but also respect actual tensor shape
-            let actual_tensor_frames = encoded.shape()[1] as usize;
-            let enc_seq_len = raw_enc_len
-                .min(session.config.valid_out_len)
-                .min(actual_tensor_frames);
-            total_encoder_frames_this_call += enc_seq_len;
-
-            let greedy = RnntStreamingDecoder::new(session.blank_id);
-            for b in 0..batch_size {
-                let row = encoded.index((b as i32..b as i32 + 1, .., ..));
-                let output = greedy.decode_frames(
-                    &row,
-                    enc_seq_len,
-                    &self.decoder,
-                    &mut session.decoder_states[b],
-                    &self.joint,
-                    &mut session.last_tokens[b],
-                    None,
-                )?;
-                session.accumulated_tokens[b].extend(&output.new_tokens);
-                all_new_tokens[b].extend(output.new_tokens);
-            }
-
-            session.is_first_chunk = false;
-            chunks_processed += 1;
-
-            // Trim old mel frames to bound memory usage.
-            // Keep enough frames for the largest pre_encode_cache we might need.
-            let max_pre_encode_cache = session.config.pre_encode_cache_size.1;
-            let _ = session.mel_buffer.trim_old_frames(max_pre_encode_cache);
-        }
-
-        if chunks_processed > 0 {
-            let (_audio_bytes, mel_bytes) = session.mel_buffer.memory_stats();
-            tracing::trace!(
-                chunks_processed,
-                encoder_frames = total_encoder_frames_this_call,
-                mel_bytes,
-                accumulated_tokens = session
-                    .accumulated_tokens
-                    .get(0)
-                    .map(|t| t.len())
-                    .unwrap_or(0),
-                "processed mel chunks"
-            );
-        }
-
-        // High-level debug: show progress summary
-        {
-            let total_mel_frames = session.mel_buffer.total_frames;
-            let mel_idx = session.mel_buffer.buffer_idx;
-            let tokens = session
-                .accumulated_tokens
-                .get(0)
-                .map(|t| t.len())
-                .unwrap_or(0);
-            tracing::debug!(
-                audio_samples = session.mel_buffer.total_audio_samples,
-                total_mel_frames,
-                mel_idx,
-                remaining_frames = total_mel_frames.saturating_sub(mel_idx),
-                tokens,
-                "streaming progress summary"
-            );
-        }
-
-        // Build output texts from accumulated tokens
-        let mut texts = Vec::with_capacity(batch_size);
-        for b in 0..batch_size {
-            let text = if let Some(tokenizer) = &self.tokenizer {
-                self.tokens_to_text(tokenizer, &session.accumulated_tokens[b])
-            } else {
-                String::new()
-            };
-            texts.push(text);
-        }
-
-        Ok(StreamingOutput {
-            log_probs: None,
-            tokens: all_new_tokens,
-            text: texts,
-            is_final: false,
-        })
+        input: impl Into<AudioInput<'a>>,
+        options: StreamingOptions,
+    ) -> Result<Transcript> {
+        let sample_rate = self.sample_rate();
+        let samples = input.into().load(sample_rate)?;
+        let mut stream = self.stream(options)?;
+        stream.push_audio(&samples, sample_rate)?;
+        stream.finish()
     }
-
-    /// Finalize streaming and get final transcription.
-    ///
-    /// Processes any remaining mel frames in the buffer.
-    pub fn finalize_streaming(
-        &mut self,
-        mut session: RnntStreamingSession,
-    ) -> Result<StreamingOutput> {
-        // Note: preprocessor is stateless, no flush needed
-        // All audio has been processed through process_chunk()
-
-        // Process any remaining mel frames
-        // If there are remaining frames but not enough for a full chunk, pad with zeros
-        let chunk_size = session.config.chunk_size_for_step(session.is_first_chunk);
-        let remaining = session.mel_buffer.remaining_frames();
-
-        if remaining > 0 && remaining < chunk_size {
-            // Pad mel buffer with zeros to make a full chunk
-            let frames_to_pad = chunk_size - remaining;
-            let n_mels = session.n_mels;
-
-            tracing::debug!(
-                frames_to_pad,
-                chunk_size,
-                "finalize: padding mel frames for full chunk"
-            );
-
-            // Create zero padding Array in [n_mels, time] format
-            let padding = mlx_rs::ops::zeros::<f32>(&[n_mels as i32, frames_to_pad as i32])?;
-            session.mel_buffer.append_mel(&padding)?;
-        }
-
-        while !session.mel_buffer.is_empty() {
-            let remaining = session.mel_buffer.remaining_frames();
-            if remaining == 0 {
-                break;
-            }
-
-            tracing::debug!(
-                mel_frames_remaining = remaining,
-                "finalize: processing remaining mel frames"
-            );
-
-            // Try to process remaining frames
-            let result = self.process_chunk(&mut session, &[])?;
-
-            // Break if no progress was made
-            if result.tokens.iter().all(|t| t.is_empty())
-                && session.mel_buffer.remaining_frames() == remaining
-            {
-                break;
-            }
-        }
-
-        // Final output with all accumulated tokens
-        let batch_size = session.accumulated_tokens.len();
-        let mut final_tokens = Vec::with_capacity(batch_size);
-        let mut final_texts = Vec::with_capacity(batch_size);
-
-        for tokens in &session.accumulated_tokens {
-            let text = if let Some(tokenizer) = &self.tokenizer {
-                self.tokens_to_text(tokenizer, tokens)
-            } else {
-                String::new()
-            };
-
-            final_tokens.push(tokens.clone());
-            final_texts.push(text);
-        }
-
-        Ok(StreamingOutput {
-            log_probs: None,
-            tokens: final_tokens,
-            text: final_texts,
-            is_final: true,
-        })
-    }
-}
-
-/// Streaming session state for RNNT models.
-///
-/// This session manages the streaming state following NeMo's approach:
-/// 1. Audio is incrementally converted to mel frames
-/// 2. Mel frames are stored in a buffer
-/// 3. Chunks are extracted with pre_encode_cache overlap
-#[derive(Debug)]
-pub struct RnntStreamingSession {
-    /// Streaming configuration
-    config: StreamingConfig,
-
-    /// Encoder cache state
-    encoder_cache: EncoderCache,
-
-    /// Mel spectrogram buffer (stores pre-computed mel frames)
-    mel_buffer: StreamingMelBuffer,
-
-    /// Decoder states for each batch sample
-    decoder_states: Vec<DecoderState>,
-
-    /// Last emitted token for each batch sample
-    last_tokens: Vec<Option<usize>>,
-
-    /// All accumulated tokens for each batch sample
-    accumulated_tokens: Vec<Vec<usize>>,
-
-    /// Whether this is the first chunk (determines chunk_size and pre_encode_cache)
-    is_first_chunk: bool,
-
-    /// Blank token ID
-    blank_id: usize,
-
-    /// Number of mel features
-    n_mels: usize,
 }

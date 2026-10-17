@@ -7,22 +7,22 @@
 //! Run with: cargo run --example debug_decoder_isolated
 
 use mlx_rs::Array;
-use mlx_voice::asr::CacheAwareRNNTPipeline;
+use mlx_voice::asr::EncDecRNNTModel;
 
 fn main() -> mlx_voice::Result<()> {
     let model_path =
         "models/nvidia/nemotron-speech-streaming-en-0.6b/nemotron-speech-streaming-en-0.6b.nemo";
 
-    println!("Loading pipeline from: {}", model_path);
-    let pipeline = CacheAwareRNNTPipeline::from_pretrained(model_path, 2)?;
+    println!("Loading model from: {}", model_path);
+    let model = EncDecRNNTModel::from_pretrained(model_path)?;
 
-    println!("\n=== Pipeline Loaded ===");
-    println!("Sample rate: {} Hz", pipeline.sample_rate());
-    println!("Blank ID: {}", pipeline.blank_id());
+    println!("\n=== Model Loaded ===");
+    println!("Sample rate: {} Hz", model.sample_rate());
+    println!("Blank ID: {}", model.blank_id());
 
     // Access the decoder and joint network
-    let decoder = pipeline.prediction_network();
-    let joint = pipeline.joint();
+    let decoder = model.prediction_network();
+    let joint = model.joint();
 
     println!("\n=== Decoder Configuration ===");
     println!("Pred hidden: {}", decoder.pred_hidden());

@@ -8,7 +8,7 @@ mlx-voice loads NeMo checkpoints (`.nemo` archives) or converted MLX safetensors
 
 - **CTC ASR**: `EncDecCTCModel` (e.g. `nvidia/parakeet-ctc-0.6b`)
 - **RNN-T / Transducer ASR**: `EncDecRNNTModel` with greedy or beam search decoding (e.g. `nvidia/parakeet-rnnt-0.6b`)
-- **Cache-aware streaming**: `CacheAwareRNNTPipeline` for low-latency incremental transcription with selectable latency modes (e.g. `nvidia/nemotron-speech-streaming-en-0.6b`)
+- **Cache-aware streaming**: `StreamingSession` for low-latency incremental transcription with selectable latency modes (e.g. `nvidia/nemotron-speech-streaming-en-0.6b`)
 - **Multilingual streaming**: language-ID prompt conditioning for `nvidia/nemotron-3.5-asr-streaming-0.6b` (40 language-locales), with a chosen target language or automatic language detection
 - **Voice activity detection**: `EncDecClassificationModel` with NeMo-style post-processing (e.g. `nvidia/Frame_VAD_Multilingual_MarbleNet_v2.0`)
 - **Multi-talker transcription**: `MultiTalkerPipeline` combines streaming ASR with streaming Sortformer diarization (e.g. `nvidia/diar_streaming_sortformer_4spk-v2.1`). With a multitalker model (`nvidia/multitalker-parakeet-streaming-0.6b-v1`) it runs one speaker-conditioned ASR instance per speaker and transcribes overlapping speech; with an ordinary streaming model it attributes a single transcript to speakers
@@ -92,52 +92,48 @@ let transcripts = model.transcribe_with(["a.wav", "b.wav"], &options)?;
 
 ### Streaming transcription
 
-`CacheAwareRNNTPipeline` takes audio incrementally and emits partial results as they become available. The second argument to `from_pretrained` picks the streaming mode, an index into the checkpoint's `att_context_size` list. NeMo lists modes from most to least lookahead, so `0`, the model's default, has the highest latency and accuracy; `pipeline.streaming_modes()` gives each mode's latency.
+`model.stream(options)` starts a `StreamingSession`: push audio as it arrives, at any sample rate, and pull updates. Each update carries the text appended since the last one (`delta`) and the new tokens with their times. `StreamingOptions::mode` picks the streaming mode, an index into the checkpoint's `att_context_size` list. NeMo lists modes from most to least lookahead, so `0`, the default, has the highest latency and accuracy; `model.streaming_modes()` gives each mode's latency.
 
 ```rust
-use mlx_voice::asr::CacheAwareRNNTPipeline;
+use mlx_voice::asr::{EncDecRNNTModel, StreamingOptions};
 
 fn main() -> mlx_voice::Result<()> {
-    let mut pipeline = CacheAwareRNNTPipeline::from_pretrained(
+    let mut model = EncDecRNNTModel::from_pretrained(
         "models/nvidia/nemotron-speech-streaming-en-0.6b/nemotron-speech-streaming-en-0.6b.nemo",
-        0,
     )?;
+    let mut stream = model.stream(StreamingOptions::default())?;
 
-    // `chunks` yields Vec<f32> at pipeline.sample_rate()
+    // `chunks` yields Vec<f32> from a 48 kHz microphone
     for chunk in chunks {
-        pipeline.add_audio(&chunk);
-        while let Some(output) = pipeline.transcribe_step()? {
-            println!("{}", output.text);
+        stream.push_audio(&chunk, 48_000)?; // resampled to 16 kHz
+        while let Some(update) = stream.next_update()? {
+            print!("{}", update.delta);
         }
     }
 
-    pipeline.end_stream();
-    while let Some(output) = pipeline.transcribe_step()? {
-        if output.is_final {
-            println!("Final: {}", output.text);
-        }
-    }
+    let transcript = stream.finish()?; // decodes the rest
+    println!("\n{transcript}");
     Ok(())
 }
 ```
 
-For a whole file, `pipeline.set_audio_file("audio.wav")?` followed by `pipeline.run()?` returns the full transcript.
+For a whole file, `model.transcribe_streaming("audio.wav", options)?` returns the transcript the stream would produce. A session borrows its model; `StreamingSession::new(model, options)` gives one that owns it. Offline `transcribe` on the same model is unaffected by the session's mode.
 
 ### Multilingual transcription
 
 `nvidia/nemotron-3.5-asr-streaming-0.6b` conditions its output on a target language. It starts in `"auto"` mode, where the model detects the language and emits a tag such as `<de-DE>` after each sentence's terminal punctuation. Tags are stripped from the text by default but stay in the token ids:
 
 ```rust
-let mut pipeline = CacheAwareRNNTPipeline::from_pretrained(
+let mut model = EncDecRNNTModel::from_pretrained(
     "models/nvidia/nemotron-3.5-asr-streaming-0.6b/nemotron-3.5-asr-streaming-0.6b.nemo",
-    3, // [56, 13]: 1.12 s chunks
 )?;
-pipeline.set_language("de-DE")?; // or "de", "auto"; see pipeline.languages()
-pipeline.set_audio_file("audio.wav")?;
-let text = pipeline.run()?;
+model.set_language("de-DE")?; // or "de", "auto"; see model.languages()
+let options = StreamingOptions::default().mode(3); // [56, 13]: 1.12 s chunks
+let transcript = model.transcribe_streaming("audio.wav", options)?;
+println!("{} ({:?})", transcript, transcript.language);
 ```
 
-`set_strip_lang_tags(false)` keeps the tags in the text, and `detected_language(&output.tokens)` returns the last detected language. For offline transcription with `EncDecRNNTModel`, `TranscribeOptions::language` and `strip_lang_tags` set the same per call, and `Transcript::language` holds the detected language. The `streaming`, `transcribe_rnnt` and `eval` examples take `--language` (`--target-lang` for `eval`).
+`StreamingOptions::strip_lang_tags(false)` keeps the tags in the text, and `Transcript::language` holds the last detected language. For offline transcription, `TranscribeOptions::language` and `strip_lang_tags` set the same per call. The `streaming`, `transcribe_rnnt` and `eval` examples take `--language` (`--target-lang` for `eval`).
 
 ### Multi-talker transcription
 
@@ -152,22 +148,15 @@ fn main() -> mlx_voice::Result<()> {
     let mut pipeline = MultiTalkerPipeline::from_pretrained(
         "models/nvidia/multitalker-parakeet-streaming-0.6b-v1/multitalker-parakeet-streaming-0.6b-v1.nemo",
         "models/nvidia/diar_streaming_sortformer_4spk-v2.1/diar_streaming_sortformer_4spk-v2.1.nemo",
-        0,
     )?;
-    pipeline.set_audio_file("meeting.wav")?;
-    while let Some(output) = pipeline.transcribe_step()? {
-        for word in &output.new_words {
-            println!("[{:.2}s] speaker_{}: {}", word.start_time, word.speaker, word.text);
-        }
-    }
-    for segment in pipeline.segments() {
-        println!("speaker_{}: {}", segment.speaker, segment.text);
+    for segment in pipeline.transcribe("meeting.wav")? {
+        println!("[{:.2}s] speaker_{}: {}", segment.start_time, segment.speaker, segment.text);
     }
     Ok(())
 }
 ```
 
-With an ordinary streaming model the pipeline runs in serial mode instead. Each word of a single transcript goes to the most active speaker, and speech that overlaps another speaker is lost.
+For live audio, `push_audio` / `next_update` / `finish` work as on a `StreamingSession`, and each update lists the words completed in it. `MultiTalkerConfig::streaming` sets the ASR streaming options. With an ordinary streaming model the pipeline runs in serial mode instead. Each word of a single transcript goes to the most active speaker, and speech that overlaps another speaker is lost.
 
 ## Examples
 
@@ -176,7 +165,7 @@ With an ordinary streaming model the pipeline runs in serial mode instead. Each 
 | `transcribe` | Offline transcription with a CTC model |
 | `transcribe_rnnt` | Offline transcription with an RNN-T model (`--beam <size>` for beam search) |
 | `streaming` | Streaming transcription of a file, fed in small chunks |
-| `live` / `live_pipeline` | Live microphone transcription |
+| `live` | Live microphone transcription |
 | `vad` | Voice activity detection on a file |
 | `multi_talker` | Streaming transcription with speaker labels |
 | `eval` | Transcribe the shared eval set to a hypotheses JSONL for WER scoring |

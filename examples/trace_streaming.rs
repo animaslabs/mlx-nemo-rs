@@ -2,7 +2,7 @@
 //!
 //! Run with: RUST_LOG=info cargo run --example trace_streaming --release
 
-use mlx_voice::asr::CacheAwareRNNTPipeline;
+use mlx_voice::asr::{EncDecRNNTModel, StreamingOptions};
 use tracing_subscriber::{EnvFilter, fmt};
 
 fn main() -> mlx_voice::Result<()> {
@@ -17,15 +17,17 @@ fn main() -> mlx_voice::Result<()> {
     let audio_path = "samples/2086-149220-0033.wav";
     let mode_idx = 2; // Same as Python: att_context_size = [70, 1]
 
-    println!("Loading pipeline from: {}", model_path);
-    let mut pipeline = CacheAwareRNNTPipeline::from_pretrained(model_path, mode_idx)?;
+    println!("Loading model from: {}", model_path);
+    let mut model = EncDecRNNTModel::from_pretrained(model_path)?;
 
     println!("\n=== Model Info ===");
-    println!("Sample rate: {} Hz", pipeline.sample_rate());
-    println!("Blank ID: {}", pipeline.blank_id());
+    println!("Sample rate: {} Hz", model.sample_rate());
+    println!("Blank ID: {}", model.blank_id());
+
+    let mut stream = model.stream(StreamingOptions::default().mode(mode_idx))?;
 
     // Print streaming config
-    let config = pipeline.streaming_config();
+    let config = stream.streaming_config();
     println!("\n=== Streaming Config ===");
     println!("chunk_size: {:?}", config.chunk_size);
     println!("shift_size: {:?}", config.shift_size);
@@ -46,34 +48,37 @@ fn main() -> mlx_voice::Result<()> {
     println!("Duration: {:.2}s", samples.len() as f32 / sr as f32);
     println!("Samples: {}", samples.len());
 
-    // Set audio
-    pipeline.set_audio_file(audio_path)?;
+    // Stream the whole file
+    stream.push_audio(&samples, sr)?;
+    stream.end_audio()?;
 
     // Process chunks
     println!("\n=== Processing Chunks ===");
     let mut chunk_idx = 0;
     let max_chunks = 30;
 
-    while let Some(output) = pipeline.transcribe_step()? {
+    while let Some(update) = stream.next_update()? {
         println!("\n--- Chunk {} ---", chunk_idx);
-        println!("New tokens: {:?}", output.new_tokens);
+        let ids: Vec<usize> = update.tokens.iter().map(|t| t.id).collect();
+        println!("New tokens: {:?}", ids);
+        let all: Vec<usize> = stream.transcript().tokens.iter().map(|t| t.id).collect();
         println!(
             "All tokens ({} total): {:?}",
-            output.tokens.len(),
-            if output.tokens.len() > 20 {
-                format!("{:?}...", &output.tokens[..20])
+            all.len(),
+            if all.len() > 20 {
+                format!("{:?}...", &all[..20])
             } else {
-                format!("{:?}", output.tokens)
+                format!("{:?}", all)
             }
         );
 
-        if !output.text.is_empty() {
-            println!("Text: '{}'", output.text);
+        if !stream.text().is_empty() {
+            println!("Text: '{}'", stream.text());
         }
 
-        if output.is_final {
+        if update.is_final {
             println!("\n=== FINAL ===");
-            println!("Final text: '{}'", output.text);
+            println!("Final text: '{}'", stream.text());
             break;
         }
 

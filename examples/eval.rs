@@ -30,7 +30,7 @@ use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use mlx_voice::asr::{CacheAwareRNNTPipeline, EncDecRNNTModel};
+use mlx_voice::asr::{EncDecRNNTModel, StreamingOptions};
 use serde_json::{Value, json};
 use tracing_subscriber::{EnvFilter, fmt};
 
@@ -112,10 +112,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut model = if offline {
         Model::Offline(EncDecRNNTModel::from_pretrained(&model_path)?)
     } else {
-        Model::Streaming(CacheAwareRNNTPipeline::from_pretrained(
-            &model_path,
-            mode_idx,
-        )?)
+        Model::Streaming(
+            EncDecRNNTModel::from_pretrained(&model_path)?,
+            StreamingOptions::default().mode(mode_idx),
+        )
     };
     let encoder_dtype = match dtype.as_str() {
         "float32" => None,
@@ -126,7 +126,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(encoder_dtype) = encoder_dtype {
         match &mut model {
             Model::Offline(model) => model.set_encoder_dtype(encoder_dtype)?,
-            Model::Streaming(_) => return Err("--dtype applies to --offline only".into()),
+            Model::Streaming(..) => return Err("--dtype applies to --offline only".into()),
         }
     }
     let per_clip_lang = target_lang.as_deref() == Some("clip");
@@ -236,14 +236,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 enum Model {
     Offline(EncDecRNNTModel),
-    Streaming(CacheAwareRNNTPipeline),
+    Streaming(EncDecRNNTModel, StreamingOptions),
 }
 
 impl Model {
     fn set_language(&mut self, language: &str) -> mlx_voice::Result<()> {
         match self {
             Model::Offline(model) => model.set_language(language),
-            Model::Streaming(pipeline) => pipeline.set_language(language),
+            Model::Streaming(model, _) => model.set_language(language),
         }
     }
 
@@ -258,20 +258,22 @@ impl Model {
                 let text = model.transcribe_one(audio)?.text;
                 Ok((text, Vec::new()))
             }
-            Model::Streaming(pipeline) => {
-                pipeline.set_audio_file(audio)?;
-                // Same as `pipeline.run()`, timing each step.
-                let (mut text, mut steps) = (String::new(), Vec::new());
+            Model::Streaming(model, options) => {
+                let model_rate = model.sample_rate();
+                let (samples, rate) = mlx_voice::audio::load_wav(audio)?;
+                let samples = mlx_voice::audio::resample(&samples, rate, model_rate)?;
+                let mut stream = model.stream(options.clone())?;
+                stream.push_audio(&samples, model_rate)?;
+                stream.end_audio()?;
+                // Like `stream.finish()`, timing each step
+                let mut steps = Vec::new();
                 let mut start = Instant::now();
-                while let Some(output) = pipeline.transcribe_step()? {
+                while stream.next_update()?.is_some() {
                     let now = Instant::now();
                     steps.push((now - start).as_secs_f64());
                     start = now;
-                    if output.is_final || !output.text.is_empty() {
-                        text = output.text;
-                    }
                 }
-                Ok((text, steps))
+                Ok((stream.text().to_string(), steps))
             }
         }
     }
