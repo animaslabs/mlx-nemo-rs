@@ -9,7 +9,9 @@
 //!
 //! # Batch Processing Example
 //!
-//! ```no_run
+//! `MelProcessor::forward` needs the `internals` feature.
+//!
+//! ```ignore
 //! # fn main() -> mlx_voice::Result<()> {
 //! # use mlx_voice::{asr::{MelConfig, MelProcessor}, Array};
 //! # let audio = Array::from_slice(&[0.0f32; 16000], &[1, 16000]);
@@ -30,16 +32,12 @@
 //! # use mlx_voice::asr::{MelConfig, StreamingMel};
 //! # let config = MelConfig::default();
 //! # let audio_chunks: Vec<Vec<f32>> = Vec::new();
-//! # let (chunk_size, shift_size) = (16, 8);
 //! let mut mel = StreamingMel::new(config)?;
 //!
 //! for audio_chunk in audio_chunks {
 //!     mel.add_audio(&audio_chunk)?;
-//!
-//!     while mel.total_frames() >= chunk_size {
-//!         let frames = mel.get_frames(0, chunk_size)?;
-//!         // Process frames through encoder...
-//!         mel.trim(shift_size);
+//!     if let Some(bins) = mel.latest_frame_bins() {
+//!         // One value per mel band, lowest frequency first
 //!     }
 //! }
 //! # Ok(())
@@ -56,16 +54,23 @@ use crate::asr::dsp;
 use crate::core::ArrayExt;
 use crate::core::error::{Error, Result};
 
-/// Hook for modifying the power spectrum between STFT and mel filterbank.
+/// Hook for modifying the power spectrum between the STFT and the mel
+/// filterbank of a streaming session, e.g. for noise reduction or gain
+/// control. Set it with
+/// [`StreamingSession::set_spectrum_transform`](crate::asr::StreamingSession::set_spectrum_transform).
 ///
-/// Used for noise reduction, gain control, or other spectral processing.
-/// Implementors should use interior mutability (e.g. `Mutex`) since
-/// `transform` takes `&self`.
+/// This is the one public API that hands over an MLX [`Array`], so the
+/// transform can run on the GPU without a copy. The array is time-major:
+/// `[n_frames, n_fft / 2 + 1]` float32, one row per new STFT frame (oldest
+/// first) and one column per frequency bin (0 Hz first, Nyquist last),
+/// holding the magnitude squared. Return an array of the same shape, e.g.
+/// built with `mlx_voice::mlx_rs::ops`.
+///
+/// `transform` takes `&self` and may run on the session's thread, so keep
+/// state behind interior mutability (e.g. a `Mutex`).
 pub trait SpectrumTransform: Send + Sync {
-    /// Transform a power spectrum. Called once per batch of new mel frames.
-    ///
-    /// `power` has shape `[n_frames, n_fft/2+1]` (magnitude squared).
-    /// Returns a modified power spectrum with the same shape.
+    /// Transform a power spectrum `[n_frames, n_fft / 2 + 1]`. Called once
+    /// per batch of new mel frames.
     fn transform(&self, power: Array) -> Result<Array>;
 }
 
@@ -268,19 +273,25 @@ impl MelProcessor {
         self.config.features
     }
 
-    /// Get the mel filterbank matrix.
-    pub fn filterbank(&self) -> &Array {
-        &self.filterbank
+    internal_fn! {
+        /// Get the mel filterbank matrix.
+        pub fn filterbank(&self) -> &Array {
+            &self.filterbank
+        }
     }
 
-    /// Set the mel filterbank matrix (e.g., from checkpoint weights).
-    pub fn set_filterbank(&mut self, fb: Array) {
-        self.filterbank = fb;
+    internal_fn! {
+        /// Set the mel filterbank matrix (e.g., from checkpoint weights).
+        pub fn set_filterbank(&mut self, fb: Array) {
+            self.filterbank = fb;
+        }
     }
 
-    /// Set the window function (e.g., from checkpoint weights).
-    pub fn set_window(&mut self, window: Array) {
-        self.window = window;
+    internal_fn! {
+        /// Set the window function (e.g., from checkpoint weights).
+        pub fn set_window(&mut self, window: Array) {
+            self.window = window;
+        }
     }
 
     /// Calculate number of output frames for given audio length.
@@ -294,81 +305,83 @@ impl MelProcessor {
         }
     }
 
-    /// Process audio to mel spectrogram (batch API).
-    ///
-    /// # Arguments
-    /// * `audio` - Audio tensor `[batch, time]` or `[time]`.
-    /// * `lengths` - Optional input lengths `[batch]`.
-    ///
-    /// # Returns
-    /// Tuple of (mel_features, output_lengths):
-    /// - mel_features: [batch, n_mels, frames]
-    /// - output_lengths: `[batch]` frame counts
-    pub fn forward(&self, audio: &Array, lengths: Option<&Array>) -> Result<(Array, Array)> {
-        // Ensure audio is 2D [batch, time]
-        let audio = if audio.ndim() == 1 {
-            audio.reshape(&[1, -1])?
-        } else {
-            audio.clone()
-        };
+    internal_fn! {
+        /// Process audio to mel spectrogram (batch API).
+        ///
+        /// # Arguments
+        /// * `audio` - Audio tensor `[batch, time]` or `[time]`.
+        /// * `lengths` - Optional input lengths `[batch]`.
+        ///
+        /// # Returns
+        /// Tuple of (mel_features, output_lengths):
+        /// - mel_features: [batch, n_mels, frames]
+        /// - output_lengths: `[batch]` frame counts
+        pub fn forward(&self, audio: &Array, lengths: Option<&Array>) -> Result<(Array, Array)> {
+            // Ensure audio is 2D [batch, time]
+            let audio = if audio.ndim() == 1 {
+                audio.reshape(&[1, -1])?
+            } else {
+                audio.clone()
+            };
 
-        let batch_size = audio.shape()[0];
-        let audio_len = audio.shape()[1] as usize;
+            let batch_size = audio.shape()[0];
+            let audio_len = audio.shape()[1] as usize;
 
-        // Apply dithering if configured
-        let audio = if self.config.dither > 0.0 {
-            dsp::dither(&audio, self.config.dither)?
-        } else {
-            audio
-        };
+            // Apply dithering if configured
+            let audio = if self.config.dither > 0.0 {
+                dsp::dither(&audio, self.config.dither)?
+            } else {
+                audio
+            };
 
-        // Apply preemphasis if configured
-        let audio = if let Some(coef) = self.config.preemph {
-            dsp::preemphasis(&audio, coef)?
-        } else {
-            audio
-        };
+            // Apply preemphasis if configured
+            let audio = if let Some(coef) = self.config.preemph {
+                dsp::preemphasis(&audio, coef)?
+            } else {
+                audio
+            };
 
-        // Compute STFT with center padding
-        let stft = self.stft_batch(&audio)?;
+            // Compute STFT with center padding
+            let stft = self.stft_batch(&audio)?;
 
-        // Compute power spectrum
-        let power = self.power_spectrum(&stft)?;
+            // Compute power spectrum
+            let power = self.power_spectrum(&stft)?;
 
-        // Apply mel filterbank: power [batch, freqs, frames] -> mel [batch, n_mels, frames]
-        let mel = ops::einsum("mf,bft->bmt", &[self.filterbank.clone(), power])?;
+            // Apply mel filterbank: power [batch, freqs, frames] -> mel [batch, n_mels, frames]
+            let mel = ops::einsum("mf,bft->bmt", &[self.filterbank.clone(), power])?;
 
-        // Apply log compression
-        let mel = if self.config.log {
-            let mel_safe = ops::add(&mel, &self.log_guard)?;
-            ops::log(&mel_safe)?
-        } else {
-            mel
-        };
+            // Apply log compression
+            let mel = if self.config.log {
+                let mel_safe = ops::add(&mel, &self.log_guard)?;
+                ops::log(&mel_safe)?
+            } else {
+                mel
+            };
 
-        // Valid frames per stream: NeMo's get_seq_len, samples / hop. The
-        // centered STFT has one more frame, which NeMo zeroes like padding.
-        let out_lengths = match lengths {
-            Some(lens) => self.compute_output_lengths(lens)?,
-            None => ops::full::<i32>(
-                &[batch_size],
-                &Array::from_int((audio_len / self.hop_samples) as i32),
-            )?,
-        };
-        let n_frames = mel.dim(2);
-        let valid = ops::lt(
-            &ops::arange::<_, i32>(0, n_frames, 1)?.reshape(&[1, 1, n_frames])?,
-            &out_lengths.reshape(&[batch_size, 1, 1])?,
-        )?;
+            // Valid frames per stream: NeMo's get_seq_len, samples / hop. The
+            // centered STFT has one more frame, which NeMo zeroes like padding.
+            let out_lengths = match lengths {
+                Some(lens) => self.compute_output_lengths(lens)?,
+                None => ops::full::<i32>(
+                    &[batch_size],
+                    &Array::from_int((audio_len / self.hop_samples) as i32),
+                )?,
+            };
+            let n_frames = mel.dim(2);
+            let valid = ops::lt(
+                &ops::arange::<_, i32>(0, n_frames, 1)?.reshape(&[1, 1, n_frames])?,
+                &out_lengths.reshape(&[batch_size, 1, 1])?,
+            )?;
 
-        // Apply normalization if requested
-        let mel = match self.config.normalize {
-            Normalize::PerFeature => self.normalize_per_feature(&mel, &valid, &out_lengths)?,
-            _ => mel,
-        };
-        let mel = ops::select(&valid, &mel, &Array::from_f32(0.0))?;
+            // Apply normalization if requested
+            let mel = match self.config.normalize {
+                Normalize::PerFeature => self.normalize_per_feature(&mel, &valid, &out_lengths)?,
+                _ => mel,
+            };
+            let mel = ops::select(&valid, &mel, &Array::from_f32(0.0))?;
 
-        Ok((mel, out_lengths))
+            Ok((mel, out_lengths))
+        }
     }
 
     // ========================================================================
@@ -648,32 +661,23 @@ impl StreamingMelConfig {
 // StreamingMel: Simple Streaming API
 // ============================================================================
 
-/// Simple streaming mel processor with rolling buffer.
+/// Incremental mel spectrogram of a stream, matching NeMo's centered STFT
+/// across chunk boundaries.
 ///
-/// This struct provides a clean API for streaming mel spectrogram processing:
-/// - Add audio chunks with [`add_audio`](Self::add_audio)
-/// - Get mel frames with [`get_frames`](Self::get_frames)
-/// - Trim processed frames with [`trim`](Self::trim)
-///
-/// # Example
+/// A [`StreamingSession`](crate::asr::StreamingSession) owns one, and its
+/// [`streaming_mel`](crate::asr::StreamingSession::streaming_mel) gives read
+/// access, e.g. to draw a live spectrogram from
+/// [`latest_frame_bins`](Self::latest_frame_bins). It also works on its own:
 ///
 /// ```no_run
 /// # fn main() -> mlx_voice::Result<()> {
 /// # use mlx_voice::asr::{MelConfig, StreamingMel};
-/// # let config = MelConfig::default();
 /// # let audio_stream: Vec<Vec<f32>> = Vec::new();
-/// # let (chunk_size, overlap) = (16, 4);
-/// let mut mel = StreamingMel::new(config)?;
-///
+/// let mut mel = StreamingMel::new(MelConfig::default())?;
 /// for audio_chunk in audio_stream {
 ///     mel.add_audio(&audio_chunk)?;
-///
-///     while mel.total_frames() >= chunk_size + overlap {
-///         let chunk = mel.get_frames(0, chunk_size)?;
-///         // Process through encoder...
-///
-///         // Trim processed frames, keep overlap
-///         mel.trim(chunk_size - overlap);
+///     if let Some(bins) = mel.latest_frame_bins() {
+///         // `bins` holds one value per mel band, lowest frequency first
 ///     }
 /// }
 /// # Ok(())
@@ -842,121 +846,125 @@ impl StreamingMel {
         self.add_audio(&pad)
     }
 
-    /// Get mel frames as Array [n_mels, count].
-    ///
-    /// # Arguments
-    /// * `start` - Start frame index
-    /// * `end` - End frame index (exclusive)
-    ///
-    /// # Returns
-    /// Array with shape [n_mels, end - start]
-    pub fn get_frames(&self, start: usize, end: usize) -> Result<Array> {
-        if start >= self.total_frames {
-            return Ok(Array::zeros::<f32>(&[self.n_mels as i32, 0])?);
-        }
-
-        let end = end.min(self.total_frames);
-        let count = end - start;
-
-        if count == 0 {
-            return Ok(Array::zeros::<f32>(&[self.n_mels as i32, 0])?);
-        }
-
-        // Extract frames from buffer
-        // Buffer is stored as [frame0_mel0, frame0_mel1, ..., frame1_mel0, ...]
-        // We need to reshape to [n_mels, count]
-        let mut output = Vec::with_capacity(self.n_mels * count);
-
-        for mel_bin in 0..self.n_mels {
-            for frame in start..end {
-                let idx = frame * self.n_mels + mel_bin;
-                output.push(self.mel_frames[idx]);
+    internal_fn! {
+        /// Get mel frames as Array [n_mels, count].
+        ///
+        /// # Arguments
+        /// * `start` - Start frame index
+        /// * `end` - End frame index (exclusive)
+        ///
+        /// # Returns
+        /// Array with shape [n_mels, end - start]
+        pub fn get_frames(&self, start: usize, end: usize) -> Result<Array> {
+            if start >= self.total_frames {
+                return Ok(Array::zeros::<f32>(&[self.n_mels as i32, 0])?);
             }
-        }
 
-        Ok(Array::from_slice(
-            &output,
-            &[self.n_mels as i32, count as i32],
-        ))
-    }
+            let end = end.min(self.total_frames);
+            let count = end - start;
 
-    /// Get mel frames for a range, with lookahead from the audio lookback buffer.
-    ///
-    /// If the range extends beyond available committed frames, this method
-    /// speculatively computes mel frames from the audio lookback buffer
-    /// (zero-padded) to provide real-ish context for convolution layers.
-    /// These speculative frames are NOT committed to the buffer — the next
-    /// `add_audio` call will produce the real frames from the same audio.
-    ///
-    /// Falls back to `pad_value` for any frames that can't be produced
-    /// even from the lookback.
-    ///
-    /// # Arguments
-    /// * `start` - Start frame index
-    /// * `count` - Number of frames to get
-    /// * `pad_value` - Fallback value for frames beyond lookback reach
-    pub fn get_frames_padded(&self, start: usize, count: usize, pad_value: f32) -> Result<Array> {
-        let available_start = start.min(self.total_frames);
-        let available_end = (start + count).min(self.total_frames);
-        let available_count = available_end.saturating_sub(available_start);
-        let pad_before = start.saturating_sub(available_start);
-        let pad_after = count - available_count - pad_before;
-
-        // Try to produce speculative frames from the lookback buffer
-        let peek_frames = if pad_after > 0 && !self.audio_lookback.is_empty() {
-            self.peek_frames_from_lookback(pad_after)?
-        } else {
-            None
-        };
-
-        let peek_count = peek_frames
-            .as_ref()
-            .map_or(0, |data| data.len() / self.n_mels);
-        let const_pad_after = pad_after.saturating_sub(peek_count);
-
-        if peek_count > 0 {
-            tracing::debug!(
-                pad_after,
-                peek_count,
-                const_pad_after,
-                lookback_len = self.audio_lookback.len(),
-                "get_frames_padded: using lookback peek for trailing context"
-            );
-        }
-
-        let mut output = Vec::with_capacity(self.n_mels * count);
-
-        if pad_before > 0 {
-            tracing::info!("padding MEL frame");
-        }
-
-        for mel_bin in 0..self.n_mels {
-            // Pad before
-            for _ in 0..pad_before {
-                output.push(pad_value);
+            if count == 0 {
+                return Ok(Array::zeros::<f32>(&[self.n_mels as i32, 0])?);
             }
-            // Committed frames
-            for frame in available_start..available_end {
-                let idx = frame * self.n_mels + mel_bin;
-                output.push(self.mel_frames[idx]);
-            }
-            // Speculative frames from lookback
-            if let Some(ref peek_data) = peek_frames {
-                // peek_data is stored as [n_mels, peek_count] row-major
-                for frame in 0..peek_count {
-                    output.push(peek_data[mel_bin * peek_count + frame]);
+
+            // Extract frames from buffer
+            // Buffer is stored as [frame0_mel0, frame0_mel1, ..., frame1_mel0, ...]
+            // We need to reshape to [n_mels, count]
+            let mut output = Vec::with_capacity(self.n_mels * count);
+
+            for mel_bin in 0..self.n_mels {
+                for frame in start..end {
+                    let idx = frame * self.n_mels + mel_bin;
+                    output.push(self.mel_frames[idx]);
                 }
             }
-            // Constant padding for anything beyond lookback reach
-            for _ in 0..const_pad_after {
-                output.push(pad_value);
-            }
-        }
 
-        Ok(Array::from_slice(
-            &output,
-            &[self.n_mels as i32, count as i32],
-        ))
+            Ok(Array::from_slice(
+                &output,
+                &[self.n_mels as i32, count as i32],
+            ))
+        }
+    }
+
+    internal_fn! {
+        /// Get mel frames for a range, with lookahead from the audio lookback buffer.
+        ///
+        /// If the range extends beyond available committed frames, this method
+        /// speculatively computes mel frames from the audio lookback buffer
+        /// (zero-padded) to provide real-ish context for convolution layers.
+        /// These speculative frames are NOT committed to the buffer — the next
+        /// `add_audio` call will produce the real frames from the same audio.
+        ///
+        /// Falls back to `pad_value` for any frames that can't be produced
+        /// even from the lookback.
+        ///
+        /// # Arguments
+        /// * `start` - Start frame index
+        /// * `count` - Number of frames to get
+        /// * `pad_value` - Fallback value for frames beyond lookback reach
+        pub fn get_frames_padded(&self, start: usize, count: usize, pad_value: f32) -> Result<Array> {
+            let available_start = start.min(self.total_frames);
+            let available_end = (start + count).min(self.total_frames);
+            let available_count = available_end.saturating_sub(available_start);
+            let pad_before = start.saturating_sub(available_start);
+            let pad_after = count - available_count - pad_before;
+
+            // Try to produce speculative frames from the lookback buffer
+            let peek_frames = if pad_after > 0 && !self.audio_lookback.is_empty() {
+                self.peek_frames_from_lookback(pad_after)?
+            } else {
+                None
+            };
+
+            let peek_count = peek_frames
+                .as_ref()
+                .map_or(0, |data| data.len() / self.n_mels);
+            let const_pad_after = pad_after.saturating_sub(peek_count);
+
+            if peek_count > 0 {
+                tracing::debug!(
+                    pad_after,
+                    peek_count,
+                    const_pad_after,
+                    lookback_len = self.audio_lookback.len(),
+                    "get_frames_padded: using lookback peek for trailing context"
+                );
+            }
+
+            let mut output = Vec::with_capacity(self.n_mels * count);
+
+            if pad_before > 0 {
+                tracing::info!("padding MEL frame");
+            }
+
+            for mel_bin in 0..self.n_mels {
+                // Pad before
+                for _ in 0..pad_before {
+                    output.push(pad_value);
+                }
+                // Committed frames
+                for frame in available_start..available_end {
+                    let idx = frame * self.n_mels + mel_bin;
+                    output.push(self.mel_frames[idx]);
+                }
+                // Speculative frames from lookback
+                if let Some(ref peek_data) = peek_frames {
+                    // peek_data is stored as [n_mels, peek_count] row-major
+                    for frame in 0..peek_count {
+                        output.push(peek_data[mel_bin * peek_count + frame]);
+                    }
+                }
+                // Constant padding for anything beyond lookback reach
+                for _ in 0..const_pad_after {
+                    output.push(pad_value);
+                }
+            }
+
+            Ok(Array::from_slice(
+                &output,
+                &[self.n_mels as i32, count as i32],
+            ))
+        }
     }
 
     /// Compute speculative mel frames from the lookback buffer without consuming it.

@@ -13,6 +13,7 @@ mlx-voice loads NeMo checkpoints (`.nemo` archives) or converted MLX safetensors
 - **Hybrid RNN-T/CTC models**: decode with either head, offline or streaming (e.g. `nvidia/stt_en_fastconformer_hybrid_large_streaming_multi`)
 - **Multilingual streaming**: language-ID prompt conditioning for `nvidia/nemotron-3.5-asr-streaming-0.6b` (40 language-locales), with a chosen target language or automatic language detection
 - **Voice activity detection**: `EncDecClassificationModel` with NeMo-style post-processing (e.g. `nvidia/Frame_VAD_Multilingual_MarbleNet_v2.0`)
+- **Speaker diarization**: `SortformerEncLabelModel::diarize` gives per-frame speaker activity for up to four speakers (e.g. `nvidia/diar_streaming_sortformer_4spk-v2.1`)
 - **Multi-talker transcription**: `MultiTalkerPipeline` combines streaming ASR with streaming Sortformer diarization (e.g. `nvidia/diar_streaming_sortformer_4spk-v2.1`). With a multitalker model (`nvidia/multitalker-parakeet-streaming-0.6b-v1`) it runs one speaker-conditioned ASR instance per speaker and transcribes overlapping speech; with an ordinary streaming model it attributes a single transcript to speakers
 - **FastConformer encoder**, mel-spectrogram preprocessing, and SentencePiece tokenization matching NeMo
 - **Weight formats**: `.nemo` archives (PyTorch checkpoints), MLX safetensors, and 8-bit quantized MLX weights

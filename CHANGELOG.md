@@ -16,6 +16,33 @@ break the API).
   before it, as in NeMo. `EncDecRnntModel::is_tdt` tells them apart. Beam
   search and streaming sessions return a not-implemented error for TDT models.
 - `Tokenizer::is_punctuation`.
+- The VAD and the diarizer take `AudioInput` (a WAV path or
+  `(samples, sample_rate)`, resampled to the model's rate) and return plain
+  per-frame data:
+  - `EncDecClassificationModel::infer(inputs)` and `infer_one(input)` return
+    speech probabilities.
+  - `SortformerEncLabelModel::diarize(input)` returns `[frame][speaker]`
+    probabilities. The diarizer also gains `sample_rate()` and
+    `frame_duration()`.
+
+### Changed
+
+These changes break 0.2 callers:
+
+- `SortformerEncLabelModel::diarize` takes an `AudioInput` instead of audio
+  and length `Array`s. The tensor form is now `diarize_array`, behind the
+  `internals` feature.
+- These methods that take or return MLX arrays now need `internals`:
+  - `MelProcessor::forward`, `filterbank`, `set_filterbank` and `set_window`
+  - `StreamingMel::get_frames` and `get_frames_padded`
+
+  `SpectrumTransform` is the one public API that still passes an `Array`.
+  Its docs give the layout: time-major, `[n_frames, n_fft / 2 + 1]`.
+
+### Removed
+
+- `EncDecClassificationModel::infer_samples`, which assumed the model's
+  sample rate. Use `infer_one((&samples[..], sample_rate))`.
 
 ### Fixed
 
@@ -23,6 +50,19 @@ break the API).
   NeMo does: padding is hidden from attention and zeroed before each
   convolution. Before, the last second or so of every file, and clips padded
   to a longer clip in a batch, drifted from NeMo's encoder output.
+
+### Migrating from 0.2
+
+```rust
+// 0.2
+let probs = vad.infer_samples(&samples)?; // at the model's rate
+let preds: Array = diarizer.diarize(&audio_array, &lengths_array)?; // [1, frames, speakers]
+
+// Unreleased
+let probs = vad.infer_one((&samples[..], 48_000))?; // any rate; resampled
+let frames: Vec<Vec<f32>> = diarizer.diarize("meeting.wav")?; // [frame][speaker]
+let seconds_per_frame = diarizer.frame_duration();
+```
 
 ## 0.2.0 (2026-10-17)
 

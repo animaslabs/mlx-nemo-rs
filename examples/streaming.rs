@@ -240,7 +240,7 @@ fn main() -> mlx_voice::Result<()> {
 
         // Run VAD inference on the full audio
         let vad_start = Instant::now();
-        let probs = vad_model.infer_samples(&samples)?;
+        let probs = vad_model.infer_one((&samples[..], sample_rate))?;
         println!(
             "VAD inference done in {:.2}s ({} frames)",
             vad_start.elapsed().as_secs_f32(),
