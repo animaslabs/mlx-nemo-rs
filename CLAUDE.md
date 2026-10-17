@@ -25,7 +25,8 @@ cargo test --features internals test_load_parakeet_rnnt_checkpoint -- --ignored
 # `--features hub` lets from_pretrained("owner/name") download from the HF Hub.
 # Internals (encoder layers, decoders, streaming caches, checkpoint parsing) are
 # crate-private unless the `internals` feature is on. The debug_*/compare_encoder/
-# mel_test/trace_streaming examples and tests/pytorch_loading.rs require it.
+# mel_test/trace_streaming examples and tests/{pytorch,strict}_loading.rs require it.
+# Models' new/load_weights/load_tokenizer/forward are internal too (`internal_fn!`).
 cargo check --all-targets --features internals
 
 # Run an example
@@ -126,7 +127,7 @@ Models are stored in `models/nvidia/` and downloaded via xtask:
 ## Key Types
 
 - `AsrModelConfig`: Top-level config with preprocessor, encoder, decoder sections
-- `NemoCheckpoint`: Handles .nemo archive extraction and loading
+- `NemoCheckpoint`: Handles .nemo archive extraction and loading (internal; public with `internals`)
 - `StreamingModeInfo`: Describes streaming mode latency/context settings
 - `Transcript` / `Token` / `Word`: Offline transcription result with token and word timestamps (`asr::transcript`), from `transcribe(inputs)` / `transcribe_with(inputs, &TranscribeOptions)`; inputs are `AudioInput` (paths or `(samples, rate)`)
 - `StreamUpdate`: One streaming step's new tokens (with times) and appended text (`delta`)

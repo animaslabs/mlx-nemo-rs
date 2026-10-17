@@ -1,11 +1,20 @@
 //! Core abstractions and utilities for mlx-voice.
 //!
-//! This module provides the foundational types and traits used across
-//! all collections (ASR, TTS, LLM, etc.).
+//! Errors, model sources and loading options. Checkpoint parsing and the
+//! other building blocks are public with the `internals` feature.
 
-pub mod array;
-pub mod checkpoint;
-pub mod config;
+internal_mod!(
+    /// Array helpers.
+    array
+);
+internal_mod!(
+    /// `.nemo` archives and safetensors model directories.
+    checkpoint
+);
+internal_mod!(
+    /// YAML config helpers.
+    config
+);
 pub mod error;
 pub mod source;
 internal_mod!(
@@ -25,14 +34,17 @@ internal_mod!(
     weights
 );
 
-pub use array::ArrayExt;
 pub use error::{Error, Result};
 pub use loading::{LoadOptions, LoadReport};
-pub use quantization::QuantizationConfig;
 pub use source::{HubRepo, ModelSource};
-pub use weights::WeightFormat;
 
+#[cfg(feature = "internals")]
+pub use array::ArrayExt;
+#[cfg(not(feature = "internals"))]
+pub(crate) use array::ArrayExt;
 #[cfg(feature = "internals")]
 pub use loading::Weights;
 #[cfg(feature = "internals")]
-pub use quantization::{EmbeddingLayer, LinearLayer};
+pub use quantization::{EmbeddingLayer, LinearLayer, QuantizationConfig};
+#[cfg(feature = "internals")]
+pub use weights::WeightFormat;

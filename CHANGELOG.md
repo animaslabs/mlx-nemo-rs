@@ -76,9 +76,17 @@ guide below maps the 0.1 calls to their replacements.
 - `Error`, config structs, options and output types are `#[non_exhaustive]`.
   Build them with `Default` and the builder methods, and match `Error` with a
   wildcard arm.
-- Encoder layers, decoders, decoding functions, streaming caches and
-  checkpoint parsing are crate-private without the `internals` feature. The
-  documented API went from about 900 items to about 55.
+- Some items are crate-private without the `internals` feature:
+  - encoder layers, decoders, decoding functions and streaming caches
+  - checkpoint parsing: `NemoCheckpoint`, `NemoCheckpointWriter` and
+    `SafetensorsLoader`, which is no longer re-exported at the crate root
+  - `WeightFormat`, `QuantizationConfig`, `ArrayExt` and the `core::config`
+    YAML helpers
+  - the models' low-level methods: `new(config)`, `load_weights`,
+    `load_weights_with`, `load_tokenizer` and `forward`
+
+  Models load through `from_pretrained`. The documented API went from about
+  900 items to about 55.
 
 ### Removed
 
@@ -212,8 +220,14 @@ let segments = pipeline.finish()?;
 
 **Internals**
 
-Code that used encoder layers, decoders, `asr::decoding`, `asr::streaming`
-caches or checkpoint parsing needs the `internals` feature:
+Some code needs the `internals` feature:
+- code that used encoder layers, decoders, `asr::decoding` or the
+  `asr::streaming` caches
+- code that used checkpoint parsing (`NemoCheckpoint`, `SafetensorsLoader`)
+- code that built a model by hand with `new(config)` and `load_weights`, or
+  ran `forward`
+
+For the diarizer, `SortformerEncLabelModel::diarize` stays public.
 
 ```toml
 mlx-voice = { version = "0.2", features = ["internals"] }
