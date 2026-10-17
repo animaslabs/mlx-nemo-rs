@@ -107,7 +107,10 @@ impl EncDecCTCModel {
     /// Create a new model from configuration.
     pub fn new(config: AsrModelConfig) -> Result<Self> {
         config.validate()?;
-        let preprocessor = MelSpectrogram::new(config.preprocessor.clone().into())?;
+        // NeMo only dithers during training
+        let mut mel_config: crate::asr::modules::MelConfig = config.preprocessor.clone().into();
+        mel_config.dither = 0.0;
+        let preprocessor = MelSpectrogram::new(mel_config)?;
         let encoder = ConformerEncoder::new(config.encoder.clone())?;
 
         // Determine vocabulary size from config or default

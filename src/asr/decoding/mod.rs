@@ -15,12 +15,14 @@
 //! - `lcs_merge_buffer`: LCS-based token merging for streaming
 //! - `greedy_ctc_merge`: Simple CTC blank collapsing
 
+mod detokenize;
 mod greedy;
 mod merge;
 mod rnnt_beam;
 mod rnnt_greedy;
 mod rnnt_streaming;
 
+pub use detokenize::{word_start_table, IncrementalDetokenizer};
 pub use greedy::greedy_decode;
 pub use merge::{greedy_ctc_merge, lcs_merge_buffer, LcsAlignmentResult};
 pub use rnnt_beam::rnnt_beam_decode;

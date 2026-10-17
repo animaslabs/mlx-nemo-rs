@@ -31,13 +31,15 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use mlx_rs::ops::indexing::argmax_axis;
+use mlx_rs::ops::indexing::IndexOp;
 use mlx_rs::Array;
 use sentencepiece::SentencePieceProcessor;
 
 use crate::asr::config::{AsrModelConfig, JointConfig};
+use crate::asr::decoding::RnntStreamingDecoder;
 use crate::asr::modules::{
-    ConformerEncoder, LstmState, MelSpectrogram, RNNTDecoder, RNNTJoint, StatelessTransducerDecoder,
+    ConformerEncoder, LstmState, MelSpectrogram, MelSpectrogramConfig, RNNTDecoder, RNNTJoint,
+    StatelessTransducerDecoder,
 };
 use crate::asr::streaming::{
     compute_streaming_config, get_streaming_modes, EncoderCache, StreamingConfig,
@@ -257,7 +259,11 @@ impl EncDecRNNTModel {
     /// Create a new model from configuration.
     pub fn new(config: AsrModelConfig) -> Result<Self> {
         config.validate()?;
-        let preprocessor = MelSpectrogram::new(config.preprocessor.clone().into())?;
+        // NeMo only dithers during training; at inference it would make the
+        // output random
+        let mut preproc_config: MelSpectrogramConfig = config.preprocessor.clone().into();
+        preproc_config.dither = 0.0;
+        let preprocessor = MelSpectrogram::new(preproc_config)?;
         let encoder = ConformerEncoder::new(config.encoder.clone())?;
 
         // Determine vocabulary size from config or default
@@ -638,6 +644,16 @@ impl EncDecRNNTModel {
         self.decoding_strategy = strategy;
     }
 
+    /// Run the encoder in `dtype` instead of float32, e.g. `Dtype::Bfloat16`.
+    ///
+    /// Roughly halves encoder time on Apple Silicon for a small accuracy
+    /// cost. Mel features, the decoder and the joint network stay float32.
+    /// Applies to [`transcribe`](Self::transcribe) and
+    /// [`forward`](Self::forward), not the streaming session.
+    pub fn set_encoder_dtype(&mut self, dtype: mlx_rs::Dtype) -> Result<()> {
+        self.encoder.set_dtype(dtype)
+    }
+
     /// Get the current decoding strategy.
     pub fn decoding_strategy(&self) -> RnntDecodingStrategy {
         self.decoding_strategy
@@ -673,80 +689,27 @@ impl EncDecRNNTModel {
         encoder_output: &Array,
         encoder_lengths: &Array,
     ) -> Result<Vec<Vec<usize>>> {
-        use mlx_rs::ops::indexing::{argmax_axis, IndexOp};
+        let lengths: Vec<i32> = encoder_lengths.as_dtype(mlx_rs::Dtype::Int32)?.to_vec_row_major()?;
+        let greedy = RnntStreamingDecoder::new(self.blank_id);
 
-        const MAX_SYMBOLS_PER_STEP: usize = 10;
-
-        encoder_output.eval()?;
-        encoder_lengths.eval()?;
-
-        let batch_size = encoder_output.shape()[0] as usize;
-
-        // Get encoder lengths as a vector
-        let lengths_i32 = encoder_lengths.as_type::<i32>()?;
-        lengths_i32.eval()?;
-        let lengths_data: Vec<i32> = lengths_i32.to_vec_row_major::<i32>()?;
-
-        let mut results = Vec::with_capacity(batch_size);
-
-        // Process each sequence in the batch independently
-        for b in 0..batch_size {
-            let seq_len = lengths_data[b] as usize;
-            let mut tokens = Vec::new();
-
-            // Initialize decoder state for this sequence
+        // Each sequence decodes independently from a fresh decoder state
+        let mut results = Vec::with_capacity(lengths.len());
+        for (b, &len) in lengths.iter().enumerate() {
+            let seq_len = (len.max(0) as usize).min(encoder_output.dim(1) as usize);
+            let frames = encoder_output.index((b as i32, ..seq_len as i32, ..));
+            let enc_proj = self.joint.project_encoder(&frames)?;
             let mut state = self.decoder.initialize_state(1)?;
-
-            // Process each encoder frame
-            let mut t = 0;
-            while t < seq_len {
-                // Get encoder output for current frame: [1, 1, encoder_hidden]
-                let enc_frame =
-                    encoder_output.index((b as i32..b as i32 + 1, t as i32..t as i32 + 1, ..));
-
-                let mut symbols_emitted = 0;
-
-                // Emit symbols until blank or max symbols reached
-                loop {
-                    // Get prediction network output
-                    let last_token = if tokens.is_empty() {
-                        None
-                    } else {
-                        let last = *tokens.last().unwrap() as i32;
-                        Some(Array::from_slice(&[last], &[1, 1]))
-                    };
-                    let (pred_output, new_state) =
-                        self.decoder.predict_one(last_token.as_ref(), &state)?;
-
-                    // Compute joint output: [1, vocab_size]
-                    let log_probs = self.joint.forward_one(&enc_frame, &pred_output)?;
-                    log_probs.eval()?;
-
-                    // Get argmax
-                    let prediction = argmax_axis(&log_probs, -1, false)?;
-                    prediction.eval()?;
-                    let pred_token = prediction.to_vec_row_major::<u32>()?[0] as usize;
-
-                    if pred_token == self.blank_id {
-                        // Blank: advance to next encoder frame
-                        break;
-                    }
-
-                    // Non-blank: emit token and update state
-                    tokens.push(pred_token);
-                    state = new_state;
-                    symbols_emitted += 1;
-
-                    if symbols_emitted >= MAX_SYMBOLS_PER_STEP {
-                        // Safety limit reached, advance frame
-                        break;
-                    }
-                }
-
-                t += 1;
-            }
-
-            results.push(tokens);
+            let mut last_token = None;
+            let output = greedy.decode_projected(
+                &enc_proj,
+                seq_len,
+                &self.decoder,
+                &mut state,
+                &self.joint,
+                &mut last_token,
+                None,
+            )?;
+            results.push(output.new_tokens);
         }
 
         Ok(results)
@@ -765,50 +728,9 @@ impl EncDecRNNTModel {
         // Preprocess audio to mel spectrogram
         let (features, feature_lengths) = self.preprocessor.forward(audio, lengths)?;
 
-        // Debug: print mel spectrogram stats
-        features.eval()?;
-        feature_lengths.eval()?;
-        tracing::debug!(
-            "Mel spectrogram shape: {:?}, length: {:?}",
-            features.shape(),
-            feature_lengths.to_vec_row_major::<i32>()?
-        );
-        let features_flat = features.reshape(&[-1])?;
-        features_flat.eval()?;
-        let f_slice: Vec<f32> = features_flat.to_vec_row_major()?;
-        let f_min = f_slice.iter().cloned().fold(f32::INFINITY, f32::min);
-        let f_max = f_slice.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-        let f_mean: f32 = f_slice.iter().sum::<f32>() / f_slice.len() as f32;
-        tracing::debug!(
-            "Mel min: {:.4}, max: {:.4}, mean: {:.4}",
-            f_min,
-            f_max,
-            f_mean
-        );
-
         // Encode
         let (encoded, encoded_lengths) = self.encoder.forward(&features, &feature_lengths)?;
-
-        // Debug: print encoder output stats
-        encoded.eval()?;
-        encoded_lengths.eval()?;
-        tracing::debug!(
-            "Encoder output shape: {:?}, length: {:?}",
-            encoded.shape(),
-            encoded_lengths.to_vec_row_major::<i32>()?
-        );
-        let encoded_flat = encoded.reshape(&[-1])?;
-        encoded_flat.eval()?;
-        let e_slice: Vec<f32> = encoded_flat.to_vec_row_major()?;
-        let e_min = e_slice.iter().cloned().fold(f32::INFINITY, f32::min);
-        let e_max = e_slice.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-        let e_mean: f32 = e_slice.iter().sum::<f32>() / e_slice.len() as f32;
-        tracing::debug!(
-            "Encoder min: {:.4}, max: {:.4}, mean: {:.4}",
-            e_min,
-            e_max,
-            e_mean
-        );
+        tracing::debug!(encoded_shape = ?encoded.shape(), "encoder output");
 
         // For RNNT, we return encoder output directly (decoding happens separately)
         // Transpose from [B, D, T] to [B, T, D]
@@ -1088,9 +1010,8 @@ impl EncDecRNNTModel {
             let pre_encode_cache = session
                 .config
                 .pre_encode_cache_for_step(session.is_first_chunk);
-            // NeMo drops drop_extra_pre_encoded frames on subsequent chunks only;
-            // this path always drops a single frame instead.
-            let drop_extra = 1;
+            // NeMo drops drop_extra_pre_encoded frames on subsequent chunks only
+            let drop_extra = session.config.drop_extra_for_step(session.is_first_chunk);
 
             // Check if we have enough mel frames
             let remaining = session.mel_buffer.remaining_frames();
@@ -1121,45 +1042,6 @@ impl EncDecRNNTModel {
                 .extract_chunk(chunk_size, shift_size, pre_encode_cache)
                 .ok_or_else(|| crate::core::error::Error::model("Failed to extract mel chunk"))?;
 
-            {
-                // Flatten the mel chunk to a Vec for debug statistics
-                let mel_flat: Vec<f32> = mel_chunk
-                    .flatten(0, -1)
-                    .ok()
-                    .and_then(|a| a.to_vec_row_major::<f32>().ok())
-                    .unwrap_or_default();
-                let mel_min = mel_flat.iter().cloned().fold(f32::INFINITY, f32::min);
-                let mel_max = mel_flat.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-                let mel_mean: f32 = if !mel_flat.is_empty() {
-                    mel_flat.iter().sum::<f32>() / mel_flat.len() as f32
-                } else {
-                    0.0
-                };
-                tracing::trace!(
-                    frames_extracted = chunk_len,
-                    chunk_size,
-                    cache_frames = chunk_len.saturating_sub(chunk_size),
-                    mel_min,
-                    mel_max,
-                    mel_mean,
-                    "extracted mel chunk"
-                );
-                // Show first few mel frames at trace level
-                // mel_chunk is [n_mels, time] format, so frame t, freq f = mel_flat[f * chunk_len + t]
-                for t in 0..5.min(chunk_len) {
-                    let f0 = mel_flat.get(t).copied().unwrap_or(0.0);
-                    let f1 = mel_flat.get(chunk_len + t).copied().unwrap_or(0.0);
-                    let f2 = mel_flat.get(2 * chunk_len + t).copied().unwrap_or(0.0);
-                    tracing::trace!(
-                        frame = t,
-                        freq_bin_0 = f0,
-                        freq_bin_1 = f1,
-                        freq_bin_2 = f2,
-                        "mel frame values"
-                    );
-                }
-            }
-
             // Add batch dimension: [n_mels, time] -> [1, n_mels, time]
             let features = mel_chunk.reshape(&[1, session.n_mels as i32, chunk_len as i32])?;
 
@@ -1167,8 +1049,6 @@ impl EncDecRNNTModel {
             let lengths = Array::from_slice(&[chunk_len as i32], &[1]);
 
             // Run encoder with cache
-            let cache_len_before = session.encoder_cache.last_channel_len.to_vec_row_major::<i64>()?[0];
-
             let (encoded, encoded_lengths, cache_channel_next, cache_time_next, cache_len_next) =
                 self.encoder.forward_streaming(
                     &features,
@@ -1186,154 +1066,30 @@ impl EncDecRNNTModel {
 
             // Transpose encoder output from [B, D, T] to [B, T, D]
             let encoded = mlx_rs::ops::transpose_axes(&encoded, &[0, 2, 1])?;
-            encoded.eval()?;
-            encoded_lengths.eval()?;
-
-            let raw_enc_len = encoded_lengths.to_vec_row_major::<i32>()?[0] as usize;
-            let cache_len_after = session.encoder_cache.last_channel_len.to_vec_row_major::<i64>()?[0];
-
-            {
-                // Show encoder output stats
-                let enc_flat = encoded.reshape(&[-1]).unwrap();
-                enc_flat.eval().unwrap();
-                let enc_slice: Vec<f32> = enc_flat.to_vec_row_major()?;
-                let enc_min = enc_slice.iter().cloned().fold(f32::INFINITY, f32::min);
-                let enc_max = enc_slice.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-                let enc_mean: f32 = enc_slice.iter().sum::<f32>() / enc_slice.len() as f32;
-                let enc_var: f32 = enc_slice
-                    .iter()
-                    .map(|&v| (v - enc_mean).powi(2))
-                    .sum::<f32>()
-                    / enc_slice.len() as f32;
-                let enc_std = enc_var.sqrt();
-                let first_10: Vec<f32> = enc_slice.iter().take(10).cloned().collect();
-                // Log at debug level for chunks around problematic areas
-                tracing::debug!(
-                    chunk_idx = chunks_processed,
-                    output_frames = raw_enc_len,
-                    cache_len_before,
-                    cache_len_after,
-                    enc_min,
-                    enc_max,
-                    enc_mean,
-                    enc_std,
-                    ?first_10,
-                    "encoder output stats"
-                );
-            }
+            // A host array, so this doesn't wait on the GPU
+            let raw_enc_len = encoded_lengths.to_vec_row_major::<i32>()?[0].max(0) as usize;
 
             // Truncate to valid_out_len, but also respect actual tensor shape
-            let valid_out_len = session.config.valid_out_len;
             let actual_tensor_frames = encoded.shape()[1] as usize;
-            // Use the minimum of: what encoder reports, valid_out_len, and actual tensor frames
-            let enc_seq_len = raw_enc_len.min(valid_out_len).min(actual_tensor_frames);
+            let enc_seq_len = raw_enc_len
+                .min(session.config.valid_out_len)
+                .min(actual_tensor_frames);
             total_encoder_frames_this_call += enc_seq_len;
 
-            tracing::trace!(
-                valid_out_len,
-                raw_enc_len,
-                actual_tensor_frames,
-                frames_to_decode = enc_seq_len,
-                "decoding encoder frames"
-            );
-
-            // Decode
-            const MAX_SYMBOLS_PER_STEP: usize = 10;
-            let mut tokens_this_chunk = Vec::new();
-            let mut blank_count = 0;
-            let mut non_blank_count = 0;
-
+            let greedy = RnntStreamingDecoder::new(session.blank_id);
             for b in 0..batch_size {
-                for t in 0..enc_seq_len {
-                    let enc_frame =
-                        encoded.index((b as i32..b as i32 + 1, t as i32..t as i32 + 1, ..));
-
-                    let mut symbols_emitted = 0;
-
-                    loop {
-                        let last_token = session.last_tokens[b]
-                            .map(|tok| Array::from_slice(&[tok as i32], &[1, 1]));
-                        let (pred_output, new_state) = self
-                            .decoder
-                            .predict_one(last_token.as_ref(), &session.decoder_states[b])?;
-
-                        let log_probs = self.joint.forward_one(&enc_frame, &pred_output)?;
-                        log_probs.eval()?;
-
-                        let prediction = argmax_axis(&log_probs, -1, false)?;
-                        prediction.eval()?;
-                        let pred_token = prediction.to_vec_row_major::<u32>()?[0] as usize;
-
-                        // Debug: log top predictions when we get a blank at first symbol
-                        if pred_token == session.blank_id && symbols_emitted == 0 && t == 0 {
-                            let lp_slice: Vec<f32> = log_probs.to_vec_row_major()?;
-                            // Get top 5 predictions
-                            let mut indexed: Vec<(usize, f32)> =
-                                lp_slice.iter().cloned().enumerate().collect();
-                            indexed.sort_by(|a, b| {
-                                b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
-                            });
-                            let top5: Vec<(usize, f32)> = indexed.into_iter().take(5).collect();
-                            let blank_prob = lp_slice
-                                .get(session.blank_id)
-                                .copied()
-                                .unwrap_or(f32::NEG_INFINITY);
-                            tracing::debug!(
-                                ?top5,
-                                blank_prob,
-                                blank_id = session.blank_id,
-                                "first frame blank prediction"
-                            );
-                        }
-
-                        if pred_token == session.blank_id {
-                            blank_count += 1;
-                            break;
-                        }
-
-                        non_blank_count += 1;
-                        all_new_tokens[b].push(pred_token);
-                        session.accumulated_tokens[b].push(pred_token);
-                        session.last_tokens[b] = Some(pred_token);
-                        session.decoder_states[b] = new_state;
-                        symbols_emitted += 1;
-                        tokens_this_chunk.push(pred_token);
-
-                        if symbols_emitted >= MAX_SYMBOLS_PER_STEP {
-                            break;
-                        }
-                    }
-                }
-            }
-
-            {
-                let total_tokens = session
-                    .accumulated_tokens
-                    .get(0)
-                    .map(|t| t.len())
-                    .unwrap_or(0);
-                let token_text = if let Some(tokenizer) = &self.tokenizer {
-                    let ids: Vec<u32> = tokens_this_chunk.iter().map(|&t| t as u32).collect();
-                    tokenizer.decode_piece_ids(&ids).unwrap_or_default()
-                } else {
-                    format!("{:?}", tokens_this_chunk)
-                };
-                // Log token IDs for comparison with Python
-                let token_ids_str: String = tokens_this_chunk
-                    .iter()
-                    .map(|t| t.to_string())
-                    .collect::<Vec<_>>()
-                    .join(",");
-                tracing::debug!(
-                    encoder_frames = enc_seq_len,
-                    blank_emissions = blank_count,
-                    non_blank_tokens = non_blank_count,
-                    total_accumulated = total_tokens,
-                    tokens_this_chunk = tokens_this_chunk.len(),
-                    token_ids = %token_ids_str,
-                    decoded_text = %token_text,
-                    "decoding results"
-                );
+                let row = encoded.index((b as i32..b as i32 + 1, .., ..));
+                let output = greedy.decode_frames(
+                    &row,
+                    enc_seq_len,
+                    &self.decoder,
+                    &mut session.decoder_states[b],
+                    &self.joint,
+                    &mut session.last_tokens[b],
+                    None,
+                )?;
+                session.accumulated_tokens[b].extend(&output.new_tokens);
+                all_new_tokens[b].extend(output.new_tokens);
             }
 
             session.is_first_chunk = false;

@@ -52,8 +52,6 @@ use crate::asr::streaming::{EncoderCache, FeatureBuffer, StreamingSortformerStat
 use crate::core::ArrayExt;
 use crate::core::error::Result;
 
-/// Log-mel value of digital silence (matches NeMo's log_zero_guard).
-const LOG_MEL_ZERO: f32 = -16.635532;
 
 /// Speaker activity threshold.
 const ACTIVITY_THRESHOLD: f32 = 0.5;
@@ -224,18 +222,7 @@ impl MultiTalkerPipeline {
         let num_spks = diar_model.max_num_spks();
         let frame_sec = asr.encoder.subsampling_factor() as f32 * asr.mel_stream_config.mel.window_stride;
 
-        let word_start = match &asr.tokenizer {
-            Some(tokenizer) => (0..tokenizer.len())
-                .map(|id| {
-                    // A piece with a leading "▁" decodes with a space between copies
-                    let id = id as u32;
-                    let one = tokenizer.decode_piece_ids(&[id]).unwrap_or_default();
-                    let two = tokenizer.decode_piece_ids(&[id, id]).unwrap_or_default();
-                    two.len() > 2 * one.len()
-                })
-                .collect(),
-            None => Vec::new(),
-        };
+        let word_start = asr.word_start.clone();
 
         tracing::info!(
             ?mode,
@@ -367,7 +354,7 @@ impl MultiTalkerPipeline {
         let n_mels = self.asr.n_mels as i32;
         let chunk_frames = fb.features.dim(1);
         let features = fb.features.reshape(&[1, n_mels, chunk_frames])?;
-        let drop_extra = self.asr.streaming_config.drop_extra_pre_encoded;
+        let drop_extra = self.asr.streaming_config.drop_extra_for_step(fb.is_first);
 
         // Diarize the same chunk the ASR model sees. Its valid frames include
         // the pre-encode cache at the front of the chunk.
@@ -404,11 +391,10 @@ impl MultiTalkerPipeline {
             self.asr.encoder.set_speaker_targets(targets.clone());
         }
 
-        let pre_silence_cache = fb.is_last.then(|| self.encoder_cache.clone());
         let n_instances = self.instances.len() as i32;
         let features = ops::broadcast_to(&features, &[n_instances, n_mels, chunk_frames])?;
-        let lengths = Array::from_slice(&vec![fb.valid_size as i32; n_instances as usize], &[n_instances]);
-        let (encoded, enc_len) = self.run_encoder(&features, &lengths)?;
+        let lengths = Array::from_slice(&vec![chunk_frames; n_instances as usize], &[n_instances]);
+        let (encoded, enc_len) = self.run_encoder(&features, &lengths, drop_extra)?;
         let enc_seq_len = if self.asr.encoder.is_chunked_limited() || fb.is_last {
             enc_len
         } else {
@@ -420,25 +406,8 @@ impl MultiTalkerPipeline {
         let chunk_activity = align_rows(&preds, enc_seq_len, self.num_spks);
         self.diar_preds.extend(chunk_activity.iter().cloned());
 
-        let mut tokens = self.decode(&encoded, enc_seq_len, self.frame_offset)?;
+        let tokens = self.decode(&encoded, enc_seq_len, self.frame_offset)?;
         self.frame_offset += enc_seq_len;
-
-        if let Some(speech_cache) = pre_silence_cache {
-            // Flush deferred tokens (e.g. final punctuation) with a silent chunk
-            // on top of the speech cache, as the single-talker pipeline does
-            self.encoder_cache = speech_cache;
-            let chunk_size = self.asr.mel_stream_config.chunk_size;
-            let total = chunk_size + self.asr.mel_stream_config.pre_encode_cache;
-            let silence = ops::full::<f32>(&[n_instances, n_mels, total as i32], Array::from_f32(LOG_MEL_ZERO))?;
-            let lengths = Array::from_slice(&vec![chunk_size as i32; n_instances as usize], &[n_instances]);
-            let (encoded, enc_len) = self.run_encoder(&silence, &lengths)?;
-            // Flushed tokens are pinned to the last real frame
-            let last_frame = self.frame_offset.saturating_sub(1);
-            for (instance, mut toks) in self.decode(&encoded, enc_len, last_frame)?.into_iter().enumerate() {
-                toks.iter_mut().for_each(|(_, frame)| *frame = last_frame);
-                tokens[instance].extend(toks);
-            }
-        }
 
         let mut new_words = self.collect_words(tokens, fb.is_last);
         new_words.sort_by(|a, b| a.start_time.total_cmp(&b.start_time));
@@ -457,7 +426,7 @@ impl MultiTalkerPipeline {
     /// Run the encoder on [instances, n_mels, frames] and update the cache.
     ///
     /// Returns the encoder output [instances, frames, d_model] and its length.
-    fn run_encoder(&mut self, features: &Array, lengths: &Array) -> Result<(Array, usize)> {
+    fn run_encoder(&mut self, features: &Array, lengths: &Array, drop_extra: usize) -> Result<(Array, usize)> {
         let (encoded, encoded_lengths, cache_channel, cache_time, cache_len) =
             self.asr.encoder.forward_streaming(
                 features,
@@ -465,14 +434,13 @@ impl MultiTalkerPipeline {
                 &self.encoder_cache.last_channel,
                 &self.encoder_cache.last_time,
                 &self.encoder_cache.last_channel_len,
-                self.asr.streaming_config.drop_extra_pre_encoded,
+                drop_extra,
             )?;
         self.encoder_cache.last_channel = cache_channel;
         self.encoder_cache.last_time = cache_time;
         self.encoder_cache.last_channel_len = cache_len;
 
         let encoded = ops::transpose_axes(&encoded, &[0, 2, 1])?;
-        encoded.eval()?;
         let enc_len = (encoded_lengths.to_vec_row_major::<i32>()?[0].max(0) as usize).min(encoded.dim(1) as usize);
         Ok((encoded, enc_len))
     }

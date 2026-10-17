@@ -9,37 +9,17 @@
 //! - Tracks labels including blanks (for future endpointing support)
 
 use mlx_rs::ops::indexing::{argmax_axis, IndexOp};
+use mlx_rs::ops::{self, max_axis};
 use mlx_rs::Array;
-use tracing::{debug, trace};
+use tracing::debug;
 
 use crate::asr::models::{DecoderState, PredictionNetwork};
 use crate::asr::modules::RNNTJoint;
 use crate::core::ArrayExt;
 use crate::core::error::Result;
 
-/// Apply a mask to log probabilities, setting specified token indices to -inf.
-///
-/// This prevents certain tokens from being selected during greedy decoding.
-fn apply_token_mask(log_probs: &Array, masked_ids: &[usize]) -> Result<Array> {
-    if masked_ids.is_empty() {
-        return Ok(log_probs.clone());
-    }
-
-    // Get the log probs data
-    let mut probs_data: Vec<f32> = log_probs.to_vec_row_major::<f32>()?;
-    let vocab_size = log_probs.dim(-1) as usize;
-
-    // Set masked token probabilities to -inf
-    for &id in masked_ids {
-        if id < vocab_size {
-            probs_data[id] = f32::NEG_INFINITY;
-        }
-    }
-
-    // Reconstruct array with same shape
-    let shape: Vec<i32> = log_probs.shape().iter().map(|&x| x as i32).collect();
-    Ok(Array::from_slice(&probs_data, &shape))
-}
+/// Encoder frames scored per GPU round trip while the prediction is unchanged.
+const DECODE_WINDOW: usize = 32;
 
 /// Maximum number of symbols that can be emitted per encoder frame.
 /// This is a safety limit to prevent infinite loops.
@@ -145,7 +125,7 @@ impl RnntStreamingDecoder {
     /// * `decoder_state` - Mutable decoder state (updated in place)
     /// * `joint` - Joint network
     /// * `last_token` - Mutable last token (updated in place)
-    /// * `masked_token_ids` - Optional token IDs to mask (set to -inf before argmax)
+    /// * `masked_token_ids` - Optional token IDs that are never emitted
     ///
     /// # Returns
     /// * `DecodeStepOutput` containing new tokens and labels
@@ -159,219 +139,125 @@ impl RnntStreamingDecoder {
         last_token: &mut Option<usize>,
         masked_token_ids: Option<&[usize]>,
     ) -> Result<DecodeStepOutput> {
-        encoder_output.eval()?;
+        let enc_proj = if valid_frames > 0 {
+            let frames = encoder_output.index((0, ..valid_frames as i32, ..));
+            joint.project_encoder(&frames)?
+        } else {
+            Array::zeros::<f32>(&[0])?
+        };
+        self.decode_projected(
+            &enc_proj,
+            valid_frames,
+            decoder,
+            decoder_state,
+            joint,
+            last_token,
+            masked_token_ids,
+        )
+    }
 
+    /// Greedy-decode encoder frames already projected by
+    /// [`RNNTJoint::project_encoder`] ([time, joint_hidden]).
+    ///
+    /// Equivalent to frame-by-frame greedy decoding, but while the prediction
+    /// is unchanged (after a blank) the joint scores up to `DECODE_WINDOW`
+    /// frames at once and the first non-blank frame is found on the host, so
+    /// there is one GPU round trip per emitted token or window of blanks rather
+    /// than one per frame. The prediction network only reruns after a token.
+    pub fn decode_projected(
+        &self,
+        enc_proj: &Array,
+        valid_frames: usize,
+        decoder: &PredictionNetwork,
+        decoder_state: &mut DecoderState,
+        joint: &RNNTJoint,
+        last_token: &mut Option<usize>,
+        masked_token_ids: Option<&[usize]>,
+    ) -> Result<DecodeStepOutput> {
+        let blank = self.blank_id;
         let mut output = DecodeStepOutput {
-            labels: vec![self.blank_id; valid_frames],
+            labels: vec![blank; valid_frames],
             ..Default::default()
         };
+        if valid_frames == 0 {
+            return Ok(output);
+        }
 
-        // Log encoder tensor shape for alignment debugging
-        let enc_shape = encoder_output.shape();
-        debug!(
-            enc_batch = enc_shape[0],
-            enc_time = enc_shape[1],
-            enc_dim = enc_shape[2],
-            valid_frames,
-            blank_id = self.blank_id,
-            max_symbols = self.max_symbols_per_step,
-            "DECODER: starting decode"
-        );
+        // Additive mask over the logits that keeps only emittable non-blank tokens
+        let vocab = joint.vocab_size();
+        let mut non_blank_mask = vec![0.0f32; vocab];
+        for id in masked_token_ids.unwrap_or_default().iter().copied().chain([blank]) {
+            if id < vocab {
+                non_blank_mask[id] = f32::NEG_INFINITY;
+            }
+        }
+        let non_blank_mask = Array::from_slice(&non_blank_mask, &[vocab as i32]);
+        let blank_arr = Array::from_int(blank as i32);
+        let threshold = Array::from_f32(self.blank_threshold);
 
-        trace!(
-            valid_frames,
-            blank_id = self.blank_id,
-            max_symbols = self.max_symbols_per_step,
-            "decode_frames start"
-        );
+        // Prediction for the current history, and the state after consuming
+        // `last_token` (committed only once a new token is emitted)
+        let predict = |token: Option<usize>, state: &DecoderState| -> Result<(Array, DecoderState)> {
+            let token = token.map(|t| Array::from_slice(&[t as i32], &[1, 1]));
+            let (pred, next_state) = decoder.predict_one(token.as_ref(), state)?;
+            Ok((joint.project_prediction(&pred.reshape(&[1, -1])?)?, next_state))
+        };
+        let (mut pred_proj, mut next_state) = predict(*last_token, decoder_state)?;
 
-        let debug_decoder = std::env::var("DEBUG_DECODER").is_ok();
+        let mut t = 0;
+        let mut symbols = 0;
+        while t < valid_frames {
+            let window = DECODE_WINDOW.min(valid_frames - t);
+            let enc = enc_proj.index((t as i32..(t + window) as i32, ..));
+            let logits = joint.logits_from_projections(&enc, &pred_proj)?;
 
-        for t in 0..valid_frames {
-            // Get encoder frame: [1, 1, d_model]
-            let enc_frame = encoder_output.index((0i32..1, t as i32..t as i32 + 1, ..));
+            // Blank wins when it beats the best allowed token by more than the
+            // threshold (argmax at threshold 0; ties go to the token, as argmax
+            // with blank last would)
+            let non_blank = ops::add(&logits, &non_blank_mask)?;
+            let best = argmax_axis(&non_blank, -1, false)?;
+            let margin = ops::subtract(
+                &logits.index((.., blank as i32)),
+                &max_axis(&non_blank, -1, false)?,
+            )?;
+            let choice = ops::select(margin.gt(&threshold)?, &blank_arr, &best)?;
+            let choice: Vec<u32> = choice.as_dtype(mlx_rs::Dtype::Uint32)?.to_vec_row_major()?;
 
-            let mut symbols_emitted = 0;
+            let Some(k) = choice.iter().position(|&c| c as usize != blank) else {
+                output.blank_count += window;
+                t += window;
+                symbols = 0;
+                continue;
+            };
+            if k > 0 {
+                output.blank_count += k;
+                t += k;
+                symbols = 0;
+            }
 
-            loop {
-                // Build last token array if we have one
-                let last_token_arr =
-                    last_token.map(|tok| Array::from_slice(&[tok as i32], &[1, 1]));
+            let token = choice[k] as usize;
+            output.new_tokens.push(token);
+            output.timesteps.push(t);
+            output.non_blank_count += 1;
+            if symbols == 0 {
+                output.labels[t] = token;
+            }
+            *last_token = Some(token);
+            let (proj, state) = predict(Some(token), &next_state)?;
+            *decoder_state = std::mem::replace(&mut next_state, state);
+            pred_proj = proj;
 
-                // Get prediction output
-                let (pred_output, new_state) =
-                    decoder.predict_one(last_token_arr.as_ref(), decoder_state)?;
-
-                // Compute joint output: [1, vocab_size+1]
-                let log_probs = joint.forward_one(&enc_frame, &pred_output)?;
-
-                // Apply token mask if provided (set masked tokens to -inf)
-                let log_probs = if let Some(mask_ids) = masked_token_ids {
-                    apply_token_mask(&log_probs, mask_ids)?
-                } else {
-                    log_probs
-                };
-
-                // Get argmax prediction - this is the only eval we need since
-                // we must read the token value for control flow
-                let prediction = argmax_axis(&log_probs, -1, false)?;
-                prediction.eval()?;
-                let pred_token = prediction.to_vec_row_major::<u32>()?[0] as usize;
-
-                // Debug: log encoder and prediction norms for frame 0
-                if debug_decoder && t == 0 && symbols_emitted == 0 {
-                    enc_frame.eval()?;
-                    pred_output.eval()?;
-                    let enc_data = enc_frame.to_vec_row_major::<f32>()?;
-                    let enc_norm: f32 = enc_data.iter().map(|v| v * v).sum::<f32>().sqrt();
-                    let pred_data = pred_output.to_vec_row_major::<f32>()?;
-                    let pred_norm: f32 = pred_data.iter().map(|v| v * v).sum::<f32>().sqrt();
-                    trace!(
-                        frame = t,
-                        enc_norm = %format!("{:.4}", enc_norm),
-                        pred_norm = %format!("{:.4}", pred_norm),
-                        last_token = ?last_token,
-                        pred_token,
-                        "frame 0 debug"
-                    );
-                }
-
-                // Apply blank threshold override if configured
-                // When blank is argmax but margin is insufficient, select best non-blank instead
-                let pred_token = if pred_token == self.blank_id && self.blank_threshold > 0.0 {
-                    log_probs.eval()?;
-                    let probs_data = log_probs.to_vec_row_major::<f32>()?;
-                    let blank_prob = probs_data[self.blank_id];
-
-                    // Find best non-blank token
-                    let (best_non_blank_token, best_non_blank_prob) = probs_data
-                        .iter()
-                        .enumerate()
-                        .filter(|(i, _)| *i != self.blank_id)
-                        .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
-                        .map(|(i, &p)| (i, p))
-                        .unwrap_or((self.blank_id, f32::NEG_INFINITY));
-
-                    let margin = blank_prob - best_non_blank_prob;
-
-                    // Debug logging for first frame
-                    if t == 0 && symbols_emitted == 0 {
-                        trace!(
-                            frame = t,
-                            blank_log_prob = %format!("{:.4}", blank_prob),
-                            best_non_blank_token,
-                            best_non_blank_log_prob = %format!("{:.4}", best_non_blank_prob),
-                            margin = %format!("{:.4}", margin),
-                            threshold = %format!("{:.4}", self.blank_threshold),
-                            "blank threshold check on frame 0"
-                        );
-                    }
-
-                    if margin > self.blank_threshold {
-                        // Blank wins, keep it
-                        self.blank_id
-                    } else {
-                        // Override: emit best non-blank instead
-                        trace!(
-                            frame = t,
-                            original = "blank",
-                            override_token = best_non_blank_token,
-                            margin = %format!("{:.4}", margin),
-                            threshold = %format!("{:.4}", self.blank_threshold),
-                            "blank overridden by threshold"
-                        );
-                        best_non_blank_token
-                    }
-                } else {
-                    // Debug: log probabilities for first frame when blank is predicted (no threshold)
-                    if debug_decoder && pred_token == self.blank_id && t == 0 && symbols_emitted == 0 {
-                        log_probs.eval()?;
-                        let probs_data = log_probs.to_vec_row_major::<f32>()?;
-                        let blank_prob = probs_data[self.blank_id];
-
-                        // Find top non-blank token
-                        let mut best_non_blank_prob = f32::NEG_INFINITY;
-                        let mut best_non_blank_token = 0;
-                        for (i, &prob) in probs_data.iter().enumerate() {
-                            if i != self.blank_id && prob > best_non_blank_prob {
-                                best_non_blank_prob = prob;
-                                best_non_blank_token = i;
-                            }
-                        }
-
-                        trace!(
-                            frame = t,
-                            blank_log_prob = %format!("{:.4}", blank_prob),
-                            best_non_blank_token,
-                            best_non_blank_log_prob = %format!("{:.4}", best_non_blank_prob),
-                            prob_diff = %format!("{:.4}", blank_prob - best_non_blank_prob),
-                            "blank predicted on frame 0"
-                        );
-                    }
-                    pred_token
-                };
-
-                if pred_token == self.blank_id {
-                    // Blank: advance to next encoder frame
-                    output.blank_count += 1;
-                    // Only set to blank if no tokens were emitted for this frame
-                    if symbols_emitted == 0 {
-                        output.labels[t] = self.blank_id;
-                    }
-                    debug!(
-                        frame = t,
-                        of = valid_frames,
-                        symbols_emitted,
-                        result = "BLANK",
-                        "DECODER: frame result"
-                    );
-                    break;
-                }
-
-                // Non-blank: emit token and update state
-                output.new_tokens.push(pred_token);
-                output.timesteps.push(t);
-                output.non_blank_count += 1;
-                // Record first token emitted for this frame (for summary display)
-                if symbols_emitted == 0 {
-                    output.labels[t] = pred_token;
-                }
-
-                *last_token = Some(pred_token);
-                *decoder_state = new_state;
-                symbols_emitted += 1;
-
-                debug!(
-                    frame = t,
-                    of = valid_frames,
-                    token = pred_token,
-                    symbols_emitted,
-                    result = "TOKEN",
-                    "DECODER: frame result"
-                );
-
-                if symbols_emitted >= self.max_symbols_per_step {
-                    debug!(frame = t, symbols_emitted, "max symbols per step reached");
-                    break;
-                }
+            symbols += 1;
+            if symbols >= self.max_symbols_per_step {
+                t += 1;
+                symbols = 0;
             }
         }
 
-        // Build a compact representation of what happened at each frame
-        // B = blank, T<id> = token with id
-        let frame_summary: String = output.labels.iter().map(|&label| {
-            if label == self.blank_id {
-                "B".to_string()
-            } else {
-                format!("T{}", label)
-            }
-        }).collect::<Vec<_>>().join(" ");
-
         debug!(
+            frames = valid_frames,
             new_tokens = output.new_tokens.len(),
             blank_count = output.blank_count,
-            non_blank_count = output.non_blank_count,
-            frame_summary = %frame_summary,
             "DECODER: decode_frames complete"
         );
 

@@ -329,19 +329,27 @@ impl MelProcessor {
             mel
         };
 
+        // Valid frames per stream: NeMo's get_seq_len, samples / hop. The
+        // centered STFT has one more frame, which NeMo zeroes like padding.
+        let out_lengths = match lengths {
+            Some(lens) => self.compute_output_lengths(lens)?,
+            None => ops::full::<i32>(
+                &[batch_size],
+                &Array::from_int((audio_len / self.hop_samples) as i32),
+            )?,
+        };
+        let n_frames = mel.dim(2);
+        let valid = ops::lt(
+            &ops::arange::<_, i32>(0, n_frames, 1)?.reshape(&[1, 1, n_frames])?,
+            &out_lengths.reshape(&[batch_size, 1, 1])?,
+        )?;
+
         // Apply normalization if requested
         let mel = match self.config.normalize.as_str() {
-            "per_feature" => self.normalize_per_feature(&mel)?,
+            "per_feature" => self.normalize_per_feature(&mel, &valid, &out_lengths)?,
             _ => mel,
         };
-
-        // Compute output lengths
-        let n_frames = audio_len / self.hop_samples + 1;
-        let out_lengths = if let Some(lens) = lengths {
-            self.compute_output_lengths(lens)?
-        } else {
-            ops::full::<i32>(&[batch_size], &Array::from_int(n_frames as i32))?
-        };
+        let mel = ops::select(&valid, &mel, &Array::from_f32(0.0))?;
 
         Ok((mel, out_lengths))
     }
@@ -384,20 +392,27 @@ impl MelProcessor {
         ops::add(&real_sq, &imag_sq).map_err(|e| Error::model(e.to_string()))
     }
 
-    /// Per-feature normalization (zero mean, unit variance per mel bin).
-    fn normalize_per_feature(&self, features: &Array) -> Result<Array> {
-        tracing::debug!("Applying per-feature normalization");
-        let mean = ops::mean_axis(features, 2, Some(true))?;
-        let centered = ops::subtract(features, &mean)?;
-        let variance = ops::mean_axis(&ops::square(&centered)?, 2, Some(true))?;
-        let std = ops::sqrt(&ops::add(&variance, &Array::from_f32(1e-5))?)?;
-        ops::divide(&centered, &std).map_err(|e| Error::model(e.to_string()))
+    /// Per-feature normalization over each stream's valid frames, like NeMo's
+    /// normalize_batch: unbiased std, plus 1e-5.
+    fn normalize_per_feature(&self, features: &Array, valid: &Array, lengths: &Array) -> Result<Array> {
+        let count = lengths.as_dtype(mlx_rs::Dtype::Float32)?.reshape(&[-1, 1, 1])?;
+        let zero = Array::from_f32(0.0);
+        let masked = ops::select(valid, features, &zero)?;
+        let mean = ops::divide(&ops::sum_axis(&masked, 2, Some(true))?, &ops::maximum(&count, &Array::from_f32(1.0))?)?;
+        let centered = ops::select(valid, &ops::subtract(features, &mean)?, &zero)?;
+        let variance = ops::divide(
+            &ops::sum_axis(&ops::square(&centered)?, 2, Some(true))?,
+            &ops::maximum(&ops::subtract(&count, &Array::from_f32(1.0))?, &Array::from_f32(1.0))?,
+        )?;
+        let std = ops::add(&ops::sqrt(&variance)?, &Array::from_f32(1e-5))?;
+        ops::divide(&ops::subtract(features, &mean)?, &std).map_err(|e| Error::model(e.to_string()))
     }
 
-    /// Compute output frame lengths from input sample lengths.
+    /// Valid frame lengths from input sample lengths (NeMo's get_seq_len).
     fn compute_output_lengths(&self, input_lengths: &Array) -> Result<Array> {
-        let divided = ops::floor_divide(input_lengths, Array::from_int(self.hop_samples as i32))?;
-        ops::add(&divided, &Array::from_int(1)).map_err(|e| Error::model(e.to_string()))
+        let lengths = input_lengths.as_dtype(mlx_rs::Dtype::Int32)?;
+        ops::floor_divide(&lengths, Array::from_int(self.hop_samples as i32))
+            .map_err(|e| Error::model(e.to_string()))
     }
 }
 
@@ -801,25 +816,35 @@ use crate::asr::streaming::StreamingConfig;
 pub struct StreamingMelConfig {
     /// Base mel configuration
     pub mel: MelConfig,
-    /// Chunk size in mel frames (new frames per chunk)
+    /// New mel frames in the first chunk
+    pub chunk_size_first: usize,
+    /// New mel frames in each later chunk
     pub chunk_size: usize,
-    /// Shift size in mel frames (how much to advance per chunk)
+    /// Frames to advance after the first chunk
+    pub shift_size_first: usize,
+    /// Frames to advance after each later chunk
     pub shift_size: usize,
     /// Pre-encode cache size in mel frames for first chunk
     pub pre_encode_cache_first: usize,
     /// Pre-encode cache size in mel frames for subsequent chunks (overlap from previous chunk)
     pub pre_encode_cache: usize,
+    /// Encoder subsampling factor: a final, shorter chunk needs at least this
+    /// many new frames (one after the first chunk) to produce an encoder frame
+    pub subsampling_factor: usize,
 }
 
 impl StreamingMelConfig {
     /// Create streaming config from MelConfig and StreamingConfig.
-    pub fn new(mel: MelConfig, streaming: &StreamingConfig) -> Self {
+    pub fn new(mel: MelConfig, streaming: &StreamingConfig, subsampling_factor: usize) -> Self {
         Self {
             mel,
+            chunk_size_first: streaming.chunk_size.0,
             chunk_size: streaming.chunk_size.1,
+            shift_size_first: streaming.shift_size.0,
             shift_size: streaming.shift_size.1,
             pre_encode_cache_first: streaming.pre_encode_cache_size.0,
             pre_encode_cache: streaming.pre_encode_cache_size.1,
+            subsampling_factor,
         }
     }
 
@@ -828,12 +853,39 @@ impl StreamingMelConfig {
         self.chunk_size * hop_samples
     }
 
+    /// Get the number of new mel frames for a given chunk.
+    pub fn chunk_size_for_chunk(&self, is_first: bool) -> usize {
+        if is_first {
+            self.chunk_size_first
+        } else {
+            self.chunk_size
+        }
+    }
+
+    /// Get the shift after a given chunk.
+    pub fn shift_size_for_chunk(&self, is_first: bool) -> usize {
+        if is_first {
+            self.shift_size_first
+        } else {
+            self.shift_size
+        }
+    }
+
     /// Get the pre-encode cache size for a given chunk.
     pub fn pre_encode_cache_for_chunk(&self, is_first: bool) -> usize {
         if is_first {
             self.pre_encode_cache_first
         } else {
             self.pre_encode_cache
+        }
+    }
+
+    /// Minimum new frames a final, shorter chunk needs (NeMo's sampling frames).
+    pub fn min_frames_for_chunk(&self, is_first: bool) -> usize {
+        if is_first {
+            1
+        } else {
+            self.subsampling_factor
         }
     }
 }
@@ -877,8 +929,9 @@ pub struct StreamingMel {
     /// The underlying mel processor
     processor: MelProcessor,
 
-    /// Audio lookback buffer for STFT window continuity.
-    /// Size: window_samples - hop_samples (e.g., 240 samples)
+    /// Audio lookback buffer for STFT window continuity: the samples from the
+    /// start of the next frame on. Starts as `win_samples / 2` zeros so frame t
+    /// is centered on sample `t * hop`, like NeMo's centered STFT.
     audio_lookback: Vec<f32>,
 
     /// Last audio sample for preemphasis continuity
@@ -910,11 +963,10 @@ impl StreamingMel {
         let n_mels = processor.n_mels();
         let win_samples = processor.win_samples();
         let hop_samples = processor.hop_samples();
-        let overlap_size = dsp::overlap_size(win_samples, hop_samples);
 
         Ok(Self {
             processor,
-            audio_lookback: vec![0.0f32; overlap_size],
+            audio_lookback: vec![0.0f32; win_samples / 2],
             last_sample: 0.0,
             mel_frames: Vec::new(),
             total_frames: 0,
@@ -1006,13 +1058,22 @@ impl StreamingMel {
         Ok(n_frames)
     }
 
-    /// Flush remaining audio from the lookback buffer by padding with silence.
+    /// Flush the end of the stream, like the right half of a centered STFT.
     ///
-    /// The lookback buffer holds `overlap_size` (win_samples - hop_samples) samples
-    /// from previous calls. Padding with `hop_samples` zeros gives exactly
-    /// `win_samples` total, producing one final mel frame.
+    /// Pads `win_samples / 2` samples that are zero after preemphasis (NeMo pads
+    /// the preemphasized signal), giving `samples / hop + 1` frames in total.
     pub fn flush(&mut self) -> Result<usize> {
-        let pad = vec![0.0f32; self.hop_samples];
+        let pad_len = self.win_samples / 2;
+        let pad = match self.processor.config.preemph {
+            // x[n] = coef * x[n-1] makes x[n] - coef * x[n-1] zero
+            Some(coef) => {
+                let last = self.audio_lookback.last().copied().unwrap_or(0.0);
+                std::iter::successors(Some(last * coef), |x| Some(x * coef))
+                    .take(pad_len)
+                    .collect()
+            }
+            None => vec![0.0f32; pad_len],
+        };
         self.add_audio(&pad)
     }
 
@@ -1208,8 +1269,7 @@ impl StreamingMel {
 
     /// Reset to initial state.
     pub fn reset(&mut self) {
-        let overlap_size = dsp::overlap_size(self.win_samples, self.hop_samples);
-        self.audio_lookback = vec![0.0f32; overlap_size];
+        self.audio_lookback = vec![0.0f32; self.win_samples / 2];
         self.last_sample = 0.0;
         self.mel_frames.clear();
         self.total_frames = 0;
@@ -1359,9 +1419,10 @@ mod tests {
         // 16000/160 + 1 = 101 frames
         assert_eq!(features.shape()[2], 101);
 
+        // NeMo counts 16000/160 = 100 of them as valid
         lengths.eval().unwrap();
         let len_data: Vec<i32> = lengths.to_vec_row_major().unwrap();
-        assert_eq!(len_data[0], 101);
+        assert_eq!(len_data[0], 100);
     }
 
     #[test]
@@ -1516,8 +1577,8 @@ mod tests {
         output_lens.eval().unwrap();
 
         let data: Vec<i32> = output_lens.to_vec_row_major().unwrap();
-        // 16000/160+1=101, 8000/160+1=51, 32000/160+1=201
-        assert_eq!(data, &[101, 51, 201]);
+        // NeMo's get_seq_len: samples / hop
+        assert_eq!(data, &[100, 50, 200]);
     }
 
     // ==================== Dithering Tests ====================
@@ -1764,7 +1825,7 @@ mod tests {
 
         assert_eq!(mel.n_mels(), 128);
         assert_eq!(mel.total_frames(), 0);
-        assert_eq!(mel.lookback_size(), 240); // window - hop = 400 - 160
+        assert_eq!(mel.lookback_size(), 200); // window / 2, for centered frames
     }
 
     #[test]
@@ -1777,13 +1838,13 @@ mod tests {
         let mut mel = StreamingMel::new(config).unwrap();
 
         // Add 1600 samples
-        // With 240 lookback (zeros) + 1600 new = 1840 total
-        // Frames = (1840 - 400) / 160 + 1 = 10
+        // With 200 lookback (zeros) + 1600 new = 1800 total
+        // Frames = (1800 - 400) / 160 + 1 = 9
         let audio: Vec<f32> = (0..1600).map(|i| (i as f32 * 0.001).sin()).collect();
         let frames_added = mel.add_audio(&audio).unwrap();
 
-        assert_eq!(frames_added, 10);
-        assert_eq!(mel.total_frames(), 10);
+        assert_eq!(frames_added, 9);
+        assert_eq!(mel.total_frames(), 9);
     }
 
     #[test]
@@ -1818,16 +1879,16 @@ mod tests {
         // Add audio to produce frames
         let audio: Vec<f32> = (0..1600).map(|i| (i as f32 * 0.001).sin()).collect();
         mel.add_audio(&audio).unwrap();
-        assert_eq!(mel.total_frames(), 10);
+        assert_eq!(mel.total_frames(), 9);
 
         // Trim first 5 frames
         mel.trim(5);
-        assert_eq!(mel.total_frames(), 5);
+        assert_eq!(mel.total_frames(), 4);
 
         // Get remaining frames
-        let frames = mel.get_frames(0, 5).unwrap();
+        let frames = mel.get_frames(0, 4).unwrap();
         frames.eval().unwrap();
-        assert_eq!(frames.shape(), &[128, 5]);
+        assert_eq!(frames.shape(), &[128, 4]);
     }
 
     #[test]
@@ -1847,7 +1908,7 @@ mod tests {
         // Reset
         mel.reset();
         assert_eq!(mel.total_frames(), 0);
-        assert_eq!(mel.lookback_size(), 240);
+        assert_eq!(mel.lookback_size(), 200);
     }
 
     #[test]
@@ -1860,7 +1921,7 @@ mod tests {
         let mut mel = StreamingMel::new(config).unwrap();
 
         // Add only 100 samples - not enough for a frame
-        // Need 400 samples for first frame, have 240 (zeros) + 100 = 340
+        // Need 400 samples for first frame, have 200 (zeros) + 100 = 300
         let audio: Vec<f32> = (0..100).map(|i| (i as f32 * 0.01).sin()).collect();
         let frames_added = mel.add_audio(&audio).unwrap();
 
@@ -1930,5 +1991,41 @@ mod tests {
             approx_eq(data[far_pad_idx], -16.0, 1e-6),
             "Frames beyond lookback reach should use constant padding"
         );
+    }
+
+    #[test]
+    fn test_streaming_mel_matches_batch() {
+        // Streaming in uneven pieces plus the flush gives the centered STFT of
+        // the whole signal, frame for frame (preemphasis included)
+        let config = MelConfig {
+            normalize: "NA".to_string(),
+            dither: 0.0,
+            ..Default::default()
+        };
+        let audio: Vec<f32> = (0..5003).map(|i| (i as f32 * 0.013).sin() * 0.3).collect();
+        let batch = MelProcessor::new(config.clone()).unwrap();
+        let (expected, _) = batch
+            .forward(&Array::from_slice(&audio, &[1, audio.len() as i32]), None)
+            .unwrap();
+        let expected: Vec<f32> = expected.to_vec_row_major().unwrap();
+
+        let mut mel = StreamingMel::new(config).unwrap();
+        for piece in audio.chunks(1234) {
+            mel.add_audio(piece).unwrap();
+        }
+        mel.flush().unwrap();
+        let n_frames = audio.len() / 160 + 1;
+        assert_eq!(mel.total_frames(), n_frames);
+
+        let streamed: Vec<f32> = mel.get_frames(0, n_frames).unwrap().to_vec_row_major().unwrap();
+        // The batch output zeroes its last frame (past NeMo's valid length)
+        // (a frame off by one sample's alignment would differ by far more than
+        // float noise)
+        for bin in 0..mel.n_mels() {
+            for t in 0..n_frames - 1 {
+                let (a, b) = (streamed[bin * n_frames + t], expected[bin * n_frames + t]);
+                assert!((a - b).abs() < 5e-3, "bin {bin} frame {t}: {a} vs {b}");
+            }
+        }
     }
 }

@@ -4,10 +4,11 @@
 //! for effective speech feature encoding.
 
 use std::collections::HashMap;
+use std::sync::LazyLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use mlx_rs::builder::Builder;
-use mlx_rs::module::Module;
+use mlx_rs::module::{Module, ModuleParameters};
 use mlx_rs::nn;
 use mlx_rs::ops::indexing::IndexOp;
 use mlx_rs::Array;
@@ -18,6 +19,12 @@ use crate::asr::modules::speaker_kernel::{SpeakerKernels, SpeakerTargets};
 use crate::core::ArrayExt;
 use crate::core::error::Result;
 use crate::core::quantization::{LinearLayer, QuantizationConfig, load_linear_layer};
+
+/// Debug switches, read from the environment once rather than on every call
+static DEBUG_MEL_MASK: LazyLock<bool> = LazyLock::new(|| std::env::var_os("DEBUG_MEL_MASK").is_some());
+static MLX_VOICE_DEBUG: LazyLock<bool> = LazyLock::new(|| std::env::var_os("MLX_VOICE_DEBUG").is_some());
+static DEBUG_LAYER0: LazyLock<bool> = LazyLock::new(|| std::env::var_os("DEBUG_LAYER0").is_some());
+static DEBUG_CONV: LazyLock<bool> = LazyLock::new(|| std::env::var_os("DEBUG_CONV").is_some());
 
 /// Global counter for encoder forward calls (for debugging)
 static ENCODER_CALL_COUNT: AtomicU64 = AtomicU64::new(0);
@@ -127,6 +134,8 @@ fn load_batch_norm(layer: &mut nn::BatchNorm, weights: &HashMap<String, Array>, 
     if let Some(running_var) = weights.get(&format!("{}.running_var", prefix)) {
         layer.running_var.value = Some(running_var.clone());
     }
+    // Use inference mode so we use loaded running stats, not batch stats
+    layer.training = false;
 }
 
 /// Apply causal padding to a 4D tensor [B, T, F, C].
@@ -145,29 +154,19 @@ fn load_batch_norm(layer: &mut nn::BatchNorm, weights: &HashMap<String, Array>, 
 ///
 /// This gives output size = floor((input + 2 + 1 - 3) / 2) + 1 = floor(input / 2) + 1
 fn causal_pad_2d(x: &Array, kernel_size: usize, stride: usize) -> Result<Array> {
-    let batch = x.dim(0) as i32;
-    let time = x.dim(1) as i32;
-    let freq = x.dim(2) as i32;
-    let channels = x.dim(3) as i32;
-
     // NeMo's CausalConv2D padding formula:
     // left_pad = kernel_size - 1
     // right_pad = stride - 1
     let left_pad = (kernel_size - 1) as i32;
     let right_pad = (stride - 1) as i32;
 
-    // Step 1: Pad time dimension (axis 1): [B, T, F, C] -> [B, T+left_pad+right_pad, F, C]
-    let time_zeros_left = mlx_rs::ops::zeros::<f32>(&[batch, left_pad, freq, channels])?;
-    let time_zeros_right = mlx_rs::ops::zeros::<f32>(&[batch, right_pad, freq, channels])?;
-    let x = mlx_rs::ops::concatenate(&[&time_zeros_left, x, &time_zeros_right], 1)?;
-
-    // Step 2: Pad frequency dimension (axis 2)
-    let new_time = time + left_pad + right_pad;
-    let freq_zeros_left = mlx_rs::ops::zeros::<f32>(&[batch, new_time, left_pad, channels])?;
-    let freq_zeros_right = mlx_rs::ops::zeros::<f32>(&[batch, new_time, right_pad, channels])?;
-    let x = mlx_rs::ops::concatenate(&[&freq_zeros_left, &x, &freq_zeros_right], 2)?;
-
-    Ok(x)
+    // Pad time (axis 1) and frequency (axis 2) the same way: [B, T, F, C]
+    Ok(mlx_rs::ops::pad(
+        x,
+        &[(0, 0), (left_pad, right_pad), (left_pad, right_pad), (0, 0)],
+        None,
+        None,
+    )?)
 }
 
 /// Create attention mask for streaming inference.
@@ -459,6 +458,14 @@ pub struct ConformerEncoder {
 
     /// Speaker targets used by the speaker kernels on the next forward pass
     speaker_targets: Option<SpeakerTargets>,
+
+    /// Dtype of the weights and activations (see `set_dtype`)
+    dtype: mlx_rs::Dtype,
+
+    /// Streaming attention masks by (filled cache, frames, valid frames):
+    /// `None` when every position is visible, else an additive f32 mask, or a
+    /// boolean one (true = visible) when some query rows see nothing
+    streaming_masks: HashMap<(i32, i32, i32), Option<Array>>,
 }
 
 impl ConformerEncoder {
@@ -506,7 +513,23 @@ impl ConformerEncoder {
             att_context_style,
             speaker_kernels: None,
             speaker_targets: None,
+            dtype: mlx_rs::Dtype::Float32,
+            streaming_masks: HashMap::new(),
         })
+    }
+
+    /// Run the encoder's weights and activations in `dtype` (e.g. `Dtype::Bfloat16`).
+    ///
+    /// For the offline [`forward`](Self::forward) pass: inputs are cast to
+    /// `dtype` and the output back to float32. The streaming caches stay float32.
+    pub fn set_dtype(&mut self, dtype: mlx_rs::Dtype) -> Result<()> {
+        self.subsampling.set_dtype(dtype)?;
+        self.pos_enc.set_dtype(dtype)?;
+        for layer in &mut self.layers {
+            layer.set_dtype(dtype)?;
+        }
+        self.dtype = dtype;
+        Ok(())
     }
 
     /// Set the streaming mode's attention context size.
@@ -554,7 +577,7 @@ impl ConformerEncoder {
         let mel_mask = mlx_rs::ops::ge(&mel_indices, &mel_lengths_expanded)?;
         let mel_mask = mel_mask.reshape(&[x.dim(0) as i32, mel_time, 1])?;
 
-        let debug_mask = std::env::var("DEBUG_MEL_MASK").is_ok();
+        let debug_mask = *DEBUG_MEL_MASK;
         if debug_mask {
             x.eval()?;
             mel_mask.eval()?;
@@ -590,12 +613,13 @@ impl ConformerEncoder {
         }
 
         // Subsampling
+        let x = x.as_dtype(self.dtype)?;
         let (mut x, lengths) = self.subsampling.forward(&x, &lengths)?;
 
         // Scale input by sqrt(d_model) if xscaling is enabled
         let xscale = self.pos_enc.xscale();
         if xscale != 1.0 {
-            x = &x * Array::from_f32(xscale);
+            x = &x * Array::from_f32(xscale).as_dtype(x.dtype())?;
         }
 
         // Generate positional encoding for this sequence length
@@ -618,7 +642,7 @@ impl ConformerEncoder {
         // So we skip the final_norm here.
 
         // Transpose back to [B, D, T]
-        let x = mlx_rs::ops::transpose_axes(&x, &[0, 2, 1])?;
+        let x = mlx_rs::ops::transpose_axes(&x, &[0, 2, 1])?.as_dtype(mlx_rs::Dtype::Float32)?;
 
         Ok((x, lengths))
     }
@@ -747,7 +771,7 @@ impl ConformerEncoder {
         // Scale input by sqrt(d_model) if xscaling is enabled
         let xscale = self.pos_enc.xscale();
         if xscale != 1.0 {
-            x = &x * Array::from_f32(xscale);
+            x = &x * Array::from_f32(xscale).as_dtype(x.dtype())?;
         }
 
         // Generate positional encoding for this sequence length
@@ -799,7 +823,7 @@ impl ConformerEncoder {
         // Scale input by sqrt(d_model) if xscaling is enabled
         let xscale = self.pos_enc.xscale();
         if xscale != 1.0 {
-            x = &x * Array::from_f32(xscale);
+            x = &x * Array::from_f32(xscale).as_dtype(x.dtype())?;
         }
         x.eval()?;
         let after_scaling = x.clone();
@@ -883,162 +907,83 @@ impl ConformerEncoder {
         cache_last_channel_len: &Array,
         drop_extra_pre_encoded: usize,
     ) -> Result<(Array, Array, Array, Array, Array)> {
-        // Track encoder calls for debugging
-        let enc_call = ENCODER_CALL_COUNT.fetch_add(1, Ordering::SeqCst);
-
-        tracing::trace!(
-            enc_call,
-            features_shape = ?features.shape(),
-            "encoder streaming forward"
-        );
+        ENCODER_CALL_COUNT.fetch_add(1, Ordering::SeqCst);
 
         // Transpose from [B, F, T] to [B, T, F] for processing
         let x = mlx_rs::ops::transpose_axes(features, &[0, 2, 1])?;
 
-        // Subsampling
-        let (mut x, lengths) = self.subsampling.forward(&x, lengths)?;
+        // Lengths and the cache fill level are host arrays (this function
+        // returns them that way too), so reading them doesn't wait on the GPU.
+        let input_lengths: Vec<i32> = lengths.as_dtype(mlx_rs::Dtype::Int32)?.to_vec_row_major()?;
+        let filled_cache_lens: Vec<i64> = cache_last_channel_len.as_dtype(mlx_rs::Dtype::Int64)?.to_vec_row_major()?;
 
-        // Drop extra pre-encoded frames for streaming
-        // This is needed because the subsampling convolutions produce extra frames
-        // at chunk boundaries that should be discarded to match offline behavior.
-        // NeMo applies this on ALL chunks (whenever cache_last_channel is not None),
-        // which in streaming mode is always.
+        // Subsampling
+        let mut x = self.subsampling.forward_frames_chunked(&x, SUBSAMPLING_CHUNK_FRAMES)?;
+
+        // Drop the frames the pre-encode cache produced (NeMo also shortens
+        // `length` by the same amount)
         if drop_extra_pre_encoded > 0 {
-            let drop = drop_extra_pre_encoded as i32;
-            tracing::trace!(
-                enc_call,
-                drop_extra_pre_encoded,
-                "dropping extra pre-encoded frames from start"
-            );
-            // Unlike NeMo, `lengths` is not reduced by `drop` here.
-            x = x.index((.., drop.., ..));
+            x = x.index((.., drop_extra_pre_encoded as i32.., ..));
         }
+        let out_lengths: Vec<i32> = input_lengths
+            .iter()
+            .map(|&len| {
+                let len = self.subsampling.output_length(len.max(0) as usize);
+                len.saturating_sub(drop_extra_pre_encoded) as i32
+            })
+            .collect();
 
         // Scale input by sqrt(d_model) if xscaling is enabled
         let xscale = self.pos_enc.xscale();
         if xscale != 1.0 {
-            x = &x * Array::from_f32(xscale);
+            x = &x * Array::from_f32(xscale).as_dtype(x.dtype())?;
         }
 
-        // Get tensor dimension (actual frames in tensor) and lengths (valid frames)
-        // Python NeMo uses lengths for attention masking, but we need tensor dimension for pos_emb
-        let tensor_seq_len = x.dim(1) as i32; // Actual tensor frames
-        lengths.eval()?;
-        let valid_seq_len = lengths.to_vec_row_major::<i32>()?[0]; // Valid frames (for masking)
-        let cache_size = cache_last_channel.dim(2) as i32; // Allocated cache size
+        // The mask is shared across the batch, so it uses the first stream's lengths
+        let tensor_seq_len = x.dim(1) as i32;
+        let valid_seq_len = out_lengths[0].min(tensor_seq_len);
+        let cache_size = cache_last_channel.dim(2) as i32;
+        let filled_cache_len = filled_cache_lens[0].clamp(0, cache_size as i64) as i32;
 
-        // Get the actual filled cache length (use first batch element, assume all same)
-        cache_last_channel_len.eval()?;
-        let filled_cache_len = cache_last_channel_len.to_vec_row_major::<i64>()?[0].max(0) as i32;
-
-        // Total length for K/V needs to cover all tensor frames for pos_emb
-        // Use tensor dimension, not valid length, to avoid pos_emb size mismatch
+        // Keys/values cover the full cache buffer plus the current frames
         let total_len = cache_size + tensor_seq_len;
-        // Valid length is used for masking
-        let seq_len = cache_size + valid_seq_len;
-
-        tracing::debug!(
-            enc_call,
-            tensor_seq_len,
-            valid_seq_len,
-            cache_size,
-            filled_cache_len,
-            total_len,
-            seq_len,
-            "streaming forward params"
-        );
-
-        // Generate positional encoding for total length (full buffer + current)
-        // This should cover positions for all K/V that attention will see
-        //
-        // For streaming with cache:
-        //   total_len = cache_size + seq_len
-        //   pos_emb shape = [1, 2*total_len - 1, d_model]
-        //
-        // The positional encoding covers relative positions from +(total_len-1) to -(total_len-1).
-        // After rel_shift in attention, these align correctly with K/V positions 0..total_len.
         let pos_emb = self.pos_enc.get_encoding(total_len as usize)?;
 
-        tracing::trace!(
-            enc_call,
-            pos_emb_shape = ?pos_emb.shape(),
-            "generated positional encoding"
-        );
-
-        // Create attention mask if we have context configuration
         // NeMo: att_mask = _create_masks(...); att_mask = att_mask[:, cache_len:]
-        //
-        // The mask is created for the full tensor (cache_size + tensor_seq_len = total_len),
-        // and uses valid_seq_len for masking extra frames.
-        let att_mask = if let Some(ctx) = self.att_context_size {
-            Some(create_attention_mask(
-                ctx,
-                &self.att_context_style,
-                total_len,        // Full buffer: cache_size + tensor_seq_len
-                cache_size,       // Full cache buffer size (for slicing)
-                filled_cache_len, // How much is filled (for offset masking)
-                tensor_seq_len,   // Tensor dimension for mask row count
-                valid_seq_len - 1, // Valid frames for query row masking
-            )?)
-        } else {
-            None
+        let att_mask = match self.att_context_size {
+            Some(ctx) => {
+                let key = (filled_cache_len, tensor_seq_len, valid_seq_len);
+                if !self.streaming_masks.contains_key(&key) {
+                    let mask = create_attention_mask(
+                        ctx,
+                        &self.att_context_style,
+                        total_len,
+                        cache_size,
+                        filled_cache_len,
+                        tensor_seq_len,
+                        valid_seq_len,
+                    )?;
+                    // Skip masking entirely once nothing is hidden. Otherwise, when
+                    // every query row sees some key (rows only go blank past the
+                    // valid length), pass an additive mask the fused attention
+                    // kernel can take.
+                    let all_visible = mlx_rs::ops::all(&mask, None)?.item_exact::<bool>();
+                    let mask = if all_visible {
+                        None
+                    } else if valid_seq_len < tensor_seq_len {
+                        Some(mask)
+                    } else {
+                        let hidden = Array::from_f32(f32::NEG_INFINITY);
+                        let additive = mlx_rs::ops::select(&mask, &Array::from_f32(0.0), &hidden)?;
+                        additive.eval()?;
+                        Some(additive)
+                    };
+                    self.streaming_masks.insert(key, mask);
+                }
+                self.streaming_masks[&key].clone()
+            }
+            None => None,
         };
-
-        tracing::trace!("Generated attention");
-
-        // Print the full attention mask matrix
-        if let Some(ref mask) = att_mask {
-            mask.eval()?;
-            let shape = mask.shape();
-            let rows = shape[1] as usize; // seq_len (query positions)
-            let cols = shape[2] as usize; // max_audio_length (key positions)
-            let flat = mask.reshape(&[-1])?;
-            flat.eval()?;
-            let data: Vec<bool> = flat.to_vec_row_major()?;
-
-            let mut grid = String::new();
-            grid.push_str(&format!(
-                "\n=== ATTENTION MASK [1, {}, {}] (enc_call={}) ===\n",
-                rows, cols, enc_call
-            ));
-            // Column header: cache positions then input positions
-            grid.push_str("     "); // row label padding
-            for c in 0..cols {
-                if c == cache_size as usize {
-                    grid.push('|'); // separator between cache and input
-                }
-                grid.push_str(&format!("{}", c % 10));
-            }
-            grid.push('\n');
-            // Separator line
-            grid.push_str("     ");
-            for c in 0..cols {
-                if c == cache_size as usize {
-                    grid.push('|');
-                }
-                grid.push('-');
-            }
-            grid.push('\n');
-
-            for r in 0..rows {
-                grid.push_str(&format!("{:4} ", r));
-                for c in 0..cols {
-                    if c == cache_size as usize {
-                        grid.push('|');
-                    }
-                    let val = data[r * cols + c];
-                    grid.push(if val { '#' } else { '.' });
-                }
-                grid.push('\n');
-            }
-            grid.push_str(&format!(
-                "Legend: #=visible .=masked  |=cache/input boundary\n\
-                 cache_size={} filled={} tensor_seq={} valid_seq={}\n\
-                 ==========================================\n",
-                cache_size, filled_cache_len, tensor_seq_len, valid_seq_len
-            ));
-            tracing::debug!("{}", grid);
-        }
 
         // Create padding mask for conv module: True where position >= valid_seq_len
         // This zeros out padding frames after GLU, matching Python NeMo behavior
@@ -1054,13 +999,6 @@ impl ConformerEncoder {
         } else {
             None
         };
-
-        tracing::trace!(
-            enc_call,
-            ?att_mask,
-            ?pad_mask,
-            "created masks"
-        );
 
         // Initialize output caches
         let mut cache_channel_next = Vec::with_capacity(self.layers.len());
@@ -1143,49 +1081,15 @@ impl ConformerEncoder {
             cache_last_time.clone()
         };
 
-        // Debug: track cache length
-        tracing::trace!(
-            tensor_seq_len,
-            valid_seq_len = seq_len,
-            cache_size,
-            filled_before = filled_cache_len,
-            "cache length tracking"
-        );
-
-        // Update cache length: clamp(old_len + tensor_seq_len, max=cache_size)
-        let cache_channel_len_next = mlx_rs::ops::clip(
-            &(cache_last_channel_len + &Array::from_int(valid_seq_len)),
-            ((), &Array::from_int(cache_size)),
-        )?;
-
-        // Verify and debug the result
-        cache_channel_len_next.eval()?;
-        let filled_after = cache_channel_len_next.to_vec_row_major::<i64>()?[0];
-
-        tracing::trace!(
-            filled_after,
-            expected_max = cache_size,
-            "cache length after update"
-        );
-
-        // Flag potential issues
-        if filled_after > cache_size as i64 {
-            tracing::warn!(filled_after, cache_size, "Cache length exceeds cache_size!");
-        }
-
-        // Safety: ensure cache length never exceeds cache_size
-        // This guards against any issues with the clip operation
-        // Note: cache_last_channel_len is i64, so we need to match that type
-        let cache_channel_len_next = if filled_after > cache_size as i64 {
-            tracing::trace!(
-                from = filled_after,
-                to = cache_size,
-                "clamping cache length"
-            );
-            Array::from_slice(&[cache_size as i64], &[1])
-        } else {
-            cache_channel_len_next
-        };
+        // NeMo: clamp(cache_last_channel_len + cache_keep_size, max=cache_len),
+        // with cache_keep_size = frames - cache_drop_size
+        let keep = (tensor_seq_len as i64 - self.layers.first().map_or(0, |l| l.self_attn.cache_drop_size) as i64).max(0);
+        let next_lens: Vec<i64> = filled_cache_lens
+            .iter()
+            .map(|&len| (len + keep).min(cache_size as i64))
+            .collect();
+        let cache_channel_len_next = Array::from_slice(&next_lens, &[next_lens.len() as i32]);
+        let lengths = Array::from_slice(&out_lengths, &[out_lengths.len() as i32]);
 
         Ok((
             x,
@@ -1195,6 +1099,14 @@ impl ConformerEncoder {
             cache_channel_len_next,
         ))
     }
+}
+
+/// Cast every parameter of an `nn` module to `dtype`.
+fn cast_module(module: &mut impl ModuleParameters, dtype: mlx_rs::Dtype) -> Result<()> {
+    for (_, param) in module.parameters_mut().flatten() {
+        *param = param.as_dtype(dtype)?;
+    }
+    Ok(())
 }
 
 /// Helper to load Conv2d weights
@@ -1252,6 +1164,14 @@ struct Subsampling {
 }
 
 impl Subsampling {
+    fn set_dtype(&mut self, dtype: mlx_rs::Dtype) -> Result<()> {
+        cast_module(&mut self.first_conv, dtype)?;
+        for conv in self.depthwise_convs.iter_mut().chain(self.pointwise_convs.iter_mut()) {
+            cast_module(conv, dtype)?;
+        }
+        self.out_proj.cast(dtype)
+    }
+
     #[tracing::instrument(skip(config), fields(feat_in = config.feat_in, d_model = config.d_model, subsampling_factor = config.subsampling_factor))]
     fn new(config: &EncoderConfig) -> Result<Self> {
         let feat_in = config.feat_in;
@@ -1429,12 +1349,30 @@ impl Subsampling {
 
     /// Calculate the output length of one causal subsampling conv.
     ///
-    /// Computes `floor((input + 2 - kernel + 1) / stride)` elementwise.
-    fn calc_conv_output_size(input_size: &Array, kernel_size: i32, stride: i32) -> Result<Array> {
-        let after_kernel = input_size + Array::from_int(2 - kernel_size + 1);
-        let divided = mlx_rs::ops::floor_divide(&after_kernel, &Array::from_int(stride))?;
-        tracing::trace!(kernel_size, stride, ?divided, "calc_conv_output_size");
-        Ok(divided)
+    /// NeMo's calc_length with CausalConv2D padding (left `k - 1`, right `s - 1`):
+    /// `floor((input + (k - 1) + (s - 1) - k) / s) + 1`, elementwise. The kernel
+    /// size cancels out.
+    fn calc_conv_output_size(input_size: &Array, stride: i32) -> Result<Array> {
+        let padded = input_size + Array::from_int(stride - 2);
+        let divided = mlx_rs::ops::floor_divide(&padded, &Array::from_int(stride))?;
+        Ok(divided + Array::from_int(1))
+    }
+
+    /// Output length after subsampling for an input of `frames` mel frames.
+    ///
+    /// Host-side twin of [`Self::output_lengths`].
+    fn output_length(&self, frames: usize) -> usize {
+        let n_convs = self.depthwise_convs.len() + 1;
+        let (kernel, stride) = (self.kernel_size as i64, self.stride as i64);
+        let mut len = frames as i64;
+        for _ in 0..n_convs {
+            len = if self.is_causal {
+                (len + (kernel - 1) + (stride - 1) - kernel).div_euclid(stride) + 1
+            } else {
+                (len - 1).div_euclid(2) + 1
+            };
+        }
+        len.max(0) as usize
     }
 
     fn forward(&mut self, x: &Array, lengths: &Array) -> Result<(Array, Array)> {
@@ -1501,7 +1439,7 @@ impl Subsampling {
         for _ in 0..n_convs {
             new_lengths = if self.is_causal {
                 // CausalConv2D: left_pad=k-1, right_pad=s-1
-                Self::calc_conv_output_size(&new_lengths, self.kernel_size as i32, self.stride as i32)?
+                Self::calc_conv_output_size(&new_lengths, self.stride as i32)?
             } else {
                 // Symmetric padding of 1 with kernel 3, stride 2 (NeMo's calc_length):
                 // out = floor((len + 2 - 3) / 2) + 1, which rounds odd lengths up
@@ -1512,7 +1450,7 @@ impl Subsampling {
                 )?
             };
         }
-        if std::env::var("MLX_VOICE_DEBUG").is_ok() {
+        if *MLX_VOICE_DEBUG {
             new_lengths.eval()?;
             let len_data: Vec<i32> = new_lengths.to_vec_row_major()?;
             tracing::info!("DEBUG subsampling: output_lengths={:?}", len_data);
@@ -1523,7 +1461,7 @@ impl Subsampling {
     /// Conv stack and output projection: [B, T, F] mel features to [B, T', d_model].
     fn forward_frames(&mut self, x: &Array) -> Result<Array> {
         // x: [B, T, F] where F is number of mel features (e.g., 80 or 128)
-        let debug_enabled = std::env::var("MLX_VOICE_DEBUG").is_ok();
+        let debug_enabled = *MLX_VOICE_DEBUG;
 
         tracing::debug!(
             input_shape = ?x.shape(),
@@ -1712,6 +1650,23 @@ struct ConformerBlock {
 }
 
 impl ConformerBlock {
+    fn set_dtype(&mut self, dtype: mlx_rs::Dtype) -> Result<()> {
+        self.ff1.set_dtype(dtype)?;
+        self.ff2.set_dtype(dtype)?;
+        self.self_attn.set_dtype(dtype)?;
+        self.conv.set_dtype(dtype)?;
+        for norm in [
+            &mut self.ff1_norm,
+            &mut self.self_attn_norm,
+            &mut self.conv_norm,
+            &mut self.ff2_norm,
+            &mut self.final_norm,
+        ] {
+            cast_module(norm, dtype)?;
+        }
+        Ok(())
+    }
+
     fn new(config: &EncoderConfig) -> Result<Self> {
         let d_model = config.d_model;
         let n_heads = config.n_heads;
@@ -1745,7 +1700,7 @@ impl ConformerBlock {
 
     fn forward(&mut self, x: &Array, pos_emb: &Array) -> Result<Array> {
         // x: [B, T, D]
-        let debug_layer = std::env::var("DEBUG_LAYER0").is_ok();
+        let debug_layer = *DEBUG_LAYER0;
 
         // Feed-forward 1 (half-step residual)
         let residual = x.clone();
@@ -1771,7 +1726,7 @@ impl ConformerBlock {
             tracing::debug!(?t00, "after ff1 T00[:5]");
         }
 
-        let half = Array::from_f32(0.5);
+        let half = Array::from_f32(0.5).as_dtype(ff1_out.dtype())?;
         let scaled_ff1 = &half * &ff1_out;
         let x = &residual + &scaled_ff1;
 
@@ -1959,7 +1914,7 @@ impl ConformerBlock {
         let residual = x.clone();
         let ff1_norm_out = self.ff1_norm.forward(x)?;
         let ff1_out = self.ff1.forward(&ff1_norm_out)?;
-        let half = Array::from_f32(0.5);
+        let half = Array::from_f32(0.5).as_dtype(ff1_out.dtype())?;
         let scaled_ff1 = &half * &ff1_out;
         let x = &residual + &scaled_ff1;
 
@@ -2080,6 +2035,11 @@ struct FeedForward {
 }
 
 impl FeedForward {
+    fn set_dtype(&mut self, dtype: mlx_rs::Dtype) -> Result<()> {
+        self.linear1.cast(dtype)?;
+        self.linear2.cast(dtype)
+    }
+
     fn new(d_model: usize, ff_dim: usize, dropout: f32, use_bias: bool) -> Result<Self> {
         // Create zero-initialized linear layers (will be loaded from weights)
         let create_linear = |in_dim: usize, out_dim: usize, with_bias: bool| -> Result<LinearLayer> {
@@ -2154,6 +2114,20 @@ struct ConvolutionModule {
 }
 
 impl ConvolutionModule {
+    fn set_dtype(&mut self, dtype: mlx_rs::Dtype) -> Result<()> {
+        self.pointwise_conv1.cast(dtype)?;
+        self.pointwise_conv2.cast(dtype)?;
+        cast_module(&mut self.depthwise_conv, dtype)?;
+        match &mut self.norm {
+            ConvNorm::BatchNorm(bn) => {
+                cast_module(bn, dtype)?;
+                bn.eps = bn.eps.as_dtype(dtype)?;
+            }
+            ConvNorm::LayerNorm(ln) => cast_module(ln, dtype)?,
+        }
+        Ok(())
+    }
+
     fn new(
         d_model: usize,
         kernel_size: usize,
@@ -2173,7 +2147,14 @@ impl ConvolutionModule {
         // Create normalization layer based on type
         let norm = match norm_type {
             "layer_norm" => ConvNorm::LayerNorm(nn::LayerNorm::new(d_model as i32)?),
-            _ => ConvNorm::BatchNorm(nn::BatchNorm::new(d_model as i32)?),
+            _ => {
+                // Inference mode: normalize with the loaded running stats. In
+                // training mode mlx-rs normalizes with each input's own stats
+                // and overwrites the running stats on every call.
+                let mut bn = nn::BatchNorm::new(d_model as i32)?;
+                bn.training = false;
+                ConvNorm::BatchNorm(bn)
+            }
         };
 
         // Create zero-initialized pointwise linear layers (will be loaded from weights)
@@ -2206,7 +2187,7 @@ impl ConvolutionModule {
 
     fn forward(&mut self, x: &Array) -> Result<Array> {
         // x: [B, T, D] - MLX Conv1d expects (N, L, C_in) format, no transpose needed
-        let debug_conv = std::env::var("DEBUG_CONV").is_ok();
+        let debug_conv = *DEBUG_CONV;
 
         if debug_conv {
             x.eval()?;
