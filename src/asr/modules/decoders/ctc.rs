@@ -8,7 +8,7 @@ use mlx_rs::Array;
 use mlx_rs::ops;
 
 use crate::asr::config::DecoderConfig;
-use crate::core::error::Result;
+use crate::core::error::{Error, Result};
 use crate::core::quantization::{LinearLayer, QuantizationConfig, load_linear_layer};
 
 /// CTC decoder that projects encoder output to vocabulary logits.
@@ -107,8 +107,9 @@ impl CTCDecoder {
 
             let bias = weights.get(&bias_key).cloned();
             self.decoder = LinearLayer::standard(weight, bias);
+            return Ok(());
         }
 
-        Ok(())
+        Err(Error::missing_weight(&weight_key))
     }
 }

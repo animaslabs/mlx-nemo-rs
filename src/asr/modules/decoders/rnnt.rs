@@ -15,7 +15,9 @@ use crate::asr::modules::LanguagePrompt;
 use crate::core::error::{Error, Result};
 use crate::core::quantization::{
     EmbeddingLayer, LinearLayer, QuantizationConfig, load_embedding_layer, load_linear_layer,
+    require_embedding_layer,
 };
+use crate::core::weights::{require, require_any};
 
 /// Stateless Transducer Decoder (Prediction Network).
 ///
@@ -309,27 +311,14 @@ impl StatelessTransducerDecoder {
         prefix: &str,
         quant: Option<&QuantizationConfig>,
     ) -> Result<()> {
-        // Try to load embedding using the quantization-aware loader
         // NeMo key: decoder.prediction.embed
         let embed_key = format!("{}.prediction.embed", prefix);
-
-        if let Some(layer) = load_embedding_layer(weights, &embed_key, quant) {
-            self.embedding = layer;
-            tracing::debug!("Loaded prediction embedding from {}", embed_key);
-        } else {
-            // Try alternative key patterns
-            let alt_key = format!("{}.embed", prefix);
-            if let Some(layer) = load_embedding_layer(weights, &alt_key, quant) {
-                self.embedding = layer;
-                tracing::debug!("Loaded prediction embedding from {}", alt_key);
-            } else {
-                tracing::warn!(
-                    "Prediction embedding not found at {} or {}",
-                    embed_key,
-                    alt_key
-                );
-            }
-        }
+        let alt_key = format!("{}.embed", prefix);
+        self.embedding = load_embedding_layer(weights, &embed_key, quant)
+            .or_else(|| load_embedding_layer(weights, &alt_key, quant))
+            .ok_or_else(|| {
+                Error::missing_weight(&format!("{embed_key}.weight` or `{alt_key}.weight"))
+            })?;
 
         Ok(())
     }
@@ -671,127 +660,37 @@ impl RNNTDecoder {
         // (and .1 for second layer, etc.)
 
         // Load embedding (may be quantized)
-        let embed_key = format!("{}.prediction.embed", prefix);
-        if let Some(layer) = load_embedding_layer(weights, &embed_key, quant) {
-            self.embedding = layer;
-            tracing::debug!("Loaded prediction embedding from {}", embed_key);
-        } else {
-            tracing::warn!("Prediction embedding not found at {}", embed_key);
-        }
+        self.embedding =
+            require_embedding_layer(weights, &format!("{}.prediction.embed", prefix), quant)?;
 
-        // Load LSTM layers - try both PyTorch and MLX naming conventions
-        for layer_idx in 0..self.num_layers {
-            // PyTorch naming
-            let weight_ih_key = format!(
-                "{}.prediction.dec_rnn.lstm.weight_ih_l{}",
-                prefix, layer_idx
-            );
-            let weight_hh_key = format!(
-                "{}.prediction.dec_rnn.lstm.weight_hh_l{}",
-                prefix, layer_idx
-            );
-            let bias_ih_key = format!("{}.prediction.dec_rnn.lstm.bias_ih_l{}", prefix, layer_idx);
-            let bias_hh_key = format!("{}.prediction.dec_rnn.lstm.bias_hh_l{}", prefix, layer_idx);
+        // Load LSTM layers, in PyTorch or MLX naming
+        let lstm = format!("{}.prediction.dec_rnn.lstm", prefix);
+        for (i, layer) in self.lstm_layers.iter_mut().enumerate() {
+            layer.weight_ih = require_any(
+                weights,
+                &[format!("{lstm}.weight_ih_l{i}"), format!("{lstm}.{i}.Wx")],
+            )?
+            .clone();
+            layer.weight_hh = require_any(
+                weights,
+                &[format!("{lstm}.weight_hh_l{i}"), format!("{lstm}.{i}.Wh")],
+            )?
+            .clone();
 
-            // MLX naming
-            let mlx_wx_key = format!("{}.prediction.dec_rnn.lstm.{}.Wx", prefix, layer_idx);
-            let mlx_wh_key = format!("{}.prediction.dec_rnn.lstm.{}.Wh", prefix, layer_idx);
-            let mlx_bias_key = format!("{}.prediction.dec_rnn.lstm.{}.bias", prefix, layer_idx);
-
-            // Try PyTorch naming first, then MLX naming
-            let weight_ih_loaded = if let Some(w) = weights.get(&weight_ih_key) {
-                self.lstm_layers[layer_idx].weight_ih = w.clone();
-                tracing::debug!(
-                    "Loaded LSTM layer {} weight_ih (PyTorch): {:?}",
-                    layer_idx,
-                    w.shape()
-                );
-                true
-            } else if let Some(w) = weights.get(&mlx_wx_key) {
-                self.lstm_layers[layer_idx].weight_ih = w.clone();
-                tracing::debug!(
-                    "Loaded LSTM layer {} weight_ih (MLX Wx): {:?}",
-                    layer_idx,
-                    w.shape()
-                );
-                true
-            } else {
-                tracing::warn!(
-                    "LSTM weight_ih not found at {} or {}",
-                    weight_ih_key,
-                    mlx_wx_key
-                );
-                false
-            };
-
-            let weight_hh_loaded = if let Some(w) = weights.get(&weight_hh_key) {
-                self.lstm_layers[layer_idx].weight_hh = w.clone();
-                tracing::debug!(
-                    "Loaded LSTM layer {} weight_hh (PyTorch): {:?}",
-                    layer_idx,
-                    w.shape()
-                );
-                true
-            } else if let Some(w) = weights.get(&mlx_wh_key) {
-                self.lstm_layers[layer_idx].weight_hh = w.clone();
-                tracing::debug!(
-                    "Loaded LSTM layer {} weight_hh (MLX Wh): {:?}",
-                    layer_idx,
-                    w.shape()
-                );
-                true
-            } else {
-                tracing::warn!(
-                    "LSTM weight_hh not found at {} or {}",
-                    weight_hh_key,
-                    mlx_wh_key
-                );
-                false
-            };
-
-            // For bias, try PyTorch naming first (separate biases)
-            let bias_loaded = if let Some(b) = weights.get(&bias_ih_key) {
-                self.lstm_layers[layer_idx].bias_ih = b.clone();
-                tracing::debug!(
-                    "Loaded LSTM layer {} bias_ih (PyTorch): {:?}",
-                    layer_idx,
-                    b.shape()
-                );
-                if let Some(b2) = weights.get(&bias_hh_key) {
-                    self.lstm_layers[layer_idx].bias_hh = b2.clone();
-                    tracing::debug!(
-                        "Loaded LSTM layer {} bias_hh (PyTorch): {:?}",
-                        layer_idx,
-                        b2.shape()
-                    );
+            // PyTorch keeps separate input and hidden biases. MLX stores their
+            // sum, the only thing the LSTM cell uses (gates = x @ W_ih^T + b_ih
+            // + h @ W_hh^T + b_hh), so it becomes b_ih with a zero b_hh.
+            match weights.get(&format!("{lstm}.{i}.bias")) {
+                Some(bias) => {
+                    layer.bias_ih = bias.clone();
+                    layer.bias_hh = Array::zeros::<f32>(&[bias.dim(0)])?;
                 }
-                true
-            } else if let Some(b) = weights.get(&mlx_bias_key) {
-                // MLX has a single combined bias - set it as bias_ih and zero out bias_hh
-                // The LSTM cell computes: gates = x @ W_ih^T + b_ih + h @ W_hh^T + b_hh
-                // With combined bias: b = b_ih + b_hh, so we set b_ih = b and b_hh = 0
-                self.lstm_layers[layer_idx].bias_ih = b.clone();
-                self.lstm_layers[layer_idx].bias_hh = Array::zeros::<f32>(&[b.dim(0) as i32])?;
-                tracing::debug!(
-                    "Loaded LSTM layer {} combined bias (MLX): {:?}",
-                    layer_idx,
-                    b.shape()
-                );
-                true
-            } else {
-                tracing::warn!(
-                    "LSTM bias not found at {}/{} or {}",
-                    bias_ih_key,
-                    bias_hh_key,
-                    mlx_bias_key
-                );
-                false
-            };
-
-            if weight_ih_loaded && weight_hh_loaded && bias_loaded {
-                tracing::info!("Successfully loaded LSTM layer {}", layer_idx);
+                None => {
+                    layer.bias_ih = require(weights, &format!("{lstm}.bias_ih_l{i}"))?.clone();
+                    layer.bias_hh = require(weights, &format!("{lstm}.bias_hh_l{i}"))?.clone();
+                }
             }
-            self.lstm_layers[layer_idx].fuse()?;
+            layer.fuse()?;
         }
 
         Ok(())
@@ -1078,50 +977,19 @@ impl RNNTJoint {
         // joint.joint_net.0.weight, joint.joint_net.0.bias (linear)
         // joint.joint_net.2.weight, joint.joint_net.2.bias (output)
 
-        // Try different key patterns for encoder projection
-        let enc_prefixes = [
-            format!("{}.enc", prefix),
-            format!("{}.encoder", prefix),
-            format!("{}.joint_net.0", prefix),
-        ];
-
-        for enc_prefix in &enc_prefixes {
-            if let Some(layer) = load_linear_layer(weights, enc_prefix, quant) {
-                self.encoder_proj = layer;
-                tracing::debug!("Loaded joint encoder projection from {}", enc_prefix);
-                break;
-            }
-        }
-
-        // Try different key patterns for prediction projection
-        let pred_prefixes = [
-            format!("{}.pred", prefix),
-            format!("{}.prediction", prefix),
-            format!("{}.joint_net.1", prefix),
-        ];
-
-        for pred_prefix in &pred_prefixes {
-            if let Some(layer) = load_linear_layer(weights, pred_prefix, quant) {
-                self.pred_proj = layer;
-                tracing::debug!("Loaded joint prediction projection from {}", pred_prefix);
-                break;
-            }
-        }
-
-        // Output projection - try multiple patterns
-        let out_prefixes = [
-            format!("{}.joint_net.2", prefix),
-            format!("{}.joint_net.output", prefix),
-            format!("{}.out", prefix),
-        ];
-
-        for out_prefix in &out_prefixes {
-            if let Some(layer) = load_linear_layer(weights, out_prefix, quant) {
-                self.joint_proj = layer;
-                tracing::debug!("Loaded joint output projection from {}", out_prefix);
-                break;
-            }
-        }
+        // The first of several key patterns the checkpoint has
+        let linear = |names: &[&str]| -> Result<LinearLayer> {
+            let prefixes: Vec<String> = names.iter().map(|n| format!("{prefix}.{n}")).collect();
+            prefixes
+                .iter()
+                .find_map(|p| load_linear_layer(weights, p, quant))
+                .ok_or_else(|| {
+                    Error::missing_weight(&format!("{}.weight", prefixes.join(".weight` or `")))
+                })
+        };
+        self.encoder_proj = linear(&["enc", "encoder", "joint_net.0"])?;
+        self.pred_proj = linear(&["pred", "prediction", "joint_net.1"])?;
+        self.joint_proj = linear(&["joint_net.2", "joint_net.output", "out"])?;
 
         Ok(())
     }

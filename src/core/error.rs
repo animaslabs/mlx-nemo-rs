@@ -1,6 +1,6 @@
 //! Error types for mlx-voice.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use thiserror::Error;
 
 /// Result type alias using [`Error`].
@@ -114,6 +114,21 @@ impl Error {
             message: message.into(),
             path: Some(path.into()),
         }
+    }
+
+    /// Create a checkpoint error for a weight tensor the model needs but the
+    /// checkpoint lacks.
+    pub(crate) fn missing_weight(key: &str) -> Self {
+        Self::checkpoint(format!("Missing weight `{key}`"))
+    }
+
+    /// Create a checkpoint error for a checkpoint or model directory without a
+    /// SentencePiece tokenizer.
+    pub(crate) fn missing_tokenizer(path: &Path) -> Self {
+        Self::checkpoint_at(
+            format!("No SentencePiece tokenizer found in {}", path.display()),
+            path,
+        )
     }
 
     /// Create a model error.

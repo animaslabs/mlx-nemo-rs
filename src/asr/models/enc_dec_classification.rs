@@ -88,17 +88,9 @@ impl EncDecClassificationModel {
 
         let mut model = Self::new(config)?;
 
-        if checkpoint.weights_path.is_some() {
-            match checkpoint.load_weights() {
-                Ok(weights) => {
-                    tracing::debug!("Loading {} weight tensors", weights.len());
-                    model.load_weights(&weights)?;
-                }
-                Err(e) => {
-                    tracing::warn!("Could not load weights: {}", e);
-                }
-            }
-        }
+        let weights = checkpoint.load_weights()?;
+        tracing::debug!("Loading {} weight tensors", weights.len());
+        model.load_weights(&weights)?;
 
         Ok(model)
     }
@@ -121,7 +113,7 @@ impl EncDecClassificationModel {
             self.preprocessor.set_filterbank(fb);
         }
 
-        self.encoder.load_weights(weights);
+        self.encoder.load_weights(weights)?;
 
         // Try decoder weight paths in order of likelihood
         let decoder_key_pairs = [

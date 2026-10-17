@@ -20,7 +20,7 @@ use mlx_rs::ops;
 
 use crate::asr::config::SortformerModulesConfig;
 use crate::core::error::Result;
-use crate::core::quantization::{LinearLayer, QuantizationConfig, load_linear_layer};
+use crate::core::quantization::{LinearLayer, QuantizationConfig, require_linear_layer};
 
 /// SortFormer speaker head modules.
 pub struct SortformerModules {
@@ -124,24 +124,21 @@ impl SortformerModules {
         prefix: &str,
         quant: Option<&QuantizationConfig>,
     ) -> Result<()> {
-        if let Some(layer) = load_linear_layer(weights, &format!("{}.encoder_proj", prefix), quant)
-        {
-            self.encoder_proj = Some(layer);
+        // Only present when fc_d_model != tf_d_model
+        if self.encoder_proj.is_some() {
+            self.encoder_proj = Some(require_linear_layer(
+                weights,
+                &format!("{}.encoder_proj", prefix),
+                quant,
+            )?);
         }
-
-        if let Some(layer) = load_linear_layer(
+        self.first_hidden_to_hidden = require_linear_layer(
             weights,
             &format!("{}.first_hidden_to_hidden", prefix),
             quant,
-        ) {
-            self.first_hidden_to_hidden = layer;
-        }
-
-        if let Some(layer) =
-            load_linear_layer(weights, &format!("{}.single_hidden_to_spks", prefix), quant)
-        {
-            self.single_hidden_to_spks = layer;
-        }
+        )?;
+        self.single_hidden_to_spks =
+            require_linear_layer(weights, &format!("{}.single_hidden_to_spks", prefix), quant)?;
 
         Ok(())
     }

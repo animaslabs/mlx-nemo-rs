@@ -289,11 +289,13 @@ impl CacheAwareRNNTPipeline {
         let mut encoder = ConformerEncoder::new(config.encoder.clone())?;
 
         // Load tokenizer
-        let tokenizer = checkpoint.find_tokenizer().and_then(|path| {
-            SentencePieceProcessor::open(&path)
-                .map_err(|e| tracing::warn!("Failed to load tokenizer: {}", e))
-                .ok()
-        });
+        let tokenizer_path = checkpoint
+            .find_tokenizer()
+            .ok_or_else(|| Error::missing_tokenizer(path))?;
+        let tokenizer = Some(
+            SentencePieceProcessor::open(&tokenizer_path)
+                .map_err(|e| Error::tokenizer(format!("Failed to load tokenizer: {}", e)))?,
+        );
 
         // Determine vocabulary size
         let vocab_size = tokenizer
@@ -551,11 +553,13 @@ impl CacheAwareRNNTPipeline {
         let mut encoder = ConformerEncoder::new(config.encoder.clone())?;
 
         // Load tokenizer
-        let tokenizer = loader.tokenizer_path().and_then(|path| {
-            SentencePieceProcessor::open(path)
-                .map_err(|e| tracing::warn!("Failed to load tokenizer: {}", e))
-                .ok()
-        });
+        let tokenizer_path = loader.tokenizer_path().ok_or_else(|| {
+            Error::missing_tokenizer(loader.weights_path.parent().unwrap_or(Path::new(".")))
+        })?;
+        let tokenizer = Some(
+            SentencePieceProcessor::open(tokenizer_path)
+                .map_err(|e| Error::tokenizer(format!("Failed to load tokenizer: {}", e)))?,
+        );
 
         // Determine vocabulary size
         let vocab_size = tokenizer

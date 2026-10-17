@@ -786,8 +786,8 @@ impl EncoderConfig {
 
     /// Reject encoder settings this port does not implement.
     ///
-    /// Weight loading is lenient, so an unsupported architecture would otherwise
-    /// load into the wrong modules and silently produce garbage output.
+    /// An unsupported architecture could otherwise share enough weight names
+    /// with a supported one to load, and silently produce garbage output.
     pub fn validate(&self) -> Result<()> {
         if let Some(target) = self.target.as_deref() {
             if !target.ends_with("ConformerEncoder") {
@@ -1044,7 +1044,7 @@ pub struct TransformerEncoderConfig {
     #[serde(default)]
     pub pre_ln: bool,
 
-    /// Whether to add a final layer norm (only used when pre_ln=False)
+    /// Whether to add a final layer norm (only used when pre_ln=True)
     #[serde(default)]
     pub pre_ln_final_layer_norm: bool,
 

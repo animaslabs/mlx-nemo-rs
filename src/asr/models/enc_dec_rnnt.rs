@@ -36,7 +36,9 @@ use mlx_rs::ops::indexing::IndexOp;
 use sentencepiece::SentencePieceProcessor;
 
 use crate::asr::config::{AsrModelConfig, JointConfig};
-use crate::asr::decoding::{RnntStreamingDecoder, decode_text, lang_tag_table, last_lang_tag};
+use crate::asr::decoding::{
+    RnntStreamingDecoder, decode_text, lang_tag_table, last_lang_tag, rnnt_beam_decode,
+};
 use crate::asr::modules::{
     ConformerEncoder, LanguagePrompt, LstmState, MelSpectrogram, MelSpectrogramConfig, RNNTDecoder,
     RNNTJoint, StatelessTransducerDecoder,
@@ -52,12 +54,16 @@ use crate::core::config::from_yaml_str;
 use crate::core::error::{Error, Result};
 use crate::core::quantization::QuantizationConfig;
 
-/// Decoding strategy for RNNT models.
+/// Decoding strategy for offline RNNT transcription.
+///
+/// Applies to [`EncDecRNNTModel::transcribe`]. Streaming decoding is always
+/// greedy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RnntDecodingStrategy {
-    /// Greedy decoding (fast, lower quality)
+    /// Greedy decoding (fast)
     Greedy,
-    /// Beam search decoding (slower, higher quality)
+    /// Beam search decoding, NeMo's default algorithm (slower, usually
+    /// slightly more accurate). `beam_size` must be at least 1.
     BeamSearch { beam_size: usize },
 }
 
@@ -76,6 +82,7 @@ pub enum PredictionNetwork {
 }
 
 /// Decoder state type.
+#[derive(Clone)]
 pub enum DecoderState {
     /// Stateless decoder state (context buffer)
     Stateless(Array),
@@ -384,24 +391,16 @@ impl EncDecRNNTModel {
         // Create the model
         let mut model = Self::new(config)?;
 
-        // Load tokenizer if available
-        if let Some(tokenizer_path) = checkpoint.find_tokenizer() {
-            tracing::debug!("Loading tokenizer from: {}", tokenizer_path.display());
-            model.load_tokenizer(&tokenizer_path)?;
-        }
+        let tokenizer_path = checkpoint
+            .find_tokenizer()
+            .ok_or_else(|| Error::missing_tokenizer(path))?;
+        tracing::debug!("Loading tokenizer from: {}", tokenizer_path.display());
+        model.load_tokenizer(&tokenizer_path)?;
 
         // Load weights (.nemo files are not quantized)
-        if checkpoint.weights_path.is_some() {
-            match checkpoint.load_weights() {
-                Ok(weights) => {
-                    tracing::debug!("Loading {} weight tensors", weights.len());
-                    model.load_weights(&weights, None)?;
-                }
-                Err(e) => {
-                    tracing::warn!("Could not load weights: {}", e);
-                }
-            }
-        }
+        let weights = checkpoint.load_weights()?;
+        tracing::debug!("Loading {} weight tensors", weights.len());
+        model.load_weights(&weights, None)?;
 
         Ok(model)
     }
@@ -561,11 +560,11 @@ impl EncDecRNNTModel {
         // Create model
         let mut model = Self::new(config)?;
 
-        // Load tokenizer if found
-        if let Some(tok_path) = loader.tokenizer_path() {
-            tracing::debug!("Loading tokenizer from: {}", tok_path.display());
-            model.load_tokenizer(tok_path)?;
-        }
+        let tok_path = loader
+            .tokenizer_path()
+            .ok_or_else(|| Error::missing_tokenizer(dir))?;
+        tracing::debug!("Loading tokenizer from: {}", tok_path.display());
+        model.load_tokenizer(tok_path)?;
 
         // Load weights (may be quantized)
         let weights = loader.load_weights()?;
@@ -702,7 +701,7 @@ impl EncDecRNNTModel {
         decode_text(tokenizer, tokens, self.strip_lang_tags)
     }
 
-    /// Set the decoding strategy.
+    /// Set the decoding strategy used by [`transcribe`](Self::transcribe).
     pub fn set_decoding_strategy(&mut self, strategy: RnntDecodingStrategy) {
         self.decoding_strategy = strategy;
     }
@@ -737,8 +736,19 @@ impl EncDecRNNTModel {
         let (encoder_output, encoder_lengths) =
             self.forward(&audio_batch.0, Some(&audio_batch.1))?;
 
-        // Decode using greedy decoding (now supports both decoder types)
-        let token_sequences = self.greedy_decode(&encoder_output, &encoder_lengths)?;
+        let token_sequences = match self.decoding_strategy {
+            RnntDecodingStrategy::Greedy => {
+                self.greedy_decode(&encoder_output, &encoder_lengths)?
+            }
+            RnntDecodingStrategy::BeamSearch { beam_size } => rnnt_beam_decode(
+                &encoder_output,
+                &encoder_lengths,
+                &self.decoder,
+                &self.joint,
+                self.blank_id,
+                beam_size,
+            )?,
+        };
 
         // Convert tokens to text
         let texts = self.decode_tokens(&token_sequences)?;
