@@ -42,6 +42,17 @@ These changes break 0.2.0 callers:
   `SpectrumTransform` is the one public API that still passes an `Array`.
   Its docs give the layout: time-major, `[n_frames, n_fft / 2 + 1]`.
 
+These don't change the API:
+
+- The minimum supported Rust version is declared: 1.88 (`rust-version` in
+  `Cargo.toml`), checked in CI.
+- `zip` is built with only its deflate codec. PyTorch checkpoints are stored
+  uncompressed, so loading is unchanged, but the AES, bzip2, LZMA, zstd and xz
+  codecs (and their C builds) are no longer dependencies.
+- API docs are published to GitHub Pages
+  (<https://animaslabs.github.io/mlx-voice-rs/mlx_voice/>), since docs.rs
+  can't build MLX.
+
 ### Removed
 
 - `EncDecClassificationModel::infer_samples`, which assumed the model's

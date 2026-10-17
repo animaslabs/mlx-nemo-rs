@@ -1,2 +1,7 @@
 [alias]
 xtask = "run --package xtask --"
+
+[env]
+# MLX can't run several Metal workloads in parallel: concurrent tests crash
+# the GPU command buffer. Overridden by an explicit --test-threads.
+RUST_TEST_THREADS = "1"
