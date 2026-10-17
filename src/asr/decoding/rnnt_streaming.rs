@@ -14,7 +14,7 @@ use mlx_rs::ops::{self, max_axis};
 use tracing::debug;
 
 use crate::asr::modules::{DecoderState, PredictionNetwork};
-use crate::asr::modules::RNNTJoint;
+use crate::asr::modules::RnntJoint;
 use crate::core::ArrayExt;
 use crate::core::error::Result;
 
@@ -135,7 +135,7 @@ impl RnntStreamingDecoder {
         valid_frames: usize,
         decoder: &PredictionNetwork,
         decoder_state: &mut DecoderState,
-        joint: &RNNTJoint,
+        joint: &RnntJoint,
         last_token: &mut Option<usize>,
         masked_token_ids: Option<&[usize]>,
     ) -> Result<DecodeStepOutput> {
@@ -157,7 +157,7 @@ impl RnntStreamingDecoder {
     }
 
     /// Greedy-decode encoder frames already projected by
-    /// [`RNNTJoint::project_encoder`] ([time, joint_hidden]).
+    /// [`RnntJoint::project_encoder`] ([time, joint_hidden]).
     ///
     /// Equivalent to frame-by-frame greedy decoding, but while the prediction
     /// is unchanged (after a blank) the joint scores up to `DECODE_WINDOW`
@@ -170,7 +170,7 @@ impl RnntStreamingDecoder {
         valid_frames: usize,
         decoder: &PredictionNetwork,
         decoder_state: &mut DecoderState,
-        joint: &RNNTJoint,
+        joint: &RnntJoint,
         last_token: &mut Option<usize>,
         masked_token_ids: Option<&[usize]>,
     ) -> Result<DecodeStepOutput> {
@@ -281,7 +281,7 @@ impl RnntStreamingDecoder {
         encoder_frame: &Array,
         decoder: &PredictionNetwork,
         decoder_state: &mut DecoderState,
-        joint: &RNNTJoint,
+        joint: &RnntJoint,
         last_token: &mut Option<usize>,
         masked_token_ids: Option<&[usize]>,
     ) -> Result<DecodeStepOutput> {

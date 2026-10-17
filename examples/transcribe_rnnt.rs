@@ -25,7 +25,7 @@ use std::path::Path;
 use std::time::Instant;
 
 use mlx_voice::WeightFormat;
-use mlx_voice::asr::{EncDecRNNTModel, TranscribeOptions};
+use mlx_voice::asr::{EncDecRnntModel, TranscribeOptions};
 use tracing_subscriber::EnvFilter;
 
 fn main() -> mlx_voice::Result<()> {
@@ -183,7 +183,7 @@ fn main() -> mlx_voice::Result<()> {
 fn load_model(
     model_path: &str,
     weight_format: Option<WeightFormat>,
-) -> mlx_voice::Result<EncDecRNNTModel> {
+) -> mlx_voice::Result<EncDecRnntModel> {
     let path = Path::new(model_path);
     if path
         .extension()
@@ -213,7 +213,7 @@ fn load_model(
             None => println!("  Weights: Auto-detect from metadata"),
         }
 
-        EncDecRNNTModel::from_safetensors(
+        EncDecRnntModel::from_safetensors(
             path,
             &config_path,
             tokenizer_path.as_ref(),
@@ -223,7 +223,7 @@ fn load_model(
         if weight_format.is_some() {
             println!("  Warning: --format only applies to .safetensors files");
         }
-        EncDecRNNTModel::from_pretrained(model_path)
+        EncDecRnntModel::from_pretrained(model_path)
     }
 }
 

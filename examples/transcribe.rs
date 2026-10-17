@@ -21,7 +21,7 @@ use std::path::Path;
 use std::time::Instant;
 
 use mlx_voice::WeightFormat;
-use mlx_voice::asr::EncDecCTCModel;
+use mlx_voice::asr::EncDecCtcModel;
 
 fn main() -> mlx_voice::Result<()> {
     // Parse command line arguments
@@ -112,7 +112,7 @@ fn main() -> mlx_voice::Result<()> {
 fn load_model(
     model_path: &str,
     weight_format: Option<WeightFormat>,
-) -> mlx_voice::Result<EncDecCTCModel> {
+) -> mlx_voice::Result<EncDecCtcModel> {
     let path = Path::new(model_path);
     if path
         .extension()
@@ -142,12 +142,12 @@ fn load_model(
             None => println!("  Weights: Auto-detect from metadata"),
         }
 
-        EncDecCTCModel::from_safetensors(path, &config_path, tokenizer_path.as_ref(), weight_format)
+        EncDecCtcModel::from_safetensors(path, &config_path, tokenizer_path.as_ref(), weight_format)
     } else {
         if weight_format.is_some() {
             println!("  Warning: --format only applies to .safetensors files");
         }
-        EncDecCTCModel::from_pretrained(model_path)
+        EncDecCtcModel::from_pretrained(model_path)
     }
 }
 

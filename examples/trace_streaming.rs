@@ -2,7 +2,7 @@
 //!
 //! Run with: RUST_LOG=info cargo run --example trace_streaming --release
 
-use mlx_voice::asr::{EncDecRNNTModel, StreamingOptions};
+use mlx_voice::asr::{EncDecRnntModel, StreamingOptions};
 use tracing_subscriber::{EnvFilter, fmt};
 
 fn main() -> mlx_voice::Result<()> {
@@ -18,7 +18,7 @@ fn main() -> mlx_voice::Result<()> {
     let mode_idx = 2; // Same as Python: att_context_size = [70, 1]
 
     println!("Loading model from: {}", model_path);
-    let mut model = EncDecRNNTModel::from_pretrained(model_path)?;
+    let mut model = EncDecRnntModel::from_pretrained(model_path)?;
 
     println!("\n=== Model Info ===");
     println!("Sample rate: {} Hz", model.sample_rate());

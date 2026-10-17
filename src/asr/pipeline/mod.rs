@@ -8,9 +8,9 @@
 //! ```no_run
 //! # fn main() -> mlx_voice::Result<()> {
 //! # let chunk: Vec<f32> = Vec::new();
-//! use mlx_voice::asr::{EncDecRNNTModel, StreamingOptions};
+//! use mlx_voice::asr::{EncDecRnntModel, StreamingOptions};
 //!
-//! let mut model = EncDecRNNTModel::from_pretrained("model.nemo")?;
+//! let mut model = EncDecRnntModel::from_pretrained("model.nemo")?;
 //!
 //! // A whole file, streamed
 //! let transcript = model.transcribe_streaming("audio.wav", StreamingOptions::default())?;

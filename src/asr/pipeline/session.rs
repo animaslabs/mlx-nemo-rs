@@ -8,7 +8,7 @@ use mlx_rs::Array;
 
 use crate::asr::Tokenizer;
 use crate::asr::decoding::{IncrementalDetokenizer, RnntStreamingDecoder, TimedToken};
-use crate::asr::models::EncDecRNNTModel;
+use crate::asr::models::EncDecRnntModel;
 use crate::asr::modules::{DecoderState, SpectrumTransform, StreamingMel, StreamingMelConfig};
 use crate::asr::streaming::{
     EncoderCache, FeatureBuffer, StreamingConfig, compute_streaming_config,
@@ -28,7 +28,7 @@ use crate::core::error::{Error, Result};
 #[non_exhaustive]
 pub struct StreamingOptions {
     /// Streaming mode: an index into the checkpoint's `att_context_size` list
-    /// (see [`EncDecRNNTModel::streaming_modes`] for each mode's latency).
+    /// (see [`EncDecRnntModel::streaming_modes`] for each mode's latency).
     /// NeMo checkpoints list modes from most to least lookahead, so mode 0,
     /// the default, has the highest latency and accuracy.
     pub mode: usize,
@@ -155,15 +155,15 @@ fn appended_text(old: &str, new: &str) -> String {
 ///
 /// Push audio as it arrives and pull updates, which emit text with roughly
 /// the latency of the chosen [`StreamingOptions::mode`]. The session borrows
-/// the model ([`EncDecRNNTModel::stream`]) or owns it
+/// the model ([`EncDecRnntModel::stream`]) or owns it
 /// ([`StreamingSession::new`]).
 ///
 /// ```no_run
 /// # fn main() -> mlx_voice::Result<()> {
 /// # let mic_chunks: Vec<Vec<f32>> = Vec::new();
-/// use mlx_voice::asr::{EncDecRNNTModel, StreamingOptions};
+/// use mlx_voice::asr::{EncDecRnntModel, StreamingOptions};
 ///
-/// let mut model = EncDecRNNTModel::from_pretrained("model.nemo")?;
+/// let mut model = EncDecRnntModel::from_pretrained("model.nemo")?;
 /// let mut stream = model.stream(StreamingOptions::default().mode(3))?;
 /// for chunk in &mic_chunks {
 ///     stream.push_audio(chunk, 48_000)?; // resampled to the model's rate
@@ -190,13 +190,13 @@ fn appended_text(old: &str, new: &str) -> String {
 /// ```no_run
 /// # fn main() -> mlx_voice::Result<()> {
 /// use std::sync::mpsc;
-/// use mlx_voice::asr::{EncDecRNNTModel, StreamingOptions, StreamingSession};
+/// use mlx_voice::asr::{EncDecRnntModel, StreamingOptions, StreamingSession};
 ///
 /// // Stands in for a lock-free queue the audio callback writes to
 /// let (audio_tx, audio_rx) = mpsc::channel::<Vec<f32>>();
 /// let (text_tx, text_rx) = mpsc::channel::<String>();
 ///
-/// let model = EncDecRNNTModel::from_pretrained("model.nemo")?;
+/// let model = EncDecRnntModel::from_pretrained("model.nemo")?;
 /// let worker = std::thread::spawn(move || -> mlx_voice::Result<()> {
 ///     let mut session = StreamingSession::new(model, StreamingOptions::default())?;
 ///     for chunk in audio_rx {
@@ -216,7 +216,7 @@ fn appended_text(old: &str, new: &str) -> String {
 /// # Ok(())
 /// # }
 /// ```
-pub struct StreamingSession<M: BorrowMut<EncDecRNNTModel> = EncDecRNNTModel> {
+pub struct StreamingSession<M: BorrowMut<EncDecRnntModel> = EncDecRnntModel> {
     pub(crate) model: M,
     options: StreamingOptions,
 
@@ -242,7 +242,7 @@ pub struct StreamingSession<M: BorrowMut<EncDecRNNTModel> = EncDecRNNTModel> {
     state: DecodeState,
 }
 
-impl<M: BorrowMut<EncDecRNNTModel>> StreamingSession<M> {
+impl<M: BorrowMut<EncDecRnntModel>> StreamingSession<M> {
     /// Start a session on `model`, which can be the model itself (the
     /// session owns it) or a mutable reference to it.
     pub fn new(mut model: M, options: StreamingOptions) -> Result<Self> {
@@ -304,12 +304,12 @@ impl<M: BorrowMut<EncDecRNNTModel>> StreamingSession<M> {
     }
 
     /// The model.
-    pub fn model(&self) -> &EncDecRNNTModel {
+    pub fn model(&self) -> &EncDecRnntModel {
         self.model.borrow()
     }
 
     /// The model, e.g. to change its language between chunks.
-    pub fn model_mut(&mut self) -> &mut EncDecRNNTModel {
+    pub fn model_mut(&mut self) -> &mut EncDecRnntModel {
         self.model.borrow_mut()
     }
 
@@ -711,7 +711,7 @@ impl<M: BorrowMut<EncDecRNNTModel>> StreamingSession<M> {
     }
 }
 
-impl<M: BorrowMut<EncDecRNNTModel>> std::fmt::Debug for StreamingSession<M> {
+impl<M: BorrowMut<EncDecRnntModel>> std::fmt::Debug for StreamingSession<M> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("StreamingSession")
             .field("model", self.model())

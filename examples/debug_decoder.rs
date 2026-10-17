@@ -1,6 +1,6 @@
 //! Debug decoder step by step to compare with Python.
 
-use mlx_voice::asr::{EncDecRNNTModel, StreamingOptions};
+use mlx_voice::asr::{EncDecRnntModel, StreamingOptions};
 
 fn main() -> mlx_voice::Result<()> {
     // Initialize tracing
@@ -15,7 +15,7 @@ fn main() -> mlx_voice::Result<()> {
         "models/nvidia/nemotron-speech-streaming-en-0.6b/nemotron-speech-streaming-en-0.6b.nemo";
 
     println!("Loading model from: {}", model_path);
-    let mut model = EncDecRNNTModel::from_pretrained(model_path)?;
+    let mut model = EncDecRnntModel::from_pretrained(model_path)?;
 
     println!("\n=== Model Loaded ===");
     println!("Sample rate: {} Hz", model.sample_rate());

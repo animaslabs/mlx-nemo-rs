@@ -1,5 +1,6 @@
 //! Test mel spectrogram computation for comparison with Python NeMo.
 
+use mlx_voice::asr::config::{Normalize, WindowType};
 use mlx_voice::asr::modules::{MelConfig, MelProcessor};
 use mlx_voice::asr::streaming::StreamingMelBuffer;
 
@@ -21,11 +22,11 @@ fn main() -> mlx_voice::Result<()> {
     config.sample_rate = 16000;
     config.window_size = 0.025;
     config.window_stride = 0.01;
-    config.window = "hann".to_string();
+    config.window = WindowType::Hann;
     config.features = 128;
     config.n_fft = 512;
     config.log = true;
-    config.normalize = "NA".to_string();
+    config.normalize = Normalize::Disabled;
     config.dither = 0.0; // Disable dither (Python only dithers in training mode)
     config.preemph = Some(0.97); // NeMo default - FilterbankFeatures has preemph=0.97 hardcoded
     config.fmin = 0.0;
@@ -155,11 +156,11 @@ fn main() -> mlx_voice::Result<()> {
     config2.sample_rate = 16000;
     config2.window_size = 0.025;
     config2.window_stride = 0.01;
-    config2.window = "hann".to_string();
+    config2.window = WindowType::Hann;
     config2.features = 128;
     config2.n_fft = 512;
     config2.log = true;
-    config2.normalize = "NA".to_string();
+    config2.normalize = Normalize::Disabled;
     config2.dither = 0.0;
     config2.preemph = Some(0.97); // NeMo default
     config2.fmin = 0.0;

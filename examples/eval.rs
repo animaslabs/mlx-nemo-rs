@@ -13,7 +13,7 @@
 //!
 //! Options:
 //!   --model <path>       RNN-T model (.nemo file or MLX directory)
-//!   --offline            Transcribe whole files with EncDecRNNTModel instead of streaming
+//!   --offline            Transcribe whole files with EncDecRnntModel instead of streaming
 //!   --dtype <dtype>      Offline encoder dtype: float32 (default), bfloat16 or float16
 //!   --mode <idx>         Streaming mode index (default: 0)
 //!   --eval-dir <dir>     Eval set directory (default: samples/eval)
@@ -30,7 +30,7 @@ use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use mlx_voice::asr::{EncDecRNNTModel, StreamingOptions};
+use mlx_voice::asr::{EncDecRnntModel, StreamingOptions};
 use serde_json::{Value, json};
 use tracing_subscriber::{EnvFilter, fmt};
 
@@ -110,10 +110,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     let load_start = Instant::now();
     let mut model = if offline {
-        Model::Offline(EncDecRNNTModel::from_pretrained(&model_path)?)
+        Model::Offline(EncDecRnntModel::from_pretrained(&model_path)?)
     } else {
         Model::Streaming(
-            EncDecRNNTModel::from_pretrained(&model_path)?,
+            EncDecRnntModel::from_pretrained(&model_path)?,
             StreamingOptions::default().mode(mode_idx),
         )
     };
@@ -235,8 +235,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 enum Model {
-    Offline(EncDecRNNTModel),
-    Streaming(EncDecRNNTModel, StreamingOptions),
+    Offline(EncDecRnntModel),
+    Streaming(EncDecRnntModel, StreamingOptions),
 }
 
 impl Model {

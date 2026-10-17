@@ -12,9 +12,9 @@ pub mod preprocessors;
 pub mod sortformer;
 pub mod speaker_kernel;
 
-pub use decoders::CTCDecoder;
+pub use decoders::CtcDecoder;
 pub use decoders::{DecoderState, PredictionNetwork};
-pub use decoders::{LstmState, RNNTDecoder, RNNTJoint, StatelessTransducerDecoder};
+pub use decoders::{LstmState, RnntDecoder, RnntJoint, StatelessTransducerDecoder};
 pub use encoders::ConformerEncoder;
 pub use encoders::TransformerEncoder;
 pub use language_prompt::{AUTO_LANGUAGE, LanguagePrompt};

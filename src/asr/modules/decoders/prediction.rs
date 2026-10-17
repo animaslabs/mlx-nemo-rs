@@ -2,7 +2,7 @@
 
 use mlx_rs::Array;
 
-use super::{LstmState, RNNTDecoder, StatelessTransducerDecoder};
+use super::{LstmState, RnntDecoder, StatelessTransducerDecoder};
 use crate::core::error::{Error, Result};
 use crate::core::loading::Weights;
 use crate::core::quantization::QuantizationConfig;
@@ -13,7 +13,7 @@ pub enum PredictionNetwork {
     /// Stateless decoder (embedding-based)
     Stateless(StatelessTransducerDecoder),
     /// LSTM-based decoder
-    Lstm(RNNTDecoder),
+    Lstm(RnntDecoder),
 }
 
 /// Decoder state type.
@@ -35,10 +35,10 @@ impl PredictionNetwork {
     }
 
     /// Get the blank token index.
-    pub fn blank_idx(&self) -> usize {
+    pub fn blank_id(&self) -> usize {
         match self {
-            Self::Stateless(d) => d.blank_idx(),
-            Self::Lstm(d) => d.blank_idx(),
+            Self::Stateless(d) => d.blank_id(),
+            Self::Lstm(d) => d.blank_id(),
         }
     }
 

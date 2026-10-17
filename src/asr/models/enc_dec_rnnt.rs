@@ -10,9 +10,9 @@
 //!
 //! ```no_run
 //! # fn main() -> mlx_voice::Result<()> {
-//! # use mlx_voice::asr::{EncDecRNNTModel, StreamingOptions};
+//! # use mlx_voice::asr::{EncDecRnntModel, StreamingOptions};
 //! # let audio_chunks: Vec<Vec<f32>> = Vec::new();
-//! let mut model = EncDecRNNTModel::from_pretrained("model.nemo")?;
+//! let mut model = EncDecRnntModel::from_pretrained("model.nemo")?;
 //! let mut stream = model.stream(StreamingOptions::default())?;
 //! for chunk in &audio_chunks {
 //!     stream.push_audio(chunk, 16_000)?;
@@ -29,12 +29,12 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use crate::asr::Tokenizer;
-use crate::asr::config::{AsrModelConfig, JointConfig};
+use crate::asr::config::{AsrModelConfig, DecodingAlgorithm, JointConfig};
 use crate::asr::decoding::TimedToken;
 use crate::asr::decoding::{RnntStreamingDecoder, rnnt_beam_decode};
 use crate::asr::modules::{
-    ConformerEncoder, LanguagePrompt, MelConfig, MelProcessor, PredictionNetwork, RNNTDecoder,
-    RNNTJoint, StatelessTransducerDecoder,
+    ConformerEncoder, LanguagePrompt, MelConfig, MelProcessor, PredictionNetwork, RnntDecoder,
+    RnntJoint, StatelessTransducerDecoder,
 };
 use crate::asr::pipeline::{StreamingOptions, StreamingSession};
 use crate::asr::streaming::{StreamingModeInfo, get_streaming_modes};
@@ -60,22 +60,23 @@ use mlx_rs::ops::indexing::IndexOp;
 ///
 /// ```no_run
 /// # fn main() -> mlx_voice::Result<()> {
-/// use mlx_voice::asr::EncDecRNNTModel;
+/// use mlx_voice::asr::EncDecRnntModel;
 ///
 /// // Load from .nemo checkpoint
-/// let mut model = EncDecRNNTModel::from_pretrained("parakeet-rnnt-0.6b.nemo")?;
+/// let mut model = EncDecRnntModel::from_pretrained("parakeet-rnnt-0.6b.nemo")?;
 ///
 /// // Transcribe audio files
 /// let texts = model.transcribe(&["audio.wav"])?;
 /// # Ok(())
 /// # }
 /// ```
-pub struct EncDecRNNTModel {
+#[doc(alias = "EncDecRNNTModel")]
+pub struct EncDecRnntModel {
     pub(crate) config: AsrModelConfig,
     pub(crate) preprocessor: MelProcessor,
     pub(crate) encoder: ConformerEncoder,
     pub(crate) decoder: PredictionNetwork,
-    pub(crate) joint: RNNTJoint,
+    pub(crate) joint: RnntJoint,
     pub(crate) tokenizer: Option<Tokenizer>,
     /// Blank token ID (typically vocab_size, last token)
     pub(crate) blank_id: usize,
@@ -83,9 +84,9 @@ pub struct EncDecRNNTModel {
     decoding_strategy: DecodingStrategy,
 }
 
-impl std::fmt::Debug for EncDecRNNTModel {
+impl std::fmt::Debug for EncDecRnntModel {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("EncDecRNNTModel")
+        f.debug_struct("EncDecRnntModel")
             .field("sample_rate", &self.sample_rate())
             .field("encoder_layers", &self.encoder.num_layers())
             .field("lstm_decoder", &self.is_lstm_decoder())
@@ -97,7 +98,7 @@ impl std::fmt::Debug for EncDecRNNTModel {
     }
 }
 
-impl EncDecRNNTModel {
+impl EncDecRnntModel {
     /// Create a new model from configuration.
     pub fn new(config: AsrModelConfig) -> Result<Self> {
         config.validate()?;
@@ -109,12 +110,8 @@ impl EncDecRNNTModel {
         let encoder = ConformerEncoder::new(config.encoder.clone())?;
 
         // Determine vocabulary size from config or default
-        let vocab_size = if config.decoder.num_classes > 0 {
-            config.decoder.num_classes as usize
-        } else {
-            // Will be set when loading tokenizer
-            1024 // Default placeholder
-        };
+        // Set properly when the tokenizer loads
+        let vocab_size = config.decoder.num_classes.unwrap_or(1024);
 
         // Detect decoder type from config
         let is_lstm_decoder = config
@@ -127,7 +124,7 @@ impl EncDecRNNTModel {
         // Create prediction network (decoder) based on config
         let decoder = if is_lstm_decoder {
             tracing::info!("Using LSTM-based prediction network");
-            PredictionNetwork::Lstm(RNNTDecoder::new(&config.decoder, vocab_size)?)
+            PredictionNetwork::Lstm(RnntDecoder::new(&config.decoder, vocab_size)?)
         } else {
             tracing::info!("Using stateless prediction network");
             PredictionNetwork::Stateless(StatelessTransducerDecoder::new(
@@ -144,7 +141,7 @@ impl EncDecRNNTModel {
 
         // Use effective values from jointnet if present
         let joint_hidden = joint_config.effective_joint_hidden();
-        let activation = joint_config.effective_activation().to_string();
+        let activation = joint_config.effective_activation().clone();
 
         let effective_joint_config = JointConfig {
             joint_hidden,
@@ -152,7 +149,7 @@ impl EncDecRNNTModel {
             ..joint_config
         };
 
-        let joint = RNNTJoint::new(
+        let joint = RnntJoint::new(
             &effective_joint_config,
             encoder_hidden,
             pred_hidden,
@@ -164,8 +161,8 @@ impl EncDecRNNTModel {
 
         // Determine decoding strategy from config
         let decoding_strategy = if let Some(ref decoding) = config.decoding {
-            match decoding.strategy.as_str() {
-                "beam" | "beam_search" => DecodingStrategy::BeamSearch {
+            match decoding.strategy {
+                DecodingAlgorithm::Beam => DecodingStrategy::BeamSearch {
                     beam_size: decoding.beam_size.unwrap_or(4),
                 },
                 _ => DecodingStrategy::Greedy,
@@ -197,11 +194,11 @@ impl EncDecRNNTModel {
     ///
     /// ```no_run
     /// # fn main() -> mlx_voice::Result<()> {
-    /// use mlx_voice::asr::EncDecRNNTModel;
+    /// use mlx_voice::asr::EncDecRnntModel;
     ///
-    /// let mut model = EncDecRNNTModel::from_pretrained("model.nemo")?;
+    /// let mut model = EncDecRnntModel::from_pretrained("model.nemo")?;
     /// // Downloads with the `hub` feature
-    /// let mut model = EncDecRNNTModel::from_pretrained("nvidia/parakeet-rnnt-0.6b")?;
+    /// let mut model = EncDecRnntModel::from_pretrained("nvidia/parakeet-rnnt-0.6b")?;
     /// let texts = model.transcribe(&["audio.wav"])?;
     /// # Ok(())
     /// # }
@@ -283,9 +280,9 @@ impl EncDecRNNTModel {
     ///
     /// ```no_run
     /// # fn main() -> mlx_voice::Result<()> {
-    /// # use mlx_voice::{asr::EncDecRNNTModel, WeightFormat};
+    /// # use mlx_voice::{asr::EncDecRnntModel, WeightFormat};
     /// // Load with explicit format
-    /// let model = EncDecRNNTModel::from_safetensors(
+    /// let model = EncDecRnntModel::from_safetensors(
     ///     "weights.safetensors",
     ///     "config.yaml",
     ///     Some("tokenizer.model"),
@@ -293,7 +290,7 @@ impl EncDecRNNTModel {
     /// )?;
     ///
     /// // Load with auto-detected format
-    /// let model = EncDecRNNTModel::from_safetensors(
+    /// let model = EncDecRnntModel::from_safetensors(
     ///     "weights.safetensors",
     ///     "config.yaml",
     ///     Some("tokenizer.model"),
@@ -433,7 +430,7 @@ impl EncDecRNNTModel {
         // Recreate decoder with correct vocab size
         let is_lstm_decoder = self.decoder.is_lstm();
         self.decoder = if is_lstm_decoder {
-            PredictionNetwork::Lstm(RNNTDecoder::new(&self.config.decoder, vocab_size)?)
+            PredictionNetwork::Lstm(RnntDecoder::new(&self.config.decoder, vocab_size)?)
         } else {
             PredictionNetwork::Stateless(StatelessTransducerDecoder::new(
                 &self.config.decoder,
@@ -446,7 +443,7 @@ impl EncDecRNNTModel {
         let encoder_hidden = self.encoder.output_dim();
         let pred_hidden = self.decoder.pred_hidden();
         let joint_hidden = joint_config.effective_joint_hidden();
-        let activation = joint_config.effective_activation().to_string();
+        let activation = joint_config.effective_activation().clone();
 
         let effective_joint_config = JointConfig {
             joint_hidden,
@@ -454,7 +451,7 @@ impl EncDecRNNTModel {
             ..joint_config
         };
 
-        self.joint = RNNTJoint::new(
+        self.joint = RnntJoint::new(
             &effective_joint_config,
             encoder_hidden,
             pred_hidden,
@@ -569,8 +566,8 @@ impl EncDecRNNTModel {
     ///
     /// ```no_run
     /// # fn main() -> mlx_voice::Result<()> {
-    /// # use mlx_voice::asr::EncDecRNNTModel;
-    /// let mut model = EncDecRNNTModel::from_pretrained("model.nemo")?;
+    /// # use mlx_voice::asr::EncDecRnntModel;
+    /// let mut model = EncDecRnntModel::from_pretrained("model.nemo")?;
     /// for transcript in model.transcribe(["a.wav", "b.wav"])? {
     ///     println!("{transcript}");
     ///     for word in &transcript.words {
@@ -768,7 +765,7 @@ impl EncDecRNNTModel {
 
     /// Get a reference to the joint network.
     #[cfg(feature = "internals")]
-    pub fn joint(&self) -> &RNNTJoint {
+    pub fn joint(&self) -> &RnntJoint {
         &self.joint
     }
 

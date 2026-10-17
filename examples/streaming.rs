@@ -27,7 +27,7 @@ use std::io::{self, Write};
 use std::time::Instant;
 
 use mlx_voice::asr::{
-    EncDecClassificationModel, EncDecRNNTModel, StreamingModeInfo, StreamingOptions,
+    EncDecClassificationModel, EncDecRnntModel, StreamingModeInfo, StreamingOptions,
     VadPostProcessConfig, VadPostProcessor,
 };
 use tracing_subscriber::{EnvFilter, fmt};
@@ -138,7 +138,7 @@ fn main() -> mlx_voice::Result<()> {
 
     println!("Loading model from: {}", model_path);
     let start = Instant::now();
-    let mut model = EncDecRNNTModel::from_pretrained(model_path)?;
+    let mut model = EncDecRnntModel::from_pretrained(model_path)?;
     println!("Model loaded in {:.2}s", start.elapsed().as_secs_f32());
 
     if let Some(language) = language {

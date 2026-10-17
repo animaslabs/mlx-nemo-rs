@@ -15,12 +15,12 @@ use crate::core::error::{Error, Result};
 ///
 /// ```no_run
 /// # fn main() -> mlx_voice::Result<()> {
-/// use mlx_voice::asr::EncDecRNNTModel;
+/// use mlx_voice::asr::EncDecRnntModel;
 /// use mlx_voice::core::source::{HubRepo, ModelSource};
 ///
-/// let model = EncDecRNNTModel::from_pretrained("models/parakeet-rnnt-0.6b.nemo")?;
-/// let model = EncDecRNNTModel::from_pretrained("nvidia/parakeet-rnnt-0.6b")?;
-/// let model = EncDecRNNTModel::from_pretrained(
+/// let model = EncDecRnntModel::from_pretrained("models/parakeet-rnnt-0.6b.nemo")?;
+/// let model = EncDecRnntModel::from_pretrained("nvidia/parakeet-rnnt-0.6b")?;
+/// let model = EncDecRnntModel::from_pretrained(
 ///     HubRepo::new("nvidia/nemotron-speech-streaming-en-0.6b").revision("main"),
 /// )?;
 /// # Ok(())

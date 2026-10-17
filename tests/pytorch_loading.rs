@@ -230,7 +230,8 @@ fn test_parse_nemotron_config() {
         "Nemotron conv kernel is 9"
     );
     assert_eq!(
-        config.encoder.conv_norm_type, "layer_norm",
+        config.encoder.conv_norm_type,
+        mlx_voice::asr::config::ConvNormType::LayerNorm,
         "Nemotron uses layer_norm in convolution"
     );
 
@@ -240,7 +241,7 @@ fn test_parse_nemotron_config() {
         "Nemotron should have causal convolution"
     );
     assert!(
-        config.encoder.is_causal_downsampling(),
+        config.encoder.causal_downsampling,
         "Nemotron should have causal downsampling"
     );
     assert!(
@@ -261,7 +262,7 @@ fn test_parse_nemotron_config() {
     );
 
     // First mode should be [70, 13] (1.12s latency)
-    let (left, right) = att_ctx.get_default().expect("Should have default context");
+    let (left, right) = att_ctx.default_mode().expect("Should have default context");
     assert_eq!(left, 70, "Default left context should be 70");
     assert_eq!(right, 13, "Default right context should be 13");
 
