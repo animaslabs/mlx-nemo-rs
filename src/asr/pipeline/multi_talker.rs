@@ -52,7 +52,7 @@ use mlx_rs::ops::indexing::IndexOp;
 
 use super::session::{StreamingOptions, StreamingSession};
 use crate::asr::Tokenizer;
-use crate::asr::models::{EncDecRNNTModel, SortformerEncLabelModel};
+use crate::asr::models::{EncDecRnntModel, SortformerEncLabelModel};
 use crate::asr::modules::DecoderState;
 use crate::asr::modules::SpeakerTargets;
 use crate::asr::streaming::{EncoderCache, FeatureBuffer, StreamingSortformerState};
@@ -166,7 +166,7 @@ struct Instance {
 /// Multi-talker streaming pipeline.
 pub struct MultiTalkerPipeline {
     /// ASR model, audio buffering and mel streaming
-    asr: StreamingSession<EncDecRNNTModel>,
+    asr: StreamingSession<EncDecRnntModel>,
     /// Diarization model
     diar_model: SortformerEncLabelModel,
     /// Diarization streaming state
@@ -228,7 +228,7 @@ impl MultiTalkerPipeline {
         diar: impl Into<ModelSource>,
         config: MultiTalkerConfig,
     ) -> Result<Self> {
-        let model = EncDecRNNTModel::from_pretrained_with(asr, config.load)?;
+        let model = EncDecRnntModel::from_pretrained_with(asr, config.load)?;
         let asr = StreamingSession::new(model, config.streaming.clone())?;
         let mut diar_model = SortformerEncLabelModel::from_pretrained_with(diar, config.load)?;
 
@@ -279,7 +279,7 @@ impl MultiTalkerPipeline {
     }
 
     fn new_encoder_cache(
-        asr: &StreamingSession<EncDecRNNTModel>,
+        asr: &StreamingSession<EncDecRnntModel>,
         batch_size: usize,
     ) -> Result<EncoderCache> {
         EncoderCache::new(

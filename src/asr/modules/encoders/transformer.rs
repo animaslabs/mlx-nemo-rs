@@ -11,8 +11,8 @@ use mlx_rs::module::Module;
 use mlx_rs::nn;
 use mlx_rs::ops;
 
-use crate::asr::config::TransformerEncoderConfig;
-use crate::core::error::Result;
+use crate::asr::config::{Activation, TransformerEncoderConfig};
+use crate::core::error::{Error, Result};
 use crate::core::loading::{Weights, load_layer_norm};
 use crate::core::quantization::{LinearLayer, QuantizationConfig};
 
@@ -145,11 +145,16 @@ impl MultiHeadAttention {
 struct PositionWiseFF {
     linear1: LinearLayer,
     linear2: LinearLayer,
-    activation: String,
+    activation: Activation,
 }
 
 impl PositionWiseFF {
-    fn new(hidden_size: usize, inner_size: usize, activation: &str) -> Result<Self> {
+    fn new(hidden_size: usize, inner_size: usize, activation: &Activation) -> Result<Self> {
+        if !matches!(activation, Activation::Relu | Activation::Gelu) {
+            return Err(Error::not_implemented(format!(
+                "transformer activation `{activation}` (only relu and gelu are supported)"
+            )));
+        }
         let h = hidden_size as i32;
         let i = inner_size as i32;
 
@@ -161,16 +166,16 @@ impl PositionWiseFF {
         Ok(Self {
             linear1: LinearLayer::standard(w1, Some(b1)),
             linear2: LinearLayer::standard(w2, Some(b2)),
-            activation: activation.to_string(),
+            activation: activation.clone(),
         })
     }
 
     fn forward(&self, x: &Array) -> Result<Array> {
         let mut h = self.linear1.forward(x)?;
 
-        h = match self.activation.as_str() {
-            "gelu" => nn::gelu(&h)?,
-            _ => ops::maximum(&h, &Array::from_f32(0.0))?, // relu default
+        h = match self.activation {
+            Activation::Gelu => nn::gelu(&h)?,
+            _ => ops::maximum(&h, &Array::from_f32(0.0))?,
         };
 
         self.linear2.forward(&h)

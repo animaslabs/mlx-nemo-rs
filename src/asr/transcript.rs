@@ -15,8 +15,8 @@ use crate::core::error::Result;
 ///
 /// ```no_run
 /// # fn main() -> mlx_voice::Result<()> {
-/// # use mlx_voice::asr::EncDecRNNTModel;
-/// # let mut model = EncDecRNNTModel::from_pretrained("model.nemo")?;
+/// # use mlx_voice::asr::EncDecRnntModel;
+/// # let mut model = EncDecRnntModel::from_pretrained("model.nemo")?;
 /// # let samples = vec![0.0f32; 48_000];
 /// let from_files = model.transcribe(["a.wav", "b.wav"])?;
 /// let from_memory = model.transcribe_one((&samples[..], 48_000))?;
@@ -102,8 +102,8 @@ pub enum DecodingStrategy {
 ///
 /// ```no_run
 /// # fn main() -> mlx_voice::Result<()> {
-/// # use mlx_voice::asr::{EncDecRNNTModel, TranscribeOptions};
-/// # let mut model = EncDecRNNTModel::from_pretrained("model.nemo")?;
+/// # use mlx_voice::asr::{EncDecRnntModel, TranscribeOptions};
+/// # let mut model = EncDecRnntModel::from_pretrained("model.nemo")?;
 /// let options = TranscribeOptions::default().beam_search(4).batch_size(8);
 /// let transcripts = model.transcribe_with(["a.wav", "b.wav"], &options)?;
 /// # Ok(())

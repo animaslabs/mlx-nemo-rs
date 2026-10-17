@@ -11,10 +11,10 @@
 //!
 //! ```no_run
 //! # fn main() -> mlx_voice::Result<()> {
-//! use mlx_voice::asr::EncDecCTCModel;
+//! use mlx_voice::asr::EncDecCtcModel;
 //!
 //! // Load a pretrained model from a .nemo file
-//! let mut model = EncDecCTCModel::from_pretrained("path/to/model.nemo")?;
+//! let mut model = EncDecCtcModel::from_pretrained("path/to/model.nemo")?;
 //!
 //! // Transcribe audio
 //! let transcriptions = model.transcribe(&["audio.wav"])?;

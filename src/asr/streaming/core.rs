@@ -15,9 +15,9 @@
 //! ```no_run
 //! # fn main() -> mlx_voice::Result<()> {
 //! # let audio_chunks: Vec<Vec<f32>> = Vec::new();
-//! use mlx_voice::asr::EncDecCTCModel;
+//! use mlx_voice::asr::EncDecCtcModel;
 //!
-//! let mut model = EncDecCTCModel::from_pretrained("model.nemo")?;
+//! let mut model = EncDecCtcModel::from_pretrained("model.nemo")?;
 //!
 //! // Check streaming modes
 //! for mode in model.streaming_modes() {
@@ -608,7 +608,7 @@ pub fn compute_streaming_config(
     let (left_context, right_context) = encoder_config
         .att_context_size
         .as_ref()
-        .and_then(|cs| cs.get_mode(mode_idx))
+        .and_then(|cs| cs.mode(mode_idx))
         .ok_or_else(|| {
             Error::config(format!(
                 "Invalid streaming mode index {} or no att_context_size configured",
@@ -616,10 +616,7 @@ pub fn compute_streaming_config(
             ))
         })?;
 
-    let att_context_style = encoder_config
-        .att_context_style
-        .as_deref()
-        .unwrap_or("regular");
+    let att_context_style = encoder_config.att_context_style.as_str();
 
     let n_layers = encoder_config.n_layers;
     let subsampling_factor = encoder_config.subsampling_factor;
@@ -733,7 +730,7 @@ pub fn get_streaming_modes(
     let mut modes = Vec::with_capacity(num_modes);
 
     for mode_idx in 0..num_modes {
-        if let Some((left, right)) = att_context_size.get_mode(mode_idx) {
+        if let Some((left, right)) = att_context_size.mode(mode_idx) {
             modes.push(StreamingModeInfo::from_context(
                 mode_idx,
                 left,

@@ -528,6 +528,32 @@ Allow switching modes on an existing model without reloading.
 
 ## 5. Configuration types
 
+**Done (§5.1–5.3, mostly):**
+
+- **Typed enums.** The closed sets are enums that (de)serialize as NeMo's
+  strings: `WindowType`, `Normalize`, `Subsampling`, `SelfAttentionModel`,
+  `AttContextStyle`, `ConvNormType`, `Activation` and `DecodingAlgorithm`, all
+  in `asr::config`. Each has an `Other(String)` fallback, so configs from newer
+  NeMo versions still load. NeMo aliases are accepted: `NA`/`None` for no
+  normalization, `silu` for swish, `beam_search` for beam.
+- **Load-time errors in place of silent fallbacks.** An unknown joint
+  activation became ReLU, an unknown transformer activation became ReLU, and
+  `normalize: all_features` skipped normalization. Each is now an error when
+  the model loads, and `validate` rejects unknown attention styles and conv
+  norms.
+- **Plain types.** `xscaling`, `untie_biases`, `use_bias`,
+  `causal_downsampling` and `blank_as_pad` are plain `bool`s with NeMo's
+  defaults (`null` reads as the default), replacing the
+  `effective_use_bias`/`is_causal_downsampling` helpers. `feat_out` and
+  `DecoderConfig::num_classes` are `Option<usize>`, with `-1` read as `None`.
+- **Renames.** `AttContextSize::get_default`/`get_mode` are now
+  `default_mode`/`mode`.
+
+Still open: `conv_context_size` stays `Option<String>` (NeMo also allows a
+`[left, right]` list), and `MelConfig` still converts from
+`PreprocessorConfig` with an infallible `From`. The checks live in
+`MelProcessor::new` instead.
+
 ### 5.1 Stringly-typed fields
 
 Many config fields are `String` where the set of valid values is closed:
@@ -633,6 +659,14 @@ The decoder side benefits the same way. A `PredictionNet` trait implemented by
 and `DecoderState` enums that `rnnt_beam_decode` now matches on.
 
 ### 6.2 Naming conventions
+
+**Done:** `EncDecRnntModel`, `EncDecCtcModel`, `CtcDecoder`, `RnntJoint` and
+`RnntDecoder` use Rust casing. The two public models carry
+`#[doc(alias = "EncDecRNNTModel")]` / `#[doc(alias = "EncDecCTCModel")]`, so
+docs searches for the NeMo names still find them. There are no deprecated
+aliases, since the crate has no users yet. `blank_idx` is now `blank_id`
+everywhere. The `classify`/`diarize` result types and the `Language` newtype
+from the table below are still open.
 
 The Rust API guidelines (C-CASE) treat acronyms as words: `Rnnt`, `Ctc`, `Vad`.
 The crate mixes both styles: `EncDecRNNTModel` and `RnntStreamingSession`,
@@ -955,8 +989,8 @@ release happens.
    `CacheAwareRNNTPipeline` into a thin wrapper or remove it (§4). Remove
    `init_streaming`/`process_chunk`/`finalize_streaming`.~~ Done for RNN-T
    (the pipeline is removed); CTC streaming is still the old API.
-7. Add typed config enums (§5) and Rust-cased type names with
-   `#[doc(alias)]` (§6.2).
+7. ~~Add typed config enums (§5) and Rust-cased type names with
+   `#[doc(alias)]` (§6.2).~~ Done.
 
 **Later**
 

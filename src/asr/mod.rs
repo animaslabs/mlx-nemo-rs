@@ -3,8 +3,8 @@
 //! This module provides ASR models and utilities compatible with NVIDIA NeMo's
 //! ASR collection, including:
 //!
-//! - CTC-based models (`EncDecCTCModel`)
-//! - RNN-T/Transducer models (`EncDecRNNTModel`)
+//! - CTC-based models (`EncDecCtcModel`)
+//! - RNN-T/Transducer models (`EncDecRnntModel`)
 //! - Conformer/FastConformer encoders
 //! - Audio preprocessing (Mel spectrogram)
 //! - Greedy and beam search decoding
@@ -14,9 +14,9 @@
 //!
 //! ```no_run
 //! # fn main() -> mlx_voice::Result<()> {
-//! use mlx_voice::asr::EncDecCTCModel;
+//! use mlx_voice::asr::EncDecCtcModel;
 //!
-//! let mut model = EncDecCTCModel::from_pretrained("parakeet-ctc-0.6b.nemo")?;
+//! let mut model = EncDecCtcModel::from_pretrained("parakeet-ctc-0.6b.nemo")?;
 //! let transcriptions = model.transcribe(&["audio.wav"])?;
 //! # Ok(())
 //! # }
@@ -26,9 +26,9 @@
 //!
 //! ```no_run
 //! # fn main() -> mlx_voice::Result<()> {
-//! use mlx_voice::asr::{EncDecRNNTModel, StreamingOptions};
+//! use mlx_voice::asr::{EncDecRnntModel, StreamingOptions};
 //!
-//! let mut model = EncDecRNNTModel::from_pretrained("model.nemo")?;
+//! let mut model = EncDecRnntModel::from_pretrained("model.nemo")?;
 //! let transcript = model.transcribe_streaming("audio.wav", StreamingOptions::default())?;
 //! # Ok(())
 //! # }
@@ -60,7 +60,7 @@ pub mod vad;
 // Re-exports
 pub use config::AsrModelConfig;
 pub use models::{
-    CtcStreamingSession, EncDecCTCModel, EncDecClassificationModel, EncDecRNNTModel,
+    CtcStreamingSession, EncDecClassificationModel, EncDecCtcModel, EncDecRnntModel,
     SortformerEncLabelModel,
 };
 pub use modules::{MelConfig, MelProcessor, SpectrumTransform, StreamingMel};
@@ -76,7 +76,7 @@ pub use vad::{SpeechSegment, VadPostProcessConfig, VadPostProcessor};
 /// Prelude for convenient imports.
 pub mod prelude {
     pub use super::config::AsrModelConfig;
-    pub use super::models::{EncDecCTCModel, EncDecRNNTModel};
+    pub use super::models::{EncDecCtcModel, EncDecRnntModel};
     pub use super::pipeline::{StreamingOptions, StreamingSession};
     pub use super::tokenizer::Tokenizer;
     pub use super::transcript::{AudioInput, DecodingStrategy, TranscribeOptions, Transcript};
@@ -86,12 +86,12 @@ pub mod prelude {
 // queue that another thread drains into a session), so keep them `Send`.
 const _: () = {
     const fn assert_send<T: Send>() {}
-    assert_send::<EncDecCTCModel>();
-    assert_send::<EncDecRNNTModel>();
+    assert_send::<EncDecCtcModel>();
+    assert_send::<EncDecRnntModel>();
     assert_send::<EncDecClassificationModel>();
     assert_send::<SortformerEncLabelModel>();
-    assert_send::<StreamingSession<EncDecRNNTModel>>();
-    assert_send::<StreamingSession<&mut EncDecRNNTModel>>();
+    assert_send::<StreamingSession<EncDecRnntModel>>();
+    assert_send::<StreamingSession<&mut EncDecRnntModel>>();
     assert_send::<MultiTalkerPipeline>();
     assert_send::<StreamUpdate>();
     assert_send::<MultiTalkerOutput>();

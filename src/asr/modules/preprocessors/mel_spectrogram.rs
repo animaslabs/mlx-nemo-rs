@@ -51,7 +51,7 @@ use std::sync::Arc;
 use mlx_rs::ops::indexing::IndexOp;
 use mlx_rs::{Array, ops};
 
-use crate::asr::config::PreprocessorConfig;
+use crate::asr::config::{Normalize, PreprocessorConfig, WindowType};
 use crate::asr::dsp;
 use crate::core::ArrayExt;
 use crate::core::error::{Error, Result};
@@ -81,16 +81,17 @@ pub struct MelConfig {
     pub window_size: f32,
     /// Window stride/hop in seconds (default: 0.01 = 10ms = 160 samples @ 16kHz).
     pub window_stride: f32,
-    /// Window function type: "hann" or "hamming" (default: "hann").
-    pub window: String,
+    /// STFT window (default: Hann).
+    pub window: WindowType,
     /// Number of mel filterbank features (default: 128).
     pub features: usize,
     /// FFT size (default: 512).
     pub n_fft: usize,
     /// Whether to apply log compression (default: true).
     pub log: bool,
-    /// Normalization mode: "per_feature" or "NA" (default: "NA").
-    pub normalize: String,
+    /// Feature normalization (default: none). Only per-feature and none are
+    /// supported.
+    pub normalize: Normalize,
     /// Dither amount for numerical stability (default: 1e-5, 0.0 to disable).
     pub dither: f32,
     /// Pre-emphasis coefficient (default: None, Some(0.97) typical).
@@ -107,11 +108,11 @@ impl Default for MelConfig {
             sample_rate: 16000,
             window_size: 0.025,
             window_stride: 0.01,
-            window: "hann".to_string(),
+            window: WindowType::Hann,
             features: 128,
             n_fft: 512,
             log: true,
-            normalize: "NA".to_string(),
+            normalize: Normalize::Disabled,
             dither: 1e-5,
             preemph: None,
             fmin: 0.0,
@@ -196,7 +197,13 @@ impl MelProcessor {
 
         // Create window function (center-padded to n_fft)
         // Used for both batch and streaming processing
-        let window = dsp::create_window_padded(&config.window, win_samples, config.n_fft)?;
+        if !matches!(config.normalize, Normalize::PerFeature | Normalize::Disabled) {
+            return Err(Error::not_implemented(format!(
+                "mel normalization `{}` (only per_feature and none are supported)",
+                config.normalize
+            )));
+        }
+        let window = dsp::create_window_padded(config.window.as_str(), win_samples, config.n_fft)?;
 
         // Create mel filterbank using dsp module
         let filterbank = dsp::mel_filterbank(
@@ -355,8 +362,8 @@ impl MelProcessor {
         )?;
 
         // Apply normalization if requested
-        let mel = match self.config.normalize.as_str() {
-            "per_feature" => self.normalize_per_feature(&mel, &valid, &out_lengths)?,
+        let mel = match self.config.normalize {
+            Normalize::PerFeature => self.normalize_per_feature(&mel, &valid, &out_lengths)?,
             _ => mel,
         };
         let mel = ops::select(&valid, &mel, &Array::from_f32(0.0))?;
@@ -536,8 +543,8 @@ impl MelProcessor {
         };
 
         // Apply normalization if requested
-        let mel = match self.config.normalize.as_str() {
-            "per_feature" => {
+        let mel = match self.config.normalize {
+            Normalize::PerFeature => {
                 // Per-feature norm over time axis (axis 1)
                 let mean = ops::mean_axis(&mel, 1, Some(true))?;
                 let centered = ops::subtract(&mel, &mean)?;
@@ -1308,7 +1315,7 @@ mod tests {
         let config = MelConfig {
             preemph: None,
             dither: 0.0,
-            normalize: "per_feature".to_string(),
+            normalize: Normalize::PerFeature,
             ..Default::default()
         };
         let mel = MelProcessor::new(config).unwrap();
@@ -1641,7 +1648,7 @@ mod tests {
         // Streaming in uneven pieces plus the flush gives the centered STFT of
         // the whole signal, frame for frame (preemphasis included)
         let config = MelConfig {
-            normalize: "NA".to_string(),
+            normalize: Normalize::Disabled,
             dither: 0.0,
             ..Default::default()
         };

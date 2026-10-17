@@ -12,7 +12,7 @@ use mlx_rs::ops::indexing::IndexOp;
 
 use crate::asr::modules::{DecoderState, PredictionNetwork};
 use super::TimedToken;
-use crate::asr::modules::RNNTJoint;
+use crate::asr::modules::RnntJoint;
 use crate::core::ArrayExt;
 use crate::core::error::{Error, Result};
 
@@ -55,7 +55,7 @@ pub fn rnnt_beam_decode(
     encoder_output: &Array,
     encoder_lengths: &Array,
     decoder: &PredictionNetwork,
-    joint: &RNNTJoint,
+    joint: &RnntJoint,
     blank_id: usize,
     beam_size: usize,
 ) -> Result<Vec<Vec<TimedToken>>> {
@@ -85,7 +85,7 @@ fn beam_search_single(
     enc_proj: &Array,
     seq_len: usize,
     decoder: &PredictionNetwork,
-    joint: &RNNTJoint,
+    joint: &RnntJoint,
     blank_id: usize,
     beam_size: usize,
 ) -> Result<Vec<TimedToken>> {
@@ -182,7 +182,7 @@ fn beam_search_single(
 /// sequence), projected into the joint space, and the decoder state after it.
 fn predict(
     decoder: &PredictionNetwork,
-    joint: &RNNTJoint,
+    joint: &RnntJoint,
     token: Option<usize>,
     state: &DecoderState,
 ) -> Result<(Array, DecoderState)> {

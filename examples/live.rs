@@ -29,7 +29,7 @@ use std::time::{Duration, Instant};
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{SampleFormat, StreamConfig};
-use mlx_voice::asr::{EncDecRNNTModel, StreamingModeInfo, StreamingOptions};
+use mlx_voice::asr::{EncDecRnntModel, StreamingModeInfo, StreamingOptions};
 use ringbuf::{
     HeapRb,
     traits::{Consumer, Producer, Split},
@@ -130,7 +130,7 @@ fn main() -> mlx_voice::Result<()> {
 
     println!("Loading model from: {}", model_path);
     let start = Instant::now();
-    let mut model = EncDecRNNTModel::from_pretrained(model_path)?;
+    let mut model = EncDecRnntModel::from_pretrained(model_path)?;
     println!("Model loaded in {:.2}s", start.elapsed().as_secs_f32());
 
     let target_rate = model.sample_rate();

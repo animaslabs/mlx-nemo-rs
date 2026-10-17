@@ -5,7 +5,7 @@
 //! `cargo test --release --features hub --test hub -- --ignored --test-threads=1`.
 
 use mlx_voice::HubRepo;
-use mlx_voice::asr::{EncDecClassificationModel, EncDecRNNTModel};
+use mlx_voice::asr::{EncDecClassificationModel, EncDecRnntModel};
 
 const TEST_AUDIO: &str = "samples/2086-149220-0033.wav";
 
@@ -25,7 +25,7 @@ fn test_hub_nemo_archive() {
 #[ignore]
 fn test_hub_safetensors_directory() {
     // A repository with MLX safetensors weights, config and tokenizer
-    let mut model = EncDecRNNTModel::from_pretrained(
+    let mut model = EncDecRnntModel::from_pretrained(
         HubRepo::new("animaslabs/nemotron-speech-streaming-en-0.6b-mlx-8bit").revision("main"),
     )
     .expect("Failed to load RNN-T model from the Hub");
@@ -41,6 +41,6 @@ fn test_hub_safetensors_directory() {
 #[test]
 #[ignore]
 fn test_missing_repository_is_an_error() {
-    let err = EncDecRNNTModel::from_pretrained("animaslabs/does-not-exist-xyz").unwrap_err();
+    let err = EncDecRnntModel::from_pretrained("animaslabs/does-not-exist-xyz").unwrap_err();
     assert!(err.to_string().contains("does-not-exist-xyz"), "{err}");
 }

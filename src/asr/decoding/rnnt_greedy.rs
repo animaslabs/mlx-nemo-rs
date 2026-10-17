@@ -8,7 +8,7 @@ use mlx_rs::Array;
 use mlx_rs::ops::indexing::{IndexOp, argmax_axis};
 use tracing::{debug, instrument, trace};
 
-use crate::asr::modules::{RNNTJoint, StatelessTransducerDecoder};
+use crate::asr::modules::{RnntJoint, StatelessTransducerDecoder};
 use crate::core::ArrayExt;
 use crate::core::error::Result;
 
@@ -42,7 +42,7 @@ pub fn rnnt_greedy_decode(
     encoder_output: &Array,
     encoder_lengths: &Array,
     decoder: &StatelessTransducerDecoder,
-    joint: &RNNTJoint,
+    joint: &RnntJoint,
     blank_id: usize,
     max_symbols_per_step: Option<usize>,
 ) -> Result<Vec<Vec<usize>>> {
@@ -194,7 +194,7 @@ pub fn rnnt_greedy_decode_batched(
     encoder_output: &Array,
     encoder_lengths: &Array,
     decoder: &StatelessTransducerDecoder,
-    joint: &RNNTJoint,
+    joint: &RnntJoint,
     blank_id: usize,
     max_symbols_per_step: Option<usize>,
 ) -> Result<Vec<Vec<usize>>> {

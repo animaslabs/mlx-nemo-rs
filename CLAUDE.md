@@ -67,17 +67,17 @@ The eval dataset revision is pinned in both `xtask/src/main.rs` and mlx-models `
 ### ASR Collection (`src/asr/`)
 
 **Models** (`models/`):
-- `EncDecCTCModel`: CTC-based ASR (e.g., parakeet-ctc-0.6b)
-- `EncDecRNNTModel`: RNN-T/Transducer ASR (e.g., parakeet-rnnt-0.6b)
+- `EncDecCtcModel`: CTC-based ASR (e.g., parakeet-ctc-0.6b)
+- `EncDecRnntModel`: RNN-T/Transducer ASR (e.g., parakeet-rnnt-0.6b)
 
 **Modules** (`modules/`):
 - `MelSpectrogram`: Audio preprocessing (mel filterbank features)
 - `ConformerEncoder`: FastConformer encoder with multi-head attention and convolution
-- `CTCDecoder`: CTC output projection layer
-- `RNNTJoint`: Joint network for RNN-T
+- `CtcDecoder`: CTC output projection layer
+- `RnntJoint`: Joint network for RNN-T
 - `SpeakerKernels`: Multitalker speaker kernels, applied by `ConformerEncoder` before selected layers when speaker targets are set
 - `SortformerModules`: SortFormer speaker head (diarization)
-- `LanguagePrompt`: Language-ID prompt (`prompt_kernel`) of multilingual prompt models; `RNNTJoint::project_encoder` applies it before the encoder projection, so every decode path is conditioned
+- `LanguagePrompt`: Language-ID prompt (`prompt_kernel`) of multilingual prompt models; `RnntJoint::project_encoder` applies it before the encoder projection, so every decode path is conditioned
 - `PredictionNetwork`: RNN-T decoder/prediction network
 
 **Pipeline** (`pipeline/`):
@@ -99,7 +99,7 @@ The eval dataset revision is pinned in both `xtask/src/main.rs` and mlx-models `
 
 1. Audio (f32 samples) → `MelSpectrogram` → mel features [batch, n_mels, frames]
 2. Mel features → `ConformerEncoder` → encoder output [batch, d_model, time']
-3. Encoder output → `CTCDecoder` or `RNNTJoint` → logits
+3. Encoder output → `CtcDecoder` or `RnntJoint` → logits
 4. Logits → greedy/beam decoding → token IDs → tokenizer → text
 
 For streaming:

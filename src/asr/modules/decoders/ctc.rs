@@ -12,7 +12,7 @@ use crate::core::quantization::{LinearLayer, QuantizationConfig, load_linear_lay
 
 /// CTC decoder that projects encoder output to vocabulary logits.
 #[derive(Debug)]
-pub struct CTCDecoder {
+pub struct CtcDecoder {
     #[allow(dead_code)]
     config: DecoderConfig,
     /// Linear projection to vocabulary size (supports quantized weights)
@@ -21,7 +21,7 @@ pub struct CTCDecoder {
     vocab_size: usize,
 }
 
-impl CTCDecoder {
+impl CtcDecoder {
     /// Create a new CTC decoder.
     ///
     /// # Arguments

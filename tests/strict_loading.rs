@@ -3,7 +3,7 @@
 use std::path::Path;
 
 use mlx_voice::LoadOptions;
-use mlx_voice::asr::{AsrModelConfig, EncDecRNNTModel};
+use mlx_voice::asr::{AsrModelConfig, EncDecRnntModel};
 use mlx_voice::core::checkpoint::NemoCheckpoint;
 
 const NEMOTRON: &str =
@@ -27,11 +27,11 @@ fn test_missing_tensor_is_an_error_unless_non_strict() {
         "{DROPPED} not in checkpoint"
     );
 
-    let mut model = EncDecRNNTModel::new(config.clone()).unwrap();
+    let mut model = EncDecRnntModel::new(config.clone()).unwrap();
     let err = model.load_weights(&weights, None).unwrap_err().to_string();
     assert!(err.contains(DROPPED), "unexpected error: {err}");
 
-    let mut model = EncDecRNNTModel::new(config).unwrap();
+    let mut model = EncDecRnntModel::new(config).unwrap();
     let report = model
         .load_weights_with(&weights, None, LoadOptions::default().strict(false))
         .unwrap();
@@ -50,7 +50,7 @@ fn test_complete_checkpoint_loads_strictly() {
     let checkpoint = NemoCheckpoint::open(path).unwrap();
     let config: AsrModelConfig = checkpoint.load_config().unwrap();
     let weights = checkpoint.load_weights().unwrap();
-    let mut model = EncDecRNNTModel::new(config).unwrap();
+    let mut model = EncDecRnntModel::new(config).unwrap();
     let report = model
         .load_weights_with(&weights, None, LoadOptions::default())
         .unwrap();

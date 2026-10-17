@@ -7,14 +7,14 @@
 //! Run with: cargo run --example debug_decoder_isolated
 
 use mlx_rs::Array;
-use mlx_voice::asr::EncDecRNNTModel;
+use mlx_voice::asr::EncDecRnntModel;
 
 fn main() -> mlx_voice::Result<()> {
     let model_path =
         "models/nvidia/nemotron-speech-streaming-en-0.6b/nemotron-speech-streaming-en-0.6b.nemo";
 
     println!("Loading model from: {}", model_path);
-    let model = EncDecRNNTModel::from_pretrained(model_path)?;
+    let model = EncDecRnntModel::from_pretrained(model_path)?;
 
     println!("\n=== Model Loaded ===");
     println!("Sample rate: {} Hz", model.sample_rate());
@@ -26,7 +26,7 @@ fn main() -> mlx_voice::Result<()> {
 
     println!("\n=== Decoder Configuration ===");
     println!("Pred hidden: {}", decoder.pred_hidden());
-    println!("Blank idx: {}", decoder.blank_idx());
+    println!("Blank idx: {}", decoder.blank_id());
     println!("Vocab size (excl blank): {}", decoder.vocab_size());
     println!("Is LSTM: {}", decoder.is_lstm());
 
@@ -110,7 +110,7 @@ fn main() -> mlx_voice::Result<()> {
     println!("  {:?}", first_5);
 
     // Get blank probability
-    let blank_id = decoder.blank_idx();
+    let blank_id = decoder.blank_id();
     let blank_prob = lp_slice.get(blank_id).copied().unwrap_or(f32::NEG_INFINITY);
     println!("\nBlank (id={}) log prob: {:.6}", blank_id, blank_prob);
 

@@ -13,7 +13,7 @@ use mlx_rs::nn;
 use mlx_rs::ops::indexing::IndexOp;
 
 use super::attention::{AttentionContext, RelPositionMultiHeadAttention, RelPositionalEncoding};
-use crate::asr::config::EncoderConfig;
+use crate::asr::config::{AttContextStyle, ConvNormType, EncoderConfig};
 use crate::asr::modules::speaker_kernel::{SpeakerKernels, SpeakerTargets};
 use crate::core::ArrayExt;
 use crate::core::error::Result;
@@ -357,7 +357,7 @@ pub struct ConformerEncoder {
     att_context_size: Option<(i32, i32)>,
 
     /// Attention context style ("regular" or "chunked_limited")
-    att_context_style: String,
+    att_context_style: AttContextStyle,
 
     /// Speaker kernels (multitalker ASR models only)
     speaker_kernels: Option<SpeakerKernels>,
@@ -382,7 +382,7 @@ impl ConformerEncoder {
         let d_model = config.d_model;
         let n_layers = config.n_layers;
         let pos_emb_max_len = config.pos_emb_max_len;
-        let xscaling = config.xscaling.unwrap_or(true);
+        let xscaling = config.xscaling;
 
         // Create subsampling layer
         let subsampling = Subsampling::new(&config)?;
@@ -400,11 +400,8 @@ impl ConformerEncoder {
         let att_context_size = config
             .att_context_size
             .as_ref()
-            .and_then(|cs| cs.get_default());
-        let att_context_style = config
-            .att_context_style
-            .clone()
-            .unwrap_or_else(|| "regular".to_string());
+            .and_then(|cs| cs.default_mode());
+        let att_context_style = config.att_context_style.clone();
 
         Ok(Self {
             config,
@@ -443,7 +440,7 @@ impl ConformerEncoder {
             .config
             .att_context_size
             .as_ref()
-            .and_then(|cs| cs.get_mode(mode_idx))
+            .and_then(|cs| cs.mode(mode_idx))
         {
             tracing::debug!(
                 mode_idx,
@@ -568,8 +565,8 @@ impl ConformerEncoder {
         self.config
             .att_context_size
             .as_ref()
-            .and_then(|cs| cs.get_default())
-            .and_then(|size| AttentionContext::new(size, &self.att_context_style))
+            .and_then(|cs| cs.default_mode())
+            .and_then(|size| AttentionContext::new(size, self.att_context_style.as_str()))
     }
 
     /// Get output dimension.
@@ -650,13 +647,13 @@ impl ConformerEncoder {
     }
 
     /// Get the attention context style.
-    pub fn att_context_style(&self) -> &str {
+    pub fn att_context_style(&self) -> &AttContextStyle {
         &self.att_context_style
     }
 
     /// Check if this is a chunked_limited style encoder.
     pub fn is_chunked_limited(&self) -> bool {
-        self.att_context_style == "chunked_limited"
+        self.att_context_style == AttContextStyle::ChunkedLimited
     }
 
     /// Forward pass through subsampling layer only.
@@ -895,7 +892,7 @@ impl ConformerEncoder {
                 if !self.streaming_masks.contains_key(&key) {
                     let mask = create_attention_mask(
                         ctx,
-                        &self.att_context_style,
+                        self.att_context_style.as_str(),
                         total_len,
                         cache_size,
                         filled_cache_len,
@@ -1111,7 +1108,7 @@ impl Subsampling {
         let d_model = config.d_model;
         let subsampling_factor = config.subsampling_factor;
         let conv_channels = config.subsampling_conv_channels.unwrap_or(256);
-        let is_causal = config.is_causal_downsampling();
+        let is_causal = config.causal_downsampling;
 
         // Number of striding operations: log2(subsampling_factor)
         let n_strides = match subsampling_factor {
@@ -1635,7 +1632,7 @@ impl ConformerBlock {
         let ff_dim = (d_model as f32 * config.ff_expansion_factor) as usize;
         let conv_kernel = config.conv_kernel_size;
         let dropout = config.dropout;
-        let use_bias = config.effective_use_bias();
+        let use_bias = config.use_bias;
 
         // Check if causal convolution is requested
         let is_causal = config.is_causal_conv();
@@ -2105,7 +2102,7 @@ impl ConvolutionModule {
         d_model: usize,
         kernel_size: usize,
         _dropout: f32,
-        norm_type: &str,
+        norm_type: &ConvNormType,
         is_causal: bool,
         use_bias: bool,
     ) -> Result<Self> {
@@ -2120,7 +2117,7 @@ impl ConvolutionModule {
 
         // Create normalization layer based on type
         let norm = match norm_type {
-            "layer_norm" => ConvNorm::LayerNorm(nn::LayerNorm::new(d_model as i32)?),
+            ConvNormType::LayerNorm => ConvNorm::LayerNorm(nn::LayerNorm::new(d_model as i32)?),
             _ => {
                 // Inference mode: normalize with the loaded running stats. In
                 // training mode mlx-rs normalizes with each input's own stats
@@ -2411,7 +2408,7 @@ mod tests {
             config.d_model = 8;
             config.subsampling_factor = 8;
             config.subsampling_conv_channels = Some(4);
-            config.causal_downsampling = Some(causal);
+            config.causal_downsampling = causal;
             let mut sub = Subsampling::new(&config).unwrap();
             // Constructor weights are placeholders until a checkpoint loads; give the
             // depthwise convs the real [channels, k, k, 1] shape.

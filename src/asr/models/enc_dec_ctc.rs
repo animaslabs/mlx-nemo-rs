@@ -10,9 +10,9 @@
 //!
 //! ```no_run
 //! # fn main() -> mlx_voice::Result<()> {
-//! # use mlx_voice::asr::EncDecCTCModel;
+//! # use mlx_voice::asr::EncDecCtcModel;
 //! # let audio_chunks: Vec<Vec<f32>> = Vec::new();
-//! let mut model = EncDecCTCModel::from_pretrained("model.nemo")?;
+//! let mut model = EncDecCtcModel::from_pretrained("model.nemo")?;
 //!
 //! // Check streaming support and modes
 //! if model.supports_streaming() {
@@ -44,7 +44,7 @@ use mlx_rs::Array;
 use crate::asr::Tokenizer;
 use crate::asr::config::AsrModelConfig;
 use crate::asr::decoding::{greedy_ctc_merge, greedy_decode, lcs_merge_buffer};
-use crate::asr::modules::{CTCDecoder, ConformerEncoder, MelProcessor};
+use crate::asr::modules::{ConformerEncoder, CtcDecoder, MelProcessor};
 use crate::asr::streaming::{
     EncoderCache, StreamingConfig, StreamingModeInfo, StreamingOutput, compute_streaming_config,
     get_streaming_modes,
@@ -67,21 +67,22 @@ use crate::core::source::{LocalModel, ModelSource};
 ///
 /// ```no_run
 /// # fn main() -> mlx_voice::Result<()> {
-/// use mlx_voice::asr::EncDecCTCModel;
+/// use mlx_voice::asr::EncDecCtcModel;
 ///
 /// // Load from .nemo checkpoint
-/// let mut model = EncDecCTCModel::from_pretrained("model.nemo")?;
+/// let mut model = EncDecCtcModel::from_pretrained("model.nemo")?;
 ///
 /// // Transcribe audio files
 /// let texts = model.transcribe(&["audio.wav"])?;
 /// # Ok(())
 /// # }
 /// ```
-pub struct EncDecCTCModel {
+#[doc(alias = "EncDecCTCModel")]
+pub struct EncDecCtcModel {
     config: AsrModelConfig,
     preprocessor: MelProcessor,
     encoder: ConformerEncoder,
-    decoder: CTCDecoder,
+    decoder: CtcDecoder,
     tokenizer: Option<Tokenizer>,
     /// Blank token ID for CTC (typically last token in vocab)
     blank_id: usize,
@@ -95,9 +96,9 @@ impl CtcStreamingSession {
     }
 }
 
-impl std::fmt::Debug for EncDecCTCModel {
+impl std::fmt::Debug for EncDecCtcModel {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("EncDecCTCModel")
+        f.debug_struct("EncDecCtcModel")
             .field("sample_rate", &self.sample_rate())
             .field("encoder_layers", &self.encoder.num_layers())
             .field("blank_id", &self.blank_id)
@@ -106,7 +107,7 @@ impl std::fmt::Debug for EncDecCTCModel {
     }
 }
 
-impl EncDecCTCModel {
+impl EncDecCtcModel {
     /// Create a new model from configuration.
     pub fn new(config: AsrModelConfig) -> Result<Self> {
         config.validate()?;
@@ -117,14 +118,10 @@ impl EncDecCTCModel {
         let encoder = ConformerEncoder::new(config.encoder.clone())?;
 
         // Determine vocabulary size from config or default
-        let vocab_size = if config.decoder.num_classes > 0 {
-            config.decoder.num_classes as usize
-        } else {
-            // Will be set when loading tokenizer
-            1024 // Default placeholder
-        };
+        // Set properly when the tokenizer loads
+        let vocab_size = config.decoder.num_classes.unwrap_or(1024);
 
-        let decoder = CTCDecoder::new(config.decoder.clone(), encoder.output_dim(), vocab_size)?;
+        let decoder = CtcDecoder::new(config.decoder.clone(), encoder.output_dim(), vocab_size)?;
 
         // Blank is typically the last token
         let blank_id = vocab_size - 1;
@@ -151,11 +148,11 @@ impl EncDecCTCModel {
     ///
     /// ```no_run
     /// # fn main() -> mlx_voice::Result<()> {
-    /// use mlx_voice::asr::EncDecCTCModel;
+    /// use mlx_voice::asr::EncDecCtcModel;
     ///
-    /// let mut model = EncDecCTCModel::from_pretrained("model.nemo")?;
+    /// let mut model = EncDecCtcModel::from_pretrained("model.nemo")?;
     /// // Downloads with the `hub` feature
-    /// let mut model = EncDecCTCModel::from_pretrained("nvidia/parakeet-ctc-0.6b")?;
+    /// let mut model = EncDecCtcModel::from_pretrained("nvidia/parakeet-ctc-0.6b")?;
     /// let texts = model.transcribe(&["audio.wav"])?;
     /// # Ok(())
     /// # }
@@ -229,9 +226,9 @@ impl EncDecCTCModel {
     ///
     /// ```no_run
     /// # fn main() -> mlx_voice::Result<()> {
-    /// # use mlx_voice::{asr::EncDecCTCModel, WeightFormat};
+    /// # use mlx_voice::{asr::EncDecCtcModel, WeightFormat};
     /// // Load with explicit format
-    /// let model = EncDecCTCModel::from_safetensors(
+    /// let model = EncDecCtcModel::from_safetensors(
     ///     "weights.safetensors",
     ///     "config.yaml",
     ///     Some("tokenizer.model"),
@@ -239,7 +236,7 @@ impl EncDecCTCModel {
     /// )?;
     ///
     /// // Load with auto-detected format
-    /// let model = EncDecCTCModel::from_safetensors(
+    /// let model = EncDecCtcModel::from_safetensors(
     ///     "weights.safetensors",
     ///     "config.yaml",
     ///     Some("tokenizer.model"),

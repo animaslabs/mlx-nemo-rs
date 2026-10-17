@@ -2,13 +2,13 @@
 //!
 //! This module implements the Transducer decoder components:
 //! - `StatelessTransducerDecoder`: The prediction network (label model)
-//! - `RNNTJoint`: The joint network that combines encoder and prediction outputs
+//! - `RnntJoint`: The joint network that combines encoder and prediction outputs
 
 use mlx_rs::Array;
 use mlx_rs::ops::{self, indexing::IndexOp};
 use tracing::{debug, instrument, trace, trace_span};
 
-use crate::asr::config::{DecoderConfig, JointConfig};
+use crate::asr::config::{Activation, DecoderConfig, JointConfig};
 use crate::asr::modules::LanguagePrompt;
 use crate::core::error::{Error, Result};
 use crate::core::loading::Weights;
@@ -32,7 +32,7 @@ pub struct StatelessTransducerDecoder {
     /// Vocabulary size (excluding blank)
     vocab_size: usize,
     /// Blank token index (typically vocab_size)
-    blank_idx: usize,
+    blank_id: usize,
 }
 
 impl StatelessTransducerDecoder {
@@ -49,7 +49,7 @@ impl StatelessTransducerDecoder {
             .unwrap_or(640);
 
         let context_size = config.context_size.unwrap_or(2);
-        let blank_idx = vocab_size;
+        let blank_id = vocab_size;
 
         // Initialize embedding with zeros (will be loaded from weights)
         // Shape: [vocab_size + 1, pred_hidden] (includes blank token)
@@ -61,7 +61,7 @@ impl StatelessTransducerDecoder {
             pred_hidden,
             context_size,
             vocab_size,
-            blank_idx,
+            blank_id,
         })
     }
 
@@ -71,8 +71,8 @@ impl StatelessTransducerDecoder {
     }
 
     /// Get the blank token index.
-    pub fn blank_idx(&self) -> usize {
-        self.blank_idx
+    pub fn blank_id(&self) -> usize {
+        self.blank_id
     }
 
     /// Get the vocabulary size (excluding blank).
@@ -94,13 +94,13 @@ impl StatelessTransducerDecoder {
     /// * `batch_size` - Number of sequences in the batch
     ///
     /// # Returns
-    /// * State tensor of shape [batch_size, context_size - 1] filled with blank_idx
-    #[instrument(skip(self), fields(batch_size, context_size = self.context_size, blank_idx = self.blank_idx))]
+    /// * State tensor of shape [batch_size, context_size - 1] filled with blank_id
+    #[instrument(skip(self), fields(batch_size, context_size = self.context_size, blank_id = self.blank_id))]
     pub fn initialize_state(&self, batch_size: usize) -> Result<Array> {
         // State contains context_size - 1 previous tokens (the current token completes it)
         let state_len = self.context_size.saturating_sub(1).max(1);
-        // Create state filled with blank_idx
-        let fill_value = Array::from_int(self.blank_idx as i32);
+        // Create state filled with blank_id
+        let fill_value = Array::from_int(self.blank_id as i32);
         let state = Array::full::<i32>(&[batch_size as i32, state_len as i32], &fill_value)?;
         debug!(state_shape = ?state.shape(), "Initialized stateless decoder state");
         Ok(state)
@@ -272,9 +272,9 @@ impl StatelessTransducerDecoder {
         } else {
             trace!("Single-step prediction with blank token");
             // No token - return blank embedding
-            let fill_value = Array::from_int(self.blank_idx as i32);
-            let blank_idx = Array::full::<i32>(&[batch as i32, 1], &fill_value)?;
-            let blank_emb = self.embed(&blank_idx)?;
+            let fill_value = Array::from_int(self.blank_id as i32);
+            let blank_id = Array::full::<i32>(&[batch as i32, 1], &fill_value)?;
+            let blank_emb = self.embed(&blank_id)?;
 
             // State stays the same when outputting blank
             trace!(output_shape = ?blank_emb.shape(), "Blank embedding returned");
@@ -331,7 +331,7 @@ impl StatelessTransducerDecoder {
 ///
 /// State consists of (hidden, cell) tensors for each LSTM layer.
 #[derive(Debug)]
-pub struct RNNTDecoder {
+pub struct RnntDecoder {
     /// Embedding layer: vocab_size + 1 (blank) -> pred_hidden (supports quantized weights)
     embedding: EmbeddingLayer,
     /// LSTM layers - list of (weight_ih, weight_hh, bias_ih, bias_hh) (not quantized)
@@ -343,7 +343,7 @@ pub struct RNNTDecoder {
     /// Vocabulary size (excluding blank)
     vocab_size: usize,
     /// Blank token index (typically vocab_size)
-    blank_idx: usize,
+    blank_id: usize,
 }
 
 /// Weights for a single LSTM layer.
@@ -398,7 +398,7 @@ pub struct LstmState {
     pub cell: Array,
 }
 
-impl RNNTDecoder {
+impl RnntDecoder {
     /// Create a new LSTM-based transducer decoder.
     ///
     /// # Arguments
@@ -417,7 +417,7 @@ impl RNNTDecoder {
             .and_then(|p| p.pred_rnn_layers)
             .unwrap_or(2);
 
-        let blank_idx = vocab_size;
+        let blank_id = vocab_size;
 
         // Initialize embedding with zeros (will be loaded from weights)
         // Shape: [vocab_size + 1, pred_hidden] (includes blank token)
@@ -436,7 +436,7 @@ impl RNNTDecoder {
             pred_hidden,
             num_layers,
             vocab_size,
-            blank_idx,
+            blank_id,
         })
     }
 
@@ -446,8 +446,8 @@ impl RNNTDecoder {
     }
 
     /// Get the blank token index.
-    pub fn blank_idx(&self) -> usize {
-        self.blank_idx
+    pub fn blank_id(&self) -> usize {
+        self.blank_id
     }
 
     /// Get the vocabulary size (excluding blank).
@@ -516,10 +516,10 @@ impl RNNTDecoder {
             self.embed(y)?
         } else {
             // Use blank token embedding
-            trace!(blank_idx = self.blank_idx, "Embedding blank token");
-            let fill_value = Array::from_int(self.blank_idx as i32);
-            let blank_idx = Array::full::<i32>(&[batch_size as i32, 1], &fill_value)?;
-            self.embed(&blank_idx)?
+            trace!(blank_id = self.blank_id, "Embedding blank token");
+            let fill_value = Array::from_int(self.blank_id as i32);
+            let blank_id = Array::full::<i32>(&[batch_size as i32, 1], &fill_value)?;
+            self.embed(&blank_id)?
         };
 
         trace!(embedding_shape = ?embedding.shape(), "Embedding computed");
@@ -718,12 +718,16 @@ pub enum JointActivation {
 }
 
 impl JointActivation {
-    /// Parse activation from string.
-    pub fn from_str(s: &str) -> Self {
-        match s.to_lowercase().as_str() {
-            "tanh" => Self::Tanh,
-            "sigmoid" => Self::Sigmoid,
-            _ => Self::Relu, // Default to ReLU
+    /// The joint activation for a configured one; NeMo's joint supports relu,
+    /// tanh and sigmoid.
+    pub fn new(activation: &Activation) -> Result<Self> {
+        match activation {
+            Activation::Relu => Ok(Self::Relu),
+            Activation::Tanh => Ok(Self::Tanh),
+            Activation::Sigmoid => Ok(Self::Sigmoid),
+            other => Err(Error::not_implemented(format!(
+                "joint activation `{other}` (only relu, tanh and sigmoid are supported)"
+            ))),
         }
     }
 
@@ -755,7 +759,7 @@ impl JointActivation {
 ///
 /// where h is encoder output and g is prediction network output.
 #[derive(Debug)]
-pub struct RNNTJoint {
+pub struct RnntJoint {
     /// Language-ID conditioning applied to encoder frames before `encoder_proj`
     /// (prompt-conditioned models only)
     prompt: Option<LanguagePrompt>,
@@ -773,7 +777,7 @@ pub struct RNNTJoint {
     vocab_size: usize,
 }
 
-impl RNNTJoint {
+impl RnntJoint {
     /// Create a new joint network.
     ///
     /// # Arguments
@@ -788,9 +792,9 @@ impl RNNTJoint {
         vocab_size: usize,
     ) -> Result<Self> {
         let joint_hidden = config.joint_hidden;
-        let activation = JointActivation::from_str(&config.activation);
+        let activation = JointActivation::new(&config.activation)?;
         tracing::debug!(
-            "RNNTJoint::new encoder_hidden {} pred_hidden {} vocab_size {} activation {:?}",
+            "RnntJoint::new encoder_hidden {} pred_hidden {} vocab_size {} activation {:?}",
             encoder_hidden,
             pred_hidden,
             vocab_size,
@@ -1031,7 +1035,7 @@ mod tests {
         assert_eq!(decoder.pred_hidden(), 256);
         assert_eq!(decoder.context_size(), 2);
         assert_eq!(decoder.vocab_size(), 1000);
-        assert_eq!(decoder.blank_idx(), 1000);
+        assert_eq!(decoder.blank_id(), 1000);
     }
 
     #[test]
@@ -1057,11 +1061,11 @@ mod tests {
     fn test_joint_init() {
         let config = JointConfig {
             joint_hidden: 512,
-            activation: "relu".to_string(),
+            activation: Activation::Relu,
             ..Default::default()
         };
 
-        let joint = RNNTJoint::new(&config, 640, 256, 1001).unwrap();
+        let joint = RnntJoint::new(&config, 640, 256, 1001).unwrap();
         assert_eq!(joint.vocab_size(), 1001);
         assert_eq!(joint.joint_hidden, 512);
     }

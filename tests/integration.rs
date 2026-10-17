@@ -8,7 +8,7 @@
 use std::path::Path;
 
 use mlx_voice::asr::{
-    AudioInput, EncDecClassificationModel, EncDecRNNTModel, StreamingOptions, StreamingSession,
+    AudioInput, EncDecClassificationModel, EncDecRnntModel, StreamingOptions, StreamingSession,
     TranscribeOptions, Transcript, VadPostProcessConfig, VadPostProcessor,
 };
 
@@ -100,7 +100,7 @@ fn test_full_file_transcription_rnnt() {
         return;
     }
 
-    let mut model = EncDecRNNTModel::from_pretrained(model_dir).expect("Failed to load RNNT model");
+    let mut model = EncDecRnntModel::from_pretrained(model_dir).expect("Failed to load RNNT model");
 
     let transcriptions = model
         .transcribe(&[TEST_AUDIO])
@@ -131,7 +131,7 @@ fn test_in_memory_audio_matches_file() {
     if !require_model(model_dir) {
         return;
     }
-    let mut model = EncDecRNNTModel::from_pretrained(model_dir).expect("Failed to load RNNT model");
+    let mut model = EncDecRnntModel::from_pretrained(model_dir).expect("Failed to load RNNT model");
 
     let from_file = model
         .transcribe_one(TEST_AUDIO)
@@ -179,7 +179,7 @@ fn test_word_timestamps() {
     if !require_model(model_dir) {
         return;
     }
-    let mut model = EncDecRNNTModel::from_pretrained(model_dir).expect("Failed to load RNNT model");
+    let mut model = EncDecRnntModel::from_pretrained(model_dir).expect("Failed to load RNNT model");
     let (samples, sample_rate) = mlx_voice::audio::load_wav(TEST_AUDIO).unwrap();
     let duration = samples.len() as f32 / sample_rate as f32;
 
@@ -218,7 +218,7 @@ fn test_tokenizer_round_trip() {
     if !require_model(model_dir) {
         return;
     }
-    let model = EncDecRNNTModel::from_pretrained(model_dir).expect("Failed to load RNNT model");
+    let model = EncDecRnntModel::from_pretrained(model_dir).expect("Failed to load RNNT model");
     let tokenizer = model.tokenizer().expect("model has a tokenizer");
 
     assert_eq!(tokenizer.vocab_size(), model.blank_id());
@@ -237,7 +237,7 @@ fn test_multilingual_offline_transcription() {
     if !require_model(model_path) {
         return;
     }
-    let mut model = EncDecRNNTModel::from_pretrained(model_path).expect("Failed to load model");
+    let mut model = EncDecRnntModel::from_pretrained(model_path).expect("Failed to load model");
 
     // Auto mode detects the language and keeps the tag out of text and words
     let auto = model.transcribe_one(TEST_AUDIO).unwrap();
@@ -276,7 +276,7 @@ fn test_multilingual_streaming_transcription() {
         return;
     }
 
-    let mut model = EncDecRNNTModel::from_pretrained(model_path).expect("Failed to load model");
+    let mut model = EncDecRnntModel::from_pretrained(model_path).expect("Failed to load model");
     assert_eq!(model.language(), Some("auto"));
     assert!(model.languages().contains(&"de-DE"));
     assert!(model.set_language("xx-YY").is_err());
@@ -310,7 +310,7 @@ fn test_streaming_transcription() {
     if !require_model(model_dir) {
         return;
     }
-    let mut model = EncDecRNNTModel::from_pretrained(model_dir).expect("Failed to load model");
+    let mut model = EncDecRnntModel::from_pretrained(model_dir).expect("Failed to load model");
 
     // Live-style input: 100 ms chunks at 48 kHz, resampled by the session
     let (samples, sample_rate) = mlx_voice::audio::load_wav(TEST_AUDIO).unwrap();
@@ -395,7 +395,7 @@ fn test_streaming_modes_are_independent() {
     if !require_model(model_dir) {
         return;
     }
-    let mut model = EncDecRNNTModel::from_pretrained(model_dir).expect("Failed to load model");
+    let mut model = EncDecRnntModel::from_pretrained(model_dir).expect("Failed to load model");
     let offline = model.transcribe_one(TEST_AUDIO).unwrap();
 
     // Streaming in another mode leaves offline transcription unchanged
@@ -408,7 +408,7 @@ fn test_streaming_modes_are_independent() {
     let mode_0 = model
         .transcribe_streaming(TEST_AUDIO, StreamingOptions::default())
         .unwrap();
-    let mut fresh = EncDecRNNTModel::from_pretrained(model_dir).unwrap();
+    let mut fresh = EncDecRnntModel::from_pretrained(model_dir).unwrap();
     let fresh_0 = fresh
         .transcribe_streaming(TEST_AUDIO, StreamingOptions::default())
         .unwrap();
@@ -417,7 +417,7 @@ fn test_streaming_modes_are_independent() {
 
     // An owned session hands its model back
     let session = StreamingSession::new(fresh, StreamingOptions::default()).unwrap();
-    let _model: EncDecRNNTModel = session.into_model();
+    let _model: EncDecRnntModel = session.into_model();
 }
 
 #[test]

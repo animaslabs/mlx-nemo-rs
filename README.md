@@ -6,8 +6,8 @@ mlx-voice loads NeMo checkpoints (`.nemo` archives) or converted MLX safetensors
 
 ## Features
 
-- **CTC ASR**: `EncDecCTCModel` (e.g. `nvidia/parakeet-ctc-0.6b`)
-- **RNN-T / Transducer ASR**: `EncDecRNNTModel` with greedy or beam search decoding (e.g. `nvidia/parakeet-rnnt-0.6b`)
+- **CTC ASR**: `EncDecCtcModel` (e.g. `nvidia/parakeet-ctc-0.6b`)
+- **RNN-T / Transducer ASR**: `EncDecRnntModel` with greedy or beam search decoding (e.g. `nvidia/parakeet-rnnt-0.6b`)
 - **Cache-aware streaming**: `StreamingSession` for low-latency incremental transcription with selectable latency modes (e.g. `nvidia/nemotron-speech-streaming-en-0.6b`)
 - **Multilingual streaming**: language-ID prompt conditioning for `nvidia/nemotron-3.5-asr-streaming-0.6b` (40 language-locales), with a chosen target language or automatic language detection
 - **Voice activity detection**: `EncDecClassificationModel` with NeMo-style post-processing (e.g. `nvidia/Frame_VAD_Multilingual_MarbleNet_v2.0`)
@@ -63,22 +63,22 @@ An existing path always wins over a repository id. `from_safetensors` loads a lo
 ### Offline transcription (CTC)
 
 ```rust
-use mlx_voice::asr::EncDecCTCModel;
+use mlx_voice::asr::EncDecCtcModel;
 
 fn main() -> mlx_voice::Result<()> {
-    let mut model = EncDecCTCModel::from_pretrained("models/nvidia/parakeet-ctc-0.6b/parakeet-ctc-0.6b.nemo")?;
+    let mut model = EncDecCtcModel::from_pretrained("models/nvidia/parakeet-ctc-0.6b/parakeet-ctc-0.6b.nemo")?;
     let transcriptions = model.transcribe(&["audio.wav"])?;
     println!("{}", transcriptions[0]);
     Ok(())
 }
 ```
 
-`EncDecRNNTModel` has the same `from_pretrained` / `transcribe` API. `transcribe` takes WAV paths or in-memory audio and returns a `Transcript` per input, with the text plus per-token and per-word timestamps in seconds. `TranscribeOptions` selects beam search, a language and the batch size:
+`EncDecRnntModel` has the same `from_pretrained` / `transcribe` API. `transcribe` takes WAV paths or in-memory audio and returns a `Transcript` per input, with the text plus per-token and per-word timestamps in seconds. `TranscribeOptions` selects beam search, a language and the batch size:
 
 ```rust
-use mlx_voice::asr::{EncDecRNNTModel, TranscribeOptions};
+use mlx_voice::asr::{EncDecRnntModel, TranscribeOptions};
 
-let mut model = EncDecRNNTModel::from_pretrained("nvidia/parakeet-rnnt-0.6b")?; // `hub` feature
+let mut model = EncDecRnntModel::from_pretrained("nvidia/parakeet-rnnt-0.6b")?; // `hub` feature
 let transcript = model.transcribe_one((&samples[..], 48_000))?; // resampled to 16 kHz
 for word in &transcript.words {
     println!("{:6.2}-{:6.2} {}", word.start, word.end, word.text);
@@ -95,10 +95,10 @@ let transcripts = model.transcribe_with(["a.wav", "b.wav"], &options)?;
 `model.stream(options)` starts a `StreamingSession`: push audio as it arrives, at any sample rate, and pull updates. Each update carries the text appended since the last one (`delta`) and the new tokens with their times. `StreamingOptions::mode` picks the streaming mode, an index into the checkpoint's `att_context_size` list. NeMo lists modes from most to least lookahead, so `0`, the default, has the highest latency and accuracy; `model.streaming_modes()` gives each mode's latency.
 
 ```rust
-use mlx_voice::asr::{EncDecRNNTModel, StreamingOptions};
+use mlx_voice::asr::{EncDecRnntModel, StreamingOptions};
 
 fn main() -> mlx_voice::Result<()> {
-    let mut model = EncDecRNNTModel::from_pretrained(
+    let mut model = EncDecRnntModel::from_pretrained(
         "models/nvidia/nemotron-speech-streaming-en-0.6b/nemotron-speech-streaming-en-0.6b.nemo",
     )?;
     let mut stream = model.stream(StreamingOptions::default())?;
@@ -124,7 +124,7 @@ For a whole file, `model.transcribe_streaming("audio.wav", options)?` returns th
 `nvidia/nemotron-3.5-asr-streaming-0.6b` conditions its output on a target language. It starts in `"auto"` mode, where the model detects the language and emits a tag such as `<de-DE>` after each sentence's terminal punctuation. Tags are stripped from the text by default but stay in the token ids:
 
 ```rust
-let mut model = EncDecRNNTModel::from_pretrained(
+let mut model = EncDecRnntModel::from_pretrained(
     "models/nvidia/nemotron-3.5-asr-streaming-0.6b/nemotron-3.5-asr-streaming-0.6b.nemo",
 )?;
 model.set_language("de-DE")?; // or "de", "auto"; see model.languages()
@@ -196,7 +196,7 @@ Each example documents its options at the top of its source file in [`examples/`
 ## Architecture
 
 ```
-audio (f32) → MelSpectrogram → ConformerEncoder → CTCDecoder | RNNTJoint + PredictionNetwork
+audio (f32) → MelSpectrogram → ConformerEncoder → CtcDecoder | RnntJoint + PredictionNetwork
             → greedy / beam search → token IDs → SentencePiece tokenizer → text
 ```
 

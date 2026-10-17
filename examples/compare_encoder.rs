@@ -5,7 +5,7 @@
 //!
 //! Run with: cargo run --example compare_encoder
 
-use mlx_voice::asr::{EncDecRNNTModel, StreamingOptions};
+use mlx_voice::asr::{EncDecRnntModel, StreamingOptions};
 
 fn main() -> mlx_voice::Result<()> {
     let model_path =
@@ -13,7 +13,7 @@ fn main() -> mlx_voice::Result<()> {
     let audio_path = "samples/2086-149220-0033.wav";
 
     println!("Loading model from: {}", model_path);
-    let mut model = EncDecRNNTModel::from_pretrained(model_path)?;
+    let mut model = EncDecRnntModel::from_pretrained(model_path)?;
     let mut stream = model.stream(StreamingOptions::default().mode(2))?; // mode 2 = 80ms lookahead
 
     println!("\n=== Model Loaded ===");

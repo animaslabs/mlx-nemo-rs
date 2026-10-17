@@ -5,9 +5,184 @@
 
 use std::collections::BTreeMap;
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::core::error::{Error, Result};
+
+/// Declare an enum that (de)serializes as NeMo's string values. A value this
+/// crate doesn't know parses as `Other`, so configs from newer NeMo versions
+/// still load; the parts of the model that can't run it reject it at load
+/// time instead.
+macro_rules! config_enum {
+    (
+        $(#[$meta:meta])*
+        $name:ident {
+            $( $(#[$vmeta:meta])* $variant:ident = $value:literal $(| $alias:literal)* ),+ $(,)?
+        }
+    ) => {
+        $(#[$meta])*
+        #[derive(Debug, Clone, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+        #[non_exhaustive]
+        pub enum $name {
+            $(
+                $(#[$vmeta])*
+                #[serde(rename = $value $(, alias = $alias)*)]
+                $variant,
+            )+
+            /// A value this crate doesn't recognize
+            #[serde(untagged)]
+            Other(String),
+        }
+
+        impl $name {
+            /// The value as written in NeMo configs.
+            pub fn as_str(&self) -> &str {
+                match self {
+                    $(Self::$variant => $value,)+
+                    Self::Other(value) => value,
+                }
+            }
+        }
+
+        impl std::fmt::Display for $name {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str(self.as_str())
+            }
+        }
+    };
+}
+
+config_enum!(
+    /// STFT analysis window (`preprocessor.window`).
+    WindowType {
+        /// Hann window
+        #[default]
+        Hann = "hann",
+        /// Hamming window
+        Hamming = "hamming",
+    }
+);
+
+config_enum!(
+    /// Mel feature normalization (`preprocessor.normalize`).
+    Normalize {
+        /// Zero mean, unit variance per mel bin over time
+        #[default]
+        PerFeature = "per_feature",
+        /// Zero mean, unit variance over all features and time
+        AllFeatures = "all_features",
+        /// No normalization (NeMo writes `NA` or `None`)
+        Disabled = "NA" | "None" | "none",
+    }
+);
+
+config_enum!(
+    /// Encoder subsampling module (`encoder.subsampling`).
+    Subsampling {
+        /// Depthwise-separable striding convolutions (FastConformer)
+        #[default]
+        DwStriding = "dw_striding",
+        /// Striding convolutions
+        Striding = "striding",
+        /// VGGNet-style subsampling
+        Vggnet = "vggnet",
+        /// Frame stacking
+        Stacking = "stacking",
+    }
+);
+
+config_enum!(
+    /// Encoder self-attention (`encoder.self_attention_model`).
+    SelfAttentionModel {
+        /// Relative positional attention (Transformer-XL style)
+        #[default]
+        RelPos = "rel_pos",
+        /// Absolute positional attention
+        AbsPos = "abs_pos",
+        /// Relative positional attention over a local window
+        RelPosLocalAttn = "rel_pos_local_attn",
+    }
+);
+
+config_enum!(
+    /// How attention context is limited (`encoder.att_context_style`).
+    AttContextStyle {
+        /// Each frame sees a fixed window around it
+        #[default]
+        Regular = "regular",
+        /// Frames attend within chunks, as in cache-aware streaming
+        ChunkedLimited = "chunked_limited",
+    }
+);
+
+config_enum!(
+    /// Normalization in the conformer convolution module
+    /// (`encoder.conv_norm_type`).
+    ConvNormType {
+        /// Batch normalization
+        #[default]
+        BatchNorm = "batch_norm",
+        /// Layer normalization (cache-aware streaming models)
+        LayerNorm = "layer_norm",
+    }
+);
+
+config_enum!(
+    /// An activation function.
+    Activation {
+        /// `max(x, 0)`
+        #[default]
+        Relu = "relu",
+        /// `tanh(x)`
+        Tanh = "tanh",
+        /// `1 / (1 + e^-x)`
+        Sigmoid = "sigmoid",
+        /// Gaussian error linear unit
+        Gelu = "gelu",
+        /// `x * sigmoid(x)`
+        Swish = "swish" | "silu",
+    }
+);
+
+config_enum!(
+    /// Decoding algorithm named in a model's config (`decoding.strategy`).
+    DecodingAlgorithm {
+        /// Greedy decoding
+        #[default]
+        Greedy = "greedy",
+        /// Batched greedy decoding
+        GreedyBatch = "greedy_batch",
+        /// Beam search
+        Beam = "beam" | "beam_search",
+        /// Time-synchronous beam search
+        Tsl = "tsl",
+        /// Alignment-length synchronous beam search
+        Alsd = "alsd",
+        /// Modified adaptive expansion search
+        Maes = "maes",
+    }
+);
+
+/// A `null` value as the type's default.
+fn null_as_default<'de, D, T>(deserializer: D) -> std::result::Result<T, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de> + Default,
+{
+    Ok(Option::<T>::deserialize(deserializer)?.unwrap_or_default())
+}
+
+/// A `null` flag as `true`.
+fn null_as_true<'de, D: Deserializer<'de>>(deserializer: D) -> std::result::Result<bool, D::Error> {
+    Ok(Option::<bool>::deserialize(deserializer)?.unwrap_or(true))
+}
+
+/// A count where NeMo writes `-1` (or `null`) for "not set".
+fn negative_as_none<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<Option<usize>, D::Error> {
+    Ok(Option::<i64>::deserialize(deserializer)?.and_then(|n| usize::try_from(n).ok()))
+}
 
 /// Attention context size configuration.
 ///
@@ -31,7 +206,7 @@ impl AttContextSize {
     /// For Multiple, returns the first mode, which NeMo uses by default. NeMo
     /// checkpoints list modes from most to least lookahead (right context), so
     /// this is the highest-latency, most accurate mode.
-    pub fn get_default(&self) -> Option<(i32, i32)> {
+    pub fn default_mode(&self) -> Option<(i32, i32)> {
         match self {
             AttContextSize::Single(v) if v.len() >= 2 => Some((v[0], v[1])),
             AttContextSize::Multiple(modes) if !modes.is_empty() => {
@@ -50,7 +225,7 @@ impl AttContextSize {
     ///
     /// For Single, always returns the same context regardless of index.
     /// For Multiple, returns the context for the given mode index.
-    pub fn get_mode(&self, mode_idx: usize) -> Option<(i32, i32)> {
+    pub fn mode(&self, mode_idx: usize) -> Option<(i32, i32)> {
         match self {
             AttContextSize::Single(v) if v.len() >= 2 => Some((v[0], v[1])),
             AttContextSize::Multiple(modes) if mode_idx < modes.len() => {
@@ -230,9 +405,9 @@ pub struct PreprocessorConfig {
     #[serde(default = "default_window_stride")]
     pub window_stride: f32,
 
-    /// Window type (e.g., "hann", "hamming")
-    #[serde(default = "default_window")]
-    pub window: String,
+    /// STFT window
+    #[serde(default, deserialize_with = "null_as_default")]
+    pub window: WindowType,
 
     /// Number of Mel filterbank features
     #[serde(default = "default_features")]
@@ -246,9 +421,9 @@ pub struct PreprocessorConfig {
     #[serde(default = "default_true")]
     pub log: bool,
 
-    /// Whether to zero-mean normalize per feature
-    #[serde(default = "default_normalize")]
-    pub normalize: String,
+    /// Feature normalization
+    #[serde(default, deserialize_with = "null_as_default")]
+    pub normalize: Normalize,
 
     /// Dither amount for numerical stability
     #[serde(default = "default_dither")]
@@ -277,9 +452,6 @@ fn default_window_size() -> f32 {
 fn default_window_stride() -> f32 {
     0.01
 }
-fn default_window() -> String {
-    "hann".to_string()
-}
 fn default_features() -> usize {
     80
 }
@@ -288,9 +460,6 @@ fn default_n_fft() -> usize {
 }
 fn default_true() -> bool {
     true
-}
-fn default_normalize() -> String {
-    "per_feature".to_string()
 }
 fn default_dither() -> f32 {
     1e-5
@@ -312,9 +481,9 @@ pub struct EncoderConfig {
     #[serde(default = "default_features")]
     pub feat_in: usize,
 
-    /// Output feature dimension (-1 means same as d_model)
-    #[serde(default = "default_feat_out")]
-    pub feat_out: i32,
+    /// Output feature dimension (`None`, written `-1`, means `d_model`)
+    #[serde(default, deserialize_with = "negative_as_none")]
+    pub feat_out: Option<usize>,
 
     /// Model dimension
     #[serde(default = "default_d_model")]
@@ -336,9 +505,9 @@ pub struct EncoderConfig {
     #[serde(default = "default_conv_kernel")]
     pub conv_kernel_size: usize,
 
-    /// Subsampling type
-    #[serde(default = "default_subsampling")]
-    pub subsampling: String,
+    /// Subsampling module
+    #[serde(default, deserialize_with = "null_as_default")]
+    pub subsampling: Subsampling,
 
     /// Subsampling factor
     #[serde(default = "default_subsampling_factor")]
@@ -348,26 +517,26 @@ pub struct EncoderConfig {
     #[serde(default)]
     pub subsampling_conv_channels: Option<usize>,
 
-    /// Self-attention model type
-    #[serde(default = "default_self_attention_model")]
-    pub self_attention_model: String,
+    /// Self-attention model
+    #[serde(default, deserialize_with = "null_as_default")]
+    pub self_attention_model: SelfAttentionModel,
 
     /// Attention context size [left, right] (-1 for unlimited)
     /// Can be a single [left, right] or multiple modes [[left1, right1], [left2, right2], ...]
     #[serde(default)]
     pub att_context_size: Option<AttContextSize>,
 
-    /// Attention context style: "regular" (default) or "chunked_limited" (streaming)
-    #[serde(default)]
-    pub att_context_style: Option<String>,
+    /// How attention context is limited
+    #[serde(default, deserialize_with = "null_as_default")]
+    pub att_context_style: AttContextStyle,
 
-    /// Whether to use x-scaling for attention
-    #[serde(default)]
-    pub xscaling: Option<bool>,
+    /// Scale the subsampled input by `sqrt(d_model)` (default true)
+    #[serde(default = "default_true", deserialize_with = "null_as_true")]
+    pub xscaling: bool,
 
-    /// Whether to untie position biases across layers (each layer has its own bias)
-    #[serde(default)]
-    pub untie_biases: Option<bool>,
+    /// Give each layer its own position biases (default true)
+    #[serde(default = "default_true", deserialize_with = "null_as_true")]
+    pub untie_biases: bool,
 
     /// Positional embedding max length
     #[serde(default = "default_pos_emb_max_len")]
@@ -385,30 +554,28 @@ pub struct EncoderConfig {
     #[serde(default)]
     pub dropout_pre_encoder: Option<f32>,
 
-    /// Convolution normalization type: "batch_norm" (default) or "layer_norm"
-    #[serde(default = "default_conv_norm")]
-    pub conv_norm_type: String,
+    /// Normalization in the convolution module
+    #[serde(default, deserialize_with = "null_as_default")]
+    pub conv_norm_type: ConvNormType,
 
     /// Convolution context size: null (symmetric, default) or "causal" (left-only padding)
     #[serde(default)]
     pub conv_context_size: Option<String>,
 
-    /// Whether to use causal (left-only) padding in subsampling convolutions
-    #[serde(default)]
-    pub causal_downsampling: Option<bool>,
+    /// Pad subsampling convolutions on the left only (causal)
+    #[serde(default, deserialize_with = "null_as_default")]
+    pub causal_downsampling: bool,
 
-    /// Whether to use bias in linear layers (default true for Parakeet, false for Nemotron)
-    #[serde(default)]
-    pub use_bias: Option<bool>,
+    /// Give linear and convolution layers a bias (default true; false for
+    /// Nemotron)
+    #[serde(default = "default_true", deserialize_with = "null_as_true")]
+    pub use_bias: bool,
 
     /// Additional fields
     #[serde(flatten)]
     extra: std::collections::HashMap<String, yaml_serde::Value>,
 }
 
-fn default_feat_out() -> i32 {
-    -1
-}
 fn default_d_model() -> usize {
     512
 }
@@ -424,14 +591,8 @@ fn default_ff_expansion() -> f32 {
 fn default_conv_kernel() -> usize {
     31
 }
-fn default_subsampling() -> String {
-    "dw_striding".to_string()
-}
 fn default_subsampling_factor() -> usize {
     8
-}
-fn default_self_attention_model() -> String {
-    "rel_pos".to_string()
 }
 fn default_pos_emb_max_len() -> usize {
     5000
@@ -439,10 +600,6 @@ fn default_pos_emb_max_len() -> usize {
 fn default_dropout() -> f32 {
     0.1
 }
-fn default_conv_norm() -> String {
-    "batch_norm".to_string()
-}
-
 /// Decoder configuration (CTC output projection).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[non_exhaustive]
@@ -455,9 +612,10 @@ pub struct DecoderConfig {
     #[serde(default)]
     pub feat_in: Option<usize>,
 
-    /// Number of output classes (vocabulary size)
-    #[serde(default)]
-    pub num_classes: i32,
+    /// Number of output classes (vocabulary size), if set (NeMo writes `-1`
+    /// to take it from the tokenizer)
+    #[serde(default, deserialize_with = "negative_as_none")]
+    pub num_classes: Option<usize>,
 
     /// Vocabulary (list of tokens)
     #[serde(default)]
@@ -476,9 +634,9 @@ pub struct DecoderConfig {
     #[serde(default)]
     pub normalization_mode: Option<String>,
 
-    /// Whether blank token is used as padding
-    #[serde(default)]
-    pub blank_as_pad: Option<bool>,
+    /// Whether the blank token doubles as padding (default true)
+    #[serde(default = "default_true", deserialize_with = "null_as_true")]
+    pub blank_as_pad: bool,
 }
 
 /// Prediction network configuration (for RNNT models).
@@ -557,9 +715,9 @@ pub struct JointConfig {
     #[serde(default)]
     pub vocabulary: Option<Vec<String>>,
 
-    /// Activation function (relu, tanh, sigmoid)
-    #[serde(default = "default_joint_activation")]
-    pub activation: String,
+    /// Activation function (relu, tanh or sigmoid)
+    #[serde(default, deserialize_with = "null_as_default")]
+    pub activation: Activation,
 
     /// Whether to use fused batch computation in joint
     #[serde(default)]
@@ -587,8 +745,8 @@ pub struct JointNetConfig {
     pub joint_hidden: usize,
 
     /// Activation function
-    #[serde(default = "default_joint_activation")]
-    pub activation: String,
+    #[serde(default, deserialize_with = "null_as_default")]
+    pub activation: Activation,
 
     /// Dropout rate
     #[serde(default)]
@@ -607,7 +765,7 @@ impl Default for JointNetConfig {
     fn default() -> Self {
         Self {
             joint_hidden: 640,
-            activation: "relu".to_string(),
+            activation: Activation::Relu,
             dropout: None,
             encoder_hidden: None,
             pred_hidden: None,
@@ -625,11 +783,10 @@ impl JointConfig {
     }
 
     /// Get the effective activation function.
-    pub fn effective_activation(&self) -> &str {
+    pub fn effective_activation(&self) -> &Activation {
         self.jointnet
             .as_ref()
-            .map(|jn| jn.activation.as_str())
-            .unwrap_or(&self.activation)
+            .map_or(&self.activation, |jn| &jn.activation)
     }
 
     /// Get the effective encoder hidden dimension.
@@ -653,10 +810,6 @@ fn default_joint_hidden() -> usize {
     640
 }
 
-fn default_joint_activation() -> String {
-    "relu".to_string()
-}
-
 impl Default for JointConfig {
     fn default() -> Self {
         Self {
@@ -666,7 +819,7 @@ impl Default for JointConfig {
             pred_hidden: None,
             num_classes: None,
             vocabulary: None,
-            activation: "relu".to_string(),
+            activation: Activation::Relu,
             fuse_loss_wer: None,
             fused_batch_size: None,
             experimental_fuse_loss_wer: None,
@@ -700,9 +853,9 @@ fn default_tokenizer_type() -> String {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct DecodingConfig {
-    /// Decoding strategy (greedy, beam, etc.)
-    #[serde(default = "default_strategy")]
-    pub strategy: String,
+    /// Decoding algorithm
+    #[serde(default, deserialize_with = "null_as_default")]
+    pub strategy: DecodingAlgorithm,
 
     /// Beam width for beam search
     #[serde(default)]
@@ -713,10 +866,6 @@ pub struct DecodingConfig {
     extra: std::collections::HashMap<String, yaml_serde::Value>,
 }
 
-fn default_strategy() -> String {
-    "greedy".to_string()
-}
-
 impl Default for PreprocessorConfig {
     fn default() -> Self {
         Self {
@@ -724,11 +873,11 @@ impl Default for PreprocessorConfig {
             sample_rate: 16000,
             window_size: 0.025,
             window_stride: 0.01,
-            window: "hann".to_string(),
+            window: WindowType::Hann,
             features: 80,
             n_fft: 512,
             log: true,
-            normalize: "per_feature".to_string(),
+            normalize: Normalize::PerFeature,
             dither: 1e-5,
             pad_to: 0,
             preemph: Some(0.97), // NeMo default
@@ -743,28 +892,28 @@ impl Default for EncoderConfig {
         Self {
             target: None,
             feat_in: 80,
-            feat_out: -1,
+            feat_out: None,
             d_model: 512,
             n_layers: 17,
             n_heads: 8,
             ff_expansion_factor: 4.0,
             conv_kernel_size: 31,
-            subsampling: "dw_striding".to_string(),
+            subsampling: Subsampling::DwStriding,
             subsampling_factor: 8,
             subsampling_conv_channels: None,
-            self_attention_model: "rel_pos".to_string(),
+            self_attention_model: SelfAttentionModel::RelPos,
             att_context_size: None,
-            att_context_style: None,
-            xscaling: None,
-            untie_biases: None,
+            att_context_style: AttContextStyle::Regular,
+            xscaling: true,
+            untie_biases: true,
             pos_emb_max_len: 5000,
             dropout: 0.1,
             dropout_att: None,
             dropout_pre_encoder: None,
-            conv_norm_type: "batch_norm".to_string(),
+            conv_norm_type: ConvNormType::BatchNorm,
             conv_context_size: None,
-            causal_downsampling: None,
-            use_bias: None,
+            causal_downsampling: false,
+            use_bias: true,
             extra: std::collections::HashMap::new(),
         }
     }
@@ -779,22 +928,9 @@ impl EncoderConfig {
             .unwrap_or(false)
     }
 
-    /// Check if causal downsampling is enabled.
-    pub fn is_causal_downsampling(&self) -> bool {
-        self.causal_downsampling.unwrap_or(false)
-    }
-
     /// Check if this is a streaming-capable encoder (chunked_limited style).
     pub fn is_streaming(&self) -> bool {
-        self.att_context_style
-            .as_ref()
-            .map(|s| s == "chunked_limited")
-            .unwrap_or(false)
-    }
-
-    /// Get effective use_bias setting (default true for backward compatibility).
-    pub fn effective_use_bias(&self) -> bool {
-        self.use_bias.unwrap_or(true)
+        self.att_context_style == AttContextStyle::ChunkedLimited
     }
 
     /// Reject encoder settings this port does not implement.
@@ -808,20 +944,25 @@ impl EncoderConfig {
             }
         }
 
-        if self.self_attention_model != "rel_pos" {
+        if self.self_attention_model != SelfAttentionModel::RelPos {
             return Err(Error::not_implemented(format!(
                 "self_attention_model `{}` (only rel_pos is supported)",
                 self.self_attention_model
             )));
         }
 
-        if let Some(style) = self.att_context_style.as_deref() {
-            if style != "regular" && style != "chunked_limited" {
-                return Err(Error::not_implemented(format!(
-                    "att_context_style `{}` (only regular and chunked_limited are supported)",
-                    style
-                )));
-            }
+        if let AttContextStyle::Other(style) = &self.att_context_style {
+            return Err(Error::not_implemented(format!(
+                "att_context_style `{}` (only regular and chunked_limited are supported)",
+                style
+            )));
+        }
+
+        if let ConvNormType::Other(norm) = &self.conv_norm_type {
+            return Err(Error::not_implemented(format!(
+                "conv_norm_type `{}` (only batch_norm and layer_norm are supported)",
+                norm
+            )));
         }
 
         if let Some(context) = &self.att_context_size {
@@ -837,7 +978,7 @@ impl EncoderConfig {
             }
         }
 
-        if self.subsampling != "dw_striding" {
+        if self.subsampling != Subsampling::DwStriding {
             return Err(Error::not_implemented(format!(
                 "subsampling `{}` (only dw_striding is supported)",
                 self.subsampling
@@ -860,12 +1001,12 @@ impl Default for DecoderConfig {
         Self {
             target: None,
             feat_in: None,
-            num_classes: -1,
+            num_classes: None,
             vocabulary: Vec::new(),
             prednet: None,
             context_size: None,
             normalization_mode: None,
-            blank_as_pad: None,
+            blank_as_pad: true,
         }
     }
 }
@@ -883,7 +1024,7 @@ impl Default for TokenizerConfig {
 impl Default for DecodingConfig {
     fn default() -> Self {
         Self {
-            strategy: "greedy".to_string(),
+            strategy: DecodingAlgorithm::Greedy,
             beam_size: None,
             extra: std::collections::HashMap::new(),
         }
@@ -934,9 +1075,9 @@ pub struct JasperEncoderConfig {
     #[serde(default = "default_features")]
     pub feat_in: usize,
 
-    /// Activation function (e.g., "relu")
-    #[serde(default = "default_jasper_activation")]
-    pub activation: String,
+    /// Activation function
+    #[serde(default, deserialize_with = "null_as_default")]
+    pub activation: Activation,
 
     /// Jasper block configurations
     pub jasper: Vec<JasperBlockConfig>,
@@ -944,10 +1085,6 @@ pub struct JasperEncoderConfig {
     /// Additional fields
     #[serde(flatten)]
     extra: std::collections::HashMap<String, yaml_serde::Value>,
-}
-
-fn default_jasper_activation() -> String {
-    "relu".to_string()
 }
 
 /// Configuration for a single Jasper block.
@@ -1054,9 +1191,9 @@ pub struct TransformerEncoderConfig {
     #[serde(default = "default_tf_num_heads")]
     pub num_attention_heads: usize,
 
-    /// Activation function for FFN ("relu", "gelu", etc.)
-    #[serde(default = "default_tf_hidden_act")]
-    pub hidden_act: String,
+    /// Activation function of the feed-forward layers (relu or gelu)
+    #[serde(default, deserialize_with = "null_as_default")]
+    pub hidden_act: Activation,
 
     /// Whether to use pre-layer-norm (True) or post-layer-norm (False)
     #[serde(default)]
@@ -1091,9 +1228,6 @@ fn default_tf_inner_size() -> usize {
 fn default_tf_num_heads() -> usize {
     8
 }
-fn default_tf_hidden_act() -> String {
-    "relu".to_string()
-}
 
 impl Default for TransformerEncoderConfig {
     fn default() -> Self {
@@ -1102,7 +1236,7 @@ impl Default for TransformerEncoderConfig {
             hidden_size: 192,
             inner_size: 768,
             num_attention_heads: 8,
-            hidden_act: "relu".to_string(),
+            hidden_act: Activation::Relu,
             pre_ln: false,
             pre_ln_final_layer_norm: true,
             attn_score_dropout: None,
@@ -1347,12 +1481,54 @@ mod tests {
     }
 
     #[test]
+    fn test_config_enums_parse_nemo_values() {
+        let parse = |yaml: &str| -> PreprocessorConfig { yaml_serde::from_str(yaml).unwrap() };
+        assert_eq!(parse("normalize: NA").normalize, Normalize::Disabled);
+        assert_eq!(parse("normalize: None").normalize, Normalize::Disabled);
+        assert_eq!(
+            parse("normalize: per_feature").normalize,
+            Normalize::PerFeature
+        );
+        assert_eq!(parse("{}").normalize, Normalize::PerFeature);
+        assert_eq!(parse("window: hamming").window, WindowType::Hamming);
+        // Unknown values load, and keep their text
+        let other = parse("window: blackman").window;
+        assert_eq!(other, WindowType::Other("blackman".to_string()));
+        assert_eq!(other.as_str(), "blackman");
+
+        let joint: JointConfig = yaml_serde::from_str("activation: silu").unwrap();
+        assert_eq!(joint.activation, Activation::Swish);
+        let decoding: DecodingConfig = yaml_serde::from_str("strategy: beam_search").unwrap();
+        assert_eq!(decoding.strategy, DecodingAlgorithm::Beam);
+    }
+
+    #[test]
+    fn test_config_counts_and_flags() {
+        let decoder: DecoderConfig = yaml_serde::from_str("num_classes: -1").unwrap();
+        assert_eq!(decoder.num_classes, None);
+        let decoder: DecoderConfig = yaml_serde::from_str("num_classes: 1024").unwrap();
+        assert_eq!(decoder.num_classes, Some(1024));
+
+        let encoder: EncoderConfig =
+            yaml_serde::from_str("feat_out: -1\nxscaling: null\nuse_bias: false").unwrap();
+        assert_eq!(encoder.feat_out, None);
+        assert!(encoder.xscaling);
+        assert!(!encoder.use_bias);
+        assert!(!encoder.causal_downsampling);
+        assert_eq!(encoder.att_context_style, AttContextStyle::Regular);
+
+        // Round trip keeps NeMo's spelling
+        let yaml = yaml_serde::to_string(&encoder).unwrap();
+        assert!(yaml.contains("att_context_style: regular"), "{yaml}");
+    }
+
+    #[test]
     fn test_encoder_validate_accepts_supported() {
         let mut config = EncoderConfig::default();
         config.target = Some("nemo.collections.asr.modules.ConformerEncoder".to_string());
         assert!(config.validate().is_ok());
 
-        config.att_context_style = Some("chunked_limited".to_string());
+        config.att_context_style = AttContextStyle::ChunkedLimited;
         config.att_context_size = Some(AttContextSize::Multiple(vec![vec![70, 13], vec![70, 0]]));
         assert!(config.validate().is_ok());
     }
@@ -1361,10 +1537,11 @@ mod tests {
     fn test_encoder_validate_rejects_unsupported() {
         let cases: Vec<fn(&mut EncoderConfig)> = vec![
             |c| c.target = Some("nemo.collections.asr.modules.TransformerEncoder".to_string()),
-            |c| c.self_attention_model = "rope".to_string(),
-            |c| c.att_context_style = Some("chunked_limited_with_rc".to_string()),
+            |c| c.self_attention_model = SelfAttentionModel::Other("rope".to_string()),
+            |c| c.att_context_style = AttContextStyle::Other("chunked_limited_with_rc".to_string()),
             |c| c.att_context_size = Some(AttContextSize::Multiple(vec![vec![70, 1, 13]])),
-            |c| c.subsampling = "feature_stacking".to_string(),
+            |c| c.subsampling = Subsampling::Other("feature_stacking".to_string()),
+            |c| c.conv_norm_type = ConvNormType::Other("group_norm".to_string()),
             |c| c.subsampling_factor = 16,
         ];
         for mutate in cases {
