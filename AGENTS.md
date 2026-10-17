@@ -13,7 +13,7 @@ cargo check                    # Quick compilation check without building
 
 ## Test Commands
 
-**IMPORTANT:** Tests must run single-threaded due to MLX runtime constraints.
+**IMPORTANT:** Tests must run single-threaded due to MLX runtime constraints. `.cargo/config.toml` sets `RUST_TEST_THREADS=1`, so plain `cargo test` is single-threaded too.
 
 ```bash
 cargo test -- --test-threads=1                     # Run all tests (single-threaded)

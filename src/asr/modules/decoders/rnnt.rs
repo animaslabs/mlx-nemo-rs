@@ -734,7 +734,7 @@ impl JointActivation {
     /// Apply activation function.
     pub fn apply(&self, x: &Array) -> Result<Array> {
         match self {
-            Self::Relu => mlx_rs::ops::maximum(x, &Array::from_f32(0.0))
+            Self::Relu => mlx_rs::ops::maximum(x, Array::from_f32(0.0))
                 .map_err(|e| Error::model(format!("ReLU failed: {}", e))),
             Self::Tanh => {
                 mlx_rs::ops::tanh(x).map_err(|e| Error::model(format!("Tanh failed: {}", e)))

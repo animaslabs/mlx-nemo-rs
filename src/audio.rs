@@ -72,6 +72,8 @@ pub fn load_wav(path: impl AsRef<Path>) -> Result<(Vec<f32>, u32)> {
     Ok((samples, sample_rate))
 }
 
+/// Load audio from a WAV file. Needs the `asr` feature; without it this
+/// always returns an error.
 #[cfg(not(feature = "asr"))]
 pub fn load_wav(_path: impl AsRef<Path>) -> Result<(Vec<f32>, u32)> {
     Err(Error::not_implemented(
@@ -113,6 +115,8 @@ pub fn resample(samples: &[f32], from_rate: u32, to_rate: u32) -> Result<Vec<f32
     Ok(output.take_data())
 }
 
+/// Resample audio to a target sample rate. Needs the `asr` feature; without
+/// it this always returns an error.
 #[cfg(not(feature = "asr"))]
 pub fn resample(_samples: &[f32], _from_rate: u32, _to_rate: u32) -> Result<Vec<f32>> {
     Err(Error::not_implemented(

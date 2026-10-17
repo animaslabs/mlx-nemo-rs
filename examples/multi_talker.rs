@@ -212,10 +212,11 @@ fn find_nemo_file(dir: &Path, pattern: &str) -> Option<String> {
             if let Some(found) = find_nemo_file(&path, pattern) {
                 return Some(found);
             }
-        } else if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-            if name.contains(pattern) && name.ends_with(".nemo") {
-                return Some(path.to_string_lossy().into_owned());
-            }
+        } else if let Some(name) = path.file_name().and_then(|n| n.to_str())
+            && name.contains(pattern)
+            && name.ends_with(".nemo")
+        {
+            return Some(path.to_string_lossy().into_owned());
         }
     }
     None

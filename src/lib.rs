@@ -14,7 +14,7 @@
 //!
 //! ```toml
 //! [dependencies]
-//! mlx-voice = { version = "0.2", features = ["hub"] }
+//! mlx-voice = { version = "0.3", features = ["hub"] }
 //! ```
 //!
 //! ```no_run
@@ -35,6 +35,9 @@
 //! which needs no `hub` feature.
 
 #![warn(missing_docs, missing_debug_implementations)]
+// The checkpoint loading and weight helpers in `core` exist for the models,
+// which all live behind `asr`
+#![cfg_attr(not(feature = "asr"), allow(dead_code, unused_imports, unused_macros))]
 
 /// Declare a module that is public with the `internals` feature and
 /// crate-private otherwise.

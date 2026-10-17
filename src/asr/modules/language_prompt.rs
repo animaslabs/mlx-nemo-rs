@@ -129,7 +129,7 @@ impl LanguagePrompt {
         *shape.last_mut().unwrap() = self.num_prompts as i32;
         let prompt = ops::broadcast_to(&self.one_hot.as_dtype(encoded.dtype())?, &shape)?;
         let x = ops::concatenate(&[encoded, &prompt], -1)?;
-        let x = ops::maximum(&self.proj_in.forward(&x)?, &Array::from_f32(0.0))?;
+        let x = ops::maximum(&self.proj_in.forward(&x)?, Array::from_f32(0.0))?;
         self.proj_out.forward(&x)
     }
 }

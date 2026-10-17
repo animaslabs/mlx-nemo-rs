@@ -16,8 +16,13 @@ cargo build
 cargo build --release
 
 # Run tests (most are #[ignore] by default - require model files)
-# IMPORTANT: Must use --test-threads=1 to avoid Metal/GPU command buffer crashes
-cargo test -- --test-threads=1
+# Tests must run single-threaded to avoid Metal/GPU command buffer crashes;
+# .cargo/config.toml sets RUST_TEST_THREADS=1, so plain `cargo test` is safe
+cargo test
+
+# CI (.github/workflows/ci.yml) runs these with RUSTFLAGS/RUSTDOCFLAGS="-D warnings"
+cargo clippy --workspace --all-targets --all-features
+cargo doc --package mlx-voice --no-deps --all-features
 
 # Run a specific ignored test (requires model files in models/)
 cargo test --features internals test_load_parakeet_rnnt_checkpoint -- --ignored
@@ -55,6 +60,8 @@ cargo run --release --example eval -- --model <model.nemo> --out hypotheses.json
 # Speed + WER benchmark vs parakeet-mlx, mlx-audio and NeMo (lives in mlx-models; builds and runs examples/eval)
 (cd ../mlx-models && uv run bench/bench.py)
 ```
+
+Releases are published by `.github/workflows/release.yml` when a `vX.Y.Z` tag is pushed (crates.io Trusted Publishing; the tag must match `Cargo.toml`, and the `## X.Y.Z (unreleased)` CHANGELOG heading must be dated as `## X.Y.Z (YYYY-MM-DD)` first). `.github/workflows/pages.yml` publishes rustdoc to GitHub Pages, since docs.rs can't build MLX. MSRV is 1.88 (`rust-version`), checked in CI.
 
 The eval dataset revision is pinned in both `xtask/src/main.rs` and mlx-models `samples/score.py` (`EVAL_REVISION`); bump both together.
 

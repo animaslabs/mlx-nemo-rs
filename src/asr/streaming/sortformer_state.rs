@@ -220,7 +220,7 @@ impl StreamingSortformerState {
         // Append reserved silence slots per speaker
         let sil = p.spkcache_sil_frames_per_spk;
         for spk_scores in scores.iter_mut() {
-            spk_scores.extend(std::iter::repeat(f32::INFINITY).take(sil));
+            spk_scores.extend(std::iter::repeat_n(f32::INFINITY, sil));
         }
         let padded_frames = n_frames + sil;
 

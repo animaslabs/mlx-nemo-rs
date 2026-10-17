@@ -69,8 +69,8 @@ pub fn rnnt_greedy_decode(
 
     // Process each sequence in the batch independently
     // (This is simpler but less efficient than batched decoding)
-    for b in 0..batch_size {
-        let seq_len = lengths_data[b] as usize;
+    for (b, &seq_len) in lengths_data.iter().enumerate().take(batch_size) {
+        let seq_len = seq_len as usize;
         let mut tokens = Vec::new();
 
         debug!(batch_idx = b, seq_len, "Processing sequence");

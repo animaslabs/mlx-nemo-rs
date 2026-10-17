@@ -186,7 +186,7 @@ impl VadPostProcessor {
         }
 
         let mut merged = Vec::with_capacity(segments.len());
-        let mut current = segments[0].clone();
+        let mut current = segments[0];
 
         for next in segments.iter().skip(1) {
             let gap = next.start - current.end;
@@ -195,7 +195,7 @@ impl VadPostProcessor {
                 current.end = next.end;
             } else {
                 merged.push(current);
-                current = next.clone();
+                current = *next;
             }
         }
         merged.push(current);

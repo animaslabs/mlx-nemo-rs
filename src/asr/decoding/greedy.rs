@@ -47,8 +47,8 @@ pub fn greedy_decode(
 
     let mut results = Vec::with_capacity(batch_size);
 
-    for b in 0..batch_size {
-        let seq_len = lengths_data[b] as usize;
+    for (b, &seq_len) in lengths_data.iter().enumerate().take(batch_size) {
+        let seq_len = seq_len as usize;
         let offset = b * max_len;
 
         let labels: Vec<usize> = pred_data[offset..offset + seq_len]

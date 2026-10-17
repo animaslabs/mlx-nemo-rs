@@ -260,8 +260,8 @@ fn main() -> mlx_voice::Result<()> {
 
             // First 50 values for detailed comparison
             println!("\n  === All first 50 values (flattened) ===");
-            for i in 0..50.min(out_slice.len()) {
-                println!("    [{}] = {:.6}", i, out_slice[i]);
+            for (i, v) in out_slice.iter().take(50).enumerate() {
+                println!("    [{}] = {:.6}", i, v);
             }
 
             // Print values at each time step (matching Python format)

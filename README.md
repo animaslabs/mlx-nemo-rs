@@ -32,7 +32,7 @@ Add the crate from crates.io:
 
 ```toml
 [dependencies]
-mlx-voice = "0.2"
+mlx-voice = "0.3"
 ```
 
 ASR support is behind the `asr` feature, which is on by default. The `hub` feature lets `from_pretrained` download models from the Hugging Face Hub. The `internals` feature exposes the building blocks (encoder layers, decoders, streaming caches, checkpoint parsing) for research and debugging; their API may change in any release.
@@ -229,15 +229,16 @@ More detail is in [`docs/`](docs/), including [`lib-architecture.md`](docs/lib-a
 
 ```bash
 cargo build
-cargo test -- --test-threads=1
+cargo test
+cargo clippy --workspace --all-targets --all-features
 ```
 
-Run tests with `--test-threads=1`. Running several Metal workloads in parallel can crash the GPU command buffer.
+Tests run one at a time: running several Metal workloads in parallel can crash the GPU command buffer, so `.cargo/config.toml` sets `RUST_TEST_THREADS=1`.
 
 Most tests are `#[ignore]` by default because they need downloaded models in `models/`. Run them with:
 
 ```bash
-cargo test -- --ignored --test-threads=1
+cargo test -- --ignored
 ```
 
 ### Word error rate

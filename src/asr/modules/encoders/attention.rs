@@ -250,25 +250,25 @@ impl AttentionContext {
                 &ops::floor_divide(&cols, &chunk_size)?,
             )?;
             ops::logical_and(
-                &ops::ge(&diff, &Array::from_int(0))?,
-                &ops::le(&diff, &Array::from_int(left_chunks))?,
+                &ops::ge(&diff, Array::from_int(0))?,
+                &ops::le(&diff, Array::from_int(left_chunks))?,
             )?
         } else {
             // offset = key - query; chunked_limited with unlimited right context
             // only limits the left side
             let offset = ops::subtract(&cols, &rows)?;
-            let mut visible = ops::ge(&offset, &Array::from_int(-self.left.max(0)))?;
+            let mut visible = ops::ge(&offset, Array::from_int(-self.left.max(0)))?;
             if self.left < 0 {
                 visible = ops::ones_like(&visible)?;
             }
             if !self.chunked && self.right >= 0 {
                 visible =
-                    ops::logical_and(&visible, &ops::le(&offset, &Array::from_int(self.right))?)?;
+                    ops::logical_and(&visible, &ops::le(&offset, Array::from_int(self.right))?)?;
             }
             visible
         };
         let hidden = Array::from_f32(f32::NEG_INFINITY);
-        Ok(ops::select(&visible, &Array::from_f32(0.0), &hidden)?.as_dtype(dtype)?)
+        Ok(ops::select(&visible, Array::from_f32(0.0), &hidden)?.as_dtype(dtype)?)
     }
 }
 
@@ -287,8 +287,8 @@ pub fn key_padding_mask(lengths: &[i32], seq_len: i32) -> Result<Option<Array>> 
     let frames = ops::arange::<_, i32>(0, seq_len, 1)?.reshape(&[1, 1, 1, seq_len])?;
     let mask = ops::select(
         &ops::lt(&frames, &lengths)?,
-        &Array::from_f32(0.0),
-        &Array::from_f32(f32::NEG_INFINITY),
+        Array::from_f32(0.0),
+        Array::from_f32(f32::NEG_INFINITY),
     )?;
     Ok(Some(mask))
 }
@@ -463,8 +463,8 @@ impl RelPositionMultiHeadAttention {
         key_mask: Option<&Array>,
         max_score_elements: i64,
     ) -> Result<Array> {
-        let batch_size = x.dim(0) as i32;
-        let seq_len = x.dim(1) as i32;
+        let batch_size = x.dim(0);
+        let seq_len = x.dim(1);
         let n_heads = self.n_heads as i32;
         let head_dim = self.head_dim as i32;
 
@@ -491,7 +491,7 @@ impl RelPositionMultiHeadAttention {
 
         // Project positional embeddings: [1, 2*seq_len-1, d_model]
         let p = self.linear_pos.forward(pos_emb)?;
-        let pos_len = pos_emb.dim(1) as i32; // 2*seq_len - 1
+        let pos_len = pos_emb.dim(1); // 2*seq_len - 1
 
         // Reshape p to multi-head: [1, 2*seq_len-1, n_heads, head_dim]
         // Then transpose to [1, n_heads, 2*seq_len-1, head_dim]
@@ -595,7 +595,7 @@ impl RelPositionMultiHeadAttention {
     /// * `x` - Input tensor [batch, seq_len, d_model] (hidden states h_k to attend over)
     /// * `pos_emb` - Positional embeddings [1, 2*total_len-1, d_model]
     /// * `cache` - Optional full cache buffer [batch, cache_size, d_model] containing
-    ///             previous chunks' attention inputs (h values)
+    ///   previous chunks' attention inputs (h values)
     /// * `cache_filled_len` - How many frames of cache are valid (0 if no cache)
     /// * `att_mask` - Optional attention mask [batch, seq_len, total_len]: boolean
     ///   (true = visible) or additive f32
@@ -611,9 +611,9 @@ impl RelPositionMultiHeadAttention {
         _cache_filled_len: i32,
         att_mask: Option<&Array>,
     ) -> Result<(Array, Option<Array>)> {
-        let batch_size = x.dim(0) as i32;
-        let seq_len = x.dim(1) as i32;
-        let d_model = x.dim(2) as i32;
+        let batch_size = x.dim(0);
+        let seq_len = x.dim(1);
+        let d_model = x.dim(2);
         let n_heads = self.n_heads as i32;
         let head_dim = self.head_dim as i32;
 
@@ -643,7 +643,7 @@ impl RelPositionMultiHeadAttention {
         // on the attention mask to hide unfilled positions during warmup.
 
         let (kv_input, total_len, new_cache) = if let Some(cache_tensor) = cache {
-            let cache_size = cache_tensor.dim(1) as i32;
+            let cache_size = cache_tensor.dim(1);
 
             // NeMo's update_cache: key = value = concat(cache, input)
             // Use FULL cache buffer, not just filled portion
@@ -703,7 +703,7 @@ impl RelPositionMultiHeadAttention {
         // Verify positional encoding dimensions match expectations
         // pos_emb should be [1, 2*total_len-1, d_model]
         let expected_pos_len = 2 * total_len - 1;
-        let actual_pos_len = pos_emb.dim(1) as i32;
+        let actual_pos_len = pos_emb.dim(1);
         if actual_pos_len != expected_pos_len {
             tracing::info!(
                 total_len,
@@ -748,7 +748,7 @@ impl RelPositionMultiHeadAttention {
 
         // Projected positional embeddings [1, n_heads, head_dim, pos_len]. Every
         // chunk of a stream has the same length, so reuse them across chunks.
-        let pos_len = pos_emb.dim(1) as i32;
+        let pos_len = pos_emb.dim(1);
         let p_t = match &self.streaming_pos {
             Some((len, p_t)) if *len == pos_len => p_t.clone(),
             _ => {
@@ -785,7 +785,7 @@ impl RelPositionMultiHeadAttention {
                 let neg_inf = Array::from_f32(f32::NEG_INFINITY);
                 let scores = ops::select(mask, &scores, &neg_inf)?;
                 let weights = ops::softmax_axis(&scores, -1, None)?;
-                let weights = ops::select(mask, &weights, &Array::from_f32(0.0))?;
+                let weights = ops::select(mask, &weights, Array::from_f32(0.0))?;
                 ops::matmul(&weights, &v)?
             }
             Some(mask) => attend(&q_with_bias_u, &k, &v, &matrix_bd, Some(mask), head_dim)?,
@@ -831,10 +831,10 @@ impl RelPositionMultiHeadAttention {
     /// Shifted scores [batch, n_heads, seq_len, pos_len]
     fn rel_shift(x: &Array) -> Result<Array> {
         let shape = x.shape();
-        let batch = shape[0] as i32;
-        let n_heads = shape[1] as i32;
-        let seq_len = shape[2] as i32;
-        let pos_len = shape[3] as i32;
+        let batch = shape[0];
+        let n_heads = shape[1];
+        let seq_len = shape[2];
+        let pos_len = shape[3];
 
         // Step 1: Pad with zeros on the left of last dimension
         // [batch, n_heads, seq_len, pos_len] -> [batch, n_heads, seq_len, pos_len+1]

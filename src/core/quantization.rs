@@ -217,7 +217,7 @@ impl EmbeddingLayer {
             Self::Quantized { weight, bits, .. } => {
                 // weight shape is [vocab, embed_dim / (32/bits)]
                 // So embed_dim = weight.dim(-1) * (32/bits)
-                let packed_dim = weight.dim(-1) as i32;
+                let packed_dim = weight.dim(-1);
                 (packed_dim * (32 / bits)) as usize
             }
         }

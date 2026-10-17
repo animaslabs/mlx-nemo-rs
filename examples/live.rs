@@ -389,7 +389,7 @@ fn get_input_config(
             && config_range.max_sample_rate() >= target_rate
             && config_range.sample_format() == SampleFormat::F32
         {
-            let config = config_range.clone().with_sample_rate(target_rate);
+            let config = (*config_range).with_sample_rate(target_rate);
             return Ok((config.into(), target_rate, 1));
         }
     }
@@ -401,7 +401,7 @@ fn get_input_config(
             && config_range.max_sample_rate() >= target_rate
             && config_range.sample_format() == SampleFormat::F32
         {
-            let config = config_range.clone().with_sample_rate(target_rate);
+            let config = (*config_range).with_sample_rate(target_rate);
             return Ok((config.into(), target_rate, 2));
         }
     }
@@ -421,7 +421,7 @@ fn get_input_config(
             && config_range.min_sample_rate() <= default_rate
             && config_range.max_sample_rate() >= default_rate
         {
-            let config = config_range.clone().with_sample_rate(default_rate);
+            let config = (*config_range).with_sample_rate(default_rate);
             return Ok((config.into(), default_rate, config_range.channels()));
         }
     }

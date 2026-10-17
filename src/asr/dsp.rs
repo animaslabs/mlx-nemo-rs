@@ -135,7 +135,7 @@ pub fn create_window_padded(window_type: &str, win_length: usize, n_fft: usize) 
 const F_SP: f32 = 200.0 / 3.0;
 const MIN_LOG_HZ: f32 = 1000.0;
 const MIN_LOG_MEL: f32 = MIN_LOG_HZ / F_SP;
-const LOGSTEP: f32 = 0.06875177742094912; // ln(6.4) / 27.0
+const LOGSTEP: f32 = 0.068_751_775; // ln(6.4) / 27.0
 
 /// Convert Hz to mel (Slaney scale).
 ///
@@ -511,8 +511,8 @@ mod tests {
         let right_pad = 512 - 400 - left_pad; // 56
 
         // Check left padding is zeros
-        for i in 0..left_pad {
-            assert_eq!(data[i], 0.0, "Left padding at index {} should be 0", i);
+        for (i, &v) in data[..left_pad].iter().enumerate() {
+            assert_eq!(v, 0.0, "Left padding at index {} should be 0", i);
         }
 
         // Check window values (Hann endpoints are ~0)
@@ -523,8 +523,8 @@ mod tests {
         );
 
         // Check right padding is zeros
-        for i in (512 - right_pad)..512 {
-            assert_eq!(data[i], 0.0, "Right padding at index {} should be 0", i);
+        for (i, &v) in data.iter().enumerate().take(512).skip(512 - right_pad) {
+            assert_eq!(v, 0.0, "Right padding at index {} should be 0", i);
         }
     }
 
@@ -700,8 +700,8 @@ mod tests {
         let left_pad = (512 - 400) / 2; // 56
 
         // Left padding should be zeros
-        for i in 0..left_pad {
-            assert_eq!(data[i], 0.0, "Left padding at index {} should be 0", i);
+        for (i, &v) in data[..left_pad].iter().enumerate() {
+            assert_eq!(v, 0.0, "Left padding at index {} should be 0", i);
         }
 
         // First audio sample (which is 0.0 from the sequence)
@@ -711,8 +711,8 @@ mod tests {
 
         // Right padding should be zeros (indices 56+400=456 to 511)
         let right_start = left_pad + 400;
-        for i in right_start..512 {
-            assert_eq!(data[i], 0.0, "Right padding at index {} should be 0", i);
+        for (i, &v) in data.iter().enumerate().take(512).skip(right_start) {
+            assert_eq!(v, 0.0, "Right padding at index {} should be 0", i);
         }
     }
 
@@ -740,8 +740,8 @@ mod tests {
         let left_pad = (512 - 400) / 2; // 56
 
         // Left padding should be zeros
-        for i in 0..left_pad {
-            assert_eq!(data[i], 0.0, "Left padding at index {} should be 0", i);
+        for (i, &v) in data[..left_pad].iter().enumerate() {
+            assert_eq!(v, 0.0, "Left padding at index {} should be 0", i);
         }
         // First audio sample
         assert_eq!(data[left_pad], 0.0);

@@ -7,18 +7,24 @@ anyhow = "1.0"
 
 [package]
 name = "mlx-voice"
-version = "0.2.1"
+version = "0.3.0"
 edition = "2024"
+rust-version = "1.88"
 description = "NeMo-compatible ASR and speech AI library for Apple Silicon, built on MLX"
 license = "Apache-2.0"
 readme = "README.md"
 repository = "https://github.com/animaslabs/mlx-voice-rs"
+homepage = "https://github.com/animaslabs/mlx-voice-rs"
+# docs.rs can't build MLX (see docs/production-readiness.md), so rustdoc is
+# published to GitHub Pages by .github/workflows/pages.yml
+documentation = "https://animaslabs.github.io/mlx-voice-rs/mlx_voice/"
 keywords = ["asr", "speech", "mlx", "nemo", "machine-learning"]
 categories = ["science", "multimedia::audio"]
 include = ["/src/**", "/README.md", "/CHANGELOG.md", "/LICENSE", "/NOTICE", "/AUTHORS"]
 
 [package.metadata.docs.rs]
 targets = ["aarch64-apple-darwin"]
+all-features = true
 
 [features]
 default = ["asr"]
@@ -46,7 +52,9 @@ thiserror = "2.0"
 # Archive handling (.nemo files are TAR archives)
 tar = "0.4"
 flate2 = "1.1"
-zip = "9.0"
+# PyTorch checkpoints are stored uncompressed; keep deflate for safety and
+# skip the default AES/bzip2/lzma/zstd/xz codecs (and their C builds)
+zip = { version = "9.0", default-features = false, features = ["deflate-flate2-zlib-rs"] }
 
 # Byte manipulation
 bytemuck = { version = "1.25", features = ["derive"] }

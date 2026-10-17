@@ -378,7 +378,7 @@ impl MelProcessor {
                 Normalize::PerFeature => self.normalize_per_feature(&mel, &valid, &out_lengths)?,
                 _ => mel,
             };
-            let mel = ops::select(&valid, &mel, &Array::from_f32(0.0))?;
+            let mel = ops::select(&valid, &mel, Array::from_f32(0.0))?;
 
             Ok((mel, out_lengths))
         }
@@ -437,17 +437,17 @@ impl MelProcessor {
         let masked = ops::select(valid, features, &zero)?;
         let mean = ops::divide(
             &ops::sum_axis(&masked, 2, Some(true))?,
-            &ops::maximum(&count, &Array::from_f32(1.0))?,
+            &ops::maximum(&count, Array::from_f32(1.0))?,
         )?;
         let centered = ops::select(valid, &ops::subtract(features, &mean)?, &zero)?;
         let variance = ops::divide(
             &ops::sum_axis(&ops::square(&centered)?, 2, Some(true))?,
             &ops::maximum(
-                &ops::subtract(&count, &Array::from_f32(1.0))?,
-                &Array::from_f32(1.0),
+                &ops::subtract(&count, Array::from_f32(1.0))?,
+                Array::from_f32(1.0),
             )?,
         )?;
-        let std = ops::add(&ops::sqrt(&variance)?, &Array::from_f32(1e-5))?;
+        let std = ops::add(&ops::sqrt(&variance)?, Array::from_f32(1e-5))?;
         ops::divide(&ops::subtract(features, &mean)?, &std).map_err(|e| Error::model(e.to_string()))
     }
 
@@ -562,7 +562,7 @@ impl MelProcessor {
                 let mean = ops::mean_axis(&mel, 1, Some(true))?;
                 let centered = ops::subtract(&mel, &mean)?;
                 let variance = ops::mean_axis(&ops::square(&centered)?, 1, Some(true))?;
-                let std = ops::sqrt(&ops::add(&variance, &Array::from_f32(1e-5))?)?;
+                let std = ops::sqrt(&ops::add(&variance, Array::from_f32(1e-5))?)?;
                 ops::divide(&centered, &std)?
             }
             _ => mel,

@@ -607,11 +607,10 @@ mod pickle {
 
             if let Value::Tuple(items) = pid {
                 // Expected format: ('storage', StorageType, key, device, numel)
-                if items.len() >= 5 {
-                    if let (Value::Global { name, .. }, Value::String(key), Value::Int(numel)) =
+                if items.len() >= 5
+                    && let (Value::Global { name, .. }, Value::String(key), Value::Int(numel)) =
                         (&items[1], &items[2], &items[4])
-                    {
-                        if let Some(storage_type) = StorageType::from_class_name(name) {
+                        && let Some(storage_type) = StorageType::from_class_name(name) {
                             self.stack.push(Value::StorageRef(StorageRef {
                                 storage_type,
                                 key: key.clone(),
@@ -619,8 +618,6 @@ mod pickle {
                             }));
                             return Ok(());
                         }
-                    }
-                }
             }
 
             // If we can't parse it, push ignored
@@ -666,11 +663,10 @@ mod pickle {
                 .pop()
                 .ok_or_else(|| Error::pickle("Stack underflow in SETITEM"))?;
 
-            if let Some(Value::Dict(dict)) = self.stack.last_mut() {
-                if let Value::String(k) = key {
+            if let Some(Value::Dict(dict)) = self.stack.last_mut()
+                && let Value::String(k) = key {
                     dict.push((k, value));
                 }
-            }
             Ok(())
         }
 
