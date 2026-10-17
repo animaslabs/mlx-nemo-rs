@@ -26,7 +26,7 @@ const DEFAULT_MAX_SYMBOLS_PER_STEP: usize = 10;
 ///
 /// # Arguments
 /// * `encoder_output` - Encoder output [batch, time, encoder_hidden]
-/// * `encoder_lengths` - Valid lengths for each sequence [batch]
+/// * `encoder_lengths` - Valid lengths for each sequence `[batch]`
 /// * `decoder` - The prediction network
 /// * `joint` - The joint network
 /// * `blank_id` - Blank token ID (typically vocab_size)
@@ -178,7 +178,7 @@ fn last_token_array(tokens: &[usize]) -> Result<Array> {
 ///
 /// # Arguments
 /// * `encoder_output` - Encoder output [batch, time, encoder_hidden]
-/// * `encoder_lengths` - Valid lengths for each sequence [batch]
+/// * `encoder_lengths` - Valid lengths for each sequence `[batch]`
 /// * `decoder` - The prediction network
 /// * `joint` - The joint network
 /// * `blank_id` - Blank token ID

@@ -121,7 +121,7 @@ pub struct EncoderCache {
     /// Cache for conv layers: [num_layers, batch, d_model, time_cache]
     pub last_time: Array,
 
-    /// Actual fill level per sample: [batch]
+    /// Actual fill level per sample: `[batch]`
     pub last_channel_len: Array,
 }
 

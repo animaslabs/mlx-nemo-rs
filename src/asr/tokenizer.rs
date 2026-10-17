@@ -11,7 +11,7 @@ use crate::core::error::{Error, Result};
 /// A model's SentencePiece tokenizer, for turning token ids into text.
 ///
 /// Token ids are the ones the models emit, e.g. in
-/// [`TranscribeOutput::tokens`](crate::asr::TranscribeOutput::tokens). The
+/// [`Transcript::tokens`](crate::asr::Transcript::tokens). The
 /// blank token is not part of the vocabulary: its id is
 /// [`vocab_size`](Self::vocab_size) for RNN-T models.
 pub struct Tokenizer {

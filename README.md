@@ -30,7 +30,7 @@ Add the crate from crates.io:
 
 ```toml
 [dependencies]
-mlx-voice = "0.1"
+mlx-voice = "0.2"
 ```
 
 ASR support is behind the `asr` feature, which is on by default. The `hub` feature lets `from_pretrained` download models from the Hugging Face Hub. The `internals` feature exposes the building blocks (encoder layers, decoders, streaming caches, checkpoint parsing) for research and debugging; their API may change in any release.
@@ -57,7 +57,7 @@ cargo xtask download nvidia/parakeet-ctc-0.6b --file parakeet-ctc-0.6b.nemo
 - a directory containing `model.safetensors`, a config, and `tokenizer.model`
 - a Hugging Face Hub repository id such as `nvidia/parakeet-rnnt-0.6b` (with the `hub` feature). The repository's `.nemo` archive, or its safetensors weights, config and tokenizer, are downloaded to the Hugging Face cache. Gated repositories use `HF_TOKEN` or the token saved by `hf auth login`, or `HubRepo::new(id).token(..)`.
 
-An existing path always wins over a repository id. `from_safetensors` loads a lone `.safetensors` file with explicit config and tokenizer paths.
+An existing path always wins over a repository id.
 
 ## Usage
 

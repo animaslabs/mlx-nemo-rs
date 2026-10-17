@@ -465,11 +465,11 @@ impl ConformerEncoder {
     ///
     /// # Arguments
     /// * `features` - Input features [batch, features, time]
-    /// * `lengths` - Sequence lengths [batch]
+    /// * `lengths` - Sequence lengths `[batch]`
     ///
     /// # Returns
     /// * Encoded features [batch, d_model, time']
-    /// * Output lengths [batch]
+    /// * Output lengths `[batch]`
     pub fn forward(&mut self, features: &Array, lengths: &Array) -> Result<(Array, Array)> {
         // Transpose from [B, F, T] to [B, T, F] for processing
         let mut x = mlx_rs::ops::transpose_axes(features, &[0, 2, 1])?;
@@ -662,11 +662,11 @@ impl ConformerEncoder {
     ///
     /// # Arguments
     /// * `features` - Input features [batch, time, features]
-    /// * `lengths` - Sequence lengths [batch]
+    /// * `lengths` - Sequence lengths `[batch]`
     ///
     /// # Returns
     /// * Subsampled features [batch, time', d_model]
-    /// * Output lengths [batch]
+    /// * Output lengths `[batch]`
     pub fn forward_subsampling_only(
         &mut self,
         features: &Array,
@@ -683,11 +683,11 @@ impl ConformerEncoder {
     ///
     /// # Arguments
     /// * `embeddings` - Pre-subsampled embeddings [batch, time, d_model]
-    /// * `lengths` - Valid sequence lengths [batch]
+    /// * `lengths` - Valid sequence lengths `[batch]`
     ///
     /// # Returns
     /// * Encoded features [batch, d_model, time]
-    /// * Output lengths [batch]
+    /// * Output lengths `[batch]`
     pub fn forward_from_embeddings(
         &mut self,
         embeddings: &Array,
@@ -820,15 +820,15 @@ impl ConformerEncoder {
     ///
     /// # Arguments
     /// * `features` - Input features [batch, features, time]
-    /// * `lengths` - Sequence lengths [batch]
+    /// * `lengths` - Sequence lengths `[batch]`
     /// * `cache_last_channel` - MHA cache [num_layers, batch, cache_len, d_model]
     /// * `cache_last_time` - Conv cache [num_layers, batch, d_model, time_cache]
-    /// * `cache_last_channel_len` - Cache fill level [batch]
+    /// * `cache_last_channel_len` - Cache fill level `[batch]`
     /// * `drop_extra_pre_encoded` - Frames to drop after subsampling
     ///
     /// # Returns
     /// * Encoded features [batch, d_model, time']
-    /// * Output lengths [batch]
+    /// * Output lengths `[batch]`
     /// * Updated MHA cache
     /// * Updated conv cache
     /// * Updated cache fill level

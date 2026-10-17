@@ -137,8 +137,7 @@ options) in place of a bare `HashMap`. `Weights::from(&map)` loads strictly.
 **Still open:** loading reports missing tensors, but not *unexpected* ones
 (checkpoint keys nothing consumed). That needs key-consumption tracking, which
 `ModuleParameters` integration (§7.1) would provide, and would add an
-`unexpected` list to `LoadReport`. `restore_safetensors` has no `_with` variant;
-to load those files non-strictly, call `load_weights_with` yourself.
+`unexpected` list to `LoadReport`.
 
 ### 1.3 Streaming `batch_size` is not real
 
@@ -182,8 +181,10 @@ directory, a Hub repo id string, or a `HubRepo` with a revision or token.
 Hub downloads use a new `hub` feature (`hf-hub`'s blocking ureq client). They
 fetch a repository's `.nemo` archive if it has one, otherwise its safetensors,
 config and tokenizer files, into the Hugging Face cache. `restore*` is gone;
-`#[doc(alias = "restore")]` keeps it searchable. `restore_safetensors` is now
-`from_safetensors`. The examples no longer branch on directory vs. file.
+`#[doc(alias = "restore")]` keeps it searchable. `restore_safetensors` is
+removed before 0.2: a directory of safetensors weights, config and tokenizer
+loads through `from_pretrained`. The examples no longer branch on directory
+vs. file.
 `MultiTalkerPipeline::from_pretrained(asr, diar, mode)` takes two sources.
 
 Still open: `dtype` in `LoadOptions` (§7.2), building pipelines from a loaded

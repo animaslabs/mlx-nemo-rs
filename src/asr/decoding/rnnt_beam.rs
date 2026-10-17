@@ -42,7 +42,7 @@ struct Hypothesis {
 ///
 /// # Arguments
 /// * `encoder_output` - Encoder output [batch, time, encoder_hidden]
-/// * `encoder_lengths` - Valid lengths for each sequence [batch]
+/// * `encoder_lengths` - Valid lengths for each sequence `[batch]`
 /// * `decoder` - The prediction network
 /// * `joint` - The joint network
 /// * `blank_id` - Blank token ID

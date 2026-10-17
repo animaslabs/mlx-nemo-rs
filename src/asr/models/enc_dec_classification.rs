@@ -201,7 +201,7 @@ impl EncDecClassificationModel {
     ///
     /// # Arguments
     /// * `audio` - Raw audio waveform [batch, samples]
-    /// * `lengths` - Optional audio lengths [batch]
+    /// * `lengths` - Optional audio lengths `[batch]`
     ///
     /// # Returns
     /// * Logits [batch, time, num_classes]
@@ -229,7 +229,7 @@ impl EncDecClassificationModel {
     ///
     /// # Returns
     /// * Vector of per-frame speech probabilities for each file.
-    ///   Each inner Vec<f32> contains the probability of class 1 (speech)
+    ///   Each inner `Vec<f32>` contains the probability of class 1 (speech)
     ///   for each frame.
     pub fn infer(&mut self, paths: &[impl AsRef<Path>]) -> Result<Vec<Vec<f32>>> {
         let audio_batch = self.load_audio_batch(paths)?;

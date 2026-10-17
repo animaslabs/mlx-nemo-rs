@@ -285,113 +285,6 @@ impl EncDecRnntModel {
         Ok(model)
     }
 
-    /// Load a model from standalone safetensors files.
-    ///
-    /// This method loads a model from separate files (weights, config, tokenizer)
-    /// rather than a bundled .nemo archive. This is useful for:
-    /// - Models exported to safetensors format
-    /// - HuggingFace/mlx-community model directories
-    /// - Custom model deployments
-    ///
-    /// # Arguments
-    /// * `weights_path` - Path to the safetensors weights file
-    /// * `config_path` - Path to the config file (YAML or JSON with NeMo AsrModelConfig schema)
-    /// * `tokenizer_path` - Optional path to the SentencePiece tokenizer file
-    /// * `format` - Optional weight format. If None, auto-detects from safetensors metadata
-    ///
-    /// # Example
-    ///
-    /// ```no_run
-    /// # fn main() -> mlx_voice::Result<()> {
-    /// # use mlx_voice::{asr::EncDecRnntModel, WeightFormat};
-    /// // Load with explicit format
-    /// let model = EncDecRnntModel::from_safetensors(
-    ///     "weights.safetensors",
-    ///     "config.yaml",
-    ///     Some("tokenizer.model"),
-    ///     Some(WeightFormat::Mlx),
-    /// )?;
-    ///
-    /// // Load with auto-detected format
-    /// let model = EncDecRnntModel::from_safetensors(
-    ///     "weights.safetensors",
-    ///     "config.yaml",
-    ///     Some("tokenizer.model"),
-    ///     None,
-    /// )?;
-    /// # Ok(())
-    /// # }
-    /// ```
-    pub fn from_safetensors(
-        weights_path: impl AsRef<Path>,
-        config_path: impl AsRef<Path>,
-        tokenizer_path: Option<impl AsRef<Path>>,
-        format: Option<crate::core::WeightFormat>,
-    ) -> Result<Self> {
-        use crate::core::checkpoint::SafetensorsLoader;
-
-        let weights_path = weights_path.as_ref();
-        let config_path = config_path.as_ref();
-        tracing::info!(
-            "Loading RNNT model from safetensors: weights={}, config={}",
-            weights_path.display(),
-            config_path.display()
-        );
-
-        // Create loader
-        let mut loader = SafetensorsLoader::new(
-            weights_path,
-            config_path,
-            tokenizer_path.as_ref().map(|p| p.as_ref()),
-        )?;
-
-        // Override format if specified
-        if let Some(fmt) = format {
-            loader.set_weight_format(fmt);
-        }
-
-        // Load config
-        let config: AsrModelConfig = loader.load_config()?;
-
-        // Verify this is an RNNT model
-        if !config.is_rnnt() {
-            tracing::warn!(
-                "Config does not appear to be an RNNT model. Target: {:?}",
-                config.target
-            );
-        }
-
-        tracing::debug!(
-            "Model config loaded, encoder layers: {}",
-            config.encoder.n_layers
-        );
-
-        // Create model
-        let mut model = Self::new(config)?;
-
-        // Load tokenizer if available
-        if let Some(tok_path) = loader.tokenizer_path() {
-            tracing::debug!("Loading tokenizer from: {}", tok_path.display());
-            model.load_tokenizer(tok_path)?;
-        } else if let Some(tok_path) = tokenizer_path {
-            tracing::debug!("Loading tokenizer from: {}", tok_path.as_ref().display());
-            model.load_tokenizer(tok_path)?;
-        }
-
-        // Load weights (may be quantized)
-        let weights = loader.load_weights()?;
-        let quant = loader.quantization();
-        tracing::debug!(
-            "Loading {} weight tensors (format: {:?}, quantized: {})",
-            weights.len(),
-            loader.weight_format(),
-            quant.is_some()
-        );
-        model.load_weights(&weights, quant)?;
-
-        Ok(model)
-    }
-
     /// Load from a directory of safetensors weights, config and tokenizer.
     fn from_directory(dir: &Path, options: LoadOptions) -> Result<Self> {
         use crate::core::checkpoint::SafetensorsLoader;
@@ -783,11 +676,11 @@ impl EncDecRnntModel {
     ///
     /// # Arguments
     /// * `audio` - Raw audio waveform [batch, samples]
-    /// * `lengths` - Optional audio lengths [batch]
+    /// * `lengths` - Optional audio lengths `[batch]`
     ///
     /// # Returns
     /// * Encoder output [batch, time, encoder_hidden]
-    /// * Encoder output lengths [batch]
+    /// * Encoder output lengths `[batch]`
     pub fn forward(&mut self, audio: &Array, lengths: Option<&Array>) -> Result<(Array, Array)> {
         // Preprocess audio to mel spectrogram
         let (features, feature_lengths) = self.preprocessor.forward(audio, lengths)?;

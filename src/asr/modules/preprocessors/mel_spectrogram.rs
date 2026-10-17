@@ -297,13 +297,13 @@ impl MelProcessor {
     /// Process audio to mel spectrogram (batch API).
     ///
     /// # Arguments
-    /// * `audio` - Audio tensor [batch, time] or [time].
-    /// * `lengths` - Optional input lengths [batch].
+    /// * `audio` - Audio tensor `[batch, time]` or `[time]`.
+    /// * `lengths` - Optional input lengths `[batch]`.
     ///
     /// # Returns
     /// Tuple of (mel_features, output_lengths):
     /// - mel_features: [batch, n_mels, frames]
-    /// - output_lengths: [batch] frame counts
+    /// - output_lengths: `[batch]` frame counts
     pub fn forward(&self, audio: &Array, lengths: Option<&Array>) -> Result<(Array, Array)> {
         // Ensure audio is 2D [batch, time]
         let audio = if audio.ndim() == 1 {
