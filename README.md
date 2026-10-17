@@ -93,7 +93,7 @@ let transcripts = model.transcribe_with(["a.wav", "b.wav"], &options)?;
 
 ### Streaming transcription
 
-`model.stream(options)` starts a `StreamingSession`: push audio as it arrives, at any sample rate, and pull updates. Each update carries the text appended since the last one (`delta`) and the new tokens with their times. `StreamingOptions::mode` picks the streaming mode, an index into the checkpoint's `att_context_size` list. NeMo lists modes from most to least lookahead, so `0`, the default, has the highest latency and accuracy; `model.streaming_modes()` gives each mode's latency.
+`model.stream(options)` starts a `StreamingSession`: push audio as it arrives, at any sample rate, and pull updates. Each update carries the text appended since the last one (`delta`) and the new tokens with their times. `StreamingOptions::mode` picks one of the checkpoint's streaming modes (its `att_context_size` list). The default is the checkpoint's own default, which NeMo lists first and which has the most lookahead, so it is the most accurate and has the highest latency. `StreamingMode::LowestLatency` and `StreamingMode::MaxLatency(duration)` choose by lookahead, and a number such as `.mode(3)` picks an entry by index. `model.streaming_modes()` gives each mode's latency, and `stream.streaming_config().mode_idx` the mode a session uses.
 
 ```rust
 use mlx_voice::asr::{EncDecRnntModel, StreamingOptions};

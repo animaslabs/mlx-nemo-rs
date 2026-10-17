@@ -36,6 +36,13 @@ guide below maps the 0.1 calls to their replacements.
 - `StreamingOptions` holds the streaming mode and the punctuation, blank and
   silence settings. `model.transcribe_streaming(input, options)` streams a
   whole file.
+- `StreamingMode` picks a checkpoint's streaming mode by latency or index:
+  - `Default`: the checkpoint's first entry, as in NeMo
+  - `LowestLatency`: the least lookahead
+  - `MaxLatency(Duration)`: the most lookahead within a budget
+  - `Index(n)`: an entry by index
+
+  A `usize` converts to `Index`, so `.mode(3)` still works.
 - Hybrid RNN-T/CTC models (e.g. `nvidia/stt_en_fastconformer_hybrid_large_streaming_multi`)
   load as `EncDecRnntModel`. `DecoderType::Ctc` decodes with their CTC head,
   offline and streaming.
@@ -179,6 +186,7 @@ Other streaming replacements:
 | `set_audio_file(path)` | `model.transcribe_streaming(path, options)` |
 | `set_suppress_punctuation`, `set_blank_threshold`, `set_silence_threshold` | the matching `StreamingOptions` builders |
 | `init_streaming` / `process_chunk` / `finalize_streaming` | a `StreamingSession` |
+| a `mode_idx` argument | `StreamingOptions::mode`: an index, or `StreamingMode::LowestLatency` / `MaxLatency(..)` |
 
 There is no pure-CTC streaming model from NVIDIA. For CTC streaming, use a
 hybrid RNN-T/CTC model with `StreamingOptions::default().decoder_type(DecoderType::Ctc)`.

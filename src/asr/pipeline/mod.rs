@@ -33,4 +33,4 @@ pub use multi_talker::{
     MultiTalkerConfig, MultiTalkerMode, MultiTalkerOutput, MultiTalkerPipeline, SpeakerSegment,
     SpeakerWord,
 };
-pub use session::{StreamUpdate, StreamingOptions, StreamingSession};
+pub use session::{StreamUpdate, StreamingMode, StreamingOptions, StreamingSession};

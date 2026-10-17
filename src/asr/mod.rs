@@ -65,7 +65,7 @@ pub use models::{
 pub use modules::{MelConfig, MelProcessor, SpectrumTransform, StreamingMel};
 pub use pipeline::{
     MultiTalkerConfig, MultiTalkerMode, MultiTalkerOutput, MultiTalkerPipeline, SpeakerSegment,
-    SpeakerWord, StreamUpdate, StreamingOptions, StreamingSession,
+    SpeakerWord, StreamUpdate, StreamingMode, StreamingOptions, StreamingSession,
 };
 pub use streaming::{StreamingConfig, StreamingModeInfo};
 pub use tokenizer::Tokenizer;
@@ -78,7 +78,7 @@ pub use vad::{SpeechSegment, VadPostProcessConfig, VadPostProcessor};
 pub mod prelude {
     pub use super::config::AsrModelConfig;
     pub use super::models::{EncDecCtcModel, EncDecRnntModel};
-    pub use super::pipeline::{StreamingOptions, StreamingSession};
+    pub use super::pipeline::{StreamingMode, StreamingOptions, StreamingSession};
     pub use super::tokenizer::Tokenizer;
     pub use super::transcript::{
         AudioInput, DecoderType, DecodingStrategy, TranscribeOptions, Transcript,

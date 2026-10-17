@@ -440,7 +440,13 @@ decoders. `EncDecCtcModel`'s untested `init_streaming`/`process_chunk`/
 `finalize_streaming`, `CtcStreamingSession`, `StreamingOutput`,
 `StreamingMelBuffer` and the LCS merge helpers are removed.
 
-Still open: §4.4 (`StreamingMode` as a type). `mode` stays an index.
+`StreamingOptions::mode` is a `StreamingMode` (§4.4).
+- `Default` is the checkpoint's first entry.
+- `LowestLatency` is the mode with the least lookahead.
+- `MaxLatency(Duration)` is the mode with the most lookahead within a budget.
+- `Index(usize)` picks an entry by index.
+
+`From<usize>` keeps `.mode(3)` working. A session resolves the mode against the model's `streaming_modes()` when it starts. An out-of-range index or an unmet budget is an error. `streaming_config().mode_idx` reports the chosen mode.
 
 ### 4.1 Two streaming APIs
 
@@ -510,6 +516,11 @@ interleaved multi-channel input too (`push_interleaved(samples, rate, channels)`
 to match what `cpal` delivers.
 
 ### 4.4 Latency modes as a type
+
+**Done** as the `StreamingMode` enum described in §4: `Default`, `LowestLatency`,
+`MaxLatency(Duration)` and `Index(usize)`. `streaming_modes()` still returns
+`StreamingModeInfo`, and choosing a mode is a property of the options rather
+than of the model. The proposal as written:
 
 `mode_idx: usize` is an index into a list whose order depends on the checkpoint
 (§1.4). `StreamingModeInfo` already carries `latency_ms`, `left_context` and
