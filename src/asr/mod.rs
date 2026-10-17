@@ -16,7 +16,7 @@
 //! # fn main() -> mlx_voice::Result<()> {
 //! use mlx_voice::asr::EncDecCTCModel;
 //!
-//! let mut model = EncDecCTCModel::restore("parakeet-ctc-0.6b.nemo")?;
+//! let mut model = EncDecCTCModel::from_pretrained("parakeet-ctc-0.6b.nemo")?;
 //! let transcriptions = model.transcribe(&["audio.wav"])?;
 //! # Ok(())
 //! # }
@@ -28,7 +28,7 @@
 //! # fn main() -> mlx_voice::Result<()> {
 //! use mlx_voice::asr::CacheAwareRNNTPipeline;
 //!
-//! let mut pipeline = CacheAwareRNNTPipeline::restore("model.nemo", 0)?;
+//! let mut pipeline = CacheAwareRNNTPipeline::from_pretrained("model.nemo", 0)?;
 //! pipeline.set_audio_file("audio.wav")?;
 //! let text = pipeline.run()?;
 //! # Ok(())

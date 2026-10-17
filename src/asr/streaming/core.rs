@@ -17,7 +17,7 @@
 //! # let audio_chunks: Vec<Vec<f32>> = Vec::new();
 //! use mlx_voice::asr::EncDecCTCModel;
 //!
-//! let mut model = EncDecCTCModel::restore("model.nemo")?;
+//! let mut model = EncDecCTCModel::from_pretrained("model.nemo")?;
 //!
 //! // Check streaming modes
 //! for mode in model.streaming_modes() {

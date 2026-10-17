@@ -120,7 +120,7 @@ fn main() -> mlx_voice::Result<()> {
     // Load model
     println!("Loading model from: {}", model_path);
     let start = Instant::now();
-    let mut model = EncDecRNNTModel::restore(model_path)?;
+    let mut model = EncDecRNNTModel::from_pretrained(model_path)?;
     println!("Model loaded in {:.2}s", start.elapsed().as_secs_f32());
 
     let target_rate = model.sample_rate();

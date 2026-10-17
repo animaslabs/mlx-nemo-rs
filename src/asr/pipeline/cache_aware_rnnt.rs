@@ -40,6 +40,7 @@ use crate::core::ArrayExt;
 use crate::core::checkpoint::NemoCheckpoint;
 use crate::core::error::{Error, Result};
 use crate::core::loading::{LoadOptions, Weights};
+use crate::core::source::{LocalModel, ModelSource};
 
 /// Output from a transcription step.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -120,7 +121,7 @@ fn is_silent(audio: &[f32], threshold: f32) -> bool {
 /// # fn main() -> mlx_voice::Result<()> {
 /// # use mlx_voice::asr::CacheAwareRNNTPipeline;
 /// # let samples: Vec<f32> = Vec::new();
-/// let mut pipeline = CacheAwareRNNTPipeline::restore("model.nemo", 0)?;
+/// let mut pipeline = CacheAwareRNNTPipeline::from_pretrained("model.nemo", 0)?;
 ///
 /// // File mode
 /// pipeline.set_audio_file("audio.wav")?;
@@ -194,28 +195,50 @@ impl std::fmt::Debug for CacheAwareRNNTPipeline {
 }
 
 impl CacheAwareRNNTPipeline {
-    /// Restore a pipeline from a .nemo checkpoint.
+    /// Load a streaming pipeline from a `.nemo` archive, a model directory or
+    /// a Hugging Face Hub repository (see [`ModelSource`]).
     ///
     /// # Arguments
-    /// * `path` - Path to the .nemo checkpoint file
+    /// * `source` - Where to load the model from
     /// * `mode_idx` - Streaming mode index into the checkpoint's `att_context_size` list (see
     ///   `streaming_modes()` for each mode's latency). NeMo checkpoints list modes
     ///   from most to least lookahead, so mode 0, the model's default, has the
     ///   highest latency and accuracy
     ///
     /// Fails if the checkpoint lacks a tokenizer or any weight the model has;
-    /// [`restore_with`](Self::restore_with) can allow that.
-    pub fn restore(path: impl AsRef<Path>, mode_idx: usize) -> Result<Self> {
-        Self::restore_with(path, mode_idx, LoadOptions::default())
+    /// [`from_pretrained_with`](Self::from_pretrained_with) can allow that.
+    ///
+    /// ```no_run
+    /// # fn main() -> mlx_voice::Result<()> {
+    /// use mlx_voice::asr::CacheAwareRNNTPipeline;
+    ///
+    /// let mut pipeline = CacheAwareRNNTPipeline::from_pretrained("model.nemo", 0)?;
+    /// // Downloads with the `hub` feature
+    /// let mut pipeline =
+    ///     CacheAwareRNNTPipeline::from_pretrained("nvidia/nemotron-speech-streaming-en-0.6b", 0)?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[doc(alias = "restore")]
+    #[doc(alias = "restore_from")]
+    pub fn from_pretrained(source: impl Into<ModelSource>, mode_idx: usize) -> Result<Self> {
+        Self::from_pretrained_with(source, mode_idx, LoadOptions::default())
     }
 
-    /// Like [`restore`](Self::restore), loading with `options`.
-    pub fn restore_with(
-        path: impl AsRef<Path>,
+    /// Like [`from_pretrained`](Self::from_pretrained), loading with `options`.
+    pub fn from_pretrained_with(
+        source: impl Into<ModelSource>,
         mode_idx: usize,
         options: LoadOptions,
     ) -> Result<Self> {
-        let path = path.as_ref();
+        match source.into().resolve()? {
+            LocalModel::Nemo(path) => Self::from_nemo(&path, mode_idx, options),
+            LocalModel::Directory(dir) => Self::from_directory(&dir, mode_idx, options),
+        }
+    }
+
+    /// Load from a `.nemo` archive.
+    fn from_nemo(path: &Path, mode_idx: usize, options: LoadOptions) -> Result<Self> {
         tracing::info!("Loading pipeline from: {}", path.display());
 
         // Load checkpoint
@@ -383,7 +406,7 @@ impl CacheAwareRNNTPipeline {
         })
     }
 
-    /// Restore a pipeline from standalone safetensors files.
+    /// Load a pipeline from standalone safetensors files.
     ///
     /// This method loads a pipeline from separate files (weights, config, tokenizer)
     /// rather than a bundled .nemo archive.
@@ -403,7 +426,7 @@ impl CacheAwareRNNTPipeline {
     /// ```no_run
     /// # fn main() -> mlx_voice::Result<()> {
     /// # use mlx_voice::{asr::CacheAwareRNNTPipeline, WeightFormat};
-    /// let pipeline = CacheAwareRNNTPipeline::restore_safetensors(
+    /// let pipeline = CacheAwareRNNTPipeline::from_safetensors(
     ///     "weights.safetensors",
     ///     "config.yaml",
     ///     Some("tokenizer.model"),
@@ -413,7 +436,7 @@ impl CacheAwareRNNTPipeline {
     /// # Ok(())
     /// # }
     /// ```
-    pub fn restore_safetensors(
+    pub fn from_safetensors(
         weights_path: impl AsRef<Path>,
         config_path: impl AsRef<Path>,
         tokenizer_path: Option<impl AsRef<Path>>,
@@ -449,40 +472,10 @@ impl CacheAwareRNNTPipeline {
         Self::build_from_config_and_weights(config, loader, mode_idx, LoadOptions::default())
     }
 
-    /// Restore a pipeline from a directory containing safetensors files.
-    ///
-    /// Auto-detects file locations within the directory.
-    ///
-    /// # Arguments
-    /// * `dir` - Path to the directory containing model files
-    /// * `mode_idx` - Streaming mode index into the checkpoint's `att_context_size` list (see
-    ///   `streaming_modes()` for each mode's latency). NeMo checkpoints list modes
-    ///   from most to least lookahead, so mode 0, the model's default, has the
-    ///   highest latency and accuracy
-    ///
-    /// # Example
-    ///
-    /// ```no_run
-    /// # fn main() -> mlx_voice::Result<()> {
-    /// # use mlx_voice::asr::CacheAwareRNNTPipeline;
-    /// let pipeline = CacheAwareRNNTPipeline::restore_from_directory("my_model/", 0)?;
-    /// # Ok(())
-    /// # }
-    /// ```
-    pub fn restore_from_directory(dir: impl AsRef<Path>, mode_idx: usize) -> Result<Self> {
-        Self::restore_from_directory_with(dir, mode_idx, LoadOptions::default())
-    }
-
-    /// Like [`restore_from_directory`](Self::restore_from_directory), loading
-    /// with `options`.
-    pub fn restore_from_directory_with(
-        dir: impl AsRef<Path>,
-        mode_idx: usize,
-        options: LoadOptions,
-    ) -> Result<Self> {
+    /// Load from a directory of safetensors weights, config and tokenizer.
+    fn from_directory(dir: &Path, mode_idx: usize, options: LoadOptions) -> Result<Self> {
         use crate::core::checkpoint::SafetensorsLoader;
 
-        let dir = dir.as_ref();
         tracing::info!("Loading pipeline from directory: {}", dir.display());
 
         let loader = SafetensorsLoader::from_directory(dir)?;

@@ -100,8 +100,7 @@ fn test_full_file_transcription_rnnt() {
         return;
     }
 
-    let mut model =
-        EncDecRNNTModel::restore_from_directory(model_dir).expect("Failed to load RNNT model");
+    let mut model = EncDecRNNTModel::from_pretrained(model_dir).expect("Failed to load RNNT model");
 
     let transcriptions = model
         .transcribe(&[TEST_AUDIO])
@@ -132,8 +131,7 @@ fn test_transcribe_samples_matches_file() {
     if !require_model(model_dir) {
         return;
     }
-    let mut model =
-        EncDecRNNTModel::restore_from_directory(model_dir).expect("Failed to load RNNT model");
+    let mut model = EncDecRNNTModel::from_pretrained(model_dir).expect("Failed to load RNNT model");
 
     let from_file = model
         .transcribe(&[TEST_AUDIO])
@@ -165,8 +163,7 @@ fn test_tokenizer_round_trip() {
     if !require_model(model_dir) {
         return;
     }
-    let model =
-        EncDecRNNTModel::restore_from_directory(model_dir).expect("Failed to load RNNT model");
+    let model = EncDecRNNTModel::from_pretrained(model_dir).expect("Failed to load RNNT model");
     let tokenizer = model.tokenizer().expect("model has a tokenizer");
 
     assert_eq!(tokenizer.vocab_size(), model.blank_id());
@@ -186,8 +183,8 @@ fn test_multilingual_streaming_transcription() {
         return;
     }
 
-    let mut pipeline =
-        CacheAwareRNNTPipeline::restore(model_path, 3).expect("Failed to load streaming pipeline");
+    let mut pipeline = CacheAwareRNNTPipeline::from_pretrained(model_path, 3)
+        .expect("Failed to load streaming pipeline");
     assert_eq!(pipeline.language(), Some("auto"));
     assert!(pipeline.languages().contains(&"de-DE"));
     assert!(pipeline.set_language("xx-YY").is_err());
@@ -238,7 +235,7 @@ fn test_streaming_transcription() {
         return;
     }
 
-    let mut pipeline = CacheAwareRNNTPipeline::restore_from_directory(model_dir, 0)
+    let mut pipeline = CacheAwareRNNTPipeline::from_pretrained(model_dir, 0)
         .expect("Failed to load streaming pipeline");
 
     pipeline
@@ -286,7 +283,7 @@ fn test_vad_speech_detection() {
     }
 
     let mut model =
-        EncDecClassificationModel::restore(model_path).expect("Failed to load VAD model");
+        EncDecClassificationModel::from_pretrained(model_path).expect("Failed to load VAD model");
 
     let all_probs = model.infer(&[TEST_AUDIO]).expect("VAD inference failed");
     assert_eq!(all_probs.len(), 1);

@@ -14,7 +14,7 @@ fn main() -> mlx_voice::Result<()> {
         "models/nvidia/nemotron-speech-streaming-en-0.6b/nemotron-speech-streaming-en-0.6b.nemo";
 
     println!("Loading pipeline from: {}", model_path);
-    let pipeline = CacheAwareRNNTPipeline::restore(model_path, 2)?;
+    let pipeline = CacheAwareRNNTPipeline::from_pretrained(model_path, 2)?;
 
     println!("\n=== Pipeline Loaded ===");
     println!("Sample rate: {} Hz", pipeline.sample_rate());

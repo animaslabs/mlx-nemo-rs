@@ -12,7 +12,7 @@
 //! # fn main() -> mlx_voice::Result<()> {
 //! # use mlx_voice::asr::EncDecCTCModel;
 //! # let audio_chunks: Vec<Vec<f32>> = Vec::new();
-//! let mut model = EncDecCTCModel::restore("model.nemo")?;
+//! let mut model = EncDecCTCModel::from_pretrained("model.nemo")?;
 //!
 //! // Check streaming support and modes
 //! if model.supports_streaming() {
@@ -54,6 +54,7 @@ use crate::core::checkpoint::NemoCheckpoint;
 use crate::core::error::{Error, Result};
 use crate::core::loading::{LoadOptions, LoadReport, Weights};
 use crate::core::quantization::QuantizationConfig;
+use crate::core::source::{LocalModel, ModelSource};
 
 /// Encoder-Decoder CTC ASR Model.
 ///
@@ -69,7 +70,7 @@ use crate::core::quantization::QuantizationConfig;
 /// use mlx_voice::asr::EncDecCTCModel;
 ///
 /// // Load from .nemo checkpoint
-/// let mut model = EncDecCTCModel::restore("model.nemo")?;
+/// let mut model = EncDecCTCModel::from_pretrained("model.nemo")?;
 ///
 /// // Transcribe audio files
 /// let texts = model.transcribe(&["audio.wav"])?;
@@ -139,17 +140,45 @@ impl EncDecCTCModel {
         })
     }
 
-    /// Restore a model from a .nemo checkpoint file.
+    /// Load a model from a `.nemo` archive, a model directory or a Hugging
+    /// Face Hub repository (see [`ModelSource`]).
     ///
-    /// Fails if the checkpoint lacks a tokenizer or any weight the model has;
-    /// [`restore_with`](Self::restore_with) can allow that.
-    pub fn restore(path: impl AsRef<Path>) -> Result<Self> {
-        Self::restore_with(path, LoadOptions::default())
+    /// A model directory holds safetensors weights (`model.safetensors`), a
+    /// config (`config.json`, `config.yaml` or `model_config.yaml`) and a
+    /// SentencePiece tokenizer (`tokenizer.model`). Fails if the checkpoint
+    /// lacks a tokenizer or any weight the model has;
+    /// [`from_pretrained_with`](Self::from_pretrained_with) can allow that.
+    ///
+    /// ```no_run
+    /// # fn main() -> mlx_voice::Result<()> {
+    /// use mlx_voice::asr::EncDecCTCModel;
+    ///
+    /// let mut model = EncDecCTCModel::from_pretrained("model.nemo")?;
+    /// // Downloads with the `hub` feature
+    /// let mut model = EncDecCTCModel::from_pretrained("nvidia/parakeet-ctc-0.6b")?;
+    /// let texts = model.transcribe(&["audio.wav"])?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[doc(alias = "restore")]
+    #[doc(alias = "restore_from")]
+    pub fn from_pretrained(source: impl Into<ModelSource>) -> Result<Self> {
+        Self::from_pretrained_with(source, LoadOptions::default())
     }
 
-    /// Restore a model from a .nemo checkpoint file, loading with `options`.
-    pub fn restore_with(path: impl AsRef<Path>, options: LoadOptions) -> Result<Self> {
-        let path = path.as_ref();
+    /// Like [`from_pretrained`](Self::from_pretrained), loading with `options`.
+    pub fn from_pretrained_with(
+        source: impl Into<ModelSource>,
+        options: LoadOptions,
+    ) -> Result<Self> {
+        match source.into().resolve()? {
+            LocalModel::Nemo(path) => Self::from_nemo(&path, options),
+            LocalModel::Directory(dir) => Self::from_directory(&dir, options),
+        }
+    }
+
+    /// Load from a `.nemo` archive.
+    fn from_nemo(path: &Path, options: LoadOptions) -> Result<Self> {
         tracing::info!("Loading model from: {}", path.display());
 
         // Open the checkpoint
@@ -182,7 +211,7 @@ impl EncDecCTCModel {
         Ok(model)
     }
 
-    /// Restore a model from standalone safetensors files.
+    /// Load a model from standalone safetensors files.
     ///
     /// This method loads a model from separate files (weights, config, tokenizer)
     /// rather than a bundled .nemo archive. This is useful for:
@@ -202,7 +231,7 @@ impl EncDecCTCModel {
     /// # fn main() -> mlx_voice::Result<()> {
     /// # use mlx_voice::{asr::EncDecCTCModel, WeightFormat};
     /// // Load with explicit format
-    /// let model = EncDecCTCModel::restore_safetensors(
+    /// let model = EncDecCTCModel::from_safetensors(
     ///     "weights.safetensors",
     ///     "config.yaml",
     ///     Some("tokenizer.model"),
@@ -210,7 +239,7 @@ impl EncDecCTCModel {
     /// )?;
     ///
     /// // Load with auto-detected format
-    /// let model = EncDecCTCModel::restore_safetensors(
+    /// let model = EncDecCTCModel::from_safetensors(
     ///     "weights.safetensors",
     ///     "config.yaml",
     ///     Some("tokenizer.model"),
@@ -219,7 +248,7 @@ impl EncDecCTCModel {
     /// # Ok(())
     /// # }
     /// ```
-    pub fn restore_safetensors(
+    pub fn from_safetensors(
         weights_path: impl AsRef<Path>,
         config_path: impl AsRef<Path>,
         tokenizer_path: Option<impl AsRef<Path>>,
@@ -280,40 +309,10 @@ impl EncDecCTCModel {
         Ok(model)
     }
 
-    /// Restore a model from a directory containing safetensors files.
-    ///
-    /// Auto-detects file locations within the directory:
-    /// - Weights: model.safetensors, weights.safetensors, model_weights.safetensors
-    /// - Config: config.yaml, config.json, model_config.yaml
-    /// - Tokenizer: tokenizer.model, *.spm, sentencepiece.bpe.model
-    ///
-    /// # Example
-    ///
-    /// ```no_run
-    /// # fn main() -> mlx_voice::Result<()> {
-    /// # use mlx_voice::asr::EncDecCTCModel;
-    /// // Load from directory structure:
-    /// // my_model/
-    /// // ├── model.safetensors
-    /// // ├── config.yaml
-    /// // └── tokenizer.model
-    /// let model = EncDecCTCModel::restore_from_directory("my_model/")?;
-    /// # Ok(())
-    /// # }
-    /// ```
-    pub fn restore_from_directory(dir: impl AsRef<Path>) -> Result<Self> {
-        Self::restore_from_directory_with(dir, LoadOptions::default())
-    }
-
-    /// Like [`restore_from_directory`](Self::restore_from_directory), loading
-    /// with `options`.
-    pub fn restore_from_directory_with(
-        dir: impl AsRef<Path>,
-        options: LoadOptions,
-    ) -> Result<Self> {
+    /// Load from a directory of safetensors weights, config and tokenizer.
+    fn from_directory(dir: &Path, options: LoadOptions) -> Result<Self> {
         use crate::core::checkpoint::SafetensorsLoader;
 
-        let dir = dir.as_ref();
         tracing::info!("Loading model from directory: {}", dir.display());
 
         let loader = SafetensorsLoader::from_directory(dir)?;

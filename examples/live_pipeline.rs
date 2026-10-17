@@ -22,7 +22,6 @@
 //! Press Ctrl+C to stop and see the final transcription.
 
 use std::io::{self, Write};
-use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
@@ -137,12 +136,7 @@ fn main() -> mlx_voice::Result<()> {
     // Load pipeline (detect directory vs .nemo file)
     println!("Loading pipeline from: {}", model_path);
     let start = Instant::now();
-    let model_path_ref = Path::new(model_path);
-    let mut pipeline = if model_path_ref.is_dir() {
-        CacheAwareRNNTPipeline::restore_from_directory(model_path_ref, mode_idx)?
-    } else {
-        CacheAwareRNNTPipeline::restore(model_path_ref, mode_idx)?
-    };
+    let mut pipeline = CacheAwareRNNTPipeline::from_pretrained(model_path, mode_idx)?;
     println!("Pipeline loaded in {:.2}s", start.elapsed().as_secs_f32());
 
     let target_rate = pipeline.sample_rate();

@@ -1608,6 +1608,7 @@ dependencies = [
  "ctrlc",
  "flate2",
  "half",
+ "hf-hub",
  "hound",
  "mlx-rs",
  "ringbuf",
