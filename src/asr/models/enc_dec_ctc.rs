@@ -68,32 +68,34 @@ impl std::fmt::Debug for EncDecCtcModel {
 }
 
 impl EncDecCtcModel {
-    /// Create a new model from configuration.
-    pub fn new(config: AsrModelConfig) -> Result<Self> {
-        config.validate()?;
-        // NeMo only dithers during training
-        let mut mel_config: crate::asr::modules::MelConfig = config.preprocessor.clone().into();
-        mel_config.dither = 0.0;
-        let preprocessor = MelProcessor::new(mel_config)?;
-        let encoder = ConformerEncoder::new(config.encoder.clone())?;
+    internal_fn! {
+        /// Create a new model from configuration.
+        pub fn new(config: AsrModelConfig) -> Result<Self> {
+            config.validate()?;
+            // NeMo only dithers during training
+            let mut mel_config: crate::asr::modules::MelConfig = config.preprocessor.clone().into();
+            mel_config.dither = 0.0;
+            let preprocessor = MelProcessor::new(mel_config)?;
+            let encoder = ConformerEncoder::new(config.encoder.clone())?;
 
-        // Determine vocabulary size from config or default
-        // Set properly when the tokenizer loads
-        let vocab_size = config.decoder.num_classes.unwrap_or(1024);
+            // Determine vocabulary size from config or default
+            // Set properly when the tokenizer loads
+            let vocab_size = config.decoder.num_classes.unwrap_or(1024);
 
-        let decoder = CtcDecoder::new(config.decoder.clone(), encoder.output_dim(), vocab_size)?;
+            let decoder = CtcDecoder::new(config.decoder.clone(), encoder.output_dim(), vocab_size)?;
 
-        // Blank is typically the last token
-        let blank_id = vocab_size - 1;
+            // Blank is typically the last token
+            let blank_id = vocab_size - 1;
 
-        Ok(Self {
-            config,
-            preprocessor,
-            encoder,
-            decoder,
-            tokenizer: None,
-            blank_id,
-        })
+            Ok(Self {
+                config,
+                preprocessor,
+                encoder,
+                decoder,
+                tokenizer: None,
+                blank_id,
+            })
+        }
     }
 
     /// Load a model from a `.nemo` archive, a model directory or a Hugging
@@ -207,16 +209,18 @@ impl EncDecCtcModel {
         Ok(model)
     }
 
-    /// Load a tokenizer from a SentencePiece model file.
-    pub fn load_tokenizer(&mut self, path: impl AsRef<Path>) -> Result<()> {
-        let path = path.as_ref();
-        let tokenizer = Tokenizer::open(path)?;
+    internal_fn! {
+        /// Load a tokenizer from a SentencePiece model file.
+        pub fn load_tokenizer(&mut self, path: impl AsRef<Path>) -> Result<()> {
+            let path = path.as_ref();
+            let tokenizer = Tokenizer::open(path)?;
 
-        // Blank comes after the vocabulary
-        self.blank_id = tokenizer.vocab_size();
+            // Blank comes after the vocabulary
+            self.blank_id = tokenizer.vocab_size();
 
-        self.tokenizer = Some(tokenizer);
-        Ok(())
+            self.tokenizer = Some(tokenizer);
+            Ok(())
+        }
     }
 
     /// The model's tokenizer, for turning token ids into text (`None` only
@@ -225,33 +229,37 @@ impl EncDecCtcModel {
         self.tokenizer.as_ref()
     }
 
-    /// Load weights from a checkpoint's tensors, failing if any tensor the
-    /// model has is missing.
-    ///
-    /// # Arguments
-    /// * `weights` - Weight dictionary
-    /// * `quant` - Optional quantization config for quantized models
-    pub fn load_weights(
-        &mut self,
-        weights: &std::collections::HashMap<String, Array>,
-        quant: Option<&QuantizationConfig>,
-    ) -> Result<()> {
-        self.load_weights_with(weights, quant, LoadOptions::default())
-            .map(|_| ())
+    internal_fn! {
+        /// Load weights from a checkpoint's tensors, failing if any tensor the
+        /// model has is missing.
+        ///
+        /// # Arguments
+        /// * `weights` - Weight dictionary
+        /// * `quant` - Optional quantization config for quantized models
+        pub fn load_weights(
+            &mut self,
+            weights: &std::collections::HashMap<String, Array>,
+            quant: Option<&QuantizationConfig>,
+        ) -> Result<()> {
+            self.load_weights_with(weights, quant, LoadOptions::default())
+                .map(|_| ())
+        }
     }
 
-    /// Load weights from a checkpoint's tensors with `options`, returning the
-    /// tensors a non-strict load had to leave at their initial values.
-    pub fn load_weights_with(
-        &mut self,
-        weights: &std::collections::HashMap<String, Array>,
-        quant: Option<&QuantizationConfig>,
-        options: LoadOptions,
-    ) -> Result<LoadReport> {
-        let weights = Weights::new(weights, options);
-        self.encoder.load_weights(&weights, quant)?;
-        self.decoder.load_weights(&weights, "decoder", quant)?;
-        Ok(weights.report())
+    internal_fn! {
+        /// Load weights from a checkpoint's tensors with `options`, returning the
+        /// tensors a non-strict load had to leave at their initial values.
+        pub fn load_weights_with(
+            &mut self,
+            weights: &std::collections::HashMap<String, Array>,
+            quant: Option<&QuantizationConfig>,
+            options: LoadOptions,
+        ) -> Result<LoadReport> {
+            let weights = Weights::new(weights, options);
+            self.encoder.load_weights(&weights, quant)?;
+            self.decoder.load_weights(&weights, "decoder", quant)?;
+            Ok(weights.report())
+        }
     }
 
     /// Transcribe WAV files or in-memory audio (see [`AudioInput`]) with the
@@ -310,26 +318,28 @@ impl EncDecCtcModel {
             .collect())
     }
 
-    /// Run forward pass on preprocessed audio.
-    ///
-    /// # Arguments
-    /// * `audio` - Raw audio waveform [batch, samples]
-    /// * `lengths` - Optional audio lengths `[batch]`
-    ///
-    /// # Returns
-    /// * Log probabilities [batch, time, vocab]
-    /// * Output lengths `[batch]`
-    pub fn forward(&mut self, audio: &Array, lengths: Option<&Array>) -> Result<(Array, Array)> {
-        // Preprocess audio to mel spectrogram
-        let (features, feature_lengths) = self.preprocessor.forward(audio, lengths)?;
+    internal_fn! {
+        /// Run forward pass on preprocessed audio.
+        ///
+        /// # Arguments
+        /// * `audio` - Raw audio waveform [batch, samples]
+        /// * `lengths` - Optional audio lengths `[batch]`
+        ///
+        /// # Returns
+        /// * Log probabilities [batch, time, vocab]
+        /// * Output lengths `[batch]`
+        pub fn forward(&mut self, audio: &Array, lengths: Option<&Array>) -> Result<(Array, Array)> {
+            // Preprocess audio to mel spectrogram
+            let (features, feature_lengths) = self.preprocessor.forward(audio, lengths)?;
 
-        // Encode
-        let (encoded, encoded_lengths) = self.encoder.forward(&features, &feature_lengths)?;
+            // Encode
+            let (encoded, encoded_lengths) = self.encoder.forward(&features, &feature_lengths)?;
 
-        // Decode to log probabilities
-        let log_probs = self.decoder.forward(&encoded)?;
+            // Decode to log probabilities
+            let log_probs = self.decoder.forward(&encoded)?;
 
-        Ok((log_probs, encoded_lengths))
+            Ok((log_probs, encoded_lengths))
+        }
     }
 
     /// Get the model configuration.

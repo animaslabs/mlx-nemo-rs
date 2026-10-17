@@ -2,10 +2,10 @@
 //!
 //! A Rust implementation of NVIDIA NeMo for Apple Silicon, built on MLX.
 //!
-//! This library provides speech AI capabilities including:
-//! - Automatic Speech Recognition (ASR)
-//! - Text-to-Speech (TTS) - coming soon
-//! - Large Language Models (LLM) - coming soon
+//! It loads NeMo speech recognition checkpoints (`.nemo` archives or MLX
+//! safetensors) and runs them on the GPU through Metal: offline and
+//! cache-aware streaming transcription, voice activity detection and
+//! speaker diarization. Text-to-speech is planned.
 //!
 //! ## Quick Start
 //!
@@ -42,6 +42,22 @@ macro_rules! internal_mod {
     };
 }
 
+/// Declare a method that is public with the `internals` feature and
+/// crate-private otherwise, e.g. a model's low-level constructor or forward
+/// pass.
+macro_rules! internal_fn {
+    ($(#[$attr:meta])* pub fn $($rest:tt)*) => {
+        $(#[$attr])*
+        #[cfg(feature = "internals")]
+        pub fn $($rest)*
+
+        $(#[$attr])*
+        #[cfg(not(feature = "internals"))]
+        #[allow(dead_code)]
+        pub(crate) fn $($rest)*
+    };
+}
+
 pub mod core;
 
 #[cfg(feature = "asr")]
@@ -50,11 +66,9 @@ pub mod asr;
 pub mod audio;
 
 // Re-export commonly used types
-pub use core::checkpoint::SafetensorsLoader;
 pub use core::error::{Error, Result};
 pub use core::loading::{LoadOptions, LoadReport};
 pub use core::source::{HubRepo, ModelSource};
-pub use core::weights::WeightFormat;
 #[doc(no_inline)]
 pub use mlx_rs::Array;
 

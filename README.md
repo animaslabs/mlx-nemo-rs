@@ -16,7 +16,7 @@ mlx-voice loads NeMo checkpoints (`.nemo` archives) or converted MLX safetensors
 - **FastConformer encoder**, mel-spectrogram preprocessing, and SentencePiece tokenization matching NeMo
 - **Weight formats**: `.nemo` archives (PyTorch checkpoints), MLX safetensors, and 8-bit quantized MLX weights
 
-TTS and LLM support are planned.
+Text-to-speech support is planned.
 
 ## Requirements
 

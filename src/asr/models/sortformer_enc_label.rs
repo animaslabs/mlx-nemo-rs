@@ -19,7 +19,7 @@
 //! # let audio_array = Array::from_slice(&[0.0f32; 16000], &[1, 16000]);
 //! # let lengths = Array::from_slice(&[16000i32], &[1]);
 //! let mut model = SortformerEncLabelModel::from_pretrained("diar_model.nemo")?;
-//! let preds = model.forward(&audio_array, &lengths)?;
+//! let preds = model.diarize(&audio_array, &lengths)?;
 //! // preds: [1, T, 4] - per-frame speaker probabilities
 //! # Ok(())
 //! # }
@@ -67,30 +67,32 @@ impl std::fmt::Debug for SortformerEncLabelModel {
 }
 
 impl SortformerEncLabelModel {
-    /// Create a new SortFormer model from configuration.
-    pub fn new(config: SortformerConfig) -> Result<Self> {
-        // Create preprocessor from PreprocessorConfig → MelConfig
-        let mut mel_config = MelConfig::from(config.preprocessor.clone());
-        // NeMo only dithers during training
-        mel_config.dither = 0.0;
-        let preprocessor = MelProcessor::new(mel_config)?;
+    internal_fn! {
+        /// Create a new SortFormer model from configuration.
+        pub fn new(config: SortformerConfig) -> Result<Self> {
+            // Create preprocessor from PreprocessorConfig → MelConfig
+            let mut mel_config = MelConfig::from(config.preprocessor.clone());
+            // NeMo only dithers during training
+            mel_config.dither = 0.0;
+            let preprocessor = MelProcessor::new(mel_config)?;
 
-        // Create conformer encoder
-        let encoder = ConformerEncoder::new(config.encoder.clone())?;
+            // Create conformer encoder
+            let encoder = ConformerEncoder::new(config.encoder.clone())?;
 
-        // Create transformer encoder
-        let transformer_encoder = TransformerEncoder::new(config.transformer_encoder.clone())?;
+            // Create transformer encoder
+            let transformer_encoder = TransformerEncoder::new(config.transformer_encoder.clone())?;
 
-        // Create sortformer modules
-        let sortformer_modules = SortformerModules::new(&config.sortformer_modules)?;
+            // Create sortformer modules
+            let sortformer_modules = SortformerModules::new(&config.sortformer_modules)?;
 
-        Ok(Self {
-            preprocessor,
-            encoder,
-            transformer_encoder,
-            sortformer_modules,
-            config,
-        })
+            Ok(Self {
+                preprocessor,
+                encoder,
+                transformer_encoder,
+                sortformer_modules,
+                config,
+            })
+        }
     }
 
     /// Load a model from a `.nemo` archive, local or on the Hugging Face Hub
@@ -149,64 +151,70 @@ impl SortformerEncLabelModel {
         Ok(model)
     }
 
-    /// Load weights from a checkpoint's tensors, failing if any tensor the
-    /// model has is missing.
-    pub fn load_weights(&mut self, weights: &HashMap<String, Array>) -> Result<()> {
-        self.load_weights_with(weights, LoadOptions::default())
-            .map(|_| ())
+    internal_fn! {
+        /// Load weights from a checkpoint's tensors, failing if any tensor the
+        /// model has is missing.
+        pub fn load_weights(&mut self, weights: &HashMap<String, Array>) -> Result<()> {
+            self.load_weights_with(weights, LoadOptions::default())
+                .map(|_| ())
+        }
     }
 
-    /// Load weights from a checkpoint's tensors with `options`, returning the
-    /// tensors a non-strict load had to leave at their initial values.
-    pub fn load_weights_with(
-        &mut self,
-        weights: &HashMap<String, Array>,
-        options: LoadOptions,
-    ) -> Result<LoadReport> {
-        let weights = Weights::new(weights, options);
+    internal_fn! {
+        /// Load weights from a checkpoint's tensors with `options`, returning the
+        /// tensors a non-strict load had to leave at their initial values.
+        pub fn load_weights_with(
+            &mut self,
+            weights: &HashMap<String, Array>,
+            options: LoadOptions,
+        ) -> Result<LoadReport> {
+            let weights = Weights::new(weights, options);
 
-        // Load conformer encoder weights
-        self.encoder.load_weights(&weights, None)?;
+            // Load conformer encoder weights
+            self.encoder.load_weights(&weights, None)?;
 
-        // Load transformer encoder weights
-        self.transformer_encoder
-            .load_weights(&weights, "transformer_encoder", None)?;
+            // Load transformer encoder weights
+            self.transformer_encoder
+                .load_weights(&weights, "transformer_encoder", None)?;
 
-        // Load sortformer modules weights
-        self.sortformer_modules
-            .load_weights(&weights, "sortformer_modules", None)?;
+            // Load sortformer modules weights
+            self.sortformer_modules
+                .load_weights(&weights, "sortformer_modules", None)?;
 
-        tracing::info!("SortFormer model weights loaded");
-        Ok(weights.report())
+            tracing::info!("SortFormer model weights loaded");
+            Ok(weights.report())
+        }
     }
 
-    /// Non-streaming forward pass.
-    ///
-    /// # Arguments
-    /// * `audio` - Raw audio samples [batch, samples]
-    /// * `audio_lengths` - Number of valid samples per batch `[batch]`
-    ///
-    /// # Returns
-    /// * Speaker activity probabilities [batch, time, num_spks]
-    pub fn forward(&mut self, audio: &Array, audio_lengths: &Array) -> Result<Array> {
-        // Preprocessor: audio → mel features [B, n_mels, T]
-        let (mel, mel_lengths) = self.preprocessor.forward(audio, Some(audio_lengths))?;
+    internal_fn! {
+        /// Non-streaming forward pass.
+        ///
+        /// # Arguments
+        /// * `audio` - Raw audio samples [batch, samples]
+        /// * `audio_lengths` - Number of valid samples per batch `[batch]`
+        ///
+        /// # Returns
+        /// * Speaker activity probabilities [batch, time, num_spks]
+        pub fn forward(&mut self, audio: &Array, audio_lengths: &Array) -> Result<Array> {
+            // Preprocessor: audio → mel features [B, n_mels, T]
+            let (mel, mel_lengths) = self.preprocessor.forward(audio, Some(audio_lengths))?;
 
-        // Conformer encoder: mel → embeddings [B, D, T']
-        let (enc_out, _enc_lengths) = self.encoder.forward(&mel, &mel_lengths)?;
+            // Conformer encoder: mel → embeddings [B, D, T']
+            let (enc_out, _enc_lengths) = self.encoder.forward(&mel, &mel_lengths)?;
 
-        // Transpose to [B, T', D]
-        let emb_seq = ops::transpose_axes(&enc_out, &[0, 2, 1])?;
+            // Transpose to [B, T', D]
+            let emb_seq = ops::transpose_axes(&enc_out, &[0, 2, 1])?;
 
-        // Project from fc_d_model to tf_d_model
-        let projected = self.sortformer_modules.project_encoder_output(&emb_seq)?;
+            // Project from fc_d_model to tf_d_model
+            let projected = self.sortformer_modules.project_encoder_output(&emb_seq)?;
 
-        // Transformer encoder: [B, T', tf_d_model] → [B, T', tf_d_model]
-        let hidden_out = self.transformer_encoder.forward(&projected, None)?;
+            // Transformer encoder: [B, T', tf_d_model] → [B, T', tf_d_model]
+            let hidden_out = self.transformer_encoder.forward(&projected, None)?;
 
-        // Speaker sigmoids: [B, T', num_spks]
-        self.sortformer_modules
-            .forward_speaker_sigmoids(&hidden_out)
+            // Speaker sigmoids: [B, T', num_spks]
+            self.sortformer_modules
+                .forward_speaker_sigmoids(&hidden_out)
+        }
     }
 
     /// One streaming diarization step (port of NeMo's `forward_streaming_step`).
@@ -293,11 +301,11 @@ impl SortformerEncLabelModel {
     /// run through one streaming step with the speaker cache and FIFO.
     ///
     /// # Arguments
-    /// * `audio` - Raw audio samples [1, samples]
+    /// * `audio` - Raw audio samples `[1, samples]`
     /// * `audio_lengths` - Number of valid samples `[1]`
     ///
     /// # Returns
-    /// * Speaker activity probabilities [1, frames, num_spks]
+    /// * Speaker activity probabilities `[1, frames, num_spks]`
     pub fn diarize(&mut self, audio: &Array, audio_lengths: &Array) -> Result<Array> {
         let (mel, mel_lengths) = self.preprocessor.forward(audio, Some(audio_lengths))?;
         let feat_len = mel.dim(2) as usize;

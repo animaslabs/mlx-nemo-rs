@@ -438,9 +438,9 @@ impl Default for NemoCheckpointWriter {
 ///
 /// # Example
 ///
-/// ```no_run
+/// ```ignore
 /// # fn main() -> mlx_voice::Result<()> {
-/// # use mlx_voice::SafetensorsLoader;
+/// # use mlx_voice::core::checkpoint::SafetensorsLoader;
 /// # use mlx_voice::asr::AsrModelConfig;
 /// // Load from explicit paths
 /// let loader = SafetensorsLoader::new(

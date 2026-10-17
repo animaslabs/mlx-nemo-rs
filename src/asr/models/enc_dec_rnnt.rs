@@ -104,91 +104,93 @@ impl std::fmt::Debug for EncDecRnntModel {
 }
 
 impl EncDecRnntModel {
-    /// Create a new model from configuration.
-    pub fn new(config: AsrModelConfig) -> Result<Self> {
-        config.validate()?;
-        // NeMo only dithers during training; at inference it would make the
-        // output random
-        let mut preproc_config: MelConfig = config.preprocessor.clone().into();
-        preproc_config.dither = 0.0;
-        let preprocessor = MelProcessor::new(preproc_config)?;
-        let encoder = ConformerEncoder::new(config.encoder.clone())?;
+    internal_fn! {
+        /// Create a new model from configuration.
+        pub fn new(config: AsrModelConfig) -> Result<Self> {
+            config.validate()?;
+            // NeMo only dithers during training; at inference it would make the
+            // output random
+            let mut preproc_config: MelConfig = config.preprocessor.clone().into();
+            preproc_config.dither = 0.0;
+            let preprocessor = MelProcessor::new(preproc_config)?;
+            let encoder = ConformerEncoder::new(config.encoder.clone())?;
 
-        // Determine vocabulary size from config or default
-        // Set properly when the tokenizer loads
-        let vocab_size = config.decoder.num_classes.unwrap_or(1024);
+            // Determine vocabulary size from config or default
+            // Set properly when the tokenizer loads
+            let vocab_size = config.decoder.num_classes.unwrap_or(1024);
 
-        // Detect decoder type from config
-        let is_lstm_decoder = config
-            .decoder
-            .prednet
-            .as_ref()
-            .map(|p| p.is_lstm_based())
-            .unwrap_or(false);
+            // Detect decoder type from config
+            let is_lstm_decoder = config
+                .decoder
+                .prednet
+                .as_ref()
+                .map(|p| p.is_lstm_based())
+                .unwrap_or(false);
 
-        // Create prediction network (decoder) based on config
-        let decoder = if is_lstm_decoder {
-            tracing::info!("Using LSTM-based prediction network");
-            PredictionNetwork::Lstm(RnntDecoder::new(&config.decoder, vocab_size)?)
-        } else {
-            tracing::info!("Using stateless prediction network");
-            PredictionNetwork::Stateless(StatelessTransducerDecoder::new(
-                &config.decoder,
-                vocab_size,
-            )?)
-        };
+            // Create prediction network (decoder) based on config
+            let decoder = if is_lstm_decoder {
+                tracing::info!("Using LSTM-based prediction network");
+                PredictionNetwork::Lstm(RnntDecoder::new(&config.decoder, vocab_size)?)
+            } else {
+                tracing::info!("Using stateless prediction network");
+                PredictionNetwork::Stateless(StatelessTransducerDecoder::new(
+                    &config.decoder,
+                    vocab_size,
+                )?)
+            };
 
-        // Create joint network using effective config values
-        let joint_config = config.joint.clone().unwrap_or_default();
+            // Create joint network using effective config values
+            let joint_config = config.joint.clone().unwrap_or_default();
 
-        let encoder_hidden = encoder.output_dim();
-        let pred_hidden = decoder.pred_hidden();
+            let encoder_hidden = encoder.output_dim();
+            let pred_hidden = decoder.pred_hidden();
 
-        // Use effective values from jointnet if present
-        let joint_hidden = joint_config.effective_joint_hidden();
-        let activation = joint_config.effective_activation().clone();
+            // Use effective values from jointnet if present
+            let joint_hidden = joint_config.effective_joint_hidden();
+            let activation = joint_config.effective_activation().clone();
 
-        let effective_joint_config = JointConfig {
-            joint_hidden,
-            activation,
-            ..joint_config
-        };
+            let effective_joint_config = JointConfig {
+                joint_hidden,
+                activation,
+                ..joint_config
+            };
 
-        let joint = RnntJoint::new(
-            &effective_joint_config,
-            encoder_hidden,
-            pred_hidden,
-            vocab_size + 1,
-        )?;
+            let joint = RnntJoint::new(
+                &effective_joint_config,
+                encoder_hidden,
+                pred_hidden,
+                vocab_size + 1,
+            )?;
 
-        let ctc_decoder = Self::new_ctc_decoder(&config, encoder_hidden, vocab_size)?;
+            let ctc_decoder = Self::new_ctc_decoder(&config, encoder_hidden, vocab_size)?;
 
-        // Blank is typically the last token (vocab_size)
-        let blank_id = vocab_size;
+            // Blank is typically the last token (vocab_size)
+            let blank_id = vocab_size;
 
-        // Determine decoding strategy from config
-        let decoding_strategy = if let Some(ref decoding) = config.decoding {
-            match decoding.strategy {
-                DecodingAlgorithm::Beam => DecodingStrategy::BeamSearch {
-                    beam_size: decoding.beam_size.unwrap_or(4),
-                },
-                _ => DecodingStrategy::Greedy,
-            }
-        } else {
-            DecodingStrategy::Greedy
-        };
+            // Determine decoding strategy from config
+            let decoding_strategy = if let Some(ref decoding) = config.decoding {
+                match decoding.strategy {
+                    DecodingAlgorithm::Beam => DecodingStrategy::BeamSearch {
+                        beam_size: decoding.beam_size.unwrap_or(4),
+                    },
+                    _ => DecodingStrategy::Greedy,
+                }
+            } else {
+                DecodingStrategy::Greedy
+            };
 
-        Ok(Self {
-            config,
-            preprocessor,
-            encoder,
-            decoder,
-            joint,
-            ctc_decoder,
-            tokenizer: None,
-            blank_id,
-            decoding_strategy,
-        })
+            Ok(Self {
+                config,
+                preprocessor,
+                encoder,
+                decoder,
+                joint,
+                ctc_decoder,
+                tokenizer: None,
+                blank_id,
+                decoding_strategy,
+            })
+        }
     }
 
     /// The auxiliary CTC decoder of a hybrid model, with `vocab_size` tokens
@@ -334,49 +336,51 @@ impl EncDecRnntModel {
         Ok(model)
     }
 
-    /// Load a tokenizer from a SentencePiece model file.
-    pub fn load_tokenizer(&mut self, path: impl AsRef<Path>) -> Result<()> {
-        let path = path.as_ref();
-        let tokenizer = Tokenizer::open(path)?;
+    internal_fn! {
+        /// Load a tokenizer from a SentencePiece model file.
+        pub fn load_tokenizer(&mut self, path: impl AsRef<Path>) -> Result<()> {
+            let path = path.as_ref();
+            let tokenizer = Tokenizer::open(path)?;
 
-        // Update vocabulary size and blank token
-        let vocab_size = tokenizer.vocab_size();
-        self.blank_id = vocab_size; // Blank is typically vocab_size (last index)
+            // Update vocabulary size and blank token
+            let vocab_size = tokenizer.vocab_size();
+            self.blank_id = vocab_size; // Blank is typically vocab_size (last index)
 
-        // Recreate decoder with correct vocab size
-        let is_lstm_decoder = self.decoder.is_lstm();
-        self.decoder = if is_lstm_decoder {
-            PredictionNetwork::Lstm(RnntDecoder::new(&self.config.decoder, vocab_size)?)
-        } else {
-            PredictionNetwork::Stateless(StatelessTransducerDecoder::new(
-                &self.config.decoder,
-                vocab_size,
-            )?)
-        };
+            // Recreate decoder with correct vocab size
+            let is_lstm_decoder = self.decoder.is_lstm();
+            self.decoder = if is_lstm_decoder {
+                PredictionNetwork::Lstm(RnntDecoder::new(&self.config.decoder, vocab_size)?)
+            } else {
+                PredictionNetwork::Stateless(StatelessTransducerDecoder::new(
+                    &self.config.decoder,
+                    vocab_size,
+                )?)
+            };
 
-        // Recreate joint network with correct vocab size
-        let joint_config = self.config.joint.clone().unwrap_or_default();
-        let encoder_hidden = self.encoder.output_dim();
-        let pred_hidden = self.decoder.pred_hidden();
-        let joint_hidden = joint_config.effective_joint_hidden();
-        let activation = joint_config.effective_activation().clone();
+            // Recreate joint network with correct vocab size
+            let joint_config = self.config.joint.clone().unwrap_or_default();
+            let encoder_hidden = self.encoder.output_dim();
+            let pred_hidden = self.decoder.pred_hidden();
+            let joint_hidden = joint_config.effective_joint_hidden();
+            let activation = joint_config.effective_activation().clone();
 
-        let effective_joint_config = JointConfig {
-            joint_hidden,
-            activation,
-            ..joint_config
-        };
+            let effective_joint_config = JointConfig {
+                joint_hidden,
+                activation,
+                ..joint_config
+            };
 
-        self.joint = RnntJoint::new(
-            &effective_joint_config,
-            encoder_hidden,
-            pred_hidden,
-            vocab_size + 1,
-        )?;
-        self.ctc_decoder = Self::new_ctc_decoder(&self.config, encoder_hidden, vocab_size)?;
+            self.joint = RnntJoint::new(
+                &effective_joint_config,
+                encoder_hidden,
+                pred_hidden,
+                vocab_size + 1,
+            )?;
+            self.ctc_decoder = Self::new_ctc_decoder(&self.config, encoder_hidden, vocab_size)?;
 
-        self.tokenizer = Some(tokenizer);
-        Ok(())
+            self.tokenizer = Some(tokenizer);
+            Ok(())
+        }
     }
 
     /// The model's tokenizer, for turning token ids into text (`None` only
@@ -385,50 +389,54 @@ impl EncDecRnntModel {
         self.tokenizer.as_ref()
     }
 
-    /// Load weights from a checkpoint's tensors, failing if any tensor the
-    /// model has is missing.
-    ///
-    /// # Arguments
-    /// * `weights` - Weight dictionary
-    /// * `quant` - Optional quantization config for quantized models
-    pub fn load_weights(
-        &mut self,
-        weights: &HashMap<String, Array>,
-        quant: Option<&QuantizationConfig>,
-    ) -> Result<()> {
-        self.load_weights_with(weights, quant, LoadOptions::default())
-            .map(|_| ())
+    internal_fn! {
+        /// Load weights from a checkpoint's tensors, failing if any tensor the
+        /// model has is missing.
+        ///
+        /// # Arguments
+        /// * `weights` - Weight dictionary
+        /// * `quant` - Optional quantization config for quantized models
+        pub fn load_weights(
+            &mut self,
+            weights: &HashMap<String, Array>,
+            quant: Option<&QuantizationConfig>,
+        ) -> Result<()> {
+            self.load_weights_with(weights, quant, LoadOptions::default())
+                .map(|_| ())
+        }
     }
 
-    /// Load weights from a checkpoint's tensors with `options`, returning the
-    /// tensors a non-strict load had to leave at their initial values.
-    pub fn load_weights_with(
-        &mut self,
-        weights: &HashMap<String, Array>,
-        quant: Option<&QuantizationConfig>,
-        options: LoadOptions,
-    ) -> Result<LoadReport> {
-        let weights = Weights::new(weights, options);
+    internal_fn! {
+        /// Load weights from a checkpoint's tensors with `options`, returning the
+        /// tensors a non-strict load had to leave at their initial values.
+        pub fn load_weights_with(
+            &mut self,
+            weights: &HashMap<String, Array>,
+            quant: Option<&QuantizationConfig>,
+            options: LoadOptions,
+        ) -> Result<LoadReport> {
+            let weights = Weights::new(weights, options);
 
-        // Load encoder weights (linear layers may be quantized)
-        self.encoder.load_weights(&weights, quant)?;
+            // Load encoder weights (linear layers may be quantized)
+            self.encoder.load_weights(&weights, quant)?;
 
-        // Load decoder (prediction network) weights (embeddings may be quantized)
-        self.decoder.load_weights(&weights, "decoder", quant)?;
+            // Load decoder (prediction network) weights (embeddings may be quantized)
+            self.decoder.load_weights(&weights, "decoder", quant)?;
 
-        // Load joint network weights (linear layers may be quantized)
-        self.joint.load_weights(&weights, "joint", quant)?;
+            // Load joint network weights (linear layers may be quantized)
+            self.joint.load_weights(&weights, "joint", quant)?;
 
-        // Auxiliary CTC decoder (hybrid models only)
-        if let Some(ctc_decoder) = &mut self.ctc_decoder {
-            ctc_decoder.load_weights(&weights, "ctc_decoder", quant)?;
+            // Auxiliary CTC decoder (hybrid models only)
+            if let Some(ctc_decoder) = &mut self.ctc_decoder {
+                ctc_decoder.load_weights(&weights, "ctc_decoder", quant)?;
+            }
+
+            // Language-ID prompt (prompt-conditioned models only)
+            self.joint
+                .set_prompt(LanguagePrompt::from_config(&self.config, &weights, quant)?);
+
+            Ok(weights.report())
         }
-
-        // Language-ID prompt (prompt-conditioned models only)
-        self.joint
-            .set_prompt(LanguagePrompt::from_config(&self.config, &weights, quant)?);
-
-        Ok(weights.report())
     }
 
     /// Whether this is a hybrid RNN-T/CTC model with an auxiliary CTC decoder,
@@ -477,8 +485,8 @@ impl EncDecRnntModel {
     ///
     /// Roughly halves encoder time on Apple Silicon for a small accuracy
     /// cost. Mel features, the decoder and the joint network stay float32.
-    /// Applies to [`transcribe`](Self::transcribe) and
-    /// [`forward`](Self::forward), not the streaming session.
+    /// Applies to offline transcription ([`transcribe`](Self::transcribe)
+    /// and the other `transcribe*` methods), not the streaming session.
     pub fn set_encoder_dtype(&mut self, dtype: mlx_rs::Dtype) -> Result<()> {
         self.encoder.set_dtype(dtype)
     }
@@ -672,28 +680,30 @@ impl EncDecRnntModel {
         Ok(results)
     }
 
-    /// Run forward pass on preprocessed audio.
-    ///
-    /// # Arguments
-    /// * `audio` - Raw audio waveform [batch, samples]
-    /// * `lengths` - Optional audio lengths `[batch]`
-    ///
-    /// # Returns
-    /// * Encoder output [batch, time, encoder_hidden]
-    /// * Encoder output lengths `[batch]`
-    pub fn forward(&mut self, audio: &Array, lengths: Option<&Array>) -> Result<(Array, Array)> {
-        // Preprocess audio to mel spectrogram
-        let (features, feature_lengths) = self.preprocessor.forward(audio, lengths)?;
+    internal_fn! {
+        /// Run forward pass on preprocessed audio.
+        ///
+        /// # Arguments
+        /// * `audio` - Raw audio waveform [batch, samples]
+        /// * `lengths` - Optional audio lengths `[batch]`
+        ///
+        /// # Returns
+        /// * Encoder output [batch, time, encoder_hidden]
+        /// * Encoder output lengths `[batch]`
+        pub fn forward(&mut self, audio: &Array, lengths: Option<&Array>) -> Result<(Array, Array)> {
+            // Preprocess audio to mel spectrogram
+            let (features, feature_lengths) = self.preprocessor.forward(audio, lengths)?;
 
-        // Encode
-        let (encoded, encoded_lengths) = self.encoder.forward(&features, &feature_lengths)?;
-        tracing::debug!(encoded_shape = ?encoded.shape(), "encoder output");
+            // Encode
+            let (encoded, encoded_lengths) = self.encoder.forward(&features, &feature_lengths)?;
+            tracing::debug!(encoded_shape = ?encoded.shape(), "encoder output");
 
-        // For RNNT, we return encoder output directly (decoding happens separately)
-        // Transpose from [B, D, T] to [B, T, D]
-        let encoded_transposed = mlx_rs::ops::transpose_axes(&encoded, &[0, 2, 1])?;
+            // For RNNT, we return encoder output directly (decoding happens separately)
+            // Transpose from [B, D, T] to [B, T, D]
+            let encoded_transposed = mlx_rs::ops::transpose_axes(&encoded, &[0, 2, 1])?;
 
-        Ok((encoded_transposed, encoded_lengths))
+            Ok((encoded_transposed, encoded_lengths))
+        }
     }
 
     /// Get the model configuration.
