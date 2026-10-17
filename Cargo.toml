@@ -7,7 +7,7 @@ anyhow = "1.0"
 
 [package]
 name = "mlx-voice"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2024"
 description = "NeMo-compatible ASR and speech AI library for Apple Silicon, built on MLX"
 license = "Apache-2.0"
@@ -15,7 +15,7 @@ readme = "README.md"
 repository = "https://github.com/animaslabs/mlx-voice-rs"
 keywords = ["asr", "speech", "mlx", "nemo", "machine-learning"]
 categories = ["science", "multimedia::audio"]
-include = ["/src/**", "/README.md", "/LICENSE", "/NOTICE", "/AUTHORS"]
+include = ["/src/**", "/README.md", "/CHANGELOG.md", "/LICENSE", "/NOTICE", "/AUTHORS"]
 
 [package.metadata.docs.rs]
 targets = ["aarch64-apple-darwin"]

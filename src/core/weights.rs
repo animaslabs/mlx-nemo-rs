@@ -42,8 +42,8 @@ impl WeightFormat {
     /// Detect weight format by analyzing Conv2d weight shapes.
     ///
     /// For NeMo models, the first subsampling conv has 1 input channel:
-    /// - PyTorch format: (O, I, H, W) = (256, 1, 3, 3) -> shape[1] = 1
-    /// - MLX format: (O, H, W, I) = (256, 3, 3, 1) -> shape[3] = 1
+    /// - PyTorch format: `(O, I, H, W) = (256, 1, 3, 3) -> shape[1] = 1`
+    /// - MLX format: `(O, H, W, I) = (256, 3, 3, 1) -> shape[3] = 1`
     ///
     /// This heuristic looks for Conv2d weights where one dimension is 1 (the input channel)
     /// and uses its position to infer the format.

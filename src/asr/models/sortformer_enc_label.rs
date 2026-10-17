@@ -184,7 +184,7 @@ impl SortformerEncLabelModel {
     ///
     /// # Arguments
     /// * `audio` - Raw audio samples [batch, samples]
-    /// * `audio_lengths` - Number of valid samples per batch [batch]
+    /// * `audio_lengths` - Number of valid samples per batch `[batch]`
     ///
     /// # Returns
     /// * Speaker activity probabilities [batch, time, num_spks]
@@ -294,7 +294,7 @@ impl SortformerEncLabelModel {
     ///
     /// # Arguments
     /// * `audio` - Raw audio samples [1, samples]
-    /// * `audio_lengths` - Number of valid samples [1]
+    /// * `audio_lengths` - Number of valid samples `[1]`
     ///
     /// # Returns
     /// * Speaker activity probabilities [1, frames, num_spks]

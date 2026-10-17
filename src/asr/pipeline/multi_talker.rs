@@ -139,7 +139,7 @@ pub struct SpeakerSegment {
 pub struct MultiTalkerOutput {
     /// Words completed during this step, ordered by start time
     pub new_words: Vec<SpeakerWord>,
-    /// Speaker activity for this chunk's encoder frames [frames][speakers]
+    /// Speaker activity for this chunk's encoder frames `[frames][speakers]`
     pub speaker_activity: Vec<Vec<f32>>,
     /// Whether this is the final output
     pub is_final: bool,

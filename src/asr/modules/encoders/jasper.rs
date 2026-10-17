@@ -347,7 +347,7 @@ impl JasperEncoder {
     ///
     /// # Arguments
     /// * `features` - Input features [B, T, n_mels] (MLX Conv1d format: N, L, C)
-    /// * `lengths` - Input lengths [B]
+    /// * `lengths` - Input lengths `[B]`
     ///
     /// # Returns
     /// * (encoded, encoded_lengths) where encoded is [B, T', output_dim]

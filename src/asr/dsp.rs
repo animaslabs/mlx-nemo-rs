@@ -17,13 +17,13 @@ use crate::core::error::{Error, Result};
 /// Create Hann window of given length as MLX array.
 ///
 /// The Hann window is defined as:
-/// w[n] = 0.5 * (1 - cos(2πn / (N-1)))
+/// `w[n] = 0.5 * (1 - cos(2πn / (N-1)))`
 ///
 /// # Arguments
 /// * `length` - Window length in samples
 ///
 /// # Returns
-/// MLX Array of shape [length] with window coefficients
+/// MLX Array of shape `[length]` with window coefficients
 pub fn hann_window(length: usize) -> Result<Array> {
     if length == 0 {
         return Ok(Array::zeros::<f32>(&[0])?);
@@ -49,13 +49,13 @@ pub fn hann_window(length: usize) -> Result<Array> {
 /// Create Hamming window of given length as MLX array.
 ///
 /// The Hamming window is defined as:
-/// w[n] = 0.54 - 0.46 * cos(2πn / (N-1))
+/// `w[n] = 0.54 - 0.46 * cos(2πn / (N-1))`
 ///
 /// # Arguments
 /// * `length` - Window length in samples
 ///
 /// # Returns
-/// MLX Array of shape [length] with window coefficients
+/// MLX Array of shape `[length]` with window coefficients
 pub fn hamming_window(length: usize) -> Result<Array> {
     if length == 0 {
         return Ok(Array::zeros::<f32>(&[0])?);
@@ -108,7 +108,7 @@ pub fn create_window(window_type: &str, length: usize) -> Result<Array> {
 /// * `n_fft` - FFT size (window will be zero-padded to this length)
 ///
 /// # Returns
-/// MLX Array of shape [n_fft] with center-padded window
+/// MLX Array of shape `[n_fft]` with center-padded window
 pub fn create_window_padded(window_type: &str, win_length: usize, n_fft: usize) -> Result<Array> {
     let window = create_window(window_type, win_length)?;
 
@@ -233,10 +233,10 @@ pub fn mel_filterbank(
 // Audio Processing Filters
 // ============================================================================
 
-/// Apply preemphasis filter to audio: y[n] = x[n] - coef * x[n-1]
+/// Apply preemphasis filter to audio: `y[n] = x[n] - coef * x[n-1]`
 ///
 /// # Arguments
-/// * `audio` - Input audio array [batch, time] or [time]
+/// * `audio` - Input audio array `[batch, time]` or `[time]`
 /// * `coef` - Preemphasis coefficient (typically 0.97)
 ///
 /// # Returns
@@ -314,7 +314,7 @@ pub fn dither(audio: &Array, amount: f32) -> Result<Array> {
 /// avoiding GPU→CPU→GPU data transfer.
 ///
 /// # Arguments
-/// * `audio` - Input audio [time]
+/// * `audio` - Input audio `[time]`
 /// * `window_len` - Window length in samples
 /// * `hop_len` - Hop length in samples
 /// * `n_fft` - FFT size (frames will be zero-padded to this length)

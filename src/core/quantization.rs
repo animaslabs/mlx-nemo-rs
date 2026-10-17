@@ -38,7 +38,7 @@ pub enum LinearLayer {
     Standard {
         /// Weights [out, in]
         weight: Array,
-        /// Optional layer bias [out]
+        /// Optional layer bias `[out]`
         bias: Option<Array>,
     },
     /// Quantized linear layer
@@ -49,7 +49,7 @@ pub enum LinearLayer {
         scales: Array,
         /// Quantization biases [out, in / group_size]
         biases: Array,
-        /// Optional layer bias [out]
+        /// Optional layer bias `[out]`
         bias: Option<Array>,
         /// Bits per weight
         bits: i32,

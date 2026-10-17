@@ -3,7 +3,7 @@
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 
-/// Result type alias using [`Error`].
+/// Result type alias using [`Error`](enum@Error).
 pub type Result<T> = std::result::Result<T, Error>;
 
 /// Main error type for mlx-voice operations.

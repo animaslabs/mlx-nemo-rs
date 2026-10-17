@@ -13,7 +13,7 @@ use crate::core::error::Result;
 ///
 /// # Arguments
 /// * `log_probs` - Log probabilities [batch, time, vocab_size]
-/// * `lengths` - Sequence lengths [batch]
+/// * `lengths` - Sequence lengths `[batch]`
 /// * `blank_id` - Blank token ID (typically 0 or vocab_size-1)
 ///
 /// # Returns
