@@ -5,10 +5,7 @@ All notable changes to this crate are documented here. The format follows
 [Semantic Versioning](https://semver.org/) (before 1.0, a minor release may
 break the API).
 
-## 0.2.1 (unreleased)
-
-0.2.1 breaks 0.2.0 callers (see Changed and Removed), despite the patch
-version: 0.2.0 had no users and is yanked along with 0.1.x.
+## 0.3.0 (unreleased)
 
 ### Added
 
@@ -72,7 +69,7 @@ These don't change the API:
 let probs = vad.infer_samples(&samples)?; // at the model's rate
 let preds: Array = diarizer.diarize(&audio_array, &lengths_array)?; // [1, frames, speakers]
 
-// 0.2.1
+// 0.3.0
 let probs = vad.infer_one((&samples[..], 48_000))?; // any rate; resampled
 let frames: Vec<Vec<f32>> = diarizer.diarize("meeting.wav")?; // [frame][speaker]
 let seconds_per_frame = diarizer.frame_duration();

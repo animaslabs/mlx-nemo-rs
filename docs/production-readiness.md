@@ -89,9 +89,7 @@ to Conventional Commits.
 `cargo-release` can do steps 1 and 3 in one command if you want that.
 
 `cargo-semver-checks` fails a release that breaks the API without the
-matching version bump. 0.2.1 does that on purpose (0.2.0 is to be yanked), so
-set the repository variable `SKIP_SEMVER_CHECKS=true` for that release, and
-delete it afterwards.
+matching version bump: before 1.0, a breaking change needs a minor bump.
 
 ### 1.2 Setup
 
@@ -103,7 +101,7 @@ delete it afterwards.
 3. Revoke the crates.io API token you use now once the first automated
    release succeeds.
 4. Tag the commits that `v0.1.0`, `v0.1.1` and `v0.2.0` were published from,
-   so the history is complete, even if those versions are yanked.
+   so the history is complete.
 
 ### 1.3 Workflow sketch
 

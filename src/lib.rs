@@ -14,7 +14,7 @@
 //!
 //! ```toml
 //! [dependencies]
-//! mlx-voice = { version = "0.2", features = ["hub"] }
+//! mlx-voice = { version = "0.3", features = ["hub"] }
 //! ```
 //!
 //! ```no_run

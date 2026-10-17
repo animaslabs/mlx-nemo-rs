@@ -32,7 +32,7 @@ Add the crate from crates.io:
 
 ```toml
 [dependencies]
-mlx-voice = "0.2"
+mlx-voice = "0.3"
 ```
 
 ASR support is behind the `asr` feature, which is on by default. The `hub` feature lets `from_pretrained` download models from the Hugging Face Hub. The `internals` feature exposes the building blocks (encoder layers, decoders, streaming caches, checkpoint parsing) for research and debugging; their API may change in any release.

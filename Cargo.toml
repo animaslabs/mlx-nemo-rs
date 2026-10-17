@@ -7,7 +7,7 @@ anyhow = "1.0"
 
 [package]
 name = "mlx-voice"
-version = "0.2.1"
+version = "0.3.0"
 edition = "2024"
 rust-version = "1.88"
 description = "NeMo-compatible ASR and speech AI library for Apple Silicon, built on MLX"
