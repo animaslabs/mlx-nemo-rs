@@ -24,9 +24,13 @@ fn find_punctuation_tokens(tokenizer: &SentencePieceProcessor) -> Vec<usize> {
         })
         .collect()
 }
-use crate::asr::decoding::{word_start_table, IncrementalDetokenizer, RnntStreamingDecoder};
+use crate::asr::decoding::{
+    lang_tag_table, last_lang_tag, word_start_table, IncrementalDetokenizer, RnntStreamingDecoder,
+};
 use crate::asr::models::{DecoderState, PredictionNetwork};
-use crate::asr::modules::{ConformerEncoder, MelProcessor, StreamingMel, StreamingMelConfig};
+use crate::asr::modules::{
+    ConformerEncoder, LanguagePrompt, MelProcessor, StreamingMel, StreamingMelConfig,
+};
 use crate::asr::streaming::{
     compute_streaming_config, get_streaming_modes, EncoderCache, FeatureBuffer, StreamingConfig,
     StreamingModeInfo,
@@ -245,6 +249,10 @@ pub struct CacheAwareRNNTPipeline {
     pub(super) punctuation_token_ids: Vec<usize>,
     /// For each token id, whether it starts a new word
     pub(super) word_start: Vec<bool>,
+    /// For each token id, whether it is a language tag such as `<en-US>`
+    pub(super) lang_tags: Vec<bool>,
+    /// Leave language tags out of the text
+    pub(super) strip_lang_tags: bool,
 
     // Blank threshold
     blank_threshold: f32,
@@ -339,6 +347,7 @@ impl CacheAwareRNNTPipeline {
         encoder.load_weights(&weights, None)?;
         decoder.load_weights(&weights, "decoder", None)?;
         joint.load_weights(&weights, "joint", None)?;
+        joint.set_prompt(LanguagePrompt::from_config(&config, &weights, None)?);
 
         // Set encoder's attention context for the selected streaming mode
         // This ensures the encoder uses the correct left/right context for attention masking
@@ -396,6 +405,7 @@ impl CacheAwareRNNTPipeline {
         };
 
         let word_start = tokenizer.as_ref().map(word_start_table).unwrap_or_default();
+        let lang_tags = tokenizer.as_ref().map(lang_tag_table).unwrap_or_default();
 
         Ok(Self {
             config,
@@ -422,6 +432,8 @@ impl CacheAwareRNNTPipeline {
             suppress_punctuation: false,
             punctuation_token_ids,
             word_start,
+            lang_tags,
+            strip_lang_tags: true,
             blank_threshold: 0.0,
             silence_threshold: 0.0,
         })
@@ -603,6 +615,7 @@ impl CacheAwareRNNTPipeline {
         encoder.load_weights(&weights, quant)?;
         decoder.load_weights(&weights, "decoder", quant)?;
         joint.load_weights(&weights, "joint", quant)?;
+        joint.set_prompt(LanguagePrompt::from_config(&config, &weights, quant)?);
 
         // Set encoder's attention context for the selected streaming mode
         encoder.set_streaming_mode(mode_idx);
@@ -658,6 +671,7 @@ impl CacheAwareRNNTPipeline {
         };
 
         let word_start = tokenizer.as_ref().map(word_start_table).unwrap_or_default();
+        let lang_tags = tokenizer.as_ref().map(lang_tag_table).unwrap_or_default();
 
         Ok(Self {
             config,
@@ -684,9 +698,48 @@ impl CacheAwareRNNTPipeline {
             suppress_punctuation: false,
             punctuation_token_ids,
             word_start,
+            lang_tags,
+            strip_lang_tags: true,
             blank_threshold: 0.0,
             silence_threshold: 0.0,
         })
+    }
+
+    /// Select the target language of a prompt-conditioned model, e.g. `"en-US"`,
+    /// `"de"`, or `"auto"` to let the model detect it (the default).
+    ///
+    /// Takes effect from the next encoder chunk; call before streaming starts
+    /// to condition the whole stream.
+    pub fn set_language(&mut self, language: &str) -> Result<()> {
+        self.joint
+            .prompt_mut()
+            .ok_or_else(|| Error::config("this model has no language prompt"))?
+            .set_language(language)
+    }
+
+    /// The selected target language, for prompt-conditioned models.
+    pub fn language(&self) -> Option<&str> {
+        self.joint.prompt().map(|p| p.language())
+    }
+
+    /// Every accepted target language key (empty for models without a prompt).
+    pub fn languages(&self) -> Vec<&str> {
+        self.joint.prompt().map(|p| p.languages().collect()).unwrap_or_default()
+    }
+
+    /// Keep or strip the language tags (e.g. `<en-US>`) that prompt-conditioned
+    /// models emit after each utterance's terminal punctuation.
+    ///
+    /// Tags are stripped from text by default; token ids always keep them.
+    pub fn set_strip_lang_tags(&mut self, strip: bool) {
+        self.strip_lang_tags = strip;
+        self.state.detokenizer.reset();
+    }
+
+    /// The language named by the last language tag in `tokens`, e.g. `"en-US"`
+    /// (see [`TranscribeOutput::tokens`]).
+    pub fn detected_language(&self, tokens: &[usize]) -> Option<String> {
+        last_lang_tag(self.tokenizer.as_ref()?, &self.lang_tags, tokens)
     }
 
     /// Get the sample rate expected by this pipeline.
@@ -1266,10 +1319,12 @@ impl CacheAwareRNNTPipeline {
         self.state.is_first_chunk = false;
 
         let text = match &self.tokenizer {
-            Some(tokenizer) => self
-                .state
-                .detokenizer
-                .update(tokenizer, &self.word_start, &self.state.accumulated_tokens),
+            Some(tokenizer) => self.state.detokenizer.update(
+                tokenizer,
+                &self.word_start,
+                self.strip_lang_tags,
+                &self.state.accumulated_tokens,
+            ),
             None => String::new(),
         };
 

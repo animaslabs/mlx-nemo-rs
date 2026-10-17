@@ -22,7 +22,10 @@ mod rnnt_beam;
 mod rnnt_greedy;
 mod rnnt_streaming;
 
-pub use detokenize::{word_start_table, IncrementalDetokenizer};
+pub use detokenize::{
+    decode_text, is_lang_tag, lang_tag_table, last_lang_tag, strip_lang_tags, word_start_table,
+    IncrementalDetokenizer,
+};
 pub use greedy::greedy_decode;
 pub use merge::{greedy_ctc_merge, lcs_merge_buffer, LcsAlignmentResult};
 pub use rnnt_beam::rnnt_beam_decode;

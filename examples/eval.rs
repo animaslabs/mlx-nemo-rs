@@ -19,6 +19,8 @@
 //!   --eval-dir <dir>     Eval set directory (default: samples/eval)
 //!   --out <path>         Output JSONL (default: hypotheses.jsonl)
 //!   --language <codes>   Only clips in these languages, comma-separated (e.g. en)
+//!   --target-lang <lang> Target language of a multilingual model: a key such as en-US,
+//!                        `auto` (default), or `clip` for each clip's manifest language
 //!   --clip <name>        Only this clip (repeatable)
 //!   --warmup <n>         Untimed runs on the first clip before timing (default: 1)
 //!   --repeats <n>        Timed runs per clip; the median is reported (default: 1)
@@ -50,6 +52,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut warmup: usize = 1;
     let mut repeats: usize = 1;
     let mut dtype = String::from("float32");
+    let mut target_lang: Option<String> = None;
 
     let mut i = 1;
     while i < args.len() {
@@ -69,6 +72,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "--out" => out_path = value().into(),
             "--language" => languages.extend(value().split(',').map(str::to_string)),
             "--clip" => clips.push(value()),
+            "--target-lang" => target_lang = Some(value()),
             other => return Err(format!("unknown argument: {other}").into()),
         }
         i += 2;
@@ -76,7 +80,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let Some(model_path) = model_path else {
         eprintln!(
             "Usage: {} --model <model.nemo|dir> [--offline] [--dtype DTYPE] [--mode N] [--eval-dir DIR] \
-             [--out FILE] [--language en,de] [--clip NAME]... [--warmup N] [--repeats N]",
+             [--out FILE] [--language en,de] [--target-lang LANG|clip] [--clip NAME]... \
+             [--warmup N] [--repeats N]",
             args[0]
         );
         std::process::exit(1);
@@ -125,6 +130,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             Model::Streaming(_) => return Err("--dtype applies to --offline only".into()),
         }
     }
+    let per_clip_lang = target_lang.as_deref() == Some("clip");
+    if let Some(lang) = target_lang.as_deref().filter(|_| !per_clip_lang) {
+        model.set_language(lang)?;
+    }
     let load_time = load_start.elapsed().as_secs_f64();
     println!("Loaded in {load_time:.2}s");
 
@@ -146,6 +155,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let name = entry["name"].as_str().unwrap_or_default();
         let duration = entry["duration"].as_f64().unwrap_or_default();
         let audio = eval_dir.join(entry["audio"].as_str().unwrap_or_default());
+        if per_clip_lang {
+            model.set_language(entry["language"].as_str().unwrap_or_default())?;
+        }
 
         let mut runs = Vec::with_capacity(repeats);
         let mut failure = None;
@@ -229,6 +241,13 @@ enum Model {
 }
 
 impl Model {
+    fn set_language(&mut self, language: &str) -> mlx_voice::Result<()> {
+        match self {
+            Model::Offline(model) => model.set_language(language),
+            Model::Streaming(pipeline) => pipeline.set_language(language),
+        }
+    }
+
     /// Transcribe one file, returning the text and, when streaming, the wall
     /// time of each `transcribe_step` (seconds).
     fn transcribe(

@@ -3,6 +3,8 @@
 //! These types mirror NeMo's configuration structure for ASR models,
 //! allowing loading of NeMo checkpoint configurations.
 
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 
 use crate::core::error::{Error, Result};
@@ -126,17 +128,45 @@ impl AsrModelConfig {
         !self.is_rnnt()
     }
 
+    /// Whether the model conditions its encoder output on a language prompt
+    /// (NeMo `EncDecRNNTBPEModelWithPrompt`, e.g. nemotron-3.5-asr-streaming).
+    pub fn is_prompt_conditioned(&self) -> bool {
+        let initialize = self
+            .extra
+            .get("model_defaults")
+            .and_then(|d| d.get("initialize_prompt_feature"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        initialize || self.target.as_deref().is_some_and(|t| t.contains("WithPrompt"))
+    }
+
+    /// Language prompt settings from `model_defaults`, if the model has a prompt dictionary.
+    pub fn prompt_config(&self) -> Option<PromptConfig> {
+        let defaults = self.extra.get("model_defaults")?;
+        let dictionary: BTreeMap<String, usize> = defaults
+            .get("prompt_dictionary")?
+            .as_mapping()?
+            .iter()
+            .filter_map(|(k, v)| Some((k.as_str()?.to_string(), v.as_u64()? as usize)))
+            .collect();
+        if dictionary.is_empty() {
+            return None;
+        }
+        let num_prompts = defaults
+            .get("num_prompts")
+            .and_then(|v| v.as_u64())
+            .map_or(128, |n| n as usize);
+        Some(PromptConfig { dictionary, num_prompts })
+    }
+
     /// Reject model variants that would load without error but decode incorrectly.
     ///
     /// Encoder settings are checked separately by [`EncoderConfig::validate`].
     pub fn validate(&self) -> Result<()> {
-        if let Some(target) = self.target.as_deref() {
-            if target.contains("WithPrompt") {
-                return Err(Error::not_implemented(format!(
-                    "prompt-conditioned model `{}` (prompt_kernel and target language are not supported)",
-                    target
-                )));
-            }
+        if self.is_prompt_conditioned() && self.prompt_config().is_none() {
+            return Err(Error::config(
+                "prompt-conditioned model has no model_defaults.prompt_dictionary",
+            ));
         }
 
         let has_tdt_durations = self
@@ -153,6 +183,15 @@ impl AsrModelConfig {
 
         Ok(())
     }
+}
+
+/// Language-ID prompt settings of a prompt-conditioned model.
+#[derive(Debug, Clone)]
+pub struct PromptConfig {
+    /// Language key (e.g. `en-US`, `de`, `auto`) -> one-hot index
+    pub dictionary: BTreeMap<String, usize>,
+    /// Length of the one-hot prompt vector
+    pub num_prompts: usize,
 }
 
 fn default_sample_rate() -> u32 {
@@ -1317,6 +1356,22 @@ mod tests {
         )
         .validate()
         .is_err());
+
+        let mut prompt = asr_config(
+            "nemo.collections.asr.models.rnnt_bpe_models_prompt.EncDecRNNTBPEModelWithPrompt",
+        );
+        prompt.extra.insert(
+            "model_defaults".to_string(),
+            yaml_serde::from_str(
+                "num_prompts: 128\nprompt_dictionary: {en-US: 0, en: 0, 'no': 27, auto: 101}",
+            )
+            .unwrap(),
+        );
+        assert!(prompt.validate().is_ok());
+        let prompt = prompt.prompt_config().unwrap();
+        assert_eq!(prompt.num_prompts, 128);
+        assert_eq!(prompt.dictionary["no"], 27);
+        assert_eq!(prompt.dictionary["auto"], 101);
 
         let mut tdt = asr_config("nemo.collections.asr.models.EncDecRNNTBPEModel");
         tdt.extra.insert(

@@ -7,6 +7,7 @@
 
 pub mod decoders;
 pub mod encoders;
+pub mod language_prompt;
 pub mod preprocessors;
 pub mod sortformer;
 pub mod speaker_kernel;
@@ -15,6 +16,7 @@ pub use decoders::CTCDecoder;
 pub use decoders::{LstmState, RNNTDecoder, RNNTJoint, StatelessTransducerDecoder};
 pub use encoders::ConformerEncoder;
 pub use encoders::TransformerEncoder;
+pub use language_prompt::{LanguagePrompt, AUTO_LANGUAGE};
 pub use sortformer::SortformerModules;
 pub use speaker_kernel::{SpeakerKernels, SpeakerTargets};
 

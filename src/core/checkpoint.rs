@@ -5,7 +5,7 @@
 
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::Read;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 use mlx_rs::Array;
@@ -46,10 +46,16 @@ impl NemoCheckpoint {
             ));
         }
 
-        let file = File::open(path)?;
+        let mut file = File::open(path)?;
 
-        // Try to open as uncompressed TAR first (NeMo >= 1.7.0)
-        // Fall back to gzip-compressed TAR for older files
+        // Most .nemo files are uncompressed TAR (NeMo >= 1.7.0), but some
+        // (e.g. nemotron-3.5-asr-streaming-0.6b) are still gzip-compressed
+        let mut magic = [0u8; 2];
+        let is_gzip = file.read_exact(&mut magic).is_ok() && magic == [0x1f, 0x8b];
+        if is_gzip {
+            return Self::open_gzip(path);
+        }
+        file.seek(SeekFrom::Start(0))?;
         let mut archive = Archive::new(file);
 
         // Create a temporary directory to extract files
