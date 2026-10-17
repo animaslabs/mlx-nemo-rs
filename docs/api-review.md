@@ -422,9 +422,24 @@ streaming mode for its attention context, so streaming in another mode changed
 later offline results; and changing the streaming mode didn't clear the cached
 streaming attention masks.
 
-Still open: CTC models keep their old `init_streaming` API (no cache-aware CTC
-checkpoint was available to test a port), and §4.4 (`StreamingMode` as a type).
-`mode` stays an index.
+CTC streaming moved onto the same session. NVIDIA publishes no pure CTC
+streaming checkpoint: its cache-aware CTC models are hybrid RNN-T/CTC models
+(`stt_en_fastconformer_hybrid_large_streaming_multi`, NeMo
+`EncDecHybridRNNTCTCBPEModel`) whose encoder feeds both an RNN-T decoder and an
+auxiliary CTC decoder. `EncDecRnntModel` now loads the auxiliary decoder
+(`ctc_decoder.*`, from the config's `aux_ctc` section, exposed as
+`AsrModelConfig::aux_ctc`) when `AsrModelConfig::is_hybrid()`: the nemotron
+streaming checkpoints keep an `aux_ctc` section from training but no CTC
+weights, and NeMo builds the head only for its hybrid classes. Like NeMo's `change_decoding_strategy(decoder_type=...)`,
+`TranscribeOptions::decoder_type` and `StreamingOptions::decoder_type` choose
+`DecoderType::Rnnt` (the default) or `DecoderType::Ctc`. Streaming CTC collapses
+repeats across chunk boundaries, which matches NeMo's concatenated
+per-chunk predictions. `blank_threshold` and `suppress_punctuation` apply to both
+decoders. `EncDecCtcModel`'s untested `init_streaming`/`process_chunk`/
+`finalize_streaming`, `CtcStreamingSession`, `StreamingOutput`,
+`StreamingMelBuffer` and the LCS merge helpers are removed.
+
+Still open: §4.4 (`StreamingMode` as a type). `mode` stays an index.
 
 ### 4.1 Two streaming APIs
 
@@ -987,8 +1002,9 @@ release happens.
 5. ~~Add `Transcript`/`Token`/`Word` results and `TranscribeOptions` (§3.2–3.3).~~ Done, with `AudioInput` (§3.1).
 6. ~~Add one `StreamingSession` built from a model, and turn
    `CacheAwareRNNTPipeline` into a thin wrapper or remove it (§4). Remove
-   `init_streaming`/`process_chunk`/`finalize_streaming`.~~ Done for RNN-T
-   (the pipeline is removed); CTC streaming is still the old API.
+   `init_streaming`/`process_chunk`/`finalize_streaming`.~~ Done (the pipeline
+   is removed). CTC streaming runs on the same session through a hybrid
+   model's CTC decoder.
 7. ~~Add typed config enums (§5) and Rust-cased type names with
    `#[doc(alias)]` (§6.2).~~ Done.
 

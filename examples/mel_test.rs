@@ -2,7 +2,6 @@
 
 use mlx_voice::asr::config::{Normalize, WindowType};
 use mlx_voice::asr::modules::{MelConfig, MelProcessor};
-use mlx_voice::asr::streaming::StreamingMelBuffer;
 
 fn main() -> mlx_voice::Result<()> {
     // Load audio
@@ -86,69 +85,6 @@ fn main() -> mlx_voice::Result<()> {
     }
     println!();
 
-    // ===== Test StreamingMelBuffer =====
-    println!("\n=== Testing StreamingMelBuffer ===");
-
-    let mut buffer = StreamingMelBuffer::new(16000, 0.025, 0.01, 128, 512);
-
-    // Append mel to buffer
-    buffer.append_mel(&mel)?;
-    println!(
-        "Buffer after append: total_frames={}, buffer_idx={}",
-        buffer.total_frames, buffer.buffer_idx
-    );
-
-    // Test extraction with streaming params (chunk_size=112, pre_encode_cache=9)
-    let chunk_size = 112;
-    let shift_size = 112;
-    let pre_encode_cache = 9;
-    let total_needed = chunk_size + pre_encode_cache;
-
-    println!(
-        "\nAttempting to extract: chunk_size={}, pre_encode_cache={}, total_needed={}",
-        chunk_size, pre_encode_cache, total_needed
-    );
-
-    if let Some((extracted, len, _valid_frames)) =
-        buffer.extract_chunk(chunk_size, shift_size, pre_encode_cache)
-    {
-        extracted.eval()?;
-        println!(
-            "Extracted chunk shape: {:?}, len: {}",
-            extracted.shape(),
-            len
-        );
-
-        let extracted_flat = extracted.reshape(&[-1])?;
-        extracted_flat.eval()?;
-        let ex_slice: &[f32] = extracted_flat.as_slice();
-        let ex_min = ex_slice.iter().cloned().fold(f32::INFINITY, f32::min);
-        let ex_max = ex_slice.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-        let ex_mean: f32 = ex_slice.iter().sum::<f32>() / ex_slice.len() as f32;
-
-        println!(
-            "Extracted stats: min={:.6}, max={:.6}, mean={:.6}",
-            ex_min, ex_max, ex_mean
-        );
-
-        let ex_positive = ex_slice.iter().filter(|&&v| v > 0.0).count();
-        println!(
-            "Positive values in extracted: {} out of {}",
-            ex_positive,
-            ex_slice.len()
-        );
-
-        // Print first frame of extracted
-        println!("\nFirst frame of extracted (first 10 bins):");
-        let ex_frames = extracted.dim(1) as usize;
-        for i in 0..10.min(n_mels) {
-            print!("{:.6} ", ex_slice[i * ex_frames]);
-        }
-        println!();
-    } else {
-        println!("ERROR: Failed to extract chunk!");
-    }
-
     // ===== Test multiple chunks like streaming =====
     println!("\n=== Testing Multi-chunk Streaming ===");
 
@@ -167,7 +103,6 @@ fn main() -> mlx_voice::Result<()> {
     config2.fmax = None;
 
     let mel_proc2 = MelProcessor::new(config2)?;
-    let mut buffer2 = StreamingMelBuffer::new(16000, 0.025, 0.01, 128, 512);
 
     // Process audio in multiple chunks (simulating streaming)
     let audio_chunk_size = 19360; // ~1210ms
@@ -196,15 +131,12 @@ fn main() -> mlx_voice::Result<()> {
             max,
             positive
         );
-
-        buffer2.append_mel(&mel_chunk)?;
     }
 
     println!(
         "\nTotal positive values across all chunks: {}",
         total_positive
     );
-    println!("Buffer total_frames: {}", buffer2.total_frames);
 
     Ok(())
 }

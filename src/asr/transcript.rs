@@ -98,6 +98,23 @@ pub enum DecodingStrategy {
     },
 }
 
+/// Which decoder of a hybrid RNN-T/CTC model produces tokens (NeMo's
+/// `decoder_type`).
+///
+/// Hybrid models such as `stt_en_fastconformer_hybrid_large_streaming_multi`
+/// share one encoder between an RNN-T decoder and an auxiliary CTC decoder.
+/// RNN-T, the default, is usually more accurate; CTC is faster and needs no
+/// decoder state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub enum DecoderType {
+    /// The RNN-T (transducer) decoder
+    #[default]
+    Rnnt,
+    /// The CTC decoder (greedy)
+    Ctc,
+}
+
 /// Options for offline transcription.
 ///
 /// ```no_run
@@ -115,6 +132,10 @@ pub struct TranscribeOptions {
     /// Decoding strategy; `None` uses the model's configured strategy
     /// (`decoding.strategy` in its config).
     pub decoding: Option<DecodingStrategy>,
+    /// Decoder to use; `None` uses the model's own (RNN-T for RNN-T and
+    /// hybrid models, CTC for CTC models). [`DecoderType::Ctc`] on an RNN-T
+    /// model needs a hybrid model's CTC decoder.
+    pub decoder_type: Option<DecoderType>,
     /// Target language of a multilingual (prompt-conditioned) model, e.g.
     /// `"de-DE"`, `"de"` or `"auto"`; `None` keeps the model's current one.
     pub language: Option<String>,
@@ -130,6 +151,7 @@ impl Default for TranscribeOptions {
     fn default() -> Self {
         Self {
             decoding: None,
+            decoder_type: None,
             language: None,
             strip_lang_tags: true,
             batch_size: 4,
@@ -147,6 +169,12 @@ impl TranscribeOptions {
     /// Use beam search with `beam_size` hypotheses.
     pub fn beam_search(self, beam_size: usize) -> Self {
         self.decoding(DecodingStrategy::BeamSearch { beam_size })
+    }
+
+    /// Decode with `decoder_type`, e.g. a hybrid model's CTC decoder.
+    pub fn decoder_type(mut self, decoder_type: DecoderType) -> Self {
+        self.decoder_type = Some(decoder_type);
+        self
     }
 
     /// Transcribe in `language` (multilingual models only).
@@ -315,12 +343,14 @@ mod tests {
     fn test_options_builder() {
         let options = TranscribeOptions::default()
             .beam_search(4)
+            .decoder_type(DecoderType::Ctc)
             .language("de")
             .batch_size(0);
         assert_eq!(
             options.decoding,
             Some(DecodingStrategy::BeamSearch { beam_size: 4 })
         );
+        assert_eq!(options.decoder_type, Some(DecoderType::Ctc));
         assert_eq!(options.language.as_deref(), Some("de"));
         assert_eq!(options.batch_size, 1);
         assert!(options.strip_lang_tags);

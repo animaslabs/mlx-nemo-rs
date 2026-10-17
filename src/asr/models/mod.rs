@@ -10,7 +10,7 @@ mod enc_dec_rnnt;
 mod sortformer_enc_label;
 
 pub use enc_dec_classification::EncDecClassificationModel;
-pub use enc_dec_ctc::{CtcStreamingSession, EncDecCtcModel};
+pub use enc_dec_ctc::EncDecCtcModel;
 pub use enc_dec_rnnt::EncDecRnntModel;
 pub use sortformer_enc_label::SortformerEncLabelModel;
 

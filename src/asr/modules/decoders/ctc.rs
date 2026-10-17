@@ -51,14 +51,14 @@ impl CtcDecoder {
     pub fn forward(&self, encoded: &Array) -> Result<Array> {
         // Transpose from [B, D, T] to [B, T, D]
         let x = ops::transpose_axes(encoded, &[0, 2, 1])?;
+        self.log_probs(&x)
+    }
 
-        // Project to vocabulary size
-        let logits = self.decoder.forward(&x)?;
-
-        // Apply log softmax for CTC
-        let log_probs = mlx_rs::nn::log_softmax(&logits, -1)?;
-
-        Ok(log_probs)
+    /// Project time-major encoder output `[batch, time, d_model]` to log
+    /// probabilities `[batch, time, vocab_size]`.
+    pub fn log_probs(&self, encoded: &Array) -> Result<Array> {
+        let logits = self.decoder.forward(encoded)?;
+        Ok(mlx_rs::nn::log_softmax(&logits, -1)?)
     }
 
     /// Get the vocabulary size.

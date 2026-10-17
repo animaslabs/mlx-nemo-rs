@@ -16,6 +16,7 @@
 //!   --offline            Transcribe whole files with EncDecRnntModel instead of streaming
 //!   --dtype <dtype>      Offline encoder dtype: float32 (default), bfloat16 or float16
 //!   --mode <idx>         Streaming mode index (default: 0)
+//!   --ctc                Decode with a hybrid RNN-T/CTC model's CTC decoder
 //!   --eval-dir <dir>     Eval set directory (default: samples/eval)
 //!   --out <path>         Output JSONL (default: hypotheses.jsonl)
 //!   --language <codes>   Only clips in these languages, comma-separated (e.g. en)
@@ -30,7 +31,7 @@ use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use mlx_voice::asr::{EncDecRnntModel, StreamingOptions};
+use mlx_voice::asr::{DecoderType, EncDecRnntModel, StreamingOptions, TranscribeOptions};
 use serde_json::{Value, json};
 use tracing_subscriber::{EnvFilter, fmt};
 
@@ -49,6 +50,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut languages: Vec<String> = Vec::new();
     let mut clips: Vec<String> = Vec::new();
     let mut offline = false;
+    let mut ctc = false;
     let mut warmup: usize = 1;
     let mut repeats: usize = 1;
     let mut dtype = String::from("float32");
@@ -60,6 +62,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         match args[i].as_str() {
             "--offline" => {
                 offline = true;
+                i += 1;
+                continue;
+            }
+            "--ctc" => {
+                ctc = true;
                 i += 1;
                 continue;
             }
@@ -79,7 +86,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let Some(model_path) = model_path else {
         eprintln!(
-            "Usage: {} --model <model.nemo|dir> [--offline] [--dtype DTYPE] [--mode N] [--eval-dir DIR] \
+            "Usage: {} --model <model.nemo|dir> [--offline] [--ctc] [--dtype DTYPE] [--mode N] [--eval-dir DIR] \
              [--out FILE] [--language en,de] [--target-lang LANG|clip] [--clip NAME]... \
              [--warmup N] [--repeats N]",
             args[0]
@@ -109,12 +116,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if offline { "offline" } else { "streaming" }
     );
     let load_start = Instant::now();
+    let decoder_type = if ctc {
+        DecoderType::Ctc
+    } else {
+        DecoderType::Rnnt
+    };
     let mut model = if offline {
-        Model::Offline(EncDecRnntModel::from_pretrained(&model_path)?)
+        Model::Offline(
+            EncDecRnntModel::from_pretrained(&model_path)?,
+            TranscribeOptions::default().decoder_type(decoder_type),
+        )
     } else {
         Model::Streaming(
             EncDecRnntModel::from_pretrained(&model_path)?,
-            StreamingOptions::default().mode(mode_idx),
+            StreamingOptions::default()
+                .mode(mode_idx)
+                .decoder_type(decoder_type),
         )
     };
     let encoder_dtype = match dtype.as_str() {
@@ -125,7 +142,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     if let Some(encoder_dtype) = encoder_dtype {
         match &mut model {
-            Model::Offline(model) => model.set_encoder_dtype(encoder_dtype)?,
+            Model::Offline(model, _) => model.set_encoder_dtype(encoder_dtype)?,
             Model::Streaming(..) => return Err("--dtype applies to --offline only".into()),
         }
     }
@@ -211,6 +228,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "elapsed": round(elapsed, 3),
             "load_time": round(load_time, 2),
         });
+        if ctc {
+            row["decoder"] = json!("ctc");
+        }
         if !steps.is_empty() {
             let mut ms: Vec<f64> = steps.iter().map(|s| s * 1000.0).collect();
             ms.sort_by(f64::total_cmp);
@@ -235,14 +255,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 enum Model {
-    Offline(EncDecRnntModel),
+    Offline(EncDecRnntModel, TranscribeOptions),
     Streaming(EncDecRnntModel, StreamingOptions),
 }
 
 impl Model {
     fn set_language(&mut self, language: &str) -> mlx_voice::Result<()> {
         match self {
-            Model::Offline(model) => model.set_language(language),
+            Model::Offline(model, _) => model.set_language(language),
             Model::Streaming(model, _) => model.set_language(language),
         }
     }
@@ -254,8 +274,8 @@ impl Model {
         audio: &Path,
     ) -> Result<(String, Vec<f64>), Box<dyn std::error::Error>> {
         match self {
-            Model::Offline(model) => {
-                let text = model.transcribe_one(audio)?.text;
+            Model::Offline(model, options) => {
+                let text = model.transcribe_with([audio], options)?.remove(0).text;
                 Ok((text, Vec::new()))
             }
             Model::Streaming(model, options) => {

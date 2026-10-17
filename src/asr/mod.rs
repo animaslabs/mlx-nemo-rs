@@ -60,17 +60,18 @@ pub mod vad;
 // Re-exports
 pub use config::AsrModelConfig;
 pub use models::{
-    CtcStreamingSession, EncDecClassificationModel, EncDecCtcModel, EncDecRnntModel,
-    SortformerEncLabelModel,
+    EncDecClassificationModel, EncDecCtcModel, EncDecRnntModel, SortformerEncLabelModel,
 };
 pub use modules::{MelConfig, MelProcessor, SpectrumTransform, StreamingMel};
 pub use pipeline::{
     MultiTalkerConfig, MultiTalkerMode, MultiTalkerOutput, MultiTalkerPipeline, SpeakerSegment,
     SpeakerWord, StreamUpdate, StreamingOptions, StreamingSession,
 };
-pub use streaming::{StreamingConfig, StreamingModeInfo, StreamingOutput};
+pub use streaming::{StreamingConfig, StreamingModeInfo};
 pub use tokenizer::Tokenizer;
-pub use transcript::{AudioInput, DecodingStrategy, Token, TranscribeOptions, Transcript, Word};
+pub use transcript::{
+    AudioInput, DecoderType, DecodingStrategy, Token, TranscribeOptions, Transcript, Word,
+};
 pub use vad::{SpeechSegment, VadPostProcessConfig, VadPostProcessor};
 
 /// Prelude for convenient imports.
@@ -79,7 +80,9 @@ pub mod prelude {
     pub use super::models::{EncDecCtcModel, EncDecRnntModel};
     pub use super::pipeline::{StreamingOptions, StreamingSession};
     pub use super::tokenizer::Tokenizer;
-    pub use super::transcript::{AudioInput, DecodingStrategy, TranscribeOptions, Transcript};
+    pub use super::transcript::{
+        AudioInput, DecoderType, DecodingStrategy, TranscribeOptions, Transcript,
+    };
 }
 
 // Models and sessions are moved to worker threads (audio callbacks feed a

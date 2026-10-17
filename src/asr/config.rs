@@ -282,6 +282,12 @@ pub struct AsrModelConfig {
     #[serde(default)]
     pub decoding: Option<DecodingConfig>,
 
+    /// Auxiliary CTC decoder of hybrid RNN-T/CTC models. Some RNN-T
+    /// checkpoints keep this section from hybrid training without its
+    /// weights; [`is_hybrid`](Self::is_hybrid) tells them apart.
+    #[serde(default)]
+    pub aux_ctc: Option<AuxCtcConfig>,
+
     /// Spec augmentation (training only)
     #[serde(default)]
     spec_augment: Option<yaml_serde::Value>,
@@ -300,6 +306,13 @@ impl AsrModelConfig {
             // Fall back to checking if joint config is present
             self.joint.is_some()
         }
+    }
+
+    /// Whether this is a hybrid RNN-T/CTC model (NeMo
+    /// `EncDecHybridRNNTCTCModel` and subclasses), which has an auxiliary CTC
+    /// decoder besides its RNN-T decoder.
+    pub fn is_hybrid(&self) -> bool {
+        self.aux_ctc.is_some() && self.target.as_deref().is_some_and(|t| t.contains("Hybrid"))
     }
 
     /// Check if this is a CTC model.
@@ -847,6 +860,23 @@ pub struct TokenizerConfig {
 
 fn default_tokenizer_type() -> String {
     "bpe".to_string()
+}
+
+/// The auxiliary CTC decoder of a hybrid RNN-T/CTC model (NeMo
+/// `EncDecHybridRNNTCTCBPEModel`), which shares the encoder.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct AuxCtcConfig {
+    /// CTC decoder configuration
+    pub decoder: DecoderConfig,
+
+    /// CTC decoding strategy configuration
+    #[serde(default)]
+    pub decoding: Option<DecodingConfig>,
+
+    /// Additional fields
+    #[serde(flatten)]
+    extra: std::collections::HashMap<String, yaml_serde::Value>,
 }
 
 /// Decoding strategy configuration.
@@ -1450,6 +1480,7 @@ macro_rules! impl_extra_accessor {
 
 impl_extra_accessor!(
     AsrModelConfig,
+    AuxCtcConfig,
     EncoderConfig,
     DecodingConfig,
     ClassificationModelConfig,
@@ -1475,9 +1506,23 @@ mod tests {
             joint: None,
             tokenizer: None,
             decoding: None,
+            aux_ctc: None,
             spec_augment: None,
             extra: std::collections::HashMap::new(),
         }
+    }
+
+    #[test]
+    fn test_is_hybrid() {
+        let aux: AuxCtcConfig = yaml_serde::from_str("decoder: {num_classes: 1024}").unwrap();
+        let mut config = asr_config("nemo.collections.asr.models.EncDecHybridRNNTCTCBPEModel");
+        assert!(!config.is_hybrid());
+        config.aux_ctc = Some(aux.clone());
+        assert!(config.is_hybrid() && config.is_rnnt());
+        // RNN-T checkpoints may keep aux_ctc from hybrid training
+        let mut config = asr_config("nemo.collections.asr.models.EncDecRNNTBPEModel");
+        config.aux_ctc = Some(aux);
+        assert!(!config.is_hybrid());
     }
 
     #[test]

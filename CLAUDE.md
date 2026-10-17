@@ -39,6 +39,7 @@ cargo test --release --test multitalker -- --ignored --test-threads=1 --nocaptur
 # Download models from Hugging Face
 cargo xtask download nvidia/parakeet-ctc-0.6b
 cargo xtask download nvidia/nemotron-speech-streaming-en-0.6b --token $HF_TOKEN
+cargo xtask download nvidia/stt_en_fastconformer_hybrid_large_streaming_multi
 cargo xtask download nvidia/nemotron-3.5-asr-streaming-0.6b --file nemotron-3.5-asr-streaming-0.6b.nemo
 cargo xtask download nvidia/multitalker-parakeet-streaming-0.6b-v1
 cargo xtask download nvidia/diar_streaming_sortformer_4spk-v2.1
@@ -68,7 +69,7 @@ The eval dataset revision is pinned in both `xtask/src/main.rs` and mlx-models `
 
 **Models** (`models/`):
 - `EncDecCtcModel`: CTC-based ASR (e.g., parakeet-ctc-0.6b)
-- `EncDecRnntModel`: RNN-T/Transducer ASR (e.g., parakeet-rnnt-0.6b)
+- `EncDecRnntModel`: RNN-T/Transducer ASR (e.g., parakeet-rnnt-0.6b). Also loads hybrid RNN-T/CTC models (`Hybrid` target with an `aux_ctc` config, `ctc_decoder.*` weights; nemotron checkpoints have `aux_ctc` but no CTC head); `DecoderType::Ctc` in `TranscribeOptions`/`StreamingOptions` decodes with the CTC head
 
 **Modules** (`modules/`):
 - `MelSpectrogram`: Audio preprocessing (mel filterbank features)
@@ -91,9 +92,8 @@ The eval dataset revision is pinned in both `xtask/src/main.rs` and mlx-models `
 - `StreamingSortformerState`: SortFormer speaker cache / FIFO of pre-encode embeddings (port of NeMo's `streaming_update` and `_compress_spkcache`)
 
 **Decoding** (`decoding/`):
-- `greedy.rs`: Greedy CTC decoding
+- `greedy.rs`: Greedy CTC decoding, offline and per streaming chunk (`ctc_frame_labels`, `ctc_collapse`)
 - `rnnt_greedy.rs`, `rnnt_streaming.rs`: RNN-T greedy decoding
-- `merge.rs`: Token merging and LCS-based buffer merging for streaming
 
 ### Data Flow
 
@@ -113,6 +113,7 @@ Models are stored in `models/nvidia/` and downloaded via xtask:
 - `parakeet-ctc-0.6b/`: Non-streaming CTC model
 - `parakeet-rnnt-0.6b/`: Non-streaming RNN-T model
 - `nemotron-speech-streaming-en-0.6b/`: Streaming RNN-T model (gated, requires HF token)
+- `stt_en_fastconformer_hybrid_large_streaming_multi/`: Streaming hybrid RNN-T/CTC model (both decoders, offline and streaming)
 - `nemotron-3.5-asr-streaming-0.6b/`: Multilingual streaming RNN-T with a language-ID prompt (`set_language`, default `auto`; `<xx-XX>` tags stripped from text by default)
 - `multitalker-parakeet-streaming-0.6b-v1/`: Streaming multitalker RNN-T (Nemotron streaming + speaker kernels)
 - `diar_streaming_sortformer_4spk-v2.1/`: Streaming SortFormer diarizer (up to 4 speakers)

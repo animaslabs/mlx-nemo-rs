@@ -56,9 +56,9 @@ use crate::asr::models::{EncDecRnntModel, SortformerEncLabelModel};
 use crate::asr::modules::DecoderState;
 use crate::asr::modules::SpeakerTargets;
 use crate::asr::streaming::{EncoderCache, FeatureBuffer, StreamingSortformerState};
-use crate::asr::transcript::AudioInput;
+use crate::asr::transcript::{AudioInput, DecoderType};
 use crate::core::ArrayExt;
-use crate::core::error::Result;
+use crate::core::error::{Error, Result};
 use crate::core::loading::LoadOptions;
 use crate::core::source::ModelSource;
 
@@ -230,6 +230,11 @@ impl MultiTalkerPipeline {
     ) -> Result<Self> {
         let model = EncDecRnntModel::from_pretrained_with(asr, config.load)?;
         let asr = StreamingSession::new(model, config.streaming.clone())?;
+        if asr.decoder_type() != DecoderType::Rnnt {
+            return Err(Error::not_implemented(
+                "multi-talker transcription with a CTC decoder",
+            ));
+        }
         let mut diar_model = SortformerEncLabelModel::from_pretrained_with(diar, config.load)?;
 
         // Drive the diarizer with the ASR chunk geometry, as NeMo's
