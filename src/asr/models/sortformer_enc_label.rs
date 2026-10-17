@@ -18,7 +18,7 @@
 //! # use mlx_voice::{asr::SortformerEncLabelModel, Array};
 //! # let audio_array = Array::from_slice(&[0.0f32; 16000], &[1, 16000]);
 //! # let lengths = Array::from_slice(&[16000i32], &[1]);
-//! let mut model = SortformerEncLabelModel::restore("diar_model.nemo")?;
+//! let mut model = SortformerEncLabelModel::from_pretrained("diar_model.nemo")?;
 //! let preds = model.forward(&audio_array, &lengths)?;
 //! // preds: [1, T, 4] - per-frame speaker probabilities
 //! # Ok(())
@@ -39,8 +39,9 @@ use crate::asr::modules::{ConformerEncoder, MelConfig, MelProcessor};
 use crate::asr::streaming::StreamingSortformerState;
 use crate::core::ArrayExt;
 use crate::core::checkpoint::NemoCheckpoint;
-use crate::core::error::Result;
+use crate::core::error::{Error, Result};
 use crate::core::loading::{LoadOptions, LoadReport, Weights};
+use crate::core::source::{LocalModel, ModelSource};
 
 /// SortFormer diarization model.
 pub struct SortformerEncLabelModel {
@@ -92,17 +93,33 @@ impl SortformerEncLabelModel {
         })
     }
 
-    /// Restore a model from a .nemo checkpoint file.
+    /// Load a model from a `.nemo` archive, local or on the Hugging Face Hub
+    /// (see [`ModelSource`]).
     ///
     /// Fails if the checkpoint lacks any weight the model has;
-    /// [`restore_with`](Self::restore_with) can allow that.
-    pub fn restore(path: impl AsRef<Path>) -> Result<Self> {
-        Self::restore_with(path, LoadOptions::default())
+    /// [`from_pretrained_with`](Self::from_pretrained_with) can allow that.
+    #[doc(alias = "restore")]
+    #[doc(alias = "restore_from")]
+    pub fn from_pretrained(source: impl Into<ModelSource>) -> Result<Self> {
+        Self::from_pretrained_with(source, LoadOptions::default())
     }
 
-    /// Restore a model from a .nemo checkpoint file, loading with `options`.
-    pub fn restore_with(path: impl AsRef<Path>, options: LoadOptions) -> Result<Self> {
-        let path = path.as_ref();
+    /// Like [`from_pretrained`](Self::from_pretrained), loading with `options`.
+    pub fn from_pretrained_with(
+        source: impl Into<ModelSource>,
+        options: LoadOptions,
+    ) -> Result<Self> {
+        match source.into().resolve()? {
+            LocalModel::Nemo(path) => Self::from_nemo(&path, options),
+            LocalModel::Directory(dir) => Err(Error::not_implemented(format!(
+                "loading a Sortformer model from a model directory ({}); use a .nemo checkpoint",
+                dir.display()
+            ))),
+        }
+    }
+
+    /// Load from a `.nemo` archive.
+    fn from_nemo(path: &Path, options: LoadOptions) -> Result<Self> {
         tracing::info!(
             "Loading SortFormer diarization model from: {}",
             path.display()

@@ -13,7 +13,7 @@ fn main() -> mlx_voice::Result<()> {
     let audio_path = "samples/2086-149220-0033.wav";
 
     println!("Loading pipeline from: {}", model_path);
-    let mut pipeline = CacheAwareRNNTPipeline::restore(model_path, 2)?; // mode 2 = 80ms lookahead
+    let mut pipeline = CacheAwareRNNTPipeline::from_pretrained(model_path, 2)?; // mode 2 = 80ms lookahead
 
     println!("\n=== Pipeline Loaded ===");
     println!("Sample rate: {} Hz", pipeline.sample_rate());

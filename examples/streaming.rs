@@ -24,7 +24,6 @@
 //!   --vad-pad <f>        VAD padding in seconds added before/after speech (default: 0.1)
 
 use std::io::{self, Write};
-use std::path::Path;
 use std::time::Instant;
 
 use mlx_voice::asr::{
@@ -140,12 +139,7 @@ fn main() -> mlx_voice::Result<()> {
     // Load pipeline (detect directory vs .nemo file)
     println!("Loading pipeline from: {}", model_path);
     let start = Instant::now();
-    let model_path_ref = Path::new(model_path);
-    let mut pipeline = if model_path_ref.is_dir() {
-        CacheAwareRNNTPipeline::restore_from_directory(model_path_ref, mode_idx)?
-    } else {
-        CacheAwareRNNTPipeline::restore(model_path_ref, mode_idx)?
-    };
+    let mut pipeline = CacheAwareRNNTPipeline::from_pretrained(model_path, mode_idx)?;
     println!("Pipeline loaded in {:.2}s", start.elapsed().as_secs_f32());
 
     if let Some(language) = language {
@@ -224,7 +218,7 @@ fn main() -> mlx_voice::Result<()> {
     let samples = if let Some(vad_path) = vad_model_path {
         println!("\nLoading VAD model from: {}", vad_path);
         let vad_start = Instant::now();
-        let mut vad_model = EncDecClassificationModel::restore(vad_path)?;
+        let mut vad_model = EncDecClassificationModel::from_pretrained(vad_path)?;
         println!(
             "VAD model loaded in {:.2}s",
             vad_start.elapsed().as_secs_f32()

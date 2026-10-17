@@ -105,7 +105,7 @@ fn main() -> mlx_voice::Result<()> {
     tracing::info!("Loading diarization model from: {}", &diar_model_path);
 
     let start = Instant::now();
-    let mut pipeline = MultiTalkerPipeline::restore_with_config(
+    let mut pipeline = MultiTalkerPipeline::from_pretrained_with_config(
         &asr_model_path,
         &diar_model_path,
         mode_idx,

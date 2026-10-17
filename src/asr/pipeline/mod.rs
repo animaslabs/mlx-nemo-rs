@@ -11,7 +11,7 @@
 //! use mlx_voice::asr::pipeline::CacheAwareRNNTPipeline;
 //!
 //! // Load model and create pipeline
-//! let mut pipeline = CacheAwareRNNTPipeline::restore("model.nemo", 0)?;
+//! let mut pipeline = CacheAwareRNNTPipeline::from_pretrained("model.nemo", 0)?;
 //!
 //! // File mode
 //! pipeline.set_audio_file("audio.wav")?;

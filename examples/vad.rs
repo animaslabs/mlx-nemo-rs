@@ -84,7 +84,7 @@ fn main() -> mlx_voice::Result<()> {
     println!("Loading VAD model from: {}", model_path);
     let start = Instant::now();
 
-    let mut model = EncDecClassificationModel::restore(model_path)?;
+    let mut model = EncDecClassificationModel::from_pretrained(model_path)?;
 
     println!("Model loaded in {:.2}s", start.elapsed().as_secs_f32());
     println!("Sample rate: {} Hz", model.sample_rate());

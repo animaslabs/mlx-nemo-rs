@@ -26,8 +26,8 @@ pub struct LoadOptions {
     ///
     /// When `false`, missing tensors keep their initial values (usually zeros,
     /// so the model's output is not meaningful) and are listed in the
-    /// [`LoadReport`], and `restore` also accepts a checkpoint without a
-    /// tokenizer.
+    /// [`LoadReport`], and `from_pretrained_with` also accepts a checkpoint
+    /// without a tokenizer.
     pub strict: bool,
 }
 

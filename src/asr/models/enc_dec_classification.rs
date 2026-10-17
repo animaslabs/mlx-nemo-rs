@@ -9,7 +9,7 @@
 //! # fn main() -> mlx_voice::Result<()> {
 //! use mlx_voice::asr::EncDecClassificationModel;
 //!
-//! let mut model = EncDecClassificationModel::restore("vad_model.nemo")?;
+//! let mut model = EncDecClassificationModel::from_pretrained("vad_model.nemo")?;
 //! let probs = model.infer(&["audio.wav"])?;
 //! // probs[0] contains per-frame speech probabilities
 //! # Ok(())
@@ -28,9 +28,10 @@ use crate::asr::modules::encoders::JasperEncoder;
 use crate::audio::{load_wav, resample};
 use crate::core::ArrayExt;
 use crate::core::checkpoint::NemoCheckpoint;
-use crate::core::error::Result;
+use crate::core::error::{Error, Result};
 use crate::core::loading::{LoadOptions, LoadReport, Weights};
 use crate::core::quantization::LinearLayer;
+use crate::core::source::{LocalModel, ModelSource};
 
 /// Encoder-Decoder Classification Model.
 ///
@@ -81,17 +82,33 @@ impl EncDecClassificationModel {
         })
     }
 
-    /// Restore a model from a .nemo checkpoint file.
+    /// Load a model from a `.nemo` archive, local or on the Hugging Face Hub
+    /// (see [`ModelSource`]).
     ///
     /// Fails if the checkpoint lacks any weight the model has;
-    /// [`restore_with`](Self::restore_with) can allow that.
-    pub fn restore(path: impl AsRef<Path>) -> Result<Self> {
-        Self::restore_with(path, LoadOptions::default())
+    /// [`from_pretrained_with`](Self::from_pretrained_with) can allow that.
+    #[doc(alias = "restore")]
+    #[doc(alias = "restore_from")]
+    pub fn from_pretrained(source: impl Into<ModelSource>) -> Result<Self> {
+        Self::from_pretrained_with(source, LoadOptions::default())
     }
 
-    /// Restore a model from a .nemo checkpoint file, loading with `options`.
-    pub fn restore_with(path: impl AsRef<Path>, options: LoadOptions) -> Result<Self> {
-        let path = path.as_ref();
+    /// Like [`from_pretrained`](Self::from_pretrained), loading with `options`.
+    pub fn from_pretrained_with(
+        source: impl Into<ModelSource>,
+        options: LoadOptions,
+    ) -> Result<Self> {
+        match source.into().resolve()? {
+            LocalModel::Nemo(path) => Self::from_nemo(&path, options),
+            LocalModel::Directory(dir) => Err(Error::not_implemented(format!(
+                "loading a classification model from a model directory ({}); use a .nemo checkpoint",
+                dir.display()
+            ))),
+        }
+    }
+
+    /// Load from a `.nemo` archive.
+    fn from_nemo(path: &Path, options: LoadOptions) -> Result<Self> {
         tracing::info!("Loading classification model from: {}", path.display());
 
         let checkpoint = NemoCheckpoint::open(path)?;

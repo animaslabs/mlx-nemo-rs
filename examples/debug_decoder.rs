@@ -15,7 +15,7 @@ fn main() -> mlx_voice::Result<()> {
         "models/nvidia/nemotron-speech-streaming-en-0.6b/nemotron-speech-streaming-en-0.6b.nemo";
 
     println!("Loading pipeline from: {}", model_path);
-    let pipeline = CacheAwareRNNTPipeline::restore(model_path, 2)?; // mode 2 = 80ms lookahead
+    let pipeline = CacheAwareRNNTPipeline::from_pretrained(model_path, 2)?; // mode 2 = 80ms lookahead
 
     // Get the decoder component
     // Note: We'd need to add accessor methods to the pipeline to get decoder details

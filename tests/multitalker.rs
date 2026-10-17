@@ -81,7 +81,7 @@ fn load_audio(path: &str) -> Vec<f32> {
 
 /// Per-frame speaker probabilities from streaming diarization of a file.
 fn diarize(path: &str) -> Vec<Vec<f32>> {
-    let mut model = SortformerEncLabelModel::restore(DIAR_MODEL).expect("load diarizer");
+    let mut model = SortformerEncLabelModel::from_pretrained(DIAR_MODEL).expect("load diarizer");
     let audio = load_audio(path);
     let audio_arr = Array::from_slice(&audio, &[1, audio.len() as i32]);
     let lengths = Array::from_slice(&[audio.len() as i32], &[1]);
@@ -134,7 +134,8 @@ fn test_multitalker_single_speaker_wer() {
     if !require(&[DIAR_MODEL, MT_ASR_MODEL, SINGLE_SPEAKER_AUDIO]) {
         return;
     }
-    let mut pipeline = MultiTalkerPipeline::restore(MT_ASR_MODEL, DIAR_MODEL, 0).expect("load");
+    let mut pipeline =
+        MultiTalkerPipeline::from_pretrained(MT_ASR_MODEL, DIAR_MODEL, 0).expect("load");
     assert_eq!(pipeline.mode(), MultiTalkerMode::Parallel);
 
     pipeline
@@ -172,7 +173,8 @@ fn transcribe_samples(
     asr_model: &str,
     samples: Vec<f32>,
 ) -> (MultiTalkerMode, Vec<SpeakerSegment>) {
-    let mut pipeline = MultiTalkerPipeline::restore(asr_model, DIAR_MODEL, 0).expect("load");
+    let mut pipeline =
+        MultiTalkerPipeline::from_pretrained(asr_model, DIAR_MODEL, 0).expect("load");
     pipeline.add_audio(&samples);
     pipeline.end_stream();
     let segments = pipeline.run().expect("run");

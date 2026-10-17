@@ -26,6 +26,8 @@ asr = ["dep:hound", "dep:rubato"]
 # Expose building blocks (encoder layers, decoders, streaming caches, checkpoint
 # parsing) for research and debugging tools. No stability guarantees.
 internals = []
+# Download models from the Hugging Face Hub in `from_pretrained`
+hub = ["dep:hf-hub"]
 # Future features
 # tts = []
 # llm = []
@@ -54,6 +56,9 @@ half = "2.7"
 # Audio processing (for ASR feature)
 hound = { version = "3.5", optional = true }
 rubato = { version = "5.0", optional = true }
+
+# Hugging Face Hub downloads (blocking client, rustls)
+hf-hub = { version = "0.4", default-features = false, features = ["ureq"], optional = true }
 
 # Tokenization
 sentencepiece = "0.14"
@@ -104,3 +109,7 @@ required-features = ["internals"]
 [[test]]
 name = "pytorch_loading"
 required-features = ["internals"]
+
+[[test]]
+name = "hub"
+required-features = ["hub"]

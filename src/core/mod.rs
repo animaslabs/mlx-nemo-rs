@@ -7,6 +7,7 @@ pub mod array;
 pub mod checkpoint;
 pub mod config;
 pub mod error;
+pub mod source;
 internal_mod!(
     /// Loading checkpoint tensors into model layers.
     loading
@@ -28,6 +29,7 @@ pub use array::ArrayExt;
 pub use error::{Error, Result};
 pub use loading::{LoadOptions, LoadReport};
 pub use quantization::QuantizationConfig;
+pub use source::{HubRepo, ModelSource};
 pub use weights::WeightFormat;
 
 #[cfg(feature = "internals")]

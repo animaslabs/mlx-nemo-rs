@@ -108,15 +108,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "Loading {} model from: {model_path}",
         if offline { "offline" } else { "streaming" }
     );
-    let path = Path::new(&model_path);
     let load_start = Instant::now();
-    let mut model = match (offline, path.is_dir()) {
-        (true, true) => Model::Offline(EncDecRNNTModel::restore_from_directory(path)?),
-        (true, false) => Model::Offline(EncDecRNNTModel::restore(path)?),
-        (false, true) => Model::Streaming(CacheAwareRNNTPipeline::restore_from_directory(
-            path, mode_idx,
-        )?),
-        (false, false) => Model::Streaming(CacheAwareRNNTPipeline::restore(path, mode_idx)?),
+    let mut model = if offline {
+        Model::Offline(EncDecRNNTModel::from_pretrained(&model_path)?)
+    } else {
+        Model::Streaming(CacheAwareRNNTPipeline::from_pretrained(
+            &model_path,
+            mode_idx,
+        )?)
     };
     let encoder_dtype = match dtype.as_str() {
         "float32" => None,
@@ -144,7 +143,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    let model_name = path
+    let model_name = Path::new(&model_path)
         .file_stem()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| model_path.clone());

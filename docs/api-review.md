@@ -175,6 +175,21 @@ scaling. Route everything through `crate::audio`.
 
 ## 2. Loading models
 
+**Done (§2.1–2.2):** every model and both pipelines load through
+`from_pretrained(source)` and `from_pretrained_with(source, LoadOptions)`.
+`source` is anything that converts into `ModelSource`: a `.nemo` path, a model
+directory, a Hub repo id string, or a `HubRepo` with a revision or token.
+Hub downloads use a new `hub` feature (`hf-hub`'s blocking ureq client). They
+fetch a repository's `.nemo` archive if it has one, otherwise its safetensors,
+config and tokenizer files, into the Hugging Face cache. `restore*` is gone;
+`#[doc(alias = "restore")]` keeps it searchable. `restore_safetensors` is now
+`from_safetensors`. The examples no longer branch on directory vs. file.
+`MultiTalkerPipeline::from_pretrained(asr, diar, mode)` takes two sources.
+
+Still open: `dtype` in `LoadOptions` (§7.2), building pipelines from a loaded
+model (§2.3, part of the streaming redesign in §4), and model auto-detection
+(§2.4).
+
 ### 2.1 Today
 
 ```rust
@@ -873,7 +888,7 @@ release happens.
 3. ~~Add `#[non_exhaustive]` to `Error`, configs and outputs. Make internals
    `pub(crate)` or put them behind `internals` (§8). Remove the legacy aliases
    and the stateless mel API.~~ Done.
-4. Add `from_pretrained` + `LoadOptions`, and deprecate `restore*` (§2).
+4. ~~Add `from_pretrained` + `LoadOptions`, and replace `restore*` (§2).~~ Done.
 5. Add `Transcript`/`Token`/`Word` results and `TranscribeOptions` (§3.2–3.3).
 6. Add one `StreamingSession` built from a model, and turn
    `CacheAwareRNNTPipeline` into a thin wrapper or remove it (§4). Remove

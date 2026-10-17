@@ -32,7 +32,7 @@ Add the crate from crates.io:
 mlx-voice = "0.1"
 ```
 
-ASR support is behind the `asr` feature, which is on by default. The `internals` feature exposes the building blocks (encoder layers, decoders, streaming caches, checkpoint parsing) for research and debugging; their API may change in any release.
+ASR support is behind the `asr` feature, which is on by default. The `hub` feature lets `from_pretrained` download models from the Hugging Face Hub. The `internals` feature exposes the building blocks (encoder layers, decoders, streaming caches, checkpoint parsing) for research and debugging; their API may change in any release.
 
 ## Getting models
 
@@ -50,11 +50,13 @@ cargo xtask download nvidia/nemotron-3.5-asr-streaming-0.6b --file nemotron-3.5-
 cargo xtask download nvidia/parakeet-ctc-0.6b --file parakeet-ctc-0.6b.nemo
 ```
 
-Models can be loaded from:
+`from_pretrained` loads a model from:
 
 - a `.nemo` file (a TAR archive, plain or gzip-compressed, with `model_config.yaml`, `model_weights.ckpt` and the tokenizer)
-- a `.safetensors` file with `config.yaml` and a tokenizer next to it
 - a directory containing `model.safetensors`, a config, and `tokenizer.model`
+- a Hugging Face Hub repository id such as `nvidia/parakeet-rnnt-0.6b` (with the `hub` feature). The repository's `.nemo` archive, or its safetensors weights, config and tokenizer, are downloaded to the Hugging Face cache. Gated repositories use `HF_TOKEN` or the token saved by `hf auth login`, or `HubRepo::new(id).token(..)`.
+
+An existing path always wins over a repository id. `from_safetensors` loads a lone `.safetensors` file with explicit config and tokenizer paths.
 
 ## Usage
 
@@ -64,14 +66,14 @@ Models can be loaded from:
 use mlx_voice::asr::EncDecCTCModel;
 
 fn main() -> mlx_voice::Result<()> {
-    let mut model = EncDecCTCModel::restore("models/nvidia/parakeet-ctc-0.6b/parakeet-ctc-0.6b.nemo")?;
+    let mut model = EncDecCTCModel::from_pretrained("models/nvidia/parakeet-ctc-0.6b/parakeet-ctc-0.6b.nemo")?;
     let transcriptions = model.transcribe(&["audio.wav"])?;
     println!("{}", transcriptions[0]);
     Ok(())
 }
 ```
 
-`EncDecRNNTModel` has the same `restore` / `transcribe` API. Both also take audio already in memory, resampling it to the model's rate, and expose the tokenizer for turning token ids into text:
+`EncDecRNNTModel` has the same `from_pretrained` / `transcribe` API. Both also take audio already in memory, resampling it to the model's rate, and expose the tokenizer for turning token ids into text:
 
 ```rust
 let text = model.transcribe_samples(&samples, 48_000)?;
@@ -81,13 +83,13 @@ println!("{}", tokenizer.decode(&token_ids, true));
 
 ### Streaming transcription
 
-`CacheAwareRNNTPipeline` takes audio incrementally and emits partial results as they become available. The second argument to `restore` picks the streaming mode, an index into the checkpoint's `att_context_size` list. NeMo lists modes from most to least lookahead, so `0`, the model's default, has the highest latency and accuracy; `pipeline.streaming_modes()` gives each mode's latency.
+`CacheAwareRNNTPipeline` takes audio incrementally and emits partial results as they become available. The second argument to `from_pretrained` picks the streaming mode, an index into the checkpoint's `att_context_size` list. NeMo lists modes from most to least lookahead, so `0`, the model's default, has the highest latency and accuracy; `pipeline.streaming_modes()` gives each mode's latency.
 
 ```rust
 use mlx_voice::asr::CacheAwareRNNTPipeline;
 
 fn main() -> mlx_voice::Result<()> {
-    let mut pipeline = CacheAwareRNNTPipeline::restore(
+    let mut pipeline = CacheAwareRNNTPipeline::from_pretrained(
         "models/nvidia/nemotron-speech-streaming-en-0.6b/nemotron-speech-streaming-en-0.6b.nemo",
         0,
     )?;
@@ -117,7 +119,7 @@ For a whole file, `pipeline.set_audio_file("audio.wav")?` followed by `pipeline.
 `nvidia/nemotron-3.5-asr-streaming-0.6b` conditions its output on a target language. It starts in `"auto"` mode, where the model detects the language and emits a tag such as `<de-DE>` after each sentence's terminal punctuation. Tags are stripped from the text by default but stay in the token ids:
 
 ```rust
-let mut pipeline = CacheAwareRNNTPipeline::restore(
+let mut pipeline = CacheAwareRNNTPipeline::from_pretrained(
     "models/nvidia/nemotron-3.5-asr-streaming-0.6b/nemotron-3.5-asr-streaming-0.6b.nemo",
     3, // [56, 13]: 1.12 s chunks
 )?;
@@ -138,7 +140,7 @@ With `nvidia/multitalker-parakeet-streaming-0.6b-v1`, each of up to four speaker
 use mlx_voice::asr::MultiTalkerPipeline;
 
 fn main() -> mlx_voice::Result<()> {
-    let mut pipeline = MultiTalkerPipeline::restore(
+    let mut pipeline = MultiTalkerPipeline::from_pretrained(
         "models/nvidia/multitalker-parakeet-streaming-0.6b-v1/multitalker-parakeet-streaming-0.6b-v1.nemo",
         "models/nvidia/diar_streaming_sortformer_4spk-v2.1/diar_streaming_sortformer_4spk-v2.1.nemo",
         0,

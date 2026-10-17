@@ -20,7 +20,7 @@
 //! ```no_run
 //! # fn main() -> mlx_voice::Result<()> {
 //! # use mlx_voice::asr::MultiTalkerPipeline;
-//! let mut pipeline = MultiTalkerPipeline::restore(
+//! let mut pipeline = MultiTalkerPipeline::from_pretrained(
 //!     "multitalker-parakeet-streaming-0.6b-v1.nemo",
 //!     "diar_streaming_sortformer_4spk-v2.1.nemo",
 //!     0, // streaming mode
@@ -54,6 +54,7 @@ use crate::asr::streaming::{EncoderCache, FeatureBuffer, StreamingSortformerStat
 use crate::core::ArrayExt;
 use crate::core::error::Result;
 use crate::core::loading::LoadOptions;
+use crate::core::source::ModelSource;
 
 /// Speaker activity threshold.
 const ACTIVITY_THRESHOLD: f32 = 0.5;
@@ -192,39 +193,37 @@ impl std::fmt::Debug for MultiTalkerPipeline {
 }
 
 impl MultiTalkerPipeline {
-    /// Create a multi-talker pipeline from ASR and diarization model paths.
+    /// Load a multi-talker pipeline from an ASR model and a diarization model.
     ///
     /// # Arguments
-    /// * `asr_path` - Path to a streaming ASR .nemo model or MLX model directory.
-    ///   A multitalker model (with speaker kernels) runs in parallel mode, any
-    ///   other in serial mode.
-    /// * `diar_path` - Path to the streaming SortFormer diarization .nemo model
+    /// * `asr` - A streaming ASR model: a `.nemo` archive, a model directory or
+    ///   a Hugging Face Hub repository (see [`ModelSource`]). A multitalker
+    ///   model (with speaker kernels) runs in parallel mode, any other in
+    ///   serial mode.
+    /// * `diar` - A streaming Sortformer diarization `.nemo` model, local or on
+    ///   the Hub
     /// * `mode_idx` - ASR streaming mode index into the checkpoint's `att_context_size` list (see
     ///   `streaming_modes()` for each mode's latency). NeMo checkpoints list modes
     ///   from most to least lookahead, so mode 0, the model's default, has the
     ///   highest latency and accuracy
-    pub fn restore(
-        asr_path: impl AsRef<Path>,
-        diar_path: impl AsRef<Path>,
+    #[doc(alias = "restore")]
+    pub fn from_pretrained(
+        asr: impl Into<ModelSource>,
+        diar: impl Into<ModelSource>,
         mode_idx: usize,
     ) -> Result<Self> {
-        Self::restore_with_config(asr_path, diar_path, mode_idx, MultiTalkerConfig::default())
+        Self::from_pretrained_with_config(asr, diar, mode_idx, MultiTalkerConfig::default())
     }
 
-    /// Like [`Self::restore`], with explicit settings.
-    pub fn restore_with_config(
-        asr_path: impl AsRef<Path>,
-        diar_path: impl AsRef<Path>,
+    /// Like [`Self::from_pretrained`], with explicit settings.
+    pub fn from_pretrained_with_config(
+        asr: impl Into<ModelSource>,
+        diar: impl Into<ModelSource>,
         mode_idx: usize,
         config: MultiTalkerConfig,
     ) -> Result<Self> {
-        let asr_path = asr_path.as_ref();
-        let asr = if asr_path.is_dir() {
-            CacheAwareRNNTPipeline::restore_from_directory_with(asr_path, mode_idx, config.load)?
-        } else {
-            CacheAwareRNNTPipeline::restore_with(asr_path, mode_idx, config.load)?
-        };
-        let mut diar_model = SortformerEncLabelModel::restore_with(diar_path, config.load)?;
+        let asr = CacheAwareRNNTPipeline::from_pretrained_with(asr, mode_idx, config.load)?;
+        let mut diar_model = SortformerEncLabelModel::from_pretrained_with(diar, config.load)?;
 
         // Drive the diarizer with the ASR chunk geometry, as NeMo's
         // multitalker inference does

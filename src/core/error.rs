@@ -87,6 +87,16 @@ pub enum Error {
     #[error("Pickle error: {0}")]
     Pickle(String),
 
+    /// Downloading a model failed.
+    #[error("Download error: {message}")]
+    Download {
+        /// What went wrong
+        message: String,
+        /// The underlying error
+        #[source]
+        source: Option<Box<dyn std::error::Error + Send + Sync>>,
+    },
+
     /// Feature not implemented.
     #[error("Not implemented: {0}")]
     NotImplemented(String),
@@ -171,6 +181,18 @@ impl Error {
     /// Create a pickle parsing error.
     pub fn pickle(message: impl Into<String>) -> Self {
         Self::Pickle(message.into())
+    }
+
+    /// Create a download error with its cause.
+    #[cfg_attr(not(feature = "hub"), allow(dead_code))]
+    pub(crate) fn download(
+        message: impl Into<String>,
+        source: impl std::error::Error + Send + Sync + 'static,
+    ) -> Self {
+        Self::Download {
+            message: message.into(),
+            source: Some(Box::new(source)),
+        }
     }
 
     /// Create a not-implemented error.

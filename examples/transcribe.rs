@@ -106,69 +106,48 @@ fn main() -> mlx_voice::Result<()> {
     Ok(())
 }
 
-/// Load model from various formats: .nemo, .safetensors, or directory
+/// Load a model: a lone `.safetensors` file (with its config and tokenizer
+/// found next to it), or anything `from_pretrained` accepts (a `.nemo` file, a
+/// model directory or a Hugging Face Hub repository id).
 fn load_model(
     model_path: &str,
     weight_format: Option<WeightFormat>,
 ) -> mlx_voice::Result<EncDecCTCModel> {
     let path = Path::new(model_path);
+    if path
+        .extension()
+        .is_some_and(|e| e.eq_ignore_ascii_case("safetensors"))
+    {
+        // .safetensors file: look for config and tokenizer in same directory
+        println!("  Format: Safetensors");
+        let parent = path.parent().unwrap_or(Path::new("."));
 
-    if path.is_dir() {
-        // Directory: use restore_from_directory
-        println!("  Format: Directory with safetensors");
-        if weight_format.is_some() {
-            println!("  Warning: --format flag not yet supported for directory loading");
+        // Find config file
+        let config_path = find_config_file(parent)?;
+        println!("  Config: {}", config_path.display());
+
+        // Find tokenizer (optional)
+        let tokenizer_path = find_tokenizer_file(parent);
+        if let Some(ref tok) = tokenizer_path {
+            println!("  Tokenizer: {}", tok.display());
         }
-        EncDecCTCModel::restore_from_directory(path)
-    } else if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-        match ext.to_lowercase().as_str() {
-            "nemo" => {
-                // .nemo file: use standard restore
-                println!("  Format: NeMo checkpoint");
-                EncDecCTCModel::restore(path)
+
+        // Show weight format being used
+        match weight_format {
+            Some(WeightFormat::Mlx) => println!("  Weights: MLX format (no transposition)"),
+            Some(WeightFormat::PyTorch) => {
+                println!("  Weights: PyTorch format (will transpose Conv1d)")
             }
-            "safetensors" => {
-                // .safetensors file: look for config and tokenizer in same directory
-                println!("  Format: Safetensors");
-                let parent = path.parent().unwrap_or(Path::new("."));
-
-                // Find config file
-                let config_path = find_config_file(parent)?;
-                println!("  Config: {}", config_path.display());
-
-                // Find tokenizer (optional)
-                let tokenizer_path = find_tokenizer_file(parent);
-                if let Some(ref tok) = tokenizer_path {
-                    println!("  Tokenizer: {}", tok.display());
-                }
-
-                // Show weight format being used
-                match weight_format {
-                    Some(WeightFormat::Mlx) => println!("  Weights: MLX format (no transposition)"),
-                    Some(WeightFormat::PyTorch) => {
-                        println!("  Weights: PyTorch format (will transpose Conv1d)")
-                    }
-                    Some(format) => println!("  Weights: {:?} format", format),
-                    None => println!("  Weights: Auto-detect from metadata"),
-                }
-
-                EncDecCTCModel::restore_safetensors(
-                    path,
-                    &config_path,
-                    tokenizer_path.as_ref(),
-                    weight_format,
-                )
-            }
-            _ => {
-                // Unknown extension, try as .nemo
-                println!("  Format: Unknown (trying as NeMo)");
-                EncDecCTCModel::restore(path)
-            }
+            Some(format) => println!("  Weights: {:?} format", format),
+            None => println!("  Weights: Auto-detect from metadata"),
         }
+
+        EncDecCTCModel::from_safetensors(path, &config_path, tokenizer_path.as_ref(), weight_format)
     } else {
-        // No extension, try as .nemo
-        println!("  Format: No extension (trying as NeMo)");
-        EncDecCTCModel::restore(path)
+        if weight_format.is_some() {
+            println!("  Warning: --format only applies to .safetensors files");
+        }
+        EncDecCTCModel::from_pretrained(model_path)
     }
 }
 

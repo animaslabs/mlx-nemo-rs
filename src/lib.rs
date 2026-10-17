@@ -14,7 +14,7 @@
 //! use mlx_voice::asr::EncDecCTCModel;
 //!
 //! // Load a pretrained model from a .nemo file
-//! let mut model = EncDecCTCModel::restore("path/to/model.nemo")?;
+//! let mut model = EncDecCTCModel::from_pretrained("path/to/model.nemo")?;
 //!
 //! // Transcribe audio
 //! let transcriptions = model.transcribe(&["audio.wav"])?;
@@ -53,6 +53,7 @@ pub mod audio;
 pub use core::checkpoint::SafetensorsLoader;
 pub use core::error::{Error, Result};
 pub use core::loading::{LoadOptions, LoadReport};
+pub use core::source::{HubRepo, ModelSource};
 pub use core::weights::WeightFormat;
 #[doc(no_inline)]
 pub use mlx_rs::Array;

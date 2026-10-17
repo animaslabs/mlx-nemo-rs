@@ -18,7 +18,7 @@ fn main() -> mlx_voice::Result<()> {
     let mode_idx = 2; // Same as Python: att_context_size = [70, 1]
 
     println!("Loading pipeline from: {}", model_path);
-    let mut pipeline = CacheAwareRNNTPipeline::restore(model_path, mode_idx)?;
+    let mut pipeline = CacheAwareRNNTPipeline::from_pretrained(model_path, mode_idx)?;
 
     println!("\n=== Model Info ===");
     println!("Sample rate: {} Hz", pipeline.sample_rate());
