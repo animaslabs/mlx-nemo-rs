@@ -17,6 +17,13 @@ break the API).
   search and streaming sessions return a not-implemented error for TDT models.
 - `Tokenizer::is_punctuation`.
 
+### Fixed
+
+- Offline encoding keeps padded encoder frames from affecting valid ones, as
+  NeMo does: padding is hidden from attention and zeroed before each
+  convolution. Before, the last second or so of every file, and clips padded
+  to a longer clip in a batch, drifted from NeMo's encoder output.
+
 ## 0.2.0 (2026-10-17)
 
 A redesign of the public API around `from_pretrained`, `Transcript` results
