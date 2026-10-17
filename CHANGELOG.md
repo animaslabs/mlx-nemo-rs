@@ -5,7 +5,7 @@ All notable changes to this crate are documented here. The format follows
 [Semantic Versioning](https://semver.org/) (before 1.0, a minor release may
 break the API).
 
-## 0.2.0 (unreleased)
+## 0.2.0 (2026-10-17)
 
 A redesign of the public API around `from_pretrained`, `Transcript` results
 and one `StreamingSession`. Almost every entry point changed; the migration
