@@ -18,7 +18,8 @@ use crate::asr::config::EncoderConfig;
 use crate::asr::modules::speaker_kernel::{SpeakerKernels, SpeakerTargets};
 use crate::core::ArrayExt;
 use crate::core::error::Result;
-use crate::core::quantization::{LinearLayer, QuantizationConfig, load_linear_layer};
+use crate::core::quantization::{LinearLayer, QuantizationConfig, require_linear_layer};
+use crate::core::weights::{load_batch_norm, load_conv1d, load_conv2d, load_layer_norm};
 
 /// Debug switches, read from the environment once rather than on every call
 static DEBUG_MEL_MASK: LazyLock<bool> =
@@ -51,93 +52,6 @@ pub struct DebugEncoderOutput {
 /// Reset the encoder call counter (call at start of streaming session)
 pub fn reset_encoder_counter() {
     ENCODER_CALL_COUNT.store(0, Ordering::SeqCst);
-}
-
-/// Helper to load LayerNorm weights
-fn load_layer_norm(layer: &mut nn::LayerNorm, weights: &HashMap<String, Array>, prefix: &str) {
-    if let Some(weight) = weights.get(&format!("{}.weight", prefix)) {
-        layer.weight.value = Some(weight.clone());
-    }
-    if let Some(bias) = weights.get(&format!("{}.bias", prefix)) {
-        layer.bias.value = Some(bias.clone());
-    }
-}
-
-/// Helper to load Conv1d weights
-///
-/// PyTorch Conv1d weight shape: (out_channels, in_channels/groups, kernel_size)
-/// MLX Conv1d weight shape: (out_channels, kernel_size, in_channels/groups)
-/// So we need to transpose axes 1 and 2.
-fn load_conv1d(layer: &mut nn::Conv1d, weights: &HashMap<String, Array>, prefix: &str) {
-    if let Some(weight) = weights.get(&format!("{}.weight", prefix)) {
-        // Weights are already in MLX format (O, K, I) after loading
-        // The transformation from PyTorch (O, I, K) is done in weights.rs
-        layer.weight.value = weight.clone();
-    }
-    if let Some(bias) = weights.get(&format!("{}.bias", prefix)) {
-        layer.bias.value = Some(bias.clone());
-    }
-}
-
-/// Load a pointwise conv weight as a LinearLayer.
-///
-/// Tries `load_linear_layer()` first (handles quantized models where the weight
-/// was squeezed to 2D during conversion). Falls back to loading the 3D conv weight
-/// and squeezing the K=1 dimension for backward compatibility with non-quantized models.
-fn load_pointwise_conv_as_linear(
-    weights: &HashMap<String, Array>,
-    prefix: &str,
-    quant: Option<&QuantizationConfig>,
-) -> Option<LinearLayer> {
-    // Try loading as a linear layer first (quantized or already-2D weights)
-    if let Some(layer) = load_linear_layer(weights, prefix, quant) {
-        return Some(layer);
-    }
-
-    // Fallback: load 3D conv weight [O, K, I] (MLX format) and squeeze K=1 to get [O, I]
-    let weight_key = format!("{}.weight", prefix);
-    if let Some(weight) = weights.get(&weight_key) {
-        let shape = weight.shape();
-        let squeezed = if shape.len() == 3 && shape[1] == 1 {
-            // MLX format: [O, K=1, I] -> squeeze axis 1 -> [O, I]
-            weight.squeeze_axes(&[1]).ok()?
-        } else if shape.len() == 2 {
-            weight.clone()
-        } else {
-            tracing::warn!(
-                prefix,
-                shape = ?shape,
-                "unexpected pointwise conv weight shape"
-            );
-            return None;
-        };
-
-        let bias_key = format!("{}.bias", prefix);
-        let bias = weights.get(&bias_key).cloned();
-
-        Some(LinearLayer::standard(squeezed, bias))
-    } else {
-        tracing::warn!(prefix, "pointwise conv weights not found");
-        None
-    }
-}
-
-/// Helper to load BatchNorm weights
-fn load_batch_norm(layer: &mut nn::BatchNorm, weights: &HashMap<String, Array>, prefix: &str) {
-    if let Some(weight) = weights.get(&format!("{}.weight", prefix)) {
-        layer.weight.value = Some(weight.clone());
-    }
-    if let Some(bias) = weights.get(&format!("{}.bias", prefix)) {
-        layer.bias.value = Some(bias.clone());
-    }
-    if let Some(running_mean) = weights.get(&format!("{}.running_mean", prefix)) {
-        layer.running_mean.value = Some(running_mean.clone());
-    }
-    if let Some(running_var) = weights.get(&format!("{}.running_var", prefix)) {
-        layer.running_var.value = Some(running_var.clone());
-    }
-    // Use inference mode so we use loaded running stats, not batch stats
-    layer.training = false;
 }
 
 /// Apply causal padding to a 4D tensor [B, T, F, C].
@@ -445,9 +359,6 @@ pub struct ConformerEncoder {
     /// Conformer blocks
     layers: Vec<ConformerBlock>,
 
-    /// Final layer normalization
-    final_norm: nn::LayerNorm,
-
     /// Attention context size (left, right) for streaming
     /// Parsed from config.att_context_size
     att_context_size: Option<(i32, i32)>,
@@ -492,9 +403,6 @@ impl ConformerEncoder {
             layers.push(ConformerBlock::new(&config)?);
         }
 
-        // Final layer norm
-        let final_norm = nn::LayerNorm::new(d_model as i32)?;
-
         // Extract attention context configuration for streaming
         let att_context_size = config
             .att_context_size
@@ -510,7 +418,6 @@ impl ConformerEncoder {
             subsampling,
             pos_enc,
             layers,
-            final_norm,
             att_context_size,
             att_context_style,
             speaker_kernels: None,
@@ -695,11 +602,8 @@ impl ConformerEncoder {
             layer.load_weights(weights, &format!("encoder.layers.{}", i), quant)?;
         }
 
-        // Load final norm weights (not quantized)
-        load_layer_norm(&mut self.final_norm, weights, "encoder.final_norm");
-
         // Speaker kernels live at the model root (spk_kernels.*, bg_spk_kernels.*)
-        self.speaker_kernels = SpeakerKernels::load(weights, quant);
+        self.speaker_kernels = SpeakerKernels::load(weights, quant)?;
 
         Ok(())
     }
@@ -1148,22 +1052,6 @@ fn cast_module(module: &mut impl ModuleParameters, dtype: mlx_rs::Dtype) -> Resu
         *param = param.as_dtype(dtype)?;
     }
     Ok(())
-}
-
-/// Helper to load Conv2d weights
-///
-/// PyTorch Conv2d weight shape: (out_channels, in_channels/groups, kernel_h, kernel_w)
-/// MLX Conv2d weight shape: (out_channels, kernel_h, kernel_w, in_channels/groups)
-/// So we need to transpose axes 1,2,3 -> 2,3,1
-fn load_conv2d(layer: &mut nn::Conv2d, weights: &HashMap<String, Array>, prefix: &str) {
-    if let Some(weight) = weights.get(&format!("{}.weight", prefix)) {
-        // Weights are already in MLX format (O, H, W, I) after loading
-        // The transformation from PyTorch (O, I, H, W) is done in weights.rs
-        layer.weight.value = weight.clone();
-    }
-    if let Some(bias) = weights.get(&format!("{}.bias", prefix)) {
-        layer.bias.value = Some(bias.clone());
-    }
 }
 
 /// Mel frames per subsampling chunk for long inputs (~41 s at 10 ms hops).
@@ -1671,7 +1559,7 @@ impl Subsampling {
         quant: Option<&QuantizationConfig>,
     ) -> Result<()> {
         // Load first conv: encoder.pre_encode.conv.0
-        load_conv2d(&mut self.first_conv, weights, &format!("{}.conv.0", prefix));
+        load_conv2d(&mut self.first_conv, weights, &format!("{}.conv.0", prefix))?;
 
         // Load depthwise and pointwise conv pairs
         // NeMo layout: conv.0 (first), activation, conv.2 (dw), conv.3 (pw), activation, ...
@@ -1684,15 +1572,12 @@ impl Subsampling {
         {
             let dw_idx = 2 + i * 3; // 2, 5, 8, ...
             let pw_idx = 3 + i * 3; // 3, 6, 9, ...
-            load_conv2d(dw_conv, weights, &format!("{}.conv.{}", prefix, dw_idx));
-            load_conv2d(pw_conv, weights, &format!("{}.conv.{}", prefix, pw_idx));
+            load_conv2d(dw_conv, weights, &format!("{}.conv.{}", prefix, dw_idx))?;
+            load_conv2d(pw_conv, weights, &format!("{}.conv.{}", prefix, pw_idx))?;
         }
 
         // Load output projection (may be quantized)
-        let proj_prefix = format!("{}.out", prefix);
-        if let Some(layer) = load_linear_layer(weights, &proj_prefix, quant) {
-            self.out_proj = layer;
-        }
+        self.out_proj = require_linear_layer(weights, &format!("{}.out", prefix), quant)?;
 
         Ok(())
     }
@@ -1764,6 +1649,7 @@ impl ConformerBlock {
                 dropout,
                 &config.conv_norm_type,
                 is_causal,
+                use_bias,
             )?,
             conv_norm: nn::LayerNorm::new(d_model as i32)?,
             ff2: FeedForward::new(d_model, ff_dim, dropout, use_bias)?,
@@ -2066,7 +1952,7 @@ impl ConformerBlock {
             &mut self.ff1_norm,
             weights,
             &format!("{}.norm_feed_forward1", prefix),
-        );
+        )?;
 
         // Load self-attention (linear projections may be quantized)
         self.self_attn
@@ -2075,7 +1961,7 @@ impl ConformerBlock {
             &mut self.self_attn_norm,
             weights,
             &format!("{}.norm_self_att", prefix),
-        );
+        )?;
 
         // Load convolution module (pointwise convs may be quantized)
         self.conv
@@ -2084,7 +1970,7 @@ impl ConformerBlock {
             &mut self.conv_norm,
             weights,
             &format!("{}.norm_conv", prefix),
-        );
+        )?;
 
         // Load feed-forward 2 (NeMo uses "feed_forward2" not "ff2")
         self.ff2
@@ -2093,14 +1979,14 @@ impl ConformerBlock {
             &mut self.ff2_norm,
             weights,
             &format!("{}.norm_feed_forward2", prefix),
-        );
+        )?;
 
         // Load final norm (NeMo uses "norm_out")
         load_layer_norm(
             &mut self.final_norm,
             weights,
             &format!("{}.norm_out", prefix),
-        );
+        )?;
 
         Ok(())
     }
@@ -2154,12 +2040,8 @@ impl FeedForward {
         prefix: &str,
         quant: Option<&QuantizationConfig>,
     ) -> Result<()> {
-        if let Some(layer) = load_linear_layer(weights, &format!("{}.linear1", prefix), quant) {
-            self.linear1 = layer;
-        }
-        if let Some(layer) = load_linear_layer(weights, &format!("{}.linear2", prefix), quant) {
-            self.linear2 = layer;
-        }
+        self.linear1 = require_linear_layer(weights, &format!("{}.linear1", prefix), quant)?;
+        self.linear2 = require_linear_layer(weights, &format!("{}.linear2", prefix), quant)?;
         Ok(())
     }
 }
@@ -2215,6 +2097,7 @@ impl ConvolutionModule {
         _dropout: f32,
         norm_type: &str,
         is_causal: bool,
+        use_bias: bool,
     ) -> Result<Self> {
         // For non-causal: symmetric padding (kernel_size - 1) / 2 on each side
         // For causal: all padding on the left (kernel_size - 1), none on right
@@ -2256,6 +2139,7 @@ impl ConvolutionModule {
             )
             .padding(padding as i32)
             .groups(d_model as i32)
+            .bias(use_bias)
             .build()?,
             // Pointwise compression (d_model -> d_model) as linear layer
             pointwise_conv2: LinearLayer::standard(pw2_weight, pw2_bias),
@@ -2474,34 +2358,27 @@ impl ConvolutionModule {
         prefix: &str,
         quant: Option<&QuantizationConfig>,
     ) -> Result<()> {
-        // Load pointwise conv1 as LinearLayer (may be quantized)
-        if let Some(layer) =
-            load_pointwise_conv_as_linear(weights, &format!("{}.pointwise_conv1", prefix), quant)
-        {
-            self.pointwise_conv1 = layer;
-        }
+        // Pointwise convs load as LinearLayer (may be quantized)
+        self.pointwise_conv1 =
+            require_linear_layer(weights, &format!("{}.pointwise_conv1", prefix), quant)?;
 
         // Depthwise conv stays as nn::Conv1d (not quantizable)
         load_conv1d(
             &mut self.depthwise_conv,
             weights,
             &format!("{}.depthwise_conv", prefix),
-        );
+        )?;
 
-        // Load pointwise conv2 as LinearLayer (may be quantized)
-        if let Some(layer) =
-            load_pointwise_conv_as_linear(weights, &format!("{}.pointwise_conv2", prefix), quant)
-        {
-            self.pointwise_conv2 = layer;
-        }
+        self.pointwise_conv2 =
+            require_linear_layer(weights, &format!("{}.pointwise_conv2", prefix), quant)?;
 
         // Load normalization weights based on type
         match &mut self.norm {
             ConvNorm::BatchNorm(bn) => {
-                load_batch_norm(bn, weights, &format!("{}.batch_norm", prefix));
+                load_batch_norm(bn, weights, &format!("{}.batch_norm", prefix))?;
             }
             ConvNorm::LayerNorm(ln) => {
-                load_layer_norm(ln, weights, &format!("{}.batch_norm", prefix));
+                load_layer_norm(ln, weights, &format!("{}.batch_norm", prefix))?;
             }
         }
         Ok(())

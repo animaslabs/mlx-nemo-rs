@@ -1,19 +1,25 @@
 //! Beam search RNN-T decoding.
 //!
-//! Implements beam search decoding for RNN-T models, which maintains
-//! multiple hypothesis candidates and expands the most promising ones.
-
-use std::cmp::Ordering;
+//! A port of NeMo's default `BeamRNNTInfer` search (`search_type: default`,
+//! after Graves 2012). For each encoder frame it keeps expanding the best
+//! hypothesis: ending it with blank moves it on to the next frame, and each of
+//! the `beam_size` best tokens extends it within the frame. The frame is done
+//! once `beam_size` hypotheses that ended in blank outscore every hypothesis
+//! still being expanded.
 
 use mlx_rs::Array;
 use mlx_rs::ops::indexing::IndexOp;
 
-use crate::asr::modules::{RNNTJoint, StatelessTransducerDecoder};
+use crate::asr::models::{DecoderState, PredictionNetwork};
+use crate::asr::modules::RNNTJoint;
 use crate::core::ArrayExt;
-use crate::core::error::Result;
+use crate::core::error::{Error, Result};
 
-/// Maximum number of symbols that can be emitted per encoder frame.
-const DEFAULT_MAX_SYMBOLS_PER_STEP: usize = 10;
+/// Expansions per frame, as a multiple of the beam size, before the search
+/// moves on with the best hypotheses so far. NeMo has no limit (scores only
+/// fall, so the search always ends); this bounds the work on a pathological
+/// frame.
+const MAX_EXPANSIONS_PER_BEAM: usize = 10;
 
 /// A hypothesis in beam search.
 #[derive(Clone)]
@@ -22,60 +28,11 @@ struct Hypothesis {
     tokens: Vec<usize>,
     /// Log probability score
     score: f32,
-    /// Decoder state
-    state: Array,
-}
-
-impl Hypothesis {
-    fn new(state: Array) -> Self {
-        Self {
-            tokens: Vec::new(),
-            score: 0.0,
-            state,
-        }
-    }
-
-    fn with_token(&self, token: usize, log_prob: f32, new_state: Array) -> Self {
-        let mut tokens = self.tokens.clone();
-        tokens.push(token);
-        Self {
-            tokens,
-            score: self.score + log_prob,
-            state: new_state,
-        }
-    }
-
-    fn with_blank(&self, log_prob: f32) -> Self {
-        Self {
-            tokens: self.tokens.clone(),
-            score: self.score + log_prob,
-            state: self.state.clone(),
-        }
-    }
-}
-
-// For max-heap ordering by score
-impl PartialEq for Hypothesis {
-    fn eq(&self, other: &Self) -> bool {
-        self.score == other.score
-    }
-}
-
-impl Eq for Hypothesis {}
-
-impl PartialOrd for Hypothesis {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl Ord for Hypothesis {
-    fn cmp(&self, other: &Self) -> Ordering {
-        // Reverse ordering for max-heap (higher scores first)
-        self.score
-            .partial_cmp(&other.score)
-            .unwrap_or(Ordering::Equal)
-    }
+    /// Decoder state before the last token in `tokens` was consumed
+    state: DecoderState,
+    /// Prediction for `tokens`, projected into the joint space, with the
+    /// decoder state after it. Computed when the hypothesis is first expanded.
+    prediction: Option<(Array, DecoderState)>,
 }
 
 /// Perform beam search RNN-T decoding.
@@ -87,192 +44,164 @@ impl Ord for Hypothesis {
 /// * `joint` - The joint network
 /// * `blank_id` - Blank token ID
 /// * `beam_size` - Number of hypotheses to keep
-/// * `max_symbols_per_step` - Maximum symbols per encoder frame
 ///
 /// # Returns
-/// * Vector of decoded token sequences (best hypothesis for each batch item)
+/// * The best hypothesis for each batch item, chosen by length-normalized
+///   score as in NeMo (`score_norm: true`)
 pub fn rnnt_beam_decode(
     encoder_output: &Array,
     encoder_lengths: &Array,
-    decoder: &StatelessTransducerDecoder,
+    decoder: &PredictionNetwork,
     joint: &RNNTJoint,
     blank_id: usize,
     beam_size: usize,
-    max_symbols_per_step: Option<usize>,
 ) -> Result<Vec<Vec<usize>>> {
-    encoder_output.eval()?;
-    encoder_lengths.eval()?;
+    if beam_size == 0 {
+        return Err(Error::decoding("beam size must be at least 1"));
+    }
 
-    let batch_size = encoder_output.shape()[0] as usize;
-    let max_symbols = max_symbols_per_step.unwrap_or(DEFAULT_MAX_SYMBOLS_PER_STEP);
+    let lengths: Vec<i32> = encoder_lengths
+        .as_dtype(mlx_rs::Dtype::Int32)?
+        .to_vec_row_major()?;
 
-    // Get encoder lengths
-    let lengths_i32 = encoder_lengths.as_type::<i32>()?;
-    lengths_i32.eval()?;
-    let lengths_data: Vec<i32> = lengths_i32.to_vec_row_major::<i32>()?;
-
-    let mut results = Vec::with_capacity(batch_size);
-
-    // Process each sequence independently
-    for b in 0..batch_size {
-        let seq_len = lengths_data[b] as usize;
-        let best_hyp = beam_search_single(
-            encoder_output,
-            b,
-            seq_len,
-            decoder,
-            joint,
-            blank_id,
-            beam_size,
-            max_symbols,
-        )?;
-        results.push(best_hyp);
+    let mut results = Vec::with_capacity(lengths.len());
+    for (b, &len) in lengths.iter().enumerate() {
+        let seq_len = (len.max(0) as usize).min(encoder_output.dim(1) as usize);
+        let frames = encoder_output.index((b as i32, ..seq_len as i32, ..));
+        let enc_proj = joint.project_encoder(&frames)?;
+        results.push(beam_search_single(
+            &enc_proj, seq_len, decoder, joint, blank_id, beam_size,
+        )?);
     }
 
     Ok(results)
 }
 
-/// Beam search for a single sequence.
+/// Beam search over one sequence of projected encoder frames [time, joint_hidden].
 fn beam_search_single(
-    encoder_output: &Array,
-    batch_idx: usize,
+    enc_proj: &Array,
     seq_len: usize,
-    decoder: &StatelessTransducerDecoder,
+    decoder: &PredictionNetwork,
     joint: &RNNTJoint,
     blank_id: usize,
     beam_size: usize,
-    max_symbols: usize,
 ) -> Result<Vec<usize>> {
-    let vocab_size = joint.vocab_size();
+    let beam_k = beam_size.min(joint.vocab_size().saturating_sub(1)).max(1);
+    let max_expansions = beam_size * MAX_EXPANSIONS_PER_BEAM;
 
-    // Initialize with empty hypothesis
-    let init_state = decoder.initialize_state(1)?;
-    let mut beams = vec![Hypothesis::new(init_state)];
+    let mut kept = vec![Hypothesis {
+        tokens: Vec::new(),
+        score: 0.0,
+        state: decoder.initialize_state(1)?,
+        prediction: None,
+    }];
 
-    // Process each encoder frame
     for t in 0..seq_len {
-        // Get encoder frame: [1, 1, encoder_hidden]
-        let enc_frame = encoder_output.index((
-            batch_idx as i32..batch_idx as i32 + 1,
-            t as i32..t as i32 + 1,
-            ..,
-        ));
+        let enc_t = enc_proj.index((t as i32..t as i32 + 1, ..));
+        let mut hyps = std::mem::take(&mut kept);
+        let mut done = false;
 
-        // Expand hypotheses for this frame
-        let mut new_beams: Vec<Hypothesis> = Vec::new();
-
-        for hyp in &beams {
-            // Each hypothesis can emit multiple symbols before moving to next frame
-            let expanded = expand_hypothesis(
-                &enc_frame,
-                hyp,
-                decoder,
-                joint,
-                blank_id,
-                vocab_size,
-                beam_size,
-                max_symbols,
-            )?;
-            new_beams.extend(expanded);
-        }
-
-        // Keep top beam_size hypotheses
-        new_beams.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(Ordering::Equal));
-        new_beams.truncate(beam_size);
-
-        if new_beams.is_empty() {
-            // Keep at least the best hypothesis from before
-            if let Some(best) = beams.first() {
-                new_beams.push(best.clone());
-            }
-        }
-
-        beams = new_beams;
-    }
-
-    // Return best hypothesis
-    Ok(beams.first().map(|h| h.tokens.clone()).unwrap_or_default())
-}
-
-/// Expand a hypothesis by emitting symbols until blank.
-fn expand_hypothesis(
-    enc_frame: &Array,
-    hyp: &Hypothesis,
-    decoder: &StatelessTransducerDecoder,
-    joint: &RNNTJoint,
-    blank_id: usize,
-    _vocab_size: usize,
-    beam_size: usize,
-    max_symbols: usize,
-) -> Result<Vec<Hypothesis>> {
-    let mut results = Vec::new();
-    let mut frontier = vec![hyp.clone()];
-
-    // Expand until we have enough blank-terminated hypotheses
-    for _ in 0..max_symbols {
-        let mut new_frontier = Vec::new();
-
-        for h in &frontier {
-            // Get prediction output
-            let last_token = if h.tokens.is_empty() {
-                None
-            } else {
-                Some(last_token_array(&h.tokens)?)
+        for _ in 0..max_expansions {
+            let mut best = hyps.swap_remove(best_index(&hyps));
+            let (pred_proj, next_state) = match best.prediction.take() {
+                Some(prediction) => prediction,
+                None => predict(decoder, joint, best.tokens.last().copied(), &best.state)?,
             };
 
-            let (pred_output, new_state) = decoder.predict_one(last_token.as_ref(), &h.state)?;
+            let logits = joint.logits_from_projections(&enc_t, &pred_proj)?;
+            let log_probs: Vec<f32> = mlx_rs::nn::log_softmax(&logits, -1)?
+                .as_dtype(mlx_rs::Dtype::Float32)?
+                .to_vec_row_major()?;
 
-            // Compute joint probabilities
-            let log_probs = joint.forward_one(enc_frame, &pred_output)?;
-            log_probs.eval()?;
+            for (token, log_prob) in top_k_non_blank(&log_probs, blank_id, beam_k) {
+                let mut tokens = best.tokens.clone();
+                tokens.push(token);
+                hyps.push(Hypothesis {
+                    tokens,
+                    score: best.score + log_prob,
+                    state: next_state.clone(),
+                    prediction: None,
+                });
+            }
 
-            // Get log probabilities as a slice
-            let log_probs_data: Vec<f32> = log_probs.to_vec_row_major::<f32>()?;
+            // Ending in blank keeps the same tokens, so the prediction carries over
+            best.score += log_probs[blank_id];
+            best.prediction = Some((pred_proj, next_state));
+            kept.push(best);
 
-            // Add blank hypothesis (terminates this expansion)
-            let blank_log_prob = log_probs_data[blank_id];
-            results.push(h.with_blank(blank_log_prob));
-
-            // Add non-blank hypotheses (continue expansion)
-            let mut token_scores: Vec<(usize, f32)> = log_probs_data
-                .iter()
-                .enumerate()
-                .filter(|(i, _)| *i != blank_id)
-                .map(|(i, &p)| (i, p))
-                .collect();
-
-            // Sort by score and take top k
-            token_scores.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal));
-            token_scores.truncate(beam_size);
-
-            for (token, log_prob) in token_scores {
-                new_frontier.push(h.with_token(token, log_prob, new_state.clone()));
+            // Stop once enough finished hypotheses beat every unfinished one
+            if hyps.is_empty() {
+                done = true;
+                break;
+            }
+            let hyps_max = hyps[best_index(&hyps)].score;
+            if kept.iter().filter(|h| h.score > hyps_max).count() >= beam_size {
+                kept.retain(|h| h.score > hyps_max);
+                done = true;
+                break;
             }
         }
 
-        if new_frontier.is_empty() {
-            break;
+        if !done {
+            kept.sort_by(|a, b| b.score.total_cmp(&a.score));
+            kept.truncate(beam_size);
         }
-
-        // Keep only top beam_size candidates for next iteration
-        new_frontier.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(Ordering::Equal));
-        new_frontier.truncate(beam_size);
-        frontier = new_frontier;
     }
 
-    // Add any remaining frontier hypotheses with blank
-    for h in &frontier {
-        // These didn't emit blank within max_symbols, force blank
-        results.push(h.clone());
-    }
-
-    Ok(results)
+    // NeMo's hypotheses start with a blank, so its length norm counts one more
+    // token than they emit
+    let best = kept
+        .iter()
+        .max_by(|a, b| {
+            let norm = |h: &Hypothesis| h.score / (h.tokens.len() + 1) as f32;
+            norm(a).total_cmp(&norm(b))
+        })
+        .map(|h| h.tokens.clone())
+        .unwrap_or_default();
+    Ok(best)
 }
 
-/// Create an array containing the last token for prediction.
-fn last_token_array(tokens: &[usize]) -> Result<Array> {
-    let last = tokens.last().copied().unwrap_or(0) as i32;
-    Ok(Array::from_slice(&[last], &[1, 1]))
+/// Prediction for a history ending in `token` (`None` for the start of the
+/// sequence), projected into the joint space, and the decoder state after it.
+fn predict(
+    decoder: &PredictionNetwork,
+    joint: &RNNTJoint,
+    token: Option<usize>,
+    state: &DecoderState,
+) -> Result<(Array, DecoderState)> {
+    let token = token.map(|t| Array::from_slice(&[t as i32], &[1, 1]));
+    let (pred, next_state) = decoder.predict_one(token.as_ref(), state)?;
+    Ok((
+        joint.project_prediction(&pred.reshape(&[1, -1])?)?,
+        next_state,
+    ))
+}
+
+/// Index of the highest-scoring hypothesis. `hyps` must not be empty.
+fn best_index(hyps: &[Hypothesis]) -> usize {
+    hyps.iter()
+        .enumerate()
+        .max_by(|(_, a), (_, b)| a.score.total_cmp(&b.score))
+        .map(|(i, _)| i)
+        .expect("beam search always has a hypothesis to expand")
+}
+
+/// The `k` most probable tokens other than blank, best first.
+fn top_k_non_blank(log_probs: &[f32], blank_id: usize, k: usize) -> Vec<(usize, f32)> {
+    let mut scored: Vec<(usize, f32)> = log_probs
+        .iter()
+        .copied()
+        .enumerate()
+        .filter(|&(i, _)| i != blank_id)
+        .collect();
+    let k = k.min(scored.len());
+    if k == 0 {
+        return Vec::new();
+    }
+    scored.select_nth_unstable_by(k - 1, |a, b| b.1.total_cmp(&a.1));
+    scored.truncate(k);
+    scored.sort_by(|a, b| b.1.total_cmp(&a.1));
+    scored
 }
 
 #[cfg(test)]
@@ -280,20 +209,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_hypothesis_ordering() {
-        let state = Array::zeros::<f32>(&[1, 1]).unwrap();
-        let h1 = Hypothesis {
-            tokens: vec![],
-            score: -1.0,
-            state: state.clone(),
-        };
-        let h2 = Hypothesis {
-            tokens: vec![],
-            score: -2.0,
-            state: state.clone(),
-        };
-
-        // h1 should be "greater" (higher priority) due to higher score
-        assert!(h1 > h2);
+    fn test_top_k_non_blank_skips_blank() {
+        let log_probs = [-0.1, -3.0, -0.5, -2.0];
+        assert_eq!(
+            top_k_non_blank(&log_probs, 0, 2),
+            vec![(2, -0.5), (3, -2.0)]
+        );
+        assert_eq!(top_k_non_blank(&log_probs, 3, 10).len(), 3);
     }
 }

@@ -21,7 +21,7 @@ use mlx_rs::ops;
 use mlx_rs::ops::indexing::IndexOp;
 
 use crate::core::error::Result;
-use crate::core::quantization::{LinearLayer, QuantizationConfig, load_linear_layer};
+use crate::core::quantization::{LinearLayer, QuantizationConfig, require_linear_layer};
 
 /// A feed-forward speaker kernel.
 struct FfKernel {
@@ -34,10 +34,10 @@ impl FfKernel {
         weights: &HashMap<String, Array>,
         prefix: &str,
         quant: Option<&QuantizationConfig>,
-    ) -> Option<Self> {
-        Some(Self {
-            up: load_linear_layer(weights, &format!("{}.0", prefix), quant)?,
-            down: load_linear_layer(weights, &format!("{}.3", prefix), quant)?,
+    ) -> Result<Self> {
+        Ok(Self {
+            up: require_linear_layer(weights, &format!("{}.0", prefix), quant)?,
+            down: require_linear_layer(weights, &format!("{}.3", prefix), quant)?,
         })
     }
 
@@ -59,22 +59,22 @@ impl SpeakerKernels {
     /// Load speaker kernels from a checkpoint.
     ///
     /// Returns `None` if the checkpoint has no `spk_kernels.*` weights (an
-    /// ordinary ASR model).
+    /// ordinary ASR model), and an error if a kernel is incomplete.
     pub fn load(
         weights: &HashMap<String, Array>,
         quant: Option<&QuantizationConfig>,
-    ) -> Option<Self> {
-        let spk = load_kernels(weights, "spk_kernels", quant);
+    ) -> Result<Option<Self>> {
+        let spk = load_kernels(weights, "spk_kernels", quant)?;
         if spk.is_empty() {
-            return None;
+            return Ok(None);
         }
-        let bg = load_kernels(weights, "bg_spk_kernels", quant);
+        let bg = load_kernels(weights, "bg_spk_kernels", quant)?;
         tracing::info!(
             layers = ?spk.keys().collect::<Vec<_>>(),
             background = !bg.is_empty(),
             "Loaded speaker kernels"
         );
-        Some(Self { spk, bg })
+        Ok(Some(Self { spk, bg }))
     }
 
     /// Whether a kernel is applied before `layer_idx`.
@@ -115,7 +115,7 @@ fn load_kernels(
     weights: &HashMap<String, Array>,
     prefix: &str,
     quant: Option<&QuantizationConfig>,
-) -> BTreeMap<usize, FfKernel> {
+) -> Result<BTreeMap<usize, FfKernel>> {
     let layer_prefix = format!("{}.", prefix);
     let mut layers: Vec<usize> = weights
         .keys()
@@ -132,12 +132,9 @@ fn load_kernels(
 
     layers
         .into_iter()
-        .filter_map(|layer| {
-            let kernel = FfKernel::load(weights, &format!("{}.{}", prefix, layer), quant);
-            if kernel.is_none() {
-                tracing::warn!("Incomplete speaker kernel weights for {}.{}", prefix, layer);
-            }
-            Some((layer, kernel?))
+        .map(|layer| {
+            let kernel = FfKernel::load(weights, &format!("{}.{}", prefix, layer), quant)?;
+            Ok((layer, kernel))
         })
         .collect()
 }
@@ -179,6 +176,10 @@ mod tests {
 
     #[test]
     fn test_load_returns_none_without_kernels() {
-        assert!(SpeakerKernels::load(&HashMap::new(), None).is_none());
+        assert!(
+            SpeakerKernels::load(&HashMap::new(), None)
+                .unwrap()
+                .is_none()
+        );
     }
 }

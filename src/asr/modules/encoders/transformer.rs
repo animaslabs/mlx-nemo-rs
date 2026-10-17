@@ -15,7 +15,8 @@ use mlx_rs::ops;
 
 use crate::asr::config::TransformerEncoderConfig;
 use crate::core::error::Result;
-use crate::core::quantization::{LinearLayer, QuantizationConfig, load_linear_layer};
+use crate::core::quantization::{LinearLayer, QuantizationConfig, require_linear_layer};
+use crate::core::weights::load_layer_norm;
 
 /// Multi-head attention (standard, no relative positional encoding).
 ///
@@ -123,21 +124,13 @@ impl MultiHeadAttention {
         weights: &HashMap<String, Array>,
         prefix: &str,
         quant: Option<&QuantizationConfig>,
-    ) {
-        if let Some(layer) = load_linear_layer(weights, &format!("{}.query_net", prefix), quant) {
-            self.query_proj = layer;
-        }
-        if let Some(layer) = load_linear_layer(weights, &format!("{}.key_net", prefix), quant) {
-            self.key_proj = layer;
-        }
-        if let Some(layer) = load_linear_layer(weights, &format!("{}.value_net", prefix), quant) {
-            self.value_proj = layer;
-        }
-        if let Some(layer) =
-            load_linear_layer(weights, &format!("{}.out_projection", prefix), quant)
-        {
-            self.out_proj = layer;
-        }
+    ) -> Result<()> {
+        let linear = |name: &str| require_linear_layer(weights, &format!("{prefix}.{name}"), quant);
+        self.query_proj = linear("query_net")?;
+        self.key_proj = linear("key_net")?;
+        self.value_proj = linear("value_net")?;
+        self.out_proj = linear("out_projection")?;
+        Ok(())
     }
 }
 
@@ -183,23 +176,10 @@ impl PositionWiseFF {
         weights: &HashMap<String, Array>,
         prefix: &str,
         quant: Option<&QuantizationConfig>,
-    ) {
-        if let Some(layer) = load_linear_layer(weights, &format!("{}.dense_in", prefix), quant) {
-            self.linear1 = layer;
-        }
-        if let Some(layer) = load_linear_layer(weights, &format!("{}.dense_out", prefix), quant) {
-            self.linear2 = layer;
-        }
-    }
-}
-
-/// Helper to load LayerNorm weights.
-fn load_layer_norm(layer: &mut nn::LayerNorm, weights: &HashMap<String, Array>, prefix: &str) {
-    if let Some(weight) = weights.get(&format!("{}.weight", prefix)) {
-        layer.weight.value = Some(weight.clone());
-    }
-    if let Some(bias) = weights.get(&format!("{}.bias", prefix)) {
-        layer.bias.value = Some(bias.clone());
+    ) -> Result<()> {
+        self.linear1 = require_linear_layer(weights, &format!("{}.dense_in", prefix), quant)?;
+        self.linear2 = require_linear_layer(weights, &format!("{}.dense_out", prefix), quant)?;
+        Ok(())
     }
 }
 
@@ -261,22 +241,22 @@ impl TransformerEncoderBlock {
         weights: &HashMap<String, Array>,
         prefix: &str,
         quant: Option<&QuantizationConfig>,
-    ) {
+    ) -> Result<()> {
         // NeMo weight prefix: {prefix}.first_sub_layer (MHA), {prefix}.second_sub_layer (FFN)
         self.self_attn
-            .load_weights(weights, &format!("{}.first_sub_layer", prefix), quant);
+            .load_weights(weights, &format!("{}.first_sub_layer", prefix), quant)?;
         self.ffn
-            .load_weights(weights, &format!("{}.second_sub_layer", prefix), quant);
+            .load_weights(weights, &format!("{}.second_sub_layer", prefix), quant)?;
         load_layer_norm(
             &mut self.layer_norm_1,
             weights,
             &format!("{}.layer_norm_1", prefix),
-        );
+        )?;
         load_layer_norm(
             &mut self.layer_norm_2,
             weights,
             &format!("{}.layer_norm_2", prefix),
-        );
+        )
     }
 }
 
@@ -298,8 +278,9 @@ impl TransformerEncoder {
             layers.push(TransformerEncoderBlock::new(&config)?);
         }
 
-        // Final layer norm: used when pre_ln=False and pre_ln_final_layer_norm=True
-        let final_norm = if !config.pre_ln && config.pre_ln_final_layer_norm {
+        // Final layer norm: NeMo only adds it to pre-LN encoders (post-LN blocks
+        // already end in a LayerNorm)
+        let final_norm = if config.pre_ln && config.pre_ln_final_layer_norm {
             Some(nn::LayerNorm::new(config.hidden_size as i32)?)
         } else {
             None
@@ -327,14 +308,6 @@ impl TransformerEncoder {
         }
 
         if let Some(ref mut norm) = self.final_norm {
-            // The final norm is NOT applied here because post-LN blocks
-            // already have LayerNorm at the end. The pre_ln_final_layer_norm
-            // config option in NeMo adds an EXTRA norm at the end of the encoder
-            // only when using pre-LN mode. For post-LN mode (our case),
-            // each block already ends with LayerNorm.
-            // But NeMo's code does: if pre_ln_final_layer_norm: self.final_layer_norm = LayerNorm
-            // and applies it unconditionally at the end.
-            // Let's follow NeMo exactly.
             out = norm.forward(&out)?;
         }
 
@@ -351,11 +324,11 @@ impl TransformerEncoder {
         quant: Option<&QuantizationConfig>,
     ) -> Result<()> {
         for (i, layer) in self.layers.iter_mut().enumerate() {
-            layer.load_weights(weights, &format!("{}.layers.{}", prefix, i), quant);
+            layer.load_weights(weights, &format!("{}.layers.{}", prefix, i), quant)?;
         }
 
         if let Some(ref mut norm) = self.final_norm {
-            load_layer_norm(norm, weights, &format!("{}.final_layer_norm", prefix));
+            load_layer_norm(norm, weights, &format!("{}.final_layer_norm", prefix))?;
         }
 
         Ok(())

@@ -159,27 +159,16 @@ impl EncDecCTCModel {
         // Create the model
         let mut model = Self::new(config)?;
 
-        // Load tokenizer if available
-        if let Some(tokenizer_path) = checkpoint.find_tokenizer() {
-            tracing::debug!("Loading tokenizer from: {}", tokenizer_path.display());
-            model.load_tokenizer(&tokenizer_path)?;
-        }
+        let tokenizer_path = checkpoint
+            .find_tokenizer()
+            .ok_or_else(|| Error::missing_tokenizer(path))?;
+        tracing::debug!("Loading tokenizer from: {}", tokenizer_path.display());
+        model.load_tokenizer(&tokenizer_path)?;
 
         // Load weights (.nemo files are not quantized)
-        // Note: For now, we support safetensors format
-        // PyTorch .ckpt support requires additional work
-        if checkpoint.weights_path.is_some() {
-            match checkpoint.load_weights() {
-                Ok(weights) => {
-                    tracing::debug!("Loading {} weight tensors", weights.len());
-                    model.load_weights(&weights, None)?;
-                }
-                Err(e) => {
-                    tracing::warn!("Could not load weights: {}", e);
-                    // Continue without weights for now (useful for testing structure)
-                }
-            }
-        }
+        let weights = checkpoint.load_weights()?;
+        tracing::debug!("Loading {} weight tensors", weights.len());
+        model.load_weights(&weights, None)?;
 
         Ok(model)
     }
@@ -321,11 +310,11 @@ impl EncDecCTCModel {
         // Create model
         let mut model = Self::new(config)?;
 
-        // Load tokenizer if found
-        if let Some(tok_path) = loader.tokenizer_path() {
-            tracing::debug!("Loading tokenizer from: {}", tok_path.display());
-            model.load_tokenizer(tok_path)?;
-        }
+        let tok_path = loader
+            .tokenizer_path()
+            .ok_or_else(|| Error::missing_tokenizer(dir))?;
+        tracing::debug!("Loading tokenizer from: {}", tok_path.display());
+        model.load_tokenizer(tok_path)?;
 
         // Load weights (may be quantized)
         let weights = loader.load_weights()?;

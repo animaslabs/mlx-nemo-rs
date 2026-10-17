@@ -15,39 +15,7 @@ use mlx_rs::nn;
 
 use crate::asr::config::{JasperBlockConfig, JasperEncoderConfig};
 use crate::core::error::Result;
-
-/// Helper to load Conv1d weights (already transposed from PyTorch by weights.rs).
-fn load_conv1d(layer: &mut nn::Conv1d, weights: &HashMap<String, Array>, prefix: &str) {
-    if let Some(weight) = weights.get(&format!("{}.weight", prefix)) {
-        layer.weight.value = weight.clone();
-    }
-    if let Some(bias) = weights.get(&format!("{}.bias", prefix)) {
-        layer.bias.value = Some(bias.clone());
-    }
-}
-
-/// Helper to load BatchNorm weights.
-fn load_batch_norm(layer: &mut nn::BatchNorm, weights: &HashMap<String, Array>, prefix: &str) {
-    let mut loaded = Vec::new();
-    if let Some(weight) = weights.get(&format!("{}.weight", prefix)) {
-        layer.weight.value = Some(weight.clone());
-        loaded.push("weight");
-    }
-    if let Some(bias) = weights.get(&format!("{}.bias", prefix)) {
-        layer.bias.value = Some(bias.clone());
-        loaded.push("bias");
-    }
-    if let Some(running_mean) = weights.get(&format!("{}.running_mean", prefix)) {
-        layer.running_mean.value = Some(running_mean.clone());
-        loaded.push("running_mean");
-    }
-    if let Some(running_var) = weights.get(&format!("{}.running_var", prefix)) {
-        layer.running_var.value = Some(running_var.clone());
-        loaded.push("running_var");
-    }
-    // Use inference mode so we use loaded running stats, not batch stats
-    layer.training = false;
-}
+use crate::core::weights::{load_batch_norm, load_conv1d};
 
 /// A single sub-block within a JasperBlock.
 ///
@@ -242,7 +210,7 @@ impl JasperBlock {
         Ok(out)
     }
 
-    fn load_weights(&mut self, weights: &HashMap<String, Array>, prefix: &str) {
+    fn load_weights(&mut self, weights: &HashMap<String, Array>, prefix: &str) -> Result<()> {
         // NeMo mconv index layout for separable blocks:
         // Per sub-block: dw_conv, pw_conv, bn, relu (no params), dropout (no params)
         // = 5 indices per sub-block (except last sub-block has no relu/dropout = 3 indices)
@@ -263,7 +231,7 @@ impl JasperBlock {
             if is_separable {
                 // dw_conv
                 if let Some(ref mut dw) = sub.dw_conv {
-                    load_conv1d(dw, weights, &format!("{}.mconv.{}.conv", prefix, mconv_idx));
+                    load_conv1d(dw, weights, &format!("{}.mconv.{}.conv", prefix, mconv_idx))?;
                     mconv_idx += 1;
                 }
                 // pw_conv
@@ -271,14 +239,14 @@ impl JasperBlock {
                     &mut sub.conv,
                     weights,
                     &format!("{}.mconv.{}.conv", prefix, mconv_idx),
-                );
+                )?;
                 mconv_idx += 1;
                 // bn
                 load_batch_norm(
                     &mut sub.bn,
                     weights,
                     &format!("{}.mconv.{}", prefix, mconv_idx),
-                );
+                )?;
                 mconv_idx += 1;
             } else {
                 // conv
@@ -286,14 +254,14 @@ impl JasperBlock {
                     &mut sub.conv,
                     weights,
                     &format!("{}.mconv.{}.conv", prefix, mconv_idx),
-                );
+                )?;
                 mconv_idx += 1;
                 // bn
                 load_batch_norm(
                     &mut sub.bn,
                     weights,
                     &format!("{}.mconv.{}", prefix, mconv_idx),
-                );
+                )?;
                 mconv_idx += 1;
             }
 
@@ -311,14 +279,15 @@ impl JasperBlock {
                     &mut branch.conv,
                     weights,
                     &format!("{}.res.{}.0.conv", prefix, res_idx),
-                );
+                )?;
                 load_batch_norm(
                     &mut branch.bn,
                     weights,
                     &format!("{}.res.{}.1", prefix, res_idx),
-                );
+                )?;
             }
         }
+        Ok(())
     }
 }
 
@@ -399,9 +368,10 @@ impl JasperEncoder {
     }
 
     /// Load weights from a state dict.
-    pub fn load_weights(&mut self, weights: &HashMap<String, Array>) {
+    pub fn load_weights(&mut self, weights: &HashMap<String, Array>) -> Result<()> {
         for (i, block) in self.blocks.iter_mut().enumerate() {
-            block.load_weights(weights, &format!("encoder.encoder.{}", i));
+            block.load_weights(weights, &format!("encoder.encoder.{}", i))?;
         }
+        Ok(())
     }
 }

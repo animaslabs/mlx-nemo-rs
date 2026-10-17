@@ -108,17 +108,9 @@ impl SortformerEncLabelModel {
         let mut model = Self::new(config)?;
 
         // Load weights
-        if checkpoint.weights_path.is_some() {
-            match checkpoint.load_weights() {
-                Ok(weights) => {
-                    tracing::debug!("Loading {} weight tensors", weights.len());
-                    model.load_weights(&weights)?;
-                }
-                Err(e) => {
-                    tracing::warn!("Could not load weights: {}", e);
-                }
-            }
-        }
+        let weights = checkpoint.load_weights()?;
+        tracing::debug!("Loading {} weight tensors", weights.len());
+        model.load_weights(&weights)?;
 
         Ok(model)
     }
