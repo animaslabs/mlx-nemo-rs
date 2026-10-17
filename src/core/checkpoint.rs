@@ -17,14 +17,14 @@ use crate::core::error::{Error, Result};
 #[derive(Debug)]
 pub struct NemoCheckpoint {
     /// Raw YAML content of the model configuration.
-    pub config_yaml: String,
+    config_yaml: String,
 
     /// Model weights as a map from parameter name to array.
     /// Note: These are loaded lazily or from safetensors/pickle format.
-    pub weights_path: Option<PathBuf>,
+    weights_path: Option<PathBuf>,
 
     /// Extracted artifact files (tokenizers, etc.)
-    pub artifacts: HashMap<String, Vec<u8>>,
+    artifacts: HashMap<String, Vec<u8>>,
 
     /// Temporary directory containing extracted files (if any).
     temp_dir: Option<tempfile::TempDir>,
@@ -89,7 +89,7 @@ impl NemoCheckpoint {
     }
 
     /// Open a gzip-compressed .nemo file (older format).
-    pub fn open_gzip(path: impl AsRef<Path>) -> Result<Self> {
+    fn open_gzip(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
 
         if !path.exists() {
@@ -120,6 +120,21 @@ impl NemoCheckpoint {
             artifacts,
             temp_dir: Some(temp_dir),
         })
+    }
+
+    /// Raw YAML content of the model configuration.
+    pub fn config_yaml(&self) -> &str {
+        &self.config_yaml
+    }
+
+    /// Path of the extracted weights file, if the archive has one.
+    pub fn weights_path(&self) -> Option<&Path> {
+        self.weights_path.as_deref()
+    }
+
+    /// Names of the extracted artifact files (tokenizers, vocabularies, etc.).
+    pub fn artifact_names(&self) -> impl Iterator<Item = &str> {
+        self.artifacts.keys().map(String::as_str)
     }
 
     /// Get the path to an extracted artifact file.
@@ -446,20 +461,20 @@ impl Default for NemoCheckpointWriter {
 #[derive(Debug)]
 pub struct SafetensorsLoader {
     /// Path to the safetensors weights file.
-    pub weights_path: PathBuf,
+    weights_path: PathBuf,
 
     /// Raw config content (YAML or JSON).
-    pub config_content: String,
+    config_content: String,
 
     /// Path to tokenizer file, if found.
-    pub tokenizer_path: Option<PathBuf>,
+    tokenizer_path: Option<PathBuf>,
 
     /// Detected or specified weight format.
     /// If None, format will be auto-detected from weight shapes during loading.
-    pub weight_format: Option<crate::core::weights::WeightFormat>,
+    weight_format: Option<crate::core::weights::WeightFormat>,
 
     /// Quantization configuration, if the model is quantized.
-    pub quantization: Option<crate::core::quantization::QuantizationConfig>,
+    quantization: Option<crate::core::quantization::QuantizationConfig>,
 }
 
 impl SafetensorsLoader {
@@ -646,6 +661,16 @@ impl SafetensorsLoader {
                 e
             ))
         })
+    }
+
+    /// Path to the safetensors weights file.
+    pub fn weights_path(&self) -> &Path {
+        &self.weights_path
+    }
+
+    /// The weight layout, if known (from metadata or set explicitly).
+    pub fn weight_format(&self) -> Option<crate::core::weights::WeightFormat> {
+        self.weight_format
     }
 
     /// Get the raw config content.

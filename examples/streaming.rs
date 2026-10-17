@@ -266,14 +266,13 @@ fn main() -> mlx_voice::Result<()> {
         }
 
         // Post-process to get speech segments
-        let vad_config = VadPostProcessConfig {
-            onset: vad_onset,
-            offset: vad_offset,
-            pad_onset: vad_pad,
-            pad_offset: vad_pad,
-            min_duration_on: 0.1,
-            min_duration_off: 0.1,
-        };
+        let mut vad_config = VadPostProcessConfig::default();
+        vad_config.onset = vad_onset;
+        vad_config.offset = vad_offset;
+        vad_config.pad_onset = vad_pad;
+        vad_config.pad_offset = vad_pad;
+        vad_config.min_duration_on = 0.1;
+        vad_config.min_duration_off = 0.1;
         let processor = VadPostProcessor::new(vad_config);
         let frame_duration = vad_model.frame_duration();
         let segments = processor.process(&probs, frame_duration, audio_duration);

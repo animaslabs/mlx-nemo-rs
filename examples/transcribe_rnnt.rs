@@ -207,6 +207,7 @@ fn load_model(
                     Some(WeightFormat::PyTorch) => {
                         println!("  Weights: PyTorch format (will transpose Conv1d)")
                     }
+                    Some(format) => println!("  Weights: {:?} format", format),
                     None => println!("  Weights: Auto-detect from metadata"),
                 }
 

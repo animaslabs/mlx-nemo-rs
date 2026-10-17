@@ -182,21 +182,23 @@ fn main() -> mlx_voice::Result<()> {
     let mut session = model.init_streaming(mode_idx, 1)?;
     println!(
         "Chunk size: {} frames (first), {} frames (subsequent)",
-        session.config.chunk_size_for_step(true),
-        session.config.chunk_size_for_step(false)
+        session.config().chunk_size_for_step(true),
+        session.config().chunk_size_for_step(false)
     );
     println!(
         "Shift size: {} frames (first), {} frames (subsequent)",
-        session.config.shift_size_for_step(true),
-        session.config.shift_size_for_step(false)
+        session.config().shift_size_for_step(true),
+        session.config().shift_size_for_step(false)
     );
     println!(
         "Valid output length: {} frames, Lookahead: {} frames",
-        session.config.valid_out_len, session.config.lookahead_frames
+        session.config().valid_out_len,
+        session.config().lookahead_frames
     );
     println!(
         "Cache sizes: channel={}, time={}",
-        session.config.last_channel_cache_size, session.config.last_time_cache_size
+        session.config().last_channel_cache_size,
+        session.config().last_time_cache_size
     );
 
     // Create ring buffer (2 seconds of audio at source rate)

@@ -5,7 +5,6 @@
 
 use std::collections::HashMap;
 use std::sync::LazyLock;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use mlx_rs::Array;
 use mlx_rs::builder::Builder;
@@ -29,8 +28,6 @@ static MLX_VOICE_DEBUG: LazyLock<bool> =
 static DEBUG_LAYER0: LazyLock<bool> = LazyLock::new(|| std::env::var_os("DEBUG_LAYER0").is_some());
 static DEBUG_CONV: LazyLock<bool> = LazyLock::new(|| std::env::var_os("DEBUG_CONV").is_some());
 
-/// Global counter for encoder forward calls (for debugging)
-static ENCODER_CALL_COUNT: AtomicU64 = AtomicU64::new(0);
 
 /// Debug output from encoder forward pass.
 #[derive(Debug)]
@@ -47,11 +44,6 @@ pub struct DebugEncoderOutput {
     pub final_output: Array,
     /// Output lengths
     pub lengths: Array,
-}
-
-/// Reset the encoder call counter (call at start of streaming session)
-pub fn reset_encoder_counter() {
-    ENCODER_CALL_COUNT.store(0, Ordering::SeqCst);
 }
 
 /// Apply causal padding to a 4D tensor [B, T, F, C].
@@ -844,8 +836,6 @@ impl ConformerEncoder {
         cache_last_channel_len: &Array,
         drop_extra_pre_encoded: usize,
     ) -> Result<(Array, Array, Array, Array, Array)> {
-        ENCODER_CALL_COUNT.fetch_add(1, Ordering::SeqCst);
-
         // Transpose from [B, F, T] to [B, T, F] for processing
         let x = mlx_rs::ops::transpose_axes(features, &[0, 2, 1])?;
 

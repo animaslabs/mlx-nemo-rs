@@ -10,15 +10,6 @@ use serde::de::DeserializeOwned;
 
 use crate::core::error::{Error, Result};
 
-/// Trait for types that can be instantiated from a configuration.
-pub trait FromConfig: Sized {
-    /// The configuration type.
-    type Config: DeserializeOwned + Serialize + Clone;
-
-    /// Create an instance from configuration.
-    fn from_config(config: Self::Config) -> Result<Self>;
-}
-
 /// Load configuration from a YAML string.
 pub fn from_yaml_str<T: DeserializeOwned>(yaml: &str) -> Result<T> {
     yaml_serde::from_str(yaml).map_err(|e| Error::config_with_source("Failed to parse YAML", e))

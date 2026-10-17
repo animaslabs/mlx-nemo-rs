@@ -16,6 +16,7 @@ use crate::core::error::Result;
 
 /// Quantization configuration from model config.json.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct QuantizationConfig {
     /// Bits per weight (typically 4 or 8)
     pub bits: i32,

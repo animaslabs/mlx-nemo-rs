@@ -36,35 +36,41 @@
 //! ```
 
 pub mod config;
-pub mod decoding;
-pub mod dsp;
+internal_mod!(
+    /// Greedy and beam search decoding, detokenization and token merging.
+    decoding
+);
+internal_mod!(
+    /// Signal processing helpers (windows, mel filterbanks, framing).
+    dsp
+);
 pub mod models;
-pub mod modules;
+internal_mod!(
+    /// Neural network building blocks: preprocessors, encoders, decoders.
+    modules
+);
 pub mod pipeline;
-pub mod streaming;
+internal_mod!(
+    /// Cache-aware streaming state and configuration.
+    streaming
+);
 pub mod tokenizer;
 pub mod vad;
 
 // Re-exports
-pub use config::*;
+pub use config::AsrModelConfig;
 pub use models::{
-    CtcStreamingSession, DebugOutput, EncDecCTCModel, EncDecClassificationModel, EncDecRNNTModel,
+    CtcStreamingSession, EncDecCTCModel, EncDecClassificationModel, EncDecRNNTModel,
     RnntDecodingStrategy, RnntStreamingSession, SortformerEncLabelModel,
 };
-pub use tokenizer::Tokenizer;
-pub use vad::{SpeechSegment, VadPostProcessConfig, VadPostProcessor};
-// Primary exports (new names)
 pub use modules::{MelConfig, MelProcessor, SpectrumTransform, StreamingMel};
-// Backwards-compatible alias
-pub use modules::MelSpectrogram;
 pub use pipeline::{
     CacheAwareRNNTPipeline, MultiTalkerConfig, MultiTalkerMode, MultiTalkerOutput,
     MultiTalkerPipeline, SpeakerSegment, SpeakerWord, TranscribeOutput,
 };
-pub use streaming::{
-    EncoderCache, FeatureBuffer, StreamingConfig, StreamingMelBuffer, StreamingModeInfo,
-    StreamingOutput, StreamingSortformerState,
-};
+pub use streaming::{StreamingConfig, StreamingModeInfo, StreamingOutput};
+pub use tokenizer::Tokenizer;
+pub use vad::{SpeechSegment, VadPostProcessConfig, VadPostProcessor};
 
 /// Prelude for convenient imports.
 pub mod prelude {

@@ -37,6 +37,7 @@ use crate::core::error::{Error, Result};
 /// # Example
 ///
 /// ```no_run
+/// # #[cfg(feature = "internals")]
 /// # fn main() -> mlx_voice::Result<()> {
 /// use mlx_voice::core::pytorch;
 ///
@@ -44,6 +45,8 @@ use crate::core::error::{Error, Result};
 /// println!("Loaded {} tensors", weights.len());
 /// # Ok(())
 /// # }
+/// # #[cfg(not(feature = "internals"))]
+/// # fn main() {}
 /// ```
 pub fn load(path: impl AsRef<Path>) -> Result<HashMap<String, Array>> {
     let path = path.as_ref();

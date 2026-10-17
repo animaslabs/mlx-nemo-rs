@@ -7,7 +7,7 @@
 //! # Architecture
 //!
 //! ```text
-//! audio → MelSpectrogram → FastConformer → encoder_proj → TransformerEncoder
+//! audio → MelProcessor → FastConformer → encoder_proj → TransformerEncoder
 //!       → SortformerModules (speaker sigmoid head) → [B, T, num_spks]
 //! ```
 //!
@@ -39,7 +39,6 @@ use crate::asr::modules::{ConformerEncoder, MelConfig, MelProcessor};
 use crate::asr::streaming::StreamingSortformerState;
 use crate::core::ArrayExt;
 use crate::core::checkpoint::NemoCheckpoint;
-use crate::core::config::from_yaml_str;
 use crate::core::error::Result;
 use crate::core::loading::{LoadOptions, LoadReport, Weights};
 
@@ -110,10 +109,10 @@ impl SortformerEncLabelModel {
         );
 
         // Open the checkpoint
-        let checkpoint = NemoCheckpoint::open(path).or_else(|_| NemoCheckpoint::open_gzip(path))?;
+        let checkpoint = NemoCheckpoint::open(path)?;
 
         // Parse the configuration
-        let config: SortformerConfig = from_yaml_str(&checkpoint.config_yaml)?;
+        let config: SortformerConfig = checkpoint.load_config()?;
 
         tracing::debug!(
             "SortFormer config: max_spks={}, encoder_layers={}, tf_layers={}",
@@ -209,7 +208,7 @@ impl SortformerEncLabelModel {
     ///
     /// # Returns
     /// * Speaker activity for the central chunk frames [1, chunk_frames, num_spks]
-    pub fn forward_streaming_step(
+    pub(crate) fn forward_streaming_step(
         &mut self,
         mel_chunk: &Array,
         mel_length: usize,
@@ -274,7 +273,7 @@ impl SortformerEncLabelModel {
     ///
     /// Port of NeMo's `forward_streaming`: the mel features are split into
     /// `chunk_len` encoder-frame chunks with left/right context, and each is
-    /// run through [`Self::forward_streaming_step`].
+    /// run through one streaming step with the speaker cache and FIFO.
     ///
     /// # Arguments
     /// * `audio` - Raw audio samples [1, samples]
@@ -331,7 +330,7 @@ impl SortformerEncLabelModel {
     }
 
     /// Create a new streaming state for this model.
-    pub fn create_streaming_state(&self) -> Result<StreamingSortformerState> {
+    pub(crate) fn create_streaming_state(&self) -> Result<StreamingSortformerState> {
         StreamingSortformerState::new(
             self.config.sortformer_modules.clone(),
             self.encoder.d_model(),
@@ -341,7 +340,7 @@ impl SortformerEncLabelModel {
     /// Override streaming parameters (speaker cache, FIFO, chunk geometry).
     ///
     /// Takes effect for states created afterwards.
-    pub fn streaming_params_mut(&mut self) -> &mut SortformerModulesConfig {
+    pub(crate) fn streaming_params_mut(&mut self) -> &mut SortformerModulesConfig {
         &mut self.config.sortformer_modules
     }
 

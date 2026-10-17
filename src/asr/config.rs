@@ -16,6 +16,7 @@ use crate::core::error::{Error, Result};
 /// - Multiple: `[[70,13], [70,6], [70,1], [70,0]]` - multiple streaming modes (Nemotron style)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
+#[non_exhaustive]
 pub enum AttContextSize {
     /// Single context window: [left_context, right_context]
     Single(Vec<i32>),
@@ -75,6 +76,7 @@ impl AttContextSize {
 
 /// Top-level configuration for ASR models (CTC and RNNT).
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct AsrModelConfig {
     /// Target class (e.g., "nemo.collections.asr.models.EncDecCTCModelBPE" or "...EncDecRNNTBPEModel")
     #[serde(default)]
@@ -196,6 +198,7 @@ impl AsrModelConfig {
 
 /// Language-ID prompt settings of a prompt-conditioned model.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct PromptConfig {
     /// Language key (e.g. `en-US`, `de`, `auto`) -> one-hot index
     pub dictionary: BTreeMap<String, usize>,
@@ -209,6 +212,7 @@ fn default_sample_rate() -> u32 {
 
 /// Audio preprocessor configuration (Mel spectrogram).
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct PreprocessorConfig {
     /// Target class
     #[serde(rename = "_target_", default)]
@@ -298,6 +302,7 @@ fn default_preemph() -> Option<f32> {
 
 /// Encoder configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct EncoderConfig {
     /// Target class
     #[serde(rename = "_target_", default)]
@@ -440,6 +445,7 @@ fn default_conv_norm() -> String {
 
 /// Decoder configuration (CTC output projection).
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct DecoderConfig {
     /// Target class
     #[serde(rename = "_target_", default)]
@@ -477,6 +483,7 @@ pub struct DecoderConfig {
 
 /// Prediction network configuration (for RNNT models).
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct PredNetConfig {
     /// Hidden dimension of the prediction network
     #[serde(default = "default_pred_hidden")]
@@ -524,6 +531,7 @@ impl PredNetConfig {
 
 /// Joint network configuration (for RNNT models).
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct JointConfig {
     /// Target class
     #[serde(rename = "_target_", default)]
@@ -572,6 +580,7 @@ pub struct JointConfig {
 
 /// Nested joint network config (inside joint.jointnet in NeMo config).
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct JointNetConfig {
     /// Joint network hidden dimension
     #[serde(default = "default_joint_hidden")]
@@ -668,6 +677,7 @@ impl Default for JointConfig {
 
 /// Tokenizer configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct TokenizerConfig {
     /// Directory or path to tokenizer model
     #[serde(default)]
@@ -688,6 +698,7 @@ fn default_tokenizer_type() -> String {
 
 /// Decoding strategy configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct DecodingConfig {
     /// Decoding strategy (greedy, beam, etc.)
     #[serde(default = "default_strategy")]
@@ -883,6 +894,7 @@ impl Default for DecodingConfig {
 
 /// Top-level configuration for classification models (e.g., VAD with MarbleNet).
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct ClassificationModelConfig {
     /// Target class
     #[serde(rename = "_target_", default)]
@@ -912,6 +924,7 @@ pub struct ClassificationModelConfig {
 
 /// Jasper/ConvASR encoder configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct JasperEncoderConfig {
     /// Target class
     #[serde(rename = "_target_", default)]
@@ -939,6 +952,7 @@ fn default_jasper_activation() -> String {
 
 /// Configuration for a single Jasper block.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct JasperBlockConfig {
     /// Output channels (filters)
     pub filters: usize,
@@ -987,6 +1001,7 @@ fn default_residual_dense() -> bool {
 
 /// Decoder configuration for classification models.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct ClassificationDecoderConfig {
     /// Target class
     #[serde(rename = "_target_", default)]
@@ -1021,6 +1036,7 @@ fn default_num_classes_2() -> usize {
 
 /// Configuration for the SortFormer transformer encoder.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct TransformerEncoderConfig {
     /// Number of transformer layers
     #[serde(default = "default_tf_num_layers")]
@@ -1098,6 +1114,7 @@ impl Default for TransformerEncoderConfig {
 
 /// Configuration for the SortFormer speaker head modules.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct SortformerModulesConfig {
     /// Number of speakers
     #[serde(default = "default_num_spks")]
@@ -1244,6 +1261,7 @@ impl Default for SortformerModulesConfig {
 
 /// Top-level configuration for SortFormer diarization models.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct SortformerConfig {
     /// Target class
     #[serde(rename = "_target_", default)]

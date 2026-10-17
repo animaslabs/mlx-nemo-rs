@@ -44,34 +44,16 @@ use mlx_rs::Array;
 use crate::asr::Tokenizer;
 use crate::asr::config::AsrModelConfig;
 use crate::asr::decoding::{greedy_ctc_merge, greedy_decode, lcs_merge_buffer};
-use crate::asr::modules::{CTCDecoder, ConformerEncoder, MelSpectrogram};
+use crate::asr::modules::{CTCDecoder, ConformerEncoder, MelProcessor};
 use crate::asr::streaming::{
     EncoderCache, StreamingConfig, StreamingModeInfo, StreamingOutput, compute_streaming_config,
     get_streaming_modes,
 };
 use crate::audio::resample;
 use crate::core::checkpoint::NemoCheckpoint;
-use crate::core::config::from_yaml_str;
 use crate::core::error::{Error, Result};
 use crate::core::loading::{LoadOptions, LoadReport, Weights};
 use crate::core::quantization::QuantizationConfig;
-
-/// Debug output containing all intermediate tensors from forward pass.
-#[derive(Debug)]
-pub struct DebugOutput {
-    /// Mel spectrogram features BEFORE normalization [batch, n_mels, frames]
-    pub mel_pre_norm: Array,
-    /// Mel spectrogram features AFTER normalization [batch, n_mels, frames]
-    pub mel_spectrogram: Array,
-    /// Mel spectrogram lengths [batch]
-    pub mel_lengths: Array,
-    /// Encoder output [batch, d_model, time']
-    pub encoder_output: Array,
-    /// Encoder output lengths [batch]
-    pub encoder_lengths: Array,
-    /// Log probabilities [batch, time', vocab_size]
-    pub log_probs: Array,
-}
 
 /// Encoder-Decoder CTC ASR Model.
 ///
@@ -96,13 +78,20 @@ pub struct DebugOutput {
 /// ```
 pub struct EncDecCTCModel {
     config: AsrModelConfig,
-    preprocessor: MelSpectrogram,
+    preprocessor: MelProcessor,
     encoder: ConformerEncoder,
     decoder: CTCDecoder,
     tokenizer: Option<Tokenizer>,
     /// Blank token ID for CTC (typically last token in vocab)
     blank_id: usize,
     chunk_count: usize,
+}
+
+impl CtcStreamingSession {
+    /// The session's streaming configuration (chunk and cache sizes).
+    pub fn config(&self) -> &StreamingConfig {
+        &self.config
+    }
 }
 
 impl std::fmt::Debug for EncDecCTCModel {
@@ -123,7 +112,7 @@ impl EncDecCTCModel {
         // NeMo only dithers during training
         let mut mel_config: crate::asr::modules::MelConfig = config.preprocessor.clone().into();
         mel_config.dither = 0.0;
-        let preprocessor = MelSpectrogram::new(mel_config)?;
+        let preprocessor = MelProcessor::new(mel_config)?;
         let encoder = ConformerEncoder::new(config.encoder.clone())?;
 
         // Determine vocabulary size from config or default
@@ -164,13 +153,10 @@ impl EncDecCTCModel {
         tracing::info!("Loading model from: {}", path.display());
 
         // Open the checkpoint
-        let checkpoint = NemoCheckpoint::open(path).or_else(|_| {
-            // Try gzip format for older checkpoints
-            NemoCheckpoint::open_gzip(path)
-        })?;
+        let checkpoint = NemoCheckpoint::open(path)?;
 
         // Parse the configuration
-        let config: AsrModelConfig = from_yaml_str(&checkpoint.config_yaml)?;
+        let config: AsrModelConfig = checkpoint.load_config()?;
 
         tracing::debug!(
             "Model config loaded, encoder layers: {}",
@@ -286,7 +272,7 @@ impl EncDecCTCModel {
         tracing::debug!(
             "Loading {} weight tensors (format: {:?}, quantized: {})",
             weights.len(),
-            loader.weight_format,
+            loader.weight_format(),
             quant.is_some()
         );
         model.load_weights(&weights, quant)?;
@@ -356,7 +342,7 @@ impl EncDecCTCModel {
         tracing::debug!(
             "Loading {} weight tensors (format: {:?}, quantized: {})",
             weights.len(),
-            loader.weight_format,
+            loader.weight_format(),
             quant.is_some()
         );
         model.load_weights_with(&weights, quant, options)?;
@@ -495,7 +481,7 @@ impl EncDecCTCModel {
     }
 
     /// Get a reference to the preprocessor (for debugging).
-    pub fn preprocessor(&self) -> &MelSpectrogram {
+    pub fn preprocessor(&self) -> &MelProcessor {
         &self.preprocessor
     }
 
@@ -714,16 +700,16 @@ impl EncDecCTCModel {
 #[derive(Debug)]
 pub struct CtcStreamingSession {
     /// Streaming configuration (chunk sizes, cache sizes, etc.)
-    pub config: StreamingConfig,
+    config: StreamingConfig,
 
     /// Encoder cache state (attention + convolution)
-    pub encoder_cache: EncoderCache,
+    encoder_cache: EncoderCache,
 
     /// Previous tokens for each batch sample (for LCS merge)
-    pub prev_tokens: Vec<Vec<usize>>,
+    prev_tokens: Vec<Vec<usize>>,
 
     /// Whether this is the first chunk (affects chunk size)
-    pub is_first_chunk: bool,
+    is_first_chunk: bool,
 
     /// Blank token ID for CTC decoding
     blank_id: usize,

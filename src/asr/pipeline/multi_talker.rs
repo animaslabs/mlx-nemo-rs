@@ -47,7 +47,8 @@ use mlx_rs::ops::indexing::IndexOp;
 
 use super::cache_aware_rnnt::CacheAwareRNNTPipeline;
 use crate::asr::Tokenizer;
-use crate::asr::models::{DecoderState, SortformerEncLabelModel};
+use crate::asr::models::SortformerEncLabelModel;
+use crate::asr::modules::DecoderState;
 use crate::asr::modules::SpeakerTargets;
 use crate::asr::streaming::{EncoderCache, FeatureBuffer, StreamingSortformerState};
 use crate::core::ArrayExt;
@@ -61,6 +62,7 @@ const ACTIVITY_THRESHOLD: f32 = 0.5;
 ///
 /// Defaults follow NeMo's `MultitalkerTranscriptionConfig`.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct MultiTalkerConfig {
     /// Binarize diarizer outputs at 0.5 before using them as speaker targets
     pub binary_diar_preds: bool,
@@ -95,6 +97,7 @@ impl Default for MultiTalkerConfig {
 
 /// A word attributed to a speaker.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct SpeakerWord {
     /// Speaker index (0-based)
     pub speaker: usize,
@@ -108,6 +111,7 @@ pub struct SpeakerWord {
 
 /// A run of words from one speaker (a SegLST entry).
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct SpeakerSegment {
     /// Speaker index (0-based, up to max_num_spks - 1)
     pub speaker: usize,
@@ -121,6 +125,7 @@ pub struct SpeakerSegment {
 
 /// Output from a multi-talker transcription step.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct MultiTalkerOutput {
     /// Words completed during this step, ordered by start time
     pub new_words: Vec<SpeakerWord>,
@@ -132,6 +137,7 @@ pub struct MultiTalkerOutput {
 
 /// How the ASR model is shared between speakers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum MultiTalkerMode {
     /// One speaker-conditioned ASR instance per speaker
     Parallel,

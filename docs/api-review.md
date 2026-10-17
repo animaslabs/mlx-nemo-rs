@@ -126,10 +126,9 @@ let lenient = LoadOptions::default().strict(false);
 let mut model = EncDecRNNTModel::restore_with("partial.nemo", lenient)?;
 let report = model.load_weights_with(&weights, None, lenient)?;   // report.missing
 let pipeline = CacheAwareRNNTPipeline::restore_from_directory_with("dir/", 0, lenient)?;
-let mt = MultiTalkerPipeline::restore_with_config(asr, diar, 0, MultiTalkerConfig {
-    load: lenient,
-    ..Default::default()
-})?;
+let mut config = MultiTalkerConfig::default();
+config.load = lenient;
+let mt = MultiTalkerPipeline::restore_with_config(asr, diar, 0, config)?;
 ```
 
 Layer loaders take a `core::Weights` (the checkpoint's tensors plus the
@@ -667,7 +666,32 @@ consistent format (`[batch, time, dim]`). Lengths should be `&[usize]` or
 
 ---
 
-## 8. Shrinking the public surface
+## 8. Shrinking the public surface (done)
+
+**Done:** the documented public API went from about 900 items to about 55.
+
+- `asr::{decoding, dsp, modules, streaming}` and
+  `core::{loading, pytorch, quantization, weights}` are crate-private unless
+  the `internals` feature is on. The stable types they contain
+  (`MelProcessor`, `MelConfig`, `StreamingMel`, `SpectrumTransform`,
+  `StreamingConfig`, `StreamingModeInfo`, `StreamingOutput`, `LoadOptions`,
+  `LoadReport`, `QuantizationConfig`, `WeightFormat`) are re-exported from
+  `asr` and `core`. `asr::config::*` is no longer glob-re-exported.
+- `PredictionNetwork` and `DecoderState` moved into `modules::decoders`.
+  The `encoder()`, `prediction_network()` and `joint()` accessors exist only
+  with `internals`, and Sortformer's streaming step is crate-private.
+- Removed the `MelSpectrogram`/`MelSpectrogramConfig` aliases, the stateless mel
+  API (`MelStreamState`, `frames_available`, `process_audio_streaming`,
+  `process_frame`), `reset_encoder_counter`, `DecoderState::compute_norm`,
+  `DebugOutput`, `FromConfig`, and the public `NemoCheckpoint::open_gzip`.
+- Made the fields of `NemoCheckpoint`, `SafetensorsLoader` and the streaming
+  sessions private, with getters where they're read.
+- Added `#[non_exhaustive]` to `Error`, every config struct, `MelConfig`,
+  `QuantizationConfig`, the output types and the public enums.
+- The debug examples and `tests/pytorch_loading.rs` require `internals`.
+  Doctests pass with and without the feature.
+
+The `cargo public-api` snapshot is still open.
 
 About 900 `pub` items are reachable. Under SemVer each of them is a promise. The
 Rust API guidelines (C-STRUCT-PRIVATE, future proofing) recommend private
@@ -846,9 +870,9 @@ release happens.
 
 **0.2.0 (breaking, one release)**
 
-3. Add `#[non_exhaustive]` to `Error`, configs and outputs. Make internals
+3. ~~Add `#[non_exhaustive]` to `Error`, configs and outputs. Make internals
    `pub(crate)` or put them behind `internals` (§8). Remove the legacy aliases
-   and the stateless mel API.
+   and the stateless mel API.~~ Done.
 4. Add `from_pretrained` + `LoadOptions`, and deprecate `restore*` (§2).
 5. Add `Transcript`/`Token`/`Word` results and `TranscribeOptions` (§3.2–3.3).
 6. Add one `StreamingSession` built from a model, and turn

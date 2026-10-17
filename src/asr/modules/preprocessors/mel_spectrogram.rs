@@ -60,9 +60,9 @@ use crate::core::error::{Error, Result};
 ///
 /// Used for noise reduction, gain control, or other spectral processing.
 /// Implementors should use interior mutability (e.g. `Mutex`) since
-/// `transform` takes `&self` to match `MelProcessor::process_frames`.
+/// `transform` takes `&self`.
 pub trait SpectrumTransform: Send + Sync {
-    /// Transform a power spectrum. Called once per `process_frames()` invocation.
+    /// Transform a power spectrum. Called once per batch of new mel frames.
     ///
     /// `power` has shape `[n_frames, n_fft/2+1]` (magnitude squared).
     /// Returns a modified power spectrum with the same shape.
@@ -73,6 +73,7 @@ pub trait SpectrumTransform: Send + Sync {
 ///
 /// Matches NeMo's `AudioToMelSpectrogramPreprocessor` configuration.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct MelConfig {
     /// Sample rate in Hz (default: 16000).
     pub sample_rate: u32,
@@ -159,7 +160,7 @@ impl From<PreprocessorConfig> for MelConfig {
 ///
 /// Caches the mel filterbank and window function for efficient repeated use.
 /// This processor is **stateless** - it does not maintain any streaming buffers.
-/// For streaming, use `StreamingMelProcessor` to handle audio buffering and
+/// For streaming, use [`StreamingMel`] to handle audio buffering and
 /// incremental mel computation.
 pub struct MelProcessor {
     config: MelConfig,
@@ -438,263 +439,6 @@ impl MelProcessor {
     }
 }
 
-/// Former name of [`MelProcessor`], kept for backwards compatibility.
-pub type MelSpectrogram = MelProcessor;
-/// Former name of [`MelConfig`], kept for backwards compatibility.
-pub type MelSpectrogramConfig = MelConfig;
-
-// ============================================================================
-// Stateless Streaming API
-// ============================================================================
-
-/// State for stateless streaming mel processing.
-///
-/// This struct holds the minimal state needed for continuous streaming:
-/// - Audio overlap buffer for STFT window continuity
-/// - Last sample for preemphasis filter continuity
-///
-/// The state is passed explicitly to streaming functions and returned updated,
-/// keeping all processing stateless from the function's perspective.
-#[derive(Debug, Clone)]
-pub struct MelStreamState {
-    /// Audio overlap buffer (window_samples - hop_samples = 240 samples by default).
-    /// This ensures STFT window continuity across chunk boundaries.
-    pub overlap: Vec<f32>,
-    /// Last sample from previous chunk for preemphasis continuity.
-    /// Only used when preemphasis is enabled (preemph != None).
-    pub last_sample: f32,
-}
-
-impl MelStreamState {
-    /// Create a new streaming state for the given processor.
-    ///
-    /// Initializes the overlap buffer with zeros and last_sample to 0.
-    pub fn new(processor: &MelProcessor) -> Self {
-        let overlap_size = processor
-            .win_samples()
-            .saturating_sub(processor.hop_samples());
-        Self {
-            overlap: vec![0.0f32; overlap_size],
-            last_sample: 0.0,
-        }
-    }
-
-    /// Create a new streaming state with explicit overlap size.
-    pub fn with_overlap_size(overlap_size: usize) -> Self {
-        Self {
-            overlap: vec![0.0f32; overlap_size],
-            last_sample: 0.0,
-        }
-    }
-
-    /// Reset the state to initial values.
-    pub fn reset(&mut self) {
-        self.overlap.fill(0.0);
-        self.last_sample = 0.0;
-    }
-
-    /// Get the overlap buffer size.
-    pub fn overlap_len(&self) -> usize {
-        self.overlap.len()
-    }
-}
-
-/// Calculate how many complete mel frames can be computed from the available audio.
-///
-/// # Arguments
-/// * `overlap_len` - Number of samples in the overlap buffer
-/// * `new_audio_len` - Number of new audio samples
-/// * `window_samples` - STFT window size in samples (e.g., 400)
-/// * `hop_samples` - STFT hop size in samples (e.g., 160)
-///
-/// # Returns
-/// Number of complete frames that can be computed.
-///
-/// # Example
-/// ```
-/// # fn main() -> mlx_voice::Result<()> {
-/// # use mlx_voice::asr::modules::frames_available;
-/// // With 240 samples overlap and 1600 new samples:
-/// // Total = 1840, need 400 for first frame, then 160 per additional
-/// // frames = (1840 - 400) / 160 + 1 = 10 frames
-/// let frames = frames_available(240, 1600, 400, 160);
-/// assert_eq!(frames, 10);
-/// # Ok(())
-/// # }
-/// ```
-#[inline]
-pub fn frames_available(
-    overlap_len: usize,
-    new_audio_len: usize,
-    window_samples: usize,
-    hop_samples: usize,
-) -> usize {
-    let total = overlap_len + new_audio_len;
-    if total < window_samples {
-        0
-    } else {
-        (total - window_samples) / hop_samples + 1
-    }
-}
-
-/// Process audio chunk in streaming mode, returning complete mel frames and updated state.
-///
-/// This is a **stateless** function - all state is passed explicitly and returned updated.
-/// The caller is responsible for managing the state between calls.
-///
-/// # Arguments
-/// * `processor` - The mel processor (contains cached filterbank and window)
-/// * `audio` - New audio samples to process
-/// * `state` - Current streaming state (overlap buffer, preemphasis state)
-///
-/// # Returns
-/// Tuple of (mel_frames, updated_state):
-/// - `mel_frames`: `Some(Array)` with shape [n_mels, n_frames] if any complete frames were computed,
-///                 `None` if not enough audio for a complete frame
-/// - `updated_state`: New state to use for the next call
-///
-/// # No Center Padding
-///
-/// Unlike the batch `forward()` method, this function does **not** apply center padding.
-/// This means:
-/// - The first frame covers samples [0, window_samples)
-/// - Each subsequent frame shifts by hop_samples
-/// - This produces slightly fewer frames than center-padded batch mode
-///
-/// # Example
-///
-/// ```no_run
-/// # fn main() -> mlx_voice::Result<()> {
-/// # use mlx_voice::asr::modules::{process_audio_streaming, MelConfig, MelProcessor, MelStreamState};
-/// # let config = MelConfig::default();
-/// # let audio_chunks: Vec<Vec<f32>> = Vec::new();
-/// # fn process_mel_chunk(_mel: mlx_voice::Array) {}
-/// let processor = MelProcessor::new(config)?;
-/// let mut state = MelStreamState::new(&processor);
-///
-/// for chunk in audio_chunks {
-///     let (frames, new_state) = process_audio_streaming(&processor, &chunk, &state)?;
-///     state = new_state;
-///
-///     if let Some(mel) = frames {
-///         // mel has shape [n_mels, n_frames]
-///         process_mel_chunk(mel);
-///     }
-/// }
-/// # Ok(())
-/// # }
-/// ```
-pub fn process_audio_streaming(
-    processor: &MelProcessor,
-    audio: &[f32],
-    state: &MelStreamState,
-) -> Result<(Option<Array>, MelStreamState)> {
-    let win_samples = processor.win_samples();
-    let hop_samples = processor.hop_samples();
-    let overlap_size = win_samples.saturating_sub(hop_samples);
-
-    // Calculate how many frames we can produce
-    let n_frames = frames_available(state.overlap.len(), audio.len(), win_samples, hop_samples);
-
-    tracing::debug!(
-        audio_len = audio.len(),
-        overlap_len = state.overlap.len(),
-        total_available = state.overlap.len() + audio.len(),
-        win_samples,
-        hop_samples,
-        overlap_size,
-        n_frames,
-        "process_audio_streaming: calculating frames"
-    );
-
-    if n_frames == 0 {
-        // Not enough audio for a complete frame - accumulate into overlap
-        let mut new_overlap = state.overlap.clone();
-        new_overlap.extend_from_slice(audio);
-
-        // Keep only the last overlap_size samples if we've accumulated too much
-        // (This shouldn't happen in normal operation, but handle it gracefully)
-        if new_overlap.len() > overlap_size + win_samples {
-            let keep_from = new_overlap.len() - overlap_size - win_samples;
-            tracing::warn!(
-                new_overlap_len = new_overlap.len(),
-                max_expected = overlap_size + win_samples,
-                trimming_from = keep_from,
-                "process_audio_streaming: overflow, trimming accumulated audio"
-            );
-            new_overlap.drain(..keep_from);
-        }
-
-        tracing::debug!(
-            new_overlap_len = new_overlap.len(),
-            "process_audio_streaming: not enough audio, accumulating"
-        );
-
-        let new_state = MelStreamState {
-            overlap: new_overlap,
-            last_sample: if audio.is_empty() {
-                state.last_sample
-            } else {
-                *audio.last().unwrap()
-            },
-        };
-
-        return Ok((None, new_state));
-    }
-
-    // Combine overlap buffer with new audio
-    let mut combined = Vec::with_capacity(state.overlap.len() + audio.len());
-    combined.extend_from_slice(&state.overlap);
-    combined.extend_from_slice(audio);
-
-    // Process frames
-    let mel = processor.process_frames(&combined, n_frames, state.last_sample)?;
-
-    // Calculate new overlap: keep the last overlap_size samples from the audio we consumed
-    let samples_consumed = (n_frames - 1) * hop_samples + win_samples;
-    let new_overlap_start = samples_consumed.saturating_sub(overlap_size);
-    let new_overlap = if new_overlap_start < combined.len() {
-        combined[new_overlap_start..samples_consumed.min(combined.len())].to_vec()
-    } else {
-        vec![0.0f32; overlap_size]
-    };
-
-    // Ensure overlap is exactly overlap_size (pad with zeros if needed)
-    let mut final_overlap = new_overlap;
-    if final_overlap.len() < overlap_size {
-        let mut padded = vec![0.0f32; overlap_size - final_overlap.len()];
-        padded.extend(final_overlap);
-        final_overlap = padded;
-    } else if final_overlap.len() > overlap_size {
-        final_overlap = final_overlap[final_overlap.len() - overlap_size..].to_vec();
-    }
-
-    // Update last_sample for preemphasis continuity
-    let new_last_sample = if samples_consumed > 0 && samples_consumed <= combined.len() {
-        combined[samples_consumed - 1]
-    } else if !audio.is_empty() {
-        *audio.last().unwrap()
-    } else {
-        state.last_sample
-    };
-
-    let new_state = MelStreamState {
-        overlap: final_overlap.clone(),
-        last_sample: new_last_sample,
-    };
-
-    tracing::debug!(
-        n_frames,
-        samples_consumed,
-        combined_len = combined.len(),
-        new_overlap_len = final_overlap.len(),
-        leftover_samples = combined.len().saturating_sub(samples_consumed),
-        "process_audio_streaming: frames computed"
-    );
-
-    Ok((Some(mel), new_state))
-}
-
 impl MelProcessor {
     /// Process multiple frames for streaming.
     ///
@@ -709,7 +453,7 @@ impl MelProcessor {
     ///
     /// # Returns
     /// Mel features with shape [n_mels, n_frames]
-    pub fn process_frames(
+    pub(crate) fn process_frames(
         &self,
         audio: &[f32],
         n_frames: usize,
@@ -806,29 +550,6 @@ impl MelProcessor {
 
         mel.eval()?;
         Ok(mel)
-    }
-
-    /// Process a single frame without center padding (for streaming).
-    ///
-    /// # Arguments
-    /// * `frame_audio` - Exactly win_samples (e.g., 400) audio samples
-    /// * `last_sample` - Last sample from previous frame (for preemphasis continuity)
-    ///
-    /// # Returns
-    /// Mel features with shape [n_mels]
-    pub fn process_frame(&self, frame_audio: &[f32], last_sample: f32) -> Result<Array> {
-        if frame_audio.len() != self.win_samples {
-            return Err(Error::config(format!(
-                "Frame must have exactly {} samples, got {}",
-                self.win_samples,
-                frame_audio.len()
-            )));
-        }
-
-        let mel = self.process_frames(frame_audio, 1, last_sample)?;
-        // Squeeze from [n_mels, 1] to [n_mels]
-        mel.reshape(&[self.config.features as i32])
-            .map_err(|e| Error::model(e.to_string()))
     }
 }
 
@@ -1694,39 +1415,7 @@ mod tests {
         );
     }
 
-    // ==================== Stateless Streaming Tests ====================
-
-    #[test]
-    fn test_frames_available() {
-        // Default: window=400, hop=160, overlap=240
-        // With 240 overlap and 1600 new samples:
-        // total = 1840, need 400 for first frame
-        // frames = (1840 - 400) / 160 + 1 = 10
-        assert_eq!(super::frames_available(240, 1600, 400, 160), 10);
-
-        // Not enough for a frame
-        assert_eq!(super::frames_available(240, 100, 400, 160), 0);
-
-        // Exactly one frame
-        // 240 + 160 = 400, which is exactly one window
-        assert_eq!(super::frames_available(240, 160, 400, 160), 1);
-
-        // Two frames
-        // 240 + 320 = 560, need 400 for first, then 160 more for second
-        // (560 - 400) / 160 + 1 = 2
-        assert_eq!(super::frames_available(240, 320, 400, 160), 2);
-    }
-
-    #[test]
-    fn test_mel_stream_state_creation() {
-        let config = MelConfig::default();
-        let processor = MelProcessor::new(config).unwrap();
-        let state = super::MelStreamState::new(&processor);
-
-        // Default: window=400, hop=160, overlap = 400-160 = 240
-        assert_eq!(state.overlap.len(), 240);
-        assert_eq!(state.last_sample, 0.0);
-    }
+    // ==================== Frame Processing Tests ====================
 
     #[test]
     fn test_process_frames_single() {
@@ -1766,105 +1455,6 @@ mod tests {
 
         // Output should be [n_mels, 5]
         assert_eq!(mel.shape(), &[128, 5]);
-    }
-
-    #[test]
-    fn test_process_audio_streaming_basic() {
-        let config = MelConfig {
-            preemph: None,
-            dither: 0.0,
-            ..Default::default()
-        };
-        let processor = MelProcessor::new(config).unwrap();
-        let state = super::MelStreamState::new(&processor);
-
-        // Create enough audio for several frames
-        // State has 240 overlap (zeros), we add 1600 samples
-        // Total = 1840, frames = (1840 - 400) / 160 + 1 = 10
-        let audio: Vec<f32> = (0..1600).map(|i| (i as f32 * 0.001).sin()).collect();
-
-        let (mel_opt, new_state) =
-            super::process_audio_streaming(&processor, &audio, &state).unwrap();
-
-        // Should produce mel frames
-        assert!(mel_opt.is_some());
-        let mel = mel_opt.unwrap();
-        mel.eval().unwrap();
-
-        // Output should have 10 frames (from the frames_available calculation)
-        assert_eq!(mel.shape()[0], 128); // n_mels
-        assert_eq!(mel.shape()[1], 10); // n_frames
-
-        // New state should have updated overlap
-        assert_eq!(new_state.overlap.len(), 240);
-    }
-
-    #[test]
-    fn test_process_audio_streaming_not_enough_audio() {
-        let config = MelConfig {
-            preemph: None,
-            dither: 0.0,
-            ..Default::default()
-        };
-        let processor = MelProcessor::new(config).unwrap();
-        let state = super::MelStreamState::new(&processor);
-
-        // Not enough audio for even one frame
-        // State overlap is 240 (zeros), add only 100 samples = 340 total < 400
-        let audio: Vec<f32> = (0..100).map(|i| (i as f32 * 0.01).sin()).collect();
-
-        let (mel_opt, new_state) =
-            super::process_audio_streaming(&processor, &audio, &state).unwrap();
-
-        // Should not produce mel frames
-        assert!(mel_opt.is_none());
-
-        // New state should accumulate the audio
-        assert!(new_state.overlap.len() >= 240);
-    }
-
-    #[test]
-    fn test_process_audio_streaming_continuity() {
-        let config = MelConfig {
-            preemph: None,
-            dither: 0.0,
-            ..Default::default()
-        };
-        let processor = MelProcessor::new(config).unwrap();
-        let mut state = super::MelStreamState::new(&processor);
-
-        // Process audio in chunks and verify continuity
-        let full_audio: Vec<f32> = (0..3200).map(|i| (i as f32 * 0.001).sin()).collect();
-
-        // Process in two chunks of 1600 samples each
-        let chunk1 = &full_audio[0..1600];
-        let chunk2 = &full_audio[1600..3200];
-
-        let (mel1_opt, state1) =
-            super::process_audio_streaming(&processor, chunk1, &state).unwrap();
-        state = state1;
-
-        let (mel2_opt, _state2) =
-            super::process_audio_streaming(&processor, chunk2, &state).unwrap();
-
-        // Both chunks should produce mel frames
-        assert!(mel1_opt.is_some());
-        assert!(mel2_opt.is_some());
-
-        let mel1 = mel1_opt.unwrap();
-        let mel2 = mel2_opt.unwrap();
-        mel1.eval().unwrap();
-        mel2.eval().unwrap();
-
-        // Total frames should be reasonable for 3200 samples
-        let total_frames = mel1.shape()[1] + mel2.shape()[1];
-        // With 240 initial overlap and 3200 new samples = 3440 total
-        // (3440 - 400) / 160 + 1 = 20 frames approximately
-        assert!(
-            total_frames >= 15,
-            "Expected ~20 frames, got {}",
-            total_frames
-        );
     }
 
     // ==================== StreamingMel Tests ====================

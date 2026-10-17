@@ -23,6 +23,9 @@ targets = ["aarch64-apple-darwin"]
 [features]
 default = ["asr"]
 asr = ["dep:hound", "dep:rubato"]
+# Expose building blocks (encoder layers, decoders, streaming caches, checkpoint
+# parsing) for research and debugging tools. No stability guarantees.
+internals = []
 # Future features
 # tts = []
 # llm = []
@@ -68,3 +71,36 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 cpal = "0.18"       # Cross-platform audio I/O (microphone capture)
 ringbuf = "0.5"     # Lock-free SPSC ring buffer for audio thread communication
 ctrlc = "3.5"       # Graceful Ctrl+C handling
+
+# Debugging tools that compare internals against NeMo
+[[example]]
+name = "compare_encoder"
+required-features = ["internals"]
+
+[[example]]
+name = "debug_decoder"
+required-features = ["internals"]
+
+[[example]]
+name = "debug_decoder_isolated"
+required-features = ["internals"]
+
+[[example]]
+name = "debug_encoder"
+required-features = ["internals"]
+
+[[example]]
+name = "debug_subsampling"
+required-features = ["internals"]
+
+[[example]]
+name = "mel_test"
+required-features = ["internals"]
+
+[[example]]
+name = "trace_streaming"
+required-features = ["internals"]
+
+[[test]]
+name = "pytorch_loading"
+required-features = ["internals"]

@@ -5,6 +5,7 @@
 
 /// Configuration for VAD post-processing.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct VadPostProcessConfig {
     /// Speech probability threshold for onset (start of speech).
     pub onset: f32,
@@ -35,6 +36,7 @@ impl Default for VadPostProcessConfig {
 
 /// A detected speech segment with start and end timestamps.
 #[derive(Debug, Clone, Copy, PartialEq)]
+#[non_exhaustive]
 pub struct SpeechSegment {
     /// Start time in seconds.
     pub start: f32,

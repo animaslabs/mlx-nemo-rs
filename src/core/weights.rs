@@ -15,6 +15,7 @@ use crate::core::error::{Error, Result};
 /// Different frameworks use different conventions for tensor layouts.
 /// This enum allows us to handle weights from various sources correctly.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub enum WeightFormat {
     /// PyTorch format - Conv1d weights are (O, I, K) and need transposition to (O, K, I).
     #[default]

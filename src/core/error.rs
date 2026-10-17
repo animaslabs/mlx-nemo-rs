@@ -8,6 +8,7 @@ pub type Result<T> = std::result::Result<T, Error>;
 
 /// Main error type for mlx-voice operations.
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum Error {
     /// I/O error during file operations.
     #[error("I/O error: {0}")]

@@ -10,7 +10,7 @@
 use mlx_rs::Array;
 use mlx_rs::ops::indexing::IndexOp;
 
-use crate::asr::models::{DecoderState, PredictionNetwork};
+use crate::asr::modules::{DecoderState, PredictionNetwork};
 use crate::asr::modules::RNNTJoint;
 use crate::core::ArrayExt;
 use crate::core::error::{Error, Result};

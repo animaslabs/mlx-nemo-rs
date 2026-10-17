@@ -20,7 +20,12 @@ cargo build --release
 cargo test -- --test-threads=1
 
 # Run a specific ignored test (requires model files in models/)
-cargo test test_load_parakeet_rnnt_checkpoint -- --ignored
+cargo test --features internals test_load_parakeet_rnnt_checkpoint -- --ignored
+
+# Internals (encoder layers, decoders, streaming caches, checkpoint parsing) are
+# crate-private unless the `internals` feature is on. The debug_*/compare_encoder/
+# mel_test/trace_streaming examples and tests/pytorch_loading.rs require it.
+cargo check --all-targets --features internals
 
 # Run an example
 cargo run --example transcribe_rnnt -- --model models/nvidia/parakeet-rnnt-0.6b/parakeet-rnnt-0.6b.nemo samples/christmas2025_nightbeforechristmas_kri_64kb.wav

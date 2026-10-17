@@ -25,6 +25,23 @@
 
 #![warn(missing_docs, missing_debug_implementations)]
 
+/// Declare a module that is public with the `internals` feature and
+/// crate-private otherwise.
+///
+/// Internal modules hold building blocks (encoder layers, decoders, streaming
+/// caches, checkpoint parsing) whose API may change in any release.
+macro_rules! internal_mod {
+    ($(#[$attr:meta])* $name:ident) => {
+        $(#[$attr])*
+        #[cfg(feature = "internals")]
+        pub mod $name;
+        $(#[$attr])*
+        #[cfg(not(feature = "internals"))]
+        #[allow(dead_code, unused_imports)]
+        pub(crate) mod $name;
+    };
+}
+
 pub mod core;
 
 #[cfg(feature = "asr")]
