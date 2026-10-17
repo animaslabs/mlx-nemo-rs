@@ -5,7 +5,10 @@ All notable changes to this crate are documented here. The format follows
 [Semantic Versioning](https://semver.org/) (before 1.0, a minor release may
 break the API).
 
-## Unreleased
+## 0.2.1 (unreleased)
+
+0.2.1 breaks 0.2.0 callers (see Changed and Removed), despite the patch
+version: 0.2.0 had no users and is yanked along with 0.1.x.
 
 ### Added
 
@@ -27,7 +30,7 @@ break the API).
 
 ### Changed
 
-These changes break 0.2 callers:
+These changes break 0.2.0 callers:
 
 - `SortformerEncLabelModel::diarize` takes an `AudioInput` instead of audio
   and length `Array`s. The tensor form is now `diarize_array`, behind the
@@ -51,14 +54,14 @@ These changes break 0.2 callers:
   convolution. Before, the last second or so of every file, and clips padded
   to a longer clip in a batch, drifted from NeMo's encoder output.
 
-### Migrating from 0.2
+### Migrating from 0.2.0
 
 ```rust
-// 0.2
+// 0.2.0
 let probs = vad.infer_samples(&samples)?; // at the model's rate
 let preds: Array = diarizer.diarize(&audio_array, &lengths_array)?; // [1, frames, speakers]
 
-// Unreleased
+// 0.2.1
 let probs = vad.infer_one((&samples[..], 48_000))?; // any rate; resampled
 let frames: Vec<Vec<f32>> = diarizer.diarize("meeting.wav")?; // [frame][speaker]
 let seconds_per_frame = diarizer.frame_duration();
