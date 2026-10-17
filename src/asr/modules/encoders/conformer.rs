@@ -12,7 +12,9 @@ use mlx_rs::module::{Module, ModuleParameters};
 use mlx_rs::nn;
 use mlx_rs::ops::indexing::IndexOp;
 
-use super::attention::{AttentionContext, RelPositionMultiHeadAttention, RelPositionalEncoding};
+use super::attention::{
+    AttentionContext, RelPositionMultiHeadAttention, RelPositionalEncoding, key_padding_mask,
+};
 use crate::asr::config::{AttContextStyle, ConvNormType, EncoderConfig};
 use crate::asr::modules::speaker_kernel::{SpeakerKernels, SpeakerTargets};
 use crate::core::ArrayExt;
@@ -536,6 +538,7 @@ impl ConformerEncoder {
 
         // Process through conformer blocks with positional info
         let context = self.offline_attention_context();
+        let padding = PaddingMask::new(&lengths, seq_len as i32)?;
         for (layer_idx, layer) in self.layers.iter_mut().enumerate() {
             x = apply_speaker_kernels(
                 self.speaker_kernels.as_ref(),
@@ -543,7 +546,7 @@ impl ConformerEncoder {
                 layer_idx,
                 x,
             )?;
-            x = layer.forward(&x, &pos_emb, context)?;
+            x = layer.forward(&x, &pos_emb, context, padding.as_ref())?;
         }
 
         // NOTE: NeMo's ConformerEncoder does NOT have a final_norm at the encoder level.
@@ -707,8 +710,9 @@ impl ConformerEncoder {
 
         // Process through conformer blocks
         let context = self.offline_attention_context();
+        let padding = PaddingMask::new(lengths, seq_len as i32)?;
         for layer in &mut self.layers {
-            x = layer.forward(&x, &pos_emb, context)?;
+            x = layer.forward(&x, &pos_emb, context, padding.as_ref())?;
         }
 
         // Transpose to [B, D, T]
@@ -767,9 +771,10 @@ impl ConformerEncoder {
 
         // Process through conformer blocks
         let context = self.offline_attention_context();
+        let padding = PaddingMask::new(&lengths, seq_len as i32)?;
         let mut layer_outputs = Vec::new();
         for (i, layer) in self.layers.iter_mut().enumerate() {
-            x = layer.forward(&x, &pos_emb, context)?;
+            x = layer.forward(&x, &pos_emb, context, padding.as_ref())?;
             x.eval()?;
             if i < 3 {
                 // Only save first few layers
@@ -1582,6 +1587,33 @@ impl Subsampling {
     }
 }
 
+/// Masks keeping padded frames (beyond each sequence's length) out of the
+/// valid ones in offline conformer layers, like NeMo's `pad_mask`: hidden
+/// from attention as keys and zeroed before the depthwise convolution.
+/// Padded frames' own outputs are left unspecified.
+struct PaddingMask {
+    /// Additive mask over attention keys [batch, 1, 1, time]
+    keys: Array,
+    /// Whether each frame is valid [batch, time, 1]
+    valid: Array,
+}
+
+impl PaddingMask {
+    /// Masks for encoder frames with valid `lengths` `[batch]`, or `None` when
+    /// no frame is padding.
+    fn new(lengths: &Array, seq_len: i32) -> Result<Option<Self>> {
+        let lengths: Vec<i32> = lengths.as_dtype(mlx_rs::Dtype::Int32)?.to_vec_row_major()?;
+        let Some(keys) = key_padding_mask(&lengths, seq_len)? else {
+            return Ok(None);
+        };
+        let batch = lengths.len() as i32;
+        let frames = mlx_rs::ops::arange::<_, i32>(0, seq_len, 1)?.reshape(&[1, seq_len, 1])?;
+        let lengths = Array::from_slice(&lengths, &[batch, 1, 1]);
+        let valid = mlx_rs::ops::lt(&frames, &lengths)?;
+        Ok(Some(Self { keys, valid }))
+    }
+}
+
 /// Single Conformer block.
 #[derive(Debug)]
 struct ConformerBlock {
@@ -1663,6 +1695,7 @@ impl ConformerBlock {
         x: &Array,
         pos_emb: &Array,
         context: Option<AttentionContext>,
+        padding: Option<&PaddingMask>,
     ) -> Result<Array> {
         // x: [B, T, D]
         let debug_layer = *DEBUG_LAYER0;
@@ -1731,7 +1764,9 @@ impl ConformerBlock {
             tracing::debug!(?t00, ?t16, "after self_attn_norm");
         }
 
-        let attn_out = self.self_attn.forward(&attn_normed, pos_emb, context)?;
+        let attn_out =
+            self.self_attn
+                .forward(&attn_normed, pos_emb, context, padding.map(|p| &p.keys))?;
 
         if debug_layer {
             attn_out.eval()?;
@@ -1766,7 +1801,7 @@ impl ConformerBlock {
             tracing::debug!(?t00, "after conv_norm T00[:5]");
         }
 
-        let conv_out = self.conv.forward(&conv_out)?;
+        let conv_out = self.conv.forward(&conv_out, padding.map(|p| &p.valid))?;
 
         if debug_layer {
             conv_out.eval()?;
@@ -2157,7 +2192,9 @@ impl ConvolutionModule {
         })
     }
 
-    fn forward(&mut self, x: &Array) -> Result<Array> {
+    /// `valid` [batch, time, 1] marks frames that aren't padding; padded frames
+    /// are zeroed before the depthwise conv so they don't reach valid ones.
+    fn forward(&mut self, x: &Array, valid: Option<&Array>) -> Result<Array> {
         // x: [B, T, D] - MLX Conv1d expects (N, L, C_in) format, no transpose needed
         let debug_conv = *DEBUG_CONV;
 
@@ -2190,7 +2227,11 @@ impl ConvolutionModule {
         // Slice second half: x[:, :, d_model:]
         let x2 = x.index((.., .., d_model..));
         let sigmoid_x2 = mlx_rs::ops::sigmoid(&x2)?;
-        let x = &x1 * &sigmoid_x2;
+        let mut x = &x1 * &sigmoid_x2;
+        if let Some(valid) = valid {
+            let zero = Array::from_f32(0.0).as_dtype(x.dtype())?;
+            x = mlx_rs::ops::select(valid, &x, &zero)?;
+        }
 
         if debug_conv {
             x.eval()?;

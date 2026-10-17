@@ -5,6 +5,25 @@ All notable changes to this crate are documented here. The format follows
 [Semantic Versioning](https://semver.org/) (before 1.0, a minor release may
 break the API).
 
+## Unreleased
+
+### Added
+
+- TDT (token-and-duration transducer) models such as
+  `nvidia/parakeet-tdt-0.6b-v3` load and transcribe with greedy offline
+  decoding, matching NeMo's `greedy_batch` decoder. Token times span each
+  token's predicted duration, and punctuation is timed at the end of the word
+  before it, as in NeMo. `EncDecRnntModel::is_tdt` tells them apart. Beam
+  search and streaming sessions return a not-implemented error for TDT models.
+- `Tokenizer::is_punctuation`.
+
+### Fixed
+
+- Offline encoding keeps padded encoder frames from affecting valid ones, as
+  NeMo does: padding is hidden from attention and zeroed before each
+  convolution. Before, the last second or so of every file, and clips padded
+  to a longer clip in a batch, drifted from NeMo's encoder output.
+
 ## 0.2.0 (2026-10-17)
 
 A redesign of the public API around `from_pretrained`, `Transcript` results

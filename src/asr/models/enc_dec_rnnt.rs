@@ -1,7 +1,9 @@
 //! Encoder-Decoder RNN-T ASR model.
 //!
 //! This model implements the RNN-T (Transducer) ASR architecture used by
-//! NeMo's EncDecRNNTModel and EncDecRNNTBPEModel (Parakeet RNNT models).
+//! NeMo's EncDecRNNTModel and EncDecRNNTBPEModel (Parakeet RNNT models),
+//! including TDT (token-and-duration transducer) models such as
+//! parakeet-tdt-0.6b-v3, which decode greedily offline.
 //!
 //! # Streaming
 //!
@@ -31,7 +33,10 @@ use std::path::Path;
 use crate::asr::Tokenizer;
 use crate::asr::config::{AsrModelConfig, DecodingAlgorithm, JointConfig};
 use crate::asr::decoding::TimedToken;
-use crate::asr::decoding::{RnntStreamingDecoder, greedy_decode, rnnt_beam_decode};
+use crate::asr::decoding::{
+    RnntStreamingDecoder, TdtGreedyDecoder, greedy_decode, refine_punctuation_timestamps,
+    rnnt_beam_decode,
+};
 use crate::asr::modules::{
     ConformerEncoder, CtcDecoder, LanguagePrompt, MelConfig, MelProcessor, PredictionNetwork,
     RnntDecoder, RnntJoint, StatelessTransducerDecoder,
@@ -86,6 +91,8 @@ pub struct EncDecRnntModel {
     pub(crate) blank_id: usize,
     /// Decoding strategy from the config
     decoding_strategy: DecodingStrategy,
+    /// Frames each duration logit advances (TDT models only)
+    tdt_durations: Option<Vec<usize>>,
 }
 
 impl std::fmt::Debug for EncDecRnntModel {
@@ -95,6 +102,7 @@ impl std::fmt::Debug for EncDecRnntModel {
             .field("encoder_layers", &self.encoder.num_layers())
             .field("lstm_decoder", &self.is_lstm_decoder())
             .field("ctc_decoder", &self.has_ctc_decoder())
+            .field("tdt_durations", &self.tdt_durations)
             .field("blank_id", &self.blank_id)
             .field("decoding_strategy", &self.decoding_strategy)
             .field("tokenizer", &self.tokenizer)
@@ -139,28 +147,8 @@ impl EncDecRnntModel {
                 )?)
             };
 
-            // Create joint network using effective config values
-            let joint_config = config.joint.clone().unwrap_or_default();
-
             let encoder_hidden = encoder.output_dim();
-            let pred_hidden = decoder.pred_hidden();
-
-            // Use effective values from jointnet if present
-            let joint_hidden = joint_config.effective_joint_hidden();
-            let activation = joint_config.effective_activation().clone();
-
-            let effective_joint_config = JointConfig {
-                joint_hidden,
-                activation,
-                ..joint_config
-            };
-
-            let joint = RnntJoint::new(
-                &effective_joint_config,
-                encoder_hidden,
-                pred_hidden,
-                vocab_size + 1,
-            )?;
+            let joint = Self::new_joint(&config, encoder_hidden, decoder.pred_hidden(), vocab_size)?;
 
             let ctc_decoder = Self::new_ctc_decoder(&config, encoder_hidden, vocab_size)?;
 
@@ -179,6 +167,8 @@ impl EncDecRnntModel {
                 DecodingStrategy::Greedy
             };
 
+            let tdt_durations = config.tdt_durations();
+
             Ok(Self {
                 config,
                 preprocessor,
@@ -189,8 +179,32 @@ impl EncDecRnntModel {
                 tokenizer: None,
                 blank_id,
                 decoding_strategy,
+                tdt_durations,
             })
         }
+    }
+
+    /// The joint network, with `vocab_size` tokens plus blank (and one
+    /// duration logit per TDT duration), using effective jointnet values.
+    fn new_joint(
+        config: &AsrModelConfig,
+        encoder_hidden: usize,
+        pred_hidden: usize,
+        vocab_size: usize,
+    ) -> Result<RnntJoint> {
+        let joint_config = config.joint.clone().unwrap_or_default();
+        let effective_joint_config = JointConfig {
+            joint_hidden: joint_config.effective_joint_hidden(),
+            activation: joint_config.effective_activation().clone(),
+            num_extra_outputs: config.tdt_durations().map(|d| d.len()),
+            ..joint_config
+        };
+        RnntJoint::new(
+            &effective_joint_config,
+            encoder_hidden,
+            pred_hidden,
+            vocab_size + 1,
+        )
     }
 
     /// The auxiliary CTC decoder of a hybrid model, with `vocab_size` tokens
@@ -358,23 +372,12 @@ impl EncDecRnntModel {
             };
 
             // Recreate joint network with correct vocab size
-            let joint_config = self.config.joint.clone().unwrap_or_default();
             let encoder_hidden = self.encoder.output_dim();
-            let pred_hidden = self.decoder.pred_hidden();
-            let joint_hidden = joint_config.effective_joint_hidden();
-            let activation = joint_config.effective_activation().clone();
-
-            let effective_joint_config = JointConfig {
-                joint_hidden,
-                activation,
-                ..joint_config
-            };
-
-            self.joint = RnntJoint::new(
-                &effective_joint_config,
+            self.joint = Self::new_joint(
+                &self.config,
                 encoder_hidden,
-                pred_hidden,
-                vocab_size + 1,
+                self.decoder.pred_hidden(),
+                vocab_size,
             )?;
             self.ctc_decoder = Self::new_ctc_decoder(&self.config, encoder_hidden, vocab_size)?;
 
@@ -437,6 +440,15 @@ impl EncDecRnntModel {
 
             Ok(weights.report())
         }
+    }
+
+    /// Whether this is a TDT (token-and-duration transducer) model, whose
+    /// joint also predicts how many encoder frames each step advances.
+    ///
+    /// TDT models decode greedily and offline: beam search and streaming
+    /// sessions are not implemented for them.
+    pub fn is_tdt(&self) -> bool {
+        self.tdt_durations.is_some()
     }
 
     /// Whether this is a hybrid RNN-T/CTC model with an auxiliary CTC decoder,
@@ -624,6 +636,9 @@ impl EncDecRnntModel {
         }
         match decoding {
             DecodingStrategy::Greedy => self.greedy_decode(&encoder_output, &encoder_lengths),
+            DecodingStrategy::BeamSearch { .. } if self.is_tdt() => Err(Error::not_implemented(
+                "beam search for TDT models (use greedy decoding)",
+            )),
             DecodingStrategy::BeamSearch { beam_size } => rnnt_beam_decode(
                 &encoder_output,
                 &encoder_lengths,
@@ -645,6 +660,16 @@ impl EncDecRnntModel {
             .as_dtype(mlx_rs::Dtype::Int32)?
             .to_vec_row_major()?;
         let greedy = RnntStreamingDecoder::new(self.blank_id);
+        let tdt = match &self.tdt_durations {
+            Some(durations) => {
+                let decoder = TdtGreedyDecoder::new(self.blank_id, durations.clone())?;
+                Some(match self.config.greedy_max_symbols() {
+                    Some(max_symbols) => decoder.with_max_symbols(max_symbols),
+                    None => decoder,
+                })
+            }
+            None => None,
+        };
 
         // Each sequence decodes independently from a fresh decoder state
         let mut results = Vec::with_capacity(lengths.len());
@@ -652,6 +677,15 @@ impl EncDecRnntModel {
             let seq_len = (len.max(0) as usize).min(encoder_output.dim(1) as usize);
             let frames = encoder_output.index((b as i32, ..seq_len as i32, ..));
             let enc_proj = self.joint.project_encoder(&frames)?;
+            if let Some(tdt) = &tdt {
+                let mut tokens =
+                    tdt.decode_projected(&enc_proj, seq_len, &self.decoder, &self.joint)?;
+                if let Some(tokenizer) = &self.tokenizer {
+                    refine_punctuation_timestamps(&mut tokens, |id| tokenizer.is_punctuation(id));
+                }
+                results.push(tokens);
+                continue;
+            }
             let mut state = self.decoder.initialize_state(1)?;
             let mut last_token = None;
             let output = greedy.decode_projected(

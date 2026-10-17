@@ -272,6 +272,27 @@ impl AttentionContext {
     }
 }
 
+/// Additive mask hiding padded keys from offline attention, like NeMo's
+/// `pad_mask` in `_create_masks`: [batch, 1, 1, seq_len], 0 for the first
+/// `lengths[b]` frames of each row and -inf after. Each row keeps at least one
+/// key so an empty sequence doesn't softmax over nothing. `None` when no
+/// frame is padding.
+pub fn key_padding_mask(lengths: &[i32], seq_len: i32) -> Result<Option<Array>> {
+    if lengths.iter().all(|&len| len >= seq_len) {
+        return Ok(None);
+    }
+    let batch = lengths.len() as i32;
+    let lengths: Vec<i32> = lengths.iter().map(|&len| len.max(1)).collect();
+    let lengths = Array::from_slice(&lengths, &[batch, 1, 1, 1]);
+    let frames = ops::arange::<_, i32>(0, seq_len, 1)?.reshape(&[1, 1, 1, seq_len])?;
+    let mask = ops::select(
+        &ops::lt(&frames, &lengths)?,
+        &Array::from_f32(0.0),
+        &Array::from_f32(f32::NEG_INFINITY),
+    )?;
+    Ok(Some(mask))
+}
+
 /// `softmax(((Q + u) @ K^T + bd + mask) / sqrt(head_dim)) @ V` with the content
 /// term fused into `fast::scaled_dot_product_attention`; the position scores
 /// `bd` (and an optional additive mask) go in as its additive mask.
@@ -417,6 +438,8 @@ impl RelPositionMultiHeadAttention {
     /// * `x` - Input tensor [batch, seq_len, d_model]
     /// * `pos_emb` - Positional embeddings [1, 2*seq_len-1, d_model]
     /// * `context` - Limited attention context, or `None` for full attention
+    /// * `key_mask` - Additive mask over keys [batch, 1, 1, seq_len] (0 valid,
+    ///   -inf padding; see [`key_padding_mask`]), or `None` when no frame is padding
     ///
     /// # Returns
     /// Output tensor [batch, seq_len, d_model]
@@ -425,8 +448,9 @@ impl RelPositionMultiHeadAttention {
         x: &Array,
         pos_emb: &Array,
         context: Option<AttentionContext>,
+        key_mask: Option<&Array>,
     ) -> Result<Array> {
-        self.forward_blocked(x, pos_emb, context, MAX_SCORE_ELEMENTS)
+        self.forward_blocked(x, pos_emb, context, key_mask, MAX_SCORE_ELEMENTS)
     }
 
     /// `forward` with queries processed in blocks whose score matrices stay
@@ -436,6 +460,7 @@ impl RelPositionMultiHeadAttention {
         x: &Array,
         pos_emb: &Array,
         context: Option<AttentionContext>,
+        key_mask: Option<&Array>,
         max_score_elements: i64,
     ) -> Result<Array> {
         let batch_size = x.dim(0) as i32;
@@ -508,9 +533,14 @@ impl RelPositionMultiHeadAttention {
 
             // softmax(((Q + u) @ K^T + bd) / sqrt(d)) @ V with the content term
             // fused: [batch, n_heads, rows, head_dim]
-            let mask = context
+            let context_mask = context
                 .map(|c| c.block_mask(start, end, seq_len, matrix_bd.dtype()))
                 .transpose()?;
+            let key_mask = key_mask.map(|m| m.as_dtype(matrix_bd.dtype())).transpose()?;
+            let mask = match (context_mask, key_mask) {
+                (Some(c), Some(k)) => Some(ops::add(&c, &k)?),
+                (c, k) => c.or(k),
+            };
             let context = attend(&q_u, &k, &v, &matrix_bd, mask.as_ref(), head_dim)?;
             if block < seq_len {
                 // Submit each block so its score matrices are freed before the next
@@ -967,10 +997,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_blocked_attention_matches_full() {
-        // Query blocks (including a ragged last block) must reproduce one-block attention.
-        let (d_model, n_heads, seq_len) = (16usize, 2usize, 13i32);
+    /// Attention with random weights.
+    fn random_attention(d_model: usize, n_heads: usize) -> RelPositionMultiHeadAttention {
         let mut attn = RelPositionMultiHeadAttention::new(d_model, n_heads, true).unwrap();
         let d = d_model as i32;
         let w = |seed: u64| {
@@ -984,6 +1012,63 @@ mod tests {
         attn.linear_pos = LinearLayer::standard(w(8), None);
         attn.pos_bias_u = w(9).index((..n_heads as i32, ..(d_model / n_heads) as i32));
         attn.pos_bias_v = w(10).index((..n_heads as i32, ..(d_model / n_heads) as i32));
+        attn
+    }
+
+    fn max_abs_diff(a: &Array, b: &Array) -> f32 {
+        assert_eq!(a.shape(), b.shape());
+        let a: Vec<f32> = a.to_vec_row_major().unwrap();
+        let b: Vec<f32> = b.to_vec_row_major().unwrap();
+        a.iter().zip(&b).map(|(x, y)| (x - y).abs()).fold(0.0, f32::max)
+    }
+
+    #[test]
+    fn test_padded_keys_are_ignored() {
+        // A row padded with garbage attends like the same row unpadded
+        let (d_model, n_heads, seq_len, valid) = (16usize, 2usize, 13i32, 9i32);
+        let mut attn = random_attention(d_model, n_heads);
+        let d = d_model as i32;
+        let key = mlx_rs::random::key(12).unwrap();
+        let x = mlx_rs::random::normal::<f32>(&[2, seq_len, d], None, None, &key).unwrap();
+        let garbage = Array::full::<f32>(&[1, seq_len - valid, d], &Array::from_f32(50.0)).unwrap();
+        let padded_row = ops::concatenate(&[&x.index((1..2, ..valid, ..)), &garbage], 1).unwrap();
+        let x = ops::concatenate(&[&x.index((..1, .., ..)), &padded_row], 0).unwrap();
+        let pos = RelPositionalEncoding::new(d_model, 64, false).unwrap();
+
+        let key_mask = key_padding_mask(&[seq_len, valid], seq_len).unwrap();
+        assert!(key_mask.is_some());
+        assert!(key_padding_mask(&[seq_len, seq_len], seq_len).unwrap().is_none());
+
+        let contexts = [None, AttentionContext::new((3, 2), "regular")];
+        for context in contexts {
+            let pos_emb = pos.get_encoding(seq_len as usize).unwrap();
+            let masked = attn
+                .forward(&x, &pos_emb, context, key_mask.as_ref())
+                .unwrap();
+            let full_row = attn
+                .forward(&x.index((..1, .., ..)), &pos_emb, context, None)
+                .unwrap();
+            let short_row = attn
+                .forward(
+                    &x.index((1..2, ..valid, ..)),
+                    &pos.get_encoding(valid as usize).unwrap(),
+                    context,
+                    None,
+                )
+                .unwrap();
+            let diff_full = max_abs_diff(&masked.index((..1, .., ..)), &full_row);
+            let diff_short = max_abs_diff(&masked.index((1..2, ..valid, ..)), &short_row);
+            assert!(diff_full < 1e-5, "{context:?}: unpadded row diff {diff_full}");
+            assert!(diff_short < 1e-4, "{context:?}: padded row diff {diff_short}");
+        }
+    }
+
+    #[test]
+    fn test_blocked_attention_matches_full() {
+        // Query blocks (including a ragged last block) must reproduce one-block attention.
+        let (d_model, n_heads, seq_len) = (16usize, 2usize, 13i32);
+        let mut attn = random_attention(d_model, n_heads);
+        let d = d_model as i32;
 
         let key = mlx_rs::random::key(11).unwrap();
         let x = mlx_rs::random::normal::<f32>(&[2, seq_len, d], None, None, &key).unwrap();
@@ -1000,11 +1085,11 @@ mod tests {
         for context in contexts {
             // i64::MAX: one block covering every query row (the unblocked computation).
             let full = attn
-                .forward_blocked(&x, &pos_emb, context, i64::MAX)
+                .forward_blocked(&x, &pos_emb, context, None, i64::MAX)
                 .unwrap();
             // 2 batch * 2 heads * 2*13 per row: a budget of 5 rows gives blocks of 5, 5, 3.
             let blocked = attn
-                .forward_blocked(&x, &pos_emb, context, 2 * 2 * 2 * 13 * 5)
+                .forward_blocked(&x, &pos_emb, context, None, 2 * 2 * 2 * 13 * 5)
                 .unwrap();
             assert_eq!(blocked.shape(), full.shape());
             let a: Vec<f32> = full.to_vec_row_major().unwrap();

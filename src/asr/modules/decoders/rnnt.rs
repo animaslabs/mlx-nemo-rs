@@ -5,7 +5,7 @@
 //! - `RnntJoint`: The joint network that combines encoder and prediction outputs
 
 use mlx_rs::Array;
-use mlx_rs::ops::{self, indexing::IndexOp};
+use mlx_rs::ops::{self, indexing::{Ellipsis, IndexOp}};
 use tracing::{debug, instrument, trace, trace_span};
 
 use crate::asr::config::{Activation, DecoderConfig, JointConfig};
@@ -775,6 +775,8 @@ pub struct RnntJoint {
     joint_hidden: usize,
     /// Vocabulary size including blank
     vocab_size: usize,
+    /// Logits after the token logits (TDT duration logits)
+    num_extra_outputs: usize,
 }
 
 impl RnntJoint {
@@ -785,6 +787,9 @@ impl RnntJoint {
     /// * `encoder_hidden` - Encoder output dimension
     /// * `pred_hidden` - Prediction network output dimension
     /// * `vocab_size` - Vocabulary size (including blank token)
+    ///
+    /// The output layer also has `config.num_extra_outputs` logits after the
+    /// `vocab_size` token logits (the duration logits of a TDT joint).
     pub fn new(
         config: &JointConfig,
         encoder_hidden: usize,
@@ -792,6 +797,7 @@ impl RnntJoint {
         vocab_size: usize,
     ) -> Result<Self> {
         let joint_hidden = config.joint_hidden;
+        let num_extra_outputs = config.num_extra_outputs.unwrap_or(0);
         let activation = JointActivation::new(&config.activation)?;
         tracing::debug!(
             "RnntJoint::new encoder_hidden {} pred_hidden {} vocab_size {} activation {:?}",
@@ -810,7 +816,7 @@ impl RnntJoint {
 
         let encoder_proj = create_linear(joint_hidden, encoder_hidden)?;
         let pred_proj = create_linear(joint_hidden, pred_hidden)?;
-        let joint_proj = create_linear(vocab_size, joint_hidden)?;
+        let joint_proj = create_linear(vocab_size + num_extra_outputs, joint_hidden)?;
 
         Ok(Self {
             prompt: None,
@@ -820,12 +826,28 @@ impl RnntJoint {
             activation,
             joint_hidden,
             vocab_size,
+            num_extra_outputs,
         })
     }
 
     /// Get vocabulary size (including blank).
     pub fn vocab_size(&self) -> usize {
         self.vocab_size
+    }
+
+    /// Number of logits after the token logits (TDT duration logits).
+    pub fn num_extra_outputs(&self) -> usize {
+        self.num_extra_outputs
+    }
+
+    /// Log softmax over the token logits, dropping any extra outputs.
+    fn token_log_probs(&self, logits: &Array) -> Result<Array> {
+        let tokens = if self.num_extra_outputs > 0 {
+            logits.index((Ellipsis, ..self.vocab_size as i32))
+        } else {
+            logits.clone()
+        };
+        Ok(mlx_rs::nn::log_softmax(&tokens, -1)?)
     }
 
     /// Condition every encoder frame on a language prompt before projecting it.
@@ -850,7 +872,7 @@ impl RnntJoint {
     /// * `pred_output` - Prediction network output [batch, labels, pred_hidden]
     ///
     /// # Returns
-    /// * Log probabilities [batch, time, labels, vocab_size]
+    /// * Log probabilities [batch, time, labels, vocab_size] (token logits only)
     #[instrument(skip(self, encoder_output, pred_output), fields(
         encoder_shape = ?encoder_output.shape(),
         pred_shape = ?pred_output.shape(),
@@ -910,12 +932,13 @@ impl RnntJoint {
 
         let logits_flat = self.joint_proj.forward(&joint_flat)?;
 
-        let logits = ops::reshape(&logits_flat, &[batch, time, labels, self.vocab_size as i32])?;
+        let out_dim = (self.vocab_size + self.num_extra_outputs) as i32;
+        let logits = ops::reshape(&logits_flat, &[batch, time, labels, out_dim])?;
         trace!(logits_shape = ?logits.shape(), "Logits computed");
 
         // Log softmax over vocabulary dimension
         trace!("Applying log softmax");
-        let log_probs = mlx_rs::nn::log_softmax(&logits, -1)?;
+        let log_probs = self.token_log_probs(&logits)?;
 
         debug!(output_shape = ?log_probs.shape(), "Joint forward complete");
 
@@ -929,7 +952,7 @@ impl RnntJoint {
     /// * `pred_output` - Single prediction output [batch, 1, pred_hidden]
     ///
     /// # Returns
-    /// * Log probabilities [batch, vocab_size]
+    /// * Log probabilities [batch, vocab_size] (token logits only)
     pub fn forward_one(&self, encoder_output: &Array, pred_output: &Array) -> Result<Array> {
         // encoder_output: [B, 1, H_enc] or [B, H_enc]
         // pred_output: [B, 1, H_pred] or [B, H_pred]
@@ -948,7 +971,7 @@ impl RnntJoint {
             &self.project_encoder(&enc)?,
             &self.project_prediction(&pred)?,
         )?;
-        Ok(mlx_rs::nn::log_softmax(&logits, -1)?)
+        self.token_log_probs(&logits)
     }
 
     /// Project encoder output into the joint space: [..., encoder_hidden] -> [..., joint_hidden].
@@ -969,7 +992,8 @@ impl RnntJoint {
 
     /// Logits (not normalized) from projected encoder and prediction outputs.
     ///
-    /// The projections broadcast against each other, e.g. [T, H] + [1, H] -> [T, vocab_size].
+    /// The projections broadcast against each other, e.g. [T, H] + [1, H] ->
+    /// [T, vocab_size + num_extra_outputs].
     pub fn logits_from_projections(&self, enc_proj: &Array, pred_proj: &Array) -> Result<Array> {
         let joint = ops::add(enc_proj, pred_proj)?;
         let activated = self.activation.apply(&joint)?;
@@ -1067,6 +1091,34 @@ mod tests {
 
         let joint = RnntJoint::new(&config, 640, 256, 1001).unwrap();
         assert_eq!(joint.vocab_size(), 1001);
+        assert_eq!(joint.num_extra_outputs(), 0);
         assert_eq!(joint.joint_hidden, 512);
+    }
+
+    #[test]
+    fn test_tdt_joint_outputs() {
+        let config = JointConfig {
+            joint_hidden: 8,
+            num_extra_outputs: Some(5),
+            ..Default::default()
+        };
+        let joint = RnntJoint::new(&config, 4, 4, 11).unwrap();
+        assert_eq!(joint.num_extra_outputs(), 5);
+
+        // Raw logits carry the duration logits; log probs cover tokens only
+        let enc = Array::zeros::<f32>(&[1, 3, 4]).unwrap();
+        let pred = Array::zeros::<f32>(&[1, 2, 4]).unwrap();
+        let logits = joint
+            .logits_from_projections(
+                &joint.project_encoder(&enc).unwrap(),
+                &joint.project_prediction(&pred.index((0, ..1, ..))).unwrap(),
+            )
+            .unwrap();
+        assert_eq!(logits.shape(), &[1, 3, 16]);
+        assert_eq!(joint.forward(&enc, &pred).unwrap().shape(), &[1, 3, 2, 11]);
+        let one = joint
+            .forward_one(&enc.index((.., ..1, ..)), &pred.index((.., ..1, ..)))
+            .unwrap();
+        assert_eq!(one.shape(), &[1, 11]);
     }
 }
