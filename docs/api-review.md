@@ -114,17 +114,32 @@ Turning this on found two real bugs, both now fixed:
 All other local models (parakeet-rnnt MLX, nemotron `.nemo` and 8-bit MLX,
 nemotron-3.5, MarbleNet VAD) produce output identical to before.
 
-**Still open:** loading reports missing tensors, but not *unexpected* ones
-(checkpoint keys nothing consumed). That needs key-consumption tracking, which
-`ModuleParameters` integration (§7.1) would provide. There's no `strict: false`
-opt-out yet. A report type for both would look like this:
+**Opting out:** `LoadOptions::default().strict(false)` makes a load leave
+missing tensors at their initial values and list them in a `LoadReport`. It
+also lets `restore` go ahead without a tokenizer, with a warning. The options
+reach every entry point:
 
 ```rust
-pub struct LoadReport {
-    pub missing: Vec<String>,     // expected by the model, absent from the checkpoint
-    pub unexpected: Vec<String>,  // in the checkpoint, unused by the model
-}
+use mlx_voice::LoadOptions;
+
+let lenient = LoadOptions::default().strict(false);
+let mut model = EncDecRNNTModel::restore_with("partial.nemo", lenient)?;
+let report = model.load_weights_with(&weights, None, lenient)?;   // report.missing
+let pipeline = CacheAwareRNNTPipeline::restore_from_directory_with("dir/", 0, lenient)?;
+let mt = MultiTalkerPipeline::restore_with_config(asr, diar, 0, MultiTalkerConfig {
+    load: lenient,
+    ..Default::default()
+})?;
 ```
+
+Layer loaders take a `core::Weights` (the checkpoint's tensors plus the
+options) in place of a bare `HashMap`. `Weights::from(&map)` loads strictly.
+
+**Still open:** loading reports missing tensors, but not *unexpected* ones
+(checkpoint keys nothing consumed). That needs key-consumption tracking, which
+`ModuleParameters` integration (§7.1) would provide, and would add an
+`unexpected` list to `LoadReport`. `restore_safetensors` has no `_with` variant;
+to load those files non-strictly, call `load_weights_with` yourself.
 
 ### 1.3 Streaming `batch_size` is not real
 

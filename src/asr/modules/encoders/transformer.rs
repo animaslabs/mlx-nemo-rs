@@ -6,8 +6,6 @@
 //! Architecture per block (post-LN mode, pre_ln=False):
 //!   x → MultiHeadAttention → residual → LayerNorm → FFN → residual → LayerNorm
 
-use std::collections::HashMap;
-
 use mlx_rs::Array;
 use mlx_rs::module::Module;
 use mlx_rs::nn;
@@ -15,8 +13,8 @@ use mlx_rs::ops;
 
 use crate::asr::config::TransformerEncoderConfig;
 use crate::core::error::Result;
-use crate::core::quantization::{LinearLayer, QuantizationConfig, require_linear_layer};
-use crate::core::weights::load_layer_norm;
+use crate::core::loading::{Weights, load_layer_norm};
+use crate::core::quantization::{LinearLayer, QuantizationConfig};
 
 /// Multi-head attention (standard, no relative positional encoding).
 ///
@@ -121,15 +119,20 @@ impl MultiHeadAttention {
 
     fn load_weights(
         &mut self,
-        weights: &HashMap<String, Array>,
+        weights: &Weights,
         prefix: &str,
         quant: Option<&QuantizationConfig>,
     ) -> Result<()> {
-        let linear = |name: &str| require_linear_layer(weights, &format!("{prefix}.{name}"), quant);
-        self.query_proj = linear("query_net")?;
-        self.key_proj = linear("key_net")?;
-        self.value_proj = linear("value_net")?;
-        self.out_proj = linear("out_projection")?;
+        for (name, layer) in [
+            ("query_net", &mut self.query_proj),
+            ("key_net", &mut self.key_proj),
+            ("value_net", &mut self.value_proj),
+            ("out_projection", &mut self.out_proj),
+        ] {
+            if let Some(loaded) = weights.fetch_linear(&format!("{prefix}.{name}"), quant)? {
+                *layer = loaded;
+            }
+        }
         Ok(())
     }
 }
@@ -173,12 +176,16 @@ impl PositionWiseFF {
 
     fn load_weights(
         &mut self,
-        weights: &HashMap<String, Array>,
+        weights: &Weights,
         prefix: &str,
         quant: Option<&QuantizationConfig>,
     ) -> Result<()> {
-        self.linear1 = require_linear_layer(weights, &format!("{}.dense_in", prefix), quant)?;
-        self.linear2 = require_linear_layer(weights, &format!("{}.dense_out", prefix), quant)?;
+        if let Some(layer) = weights.fetch_linear(&format!("{}.dense_in", prefix), quant)? {
+            self.linear1 = layer;
+        }
+        if let Some(layer) = weights.fetch_linear(&format!("{}.dense_out", prefix), quant)? {
+            self.linear2 = layer;
+        }
         Ok(())
     }
 }
@@ -238,7 +245,7 @@ impl TransformerEncoderBlock {
 
     fn load_weights(
         &mut self,
-        weights: &HashMap<String, Array>,
+        weights: &Weights,
         prefix: &str,
         quant: Option<&QuantizationConfig>,
     ) -> Result<()> {
@@ -319,7 +326,7 @@ impl TransformerEncoder {
     /// Weight prefix: `transformer_encoder.layers.{i}.{submodule}`
     pub fn load_weights(
         &mut self,
-        weights: &HashMap<String, Array>,
+        weights: &Weights,
         prefix: &str,
         quant: Option<&QuantizationConfig>,
     ) -> Result<()> {

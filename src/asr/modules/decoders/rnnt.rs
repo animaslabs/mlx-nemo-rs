@@ -4,8 +4,6 @@
 //! - `StatelessTransducerDecoder`: The prediction network (label model)
 //! - `RNNTJoint`: The joint network that combines encoder and prediction outputs
 
-use std::collections::HashMap;
-
 use mlx_rs::Array;
 use mlx_rs::ops::{self, indexing::IndexOp};
 use tracing::{debug, instrument, trace, trace_span};
@@ -13,11 +11,8 @@ use tracing::{debug, instrument, trace, trace_span};
 use crate::asr::config::{DecoderConfig, JointConfig};
 use crate::asr::modules::LanguagePrompt;
 use crate::core::error::{Error, Result};
-use crate::core::quantization::{
-    EmbeddingLayer, LinearLayer, QuantizationConfig, load_embedding_layer, load_linear_layer,
-    require_embedding_layer,
-};
-use crate::core::weights::{require, require_any};
+use crate::core::loading::Weights;
+use crate::core::quantization::{EmbeddingLayer, LinearLayer, QuantizationConfig};
 
 /// Stateless Transducer Decoder (Prediction Network).
 ///
@@ -307,18 +302,18 @@ impl StatelessTransducerDecoder {
     /// * `quant` - Optional quantization config for quantized models
     pub fn load_weights(
         &mut self,
-        weights: &HashMap<String, Array>,
+        weights: &Weights,
         prefix: &str,
         quant: Option<&QuantizationConfig>,
     ) -> Result<()> {
         // NeMo key: decoder.prediction.embed
-        let embed_key = format!("{}.prediction.embed", prefix);
-        let alt_key = format!("{}.embed", prefix);
-        self.embedding = load_embedding_layer(weights, &embed_key, quant)
-            .or_else(|| load_embedding_layer(weights, &alt_key, quant))
-            .ok_or_else(|| {
-                Error::missing_weight(&format!("{embed_key}.weight` or `{alt_key}.weight"))
-            })?;
+        let prefixes = [
+            format!("{}.prediction.embed", prefix),
+            format!("{}.embed", prefix),
+        ];
+        if let Some(layer) = weights.fetch_embedding_any(&prefixes, quant)? {
+            self.embedding = layer;
+        }
 
         Ok(())
     }
@@ -641,7 +636,7 @@ impl RNNTDecoder {
     /// * `quant` - Optional quantization config for quantized models
     pub fn load_weights(
         &mut self,
-        weights: &HashMap<String, Array>,
+        weights: &Weights,
         prefix: &str,
         quant: Option<&QuantizationConfig>,
     ) -> Result<()> {
@@ -660,22 +655,29 @@ impl RNNTDecoder {
         // (and .1 for second layer, etc.)
 
         // Load embedding (may be quantized)
-        self.embedding =
-            require_embedding_layer(weights, &format!("{}.prediction.embed", prefix), quant)?;
+        if let Some(layer) =
+            weights.fetch_embedding_any(&[format!("{}.prediction.embed", prefix)], quant)?
+        {
+            self.embedding = layer;
+        }
 
         // Load LSTM layers, in PyTorch or MLX naming
         let lstm = format!("{}.prediction.dec_rnn.lstm", prefix);
         for (i, layer) in self.lstm_layers.iter_mut().enumerate() {
-            layer.weight_ih = require_any(
-                weights,
-                &[format!("{lstm}.weight_ih_l{i}"), format!("{lstm}.{i}.Wx")],
-            )?
-            .clone();
-            layer.weight_hh = require_any(
-                weights,
-                &[format!("{lstm}.weight_hh_l{i}"), format!("{lstm}.{i}.Wh")],
-            )?
-            .clone();
+            for (param, keys) in [
+                (
+                    &mut layer.weight_ih,
+                    [format!("{lstm}.weight_ih_l{i}"), format!("{lstm}.{i}.Wx")],
+                ),
+                (
+                    &mut layer.weight_hh,
+                    [format!("{lstm}.weight_hh_l{i}"), format!("{lstm}.{i}.Wh")],
+                ),
+            ] {
+                if let Some(value) = weights.fetch_any(&keys)? {
+                    *param = value.clone();
+                }
+            }
 
             // PyTorch keeps separate input and hidden biases. MLX stores their
             // sum, the only thing the LSTM cell uses (gates = x @ W_ih^T + b_ih
@@ -686,8 +688,12 @@ impl RNNTDecoder {
                     layer.bias_hh = Array::zeros::<f32>(&[bias.dim(0)])?;
                 }
                 None => {
-                    layer.bias_ih = require(weights, &format!("{lstm}.bias_ih_l{i}"))?.clone();
-                    layer.bias_hh = require(weights, &format!("{lstm}.bias_hh_l{i}"))?.clone();
+                    if let Some(bias) = weights.fetch(&format!("{lstm}.bias_ih_l{i}"))? {
+                        layer.bias_ih = bias.clone();
+                    }
+                    if let Some(bias) = weights.fetch(&format!("{lstm}.bias_hh_l{i}"))? {
+                        layer.bias_hh = bias.clone();
+                    }
                 }
             }
             layer.fuse()?;
@@ -967,7 +973,7 @@ impl RNNTJoint {
     /// * `quant` - Optional quantization config for quantized models
     pub fn load_weights(
         &mut self,
-        weights: &HashMap<String, Array>,
+        weights: &Weights,
         prefix: &str,
         quant: Option<&QuantizationConfig>,
     ) -> Result<()> {
@@ -977,19 +983,20 @@ impl RNNTJoint {
         // joint.joint_net.0.weight, joint.joint_net.0.bias (linear)
         // joint.joint_net.2.weight, joint.joint_net.2.bias (output)
 
-        // The first of several key patterns the checkpoint has
-        let linear = |names: &[&str]| -> Result<LinearLayer> {
-            let prefixes: Vec<String> = names.iter().map(|n| format!("{prefix}.{n}")).collect();
-            prefixes
-                .iter()
-                .find_map(|p| load_linear_layer(weights, p, quant))
-                .ok_or_else(|| {
-                    Error::missing_weight(&format!("{}.weight", prefixes.join(".weight` or `")))
-                })
-        };
-        self.encoder_proj = linear(&["enc", "encoder", "joint_net.0"])?;
-        self.pred_proj = linear(&["pred", "prediction", "joint_net.1"])?;
-        self.joint_proj = linear(&["joint_net.2", "joint_net.output", "out"])?;
+        // Each layer under the first of several key patterns the checkpoint has
+        for (layer, names) in [
+            (&mut self.encoder_proj, ["enc", "encoder", "joint_net.0"]),
+            (&mut self.pred_proj, ["pred", "prediction", "joint_net.1"]),
+            (
+                &mut self.joint_proj,
+                ["joint_net.2", "joint_net.output", "out"],
+            ),
+        ] {
+            let prefixes = names.map(|n| format!("{prefix}.{n}"));
+            if let Some(loaded) = weights.fetch_linear_any(&prefixes, quant)? {
+                *layer = loaded;
+            }
+        }
 
         Ok(())
     }

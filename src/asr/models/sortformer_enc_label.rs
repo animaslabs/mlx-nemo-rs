@@ -41,6 +41,7 @@ use crate::core::ArrayExt;
 use crate::core::checkpoint::NemoCheckpoint;
 use crate::core::config::from_yaml_str;
 use crate::core::error::Result;
+use crate::core::loading::{LoadOptions, LoadReport, Weights};
 
 /// SortFormer diarization model.
 pub struct SortformerEncLabelModel {
@@ -84,7 +85,15 @@ impl SortformerEncLabelModel {
     }
 
     /// Restore a model from a .nemo checkpoint file.
+    ///
+    /// Fails if the checkpoint lacks any weight the model has;
+    /// [`restore_with`](Self::restore_with) can allow that.
     pub fn restore(path: impl AsRef<Path>) -> Result<Self> {
+        Self::restore_with(path, LoadOptions::default())
+    }
+
+    /// Restore a model from a .nemo checkpoint file, loading with `options`.
+    pub fn restore_with(path: impl AsRef<Path>, options: LoadOptions) -> Result<Self> {
         let path = path.as_ref();
         tracing::info!(
             "Loading SortFormer diarization model from: {}",
@@ -110,26 +119,40 @@ impl SortformerEncLabelModel {
         // Load weights
         let weights = checkpoint.load_weights()?;
         tracing::debug!("Loading {} weight tensors", weights.len());
-        model.load_weights(&weights)?;
+        model.load_weights_with(&weights, options)?;
 
         Ok(model)
     }
 
-    /// Load weights from a state dict.
+    /// Load weights from a checkpoint's tensors, failing if any tensor the
+    /// model has is missing.
     pub fn load_weights(&mut self, weights: &HashMap<String, Array>) -> Result<()> {
+        self.load_weights_with(weights, LoadOptions::default())
+            .map(|_| ())
+    }
+
+    /// Load weights from a checkpoint's tensors with `options`, returning the
+    /// tensors a non-strict load had to leave at their initial values.
+    pub fn load_weights_with(
+        &mut self,
+        weights: &HashMap<String, Array>,
+        options: LoadOptions,
+    ) -> Result<LoadReport> {
+        let weights = Weights::new(weights, options);
+
         // Load conformer encoder weights
-        self.encoder.load_weights(weights, None)?;
+        self.encoder.load_weights(&weights, None)?;
 
         // Load transformer encoder weights
         self.transformer_encoder
-            .load_weights(weights, "transformer_encoder", None)?;
+            .load_weights(&weights, "transformer_encoder", None)?;
 
         // Load sortformer modules weights
         self.sortformer_modules
-            .load_weights(weights, "sortformer_modules", None)?;
+            .load_weights(&weights, "sortformer_modules", None)?;
 
-        tracing::info!("SortFormer model weights loaded successfully");
-        Ok(())
+        tracing::info!("SortFormer model weights loaded");
+        Ok(weights.report())
     }
 
     /// Non-streaming forward pass.

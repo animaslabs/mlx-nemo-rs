@@ -2,13 +2,12 @@
 //!
 //! Projects encoder output to vocabulary logits for CTC decoding.
 
-use std::collections::HashMap;
-
 use mlx_rs::Array;
 use mlx_rs::ops;
 
 use crate::asr::config::DecoderConfig;
-use crate::core::error::{Error, Result};
+use crate::core::error::Result;
+use crate::core::loading::Weights;
 use crate::core::quantization::{LinearLayer, QuantizationConfig, load_linear_layer};
 
 /// CTC decoder that projects encoder output to vocabulary logits.
@@ -74,7 +73,7 @@ impl CTCDecoder {
     /// * `quant` - Optional quantization config for quantized models
     pub fn load_weights(
         &mut self,
-        weights: &HashMap<String, Array>,
+        weights: &Weights,
         prefix: &str,
         quant: Option<&QuantizationConfig>,
     ) -> Result<()> {
@@ -110,6 +109,6 @@ impl CTCDecoder {
             return Ok(());
         }
 
-        Err(Error::missing_weight(&weight_key))
+        weights.report_missing(&[weight_key])
     }
 }

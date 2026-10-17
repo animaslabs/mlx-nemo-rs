@@ -52,6 +52,7 @@ use crate::asr::modules::SpeakerTargets;
 use crate::asr::streaming::{EncoderCache, FeatureBuffer, StreamingSortformerState};
 use crate::core::ArrayExt;
 use crate::core::error::Result;
+use crate::core::loading::LoadOptions;
 
 /// Speaker activity threshold.
 const ACTIVITY_THRESHOLD: f32 = 0.5;
@@ -74,6 +75,8 @@ pub struct MultiTalkerConfig {
     pub diar_fifo_len: usize,
     /// Diarizer speaker cache update period in encoder frames
     pub diar_spkcache_update_period: usize,
+    /// How strictly to load both models' weights
+    pub load: LoadOptions,
 }
 
 impl Default for MultiTalkerConfig {
@@ -85,6 +88,7 @@ impl Default for MultiTalkerConfig {
             sent_break_sec: 1.0,
             diar_fifo_len: 188,
             diar_spkcache_update_period: 144,
+            load: LoadOptions::default(),
         }
     }
 }
@@ -197,11 +201,11 @@ impl MultiTalkerPipeline {
     ) -> Result<Self> {
         let asr_path = asr_path.as_ref();
         let asr = if asr_path.is_dir() {
-            CacheAwareRNNTPipeline::restore_from_directory(asr_path, mode_idx)?
+            CacheAwareRNNTPipeline::restore_from_directory_with(asr_path, mode_idx, config.load)?
         } else {
-            CacheAwareRNNTPipeline::restore(asr_path, mode_idx)?
+            CacheAwareRNNTPipeline::restore_with(asr_path, mode_idx, config.load)?
         };
-        let mut diar_model = SortformerEncLabelModel::restore(diar_path)?;
+        let mut diar_model = SortformerEncLabelModel::restore_with(diar_path, config.load)?;
 
         // Drive the diarizer with the ASR chunk geometry, as NeMo's
         // multitalker inference does

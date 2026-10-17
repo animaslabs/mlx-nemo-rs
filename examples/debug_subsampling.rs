@@ -55,7 +55,7 @@ fn main() -> mlx_voice::Result<()> {
 
     // Load encoder weights (.nemo files are not quantized)
     let weights = checkpoint.load_weights()?;
-    encoder.load_weights(&weights, None)?;
+    encoder.load_weights(&mlx_voice::core::Weights::from(&weights), None)?;
 
     // Streaming parameters (matching Python debug script)
     let hop_samples = 160; // 10ms at 16kHz

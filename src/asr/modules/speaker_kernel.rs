@@ -14,14 +14,15 @@
 //! stored as `spk_kernels.{layer}.0` / `spk_kernels.{layer}.3` (and likewise
 //! under `bg_spk_kernels`).
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 
 use mlx_rs::Array;
 use mlx_rs::ops;
 use mlx_rs::ops::indexing::IndexOp;
 
 use crate::core::error::Result;
-use crate::core::quantization::{LinearLayer, QuantizationConfig, require_linear_layer};
+use crate::core::loading::Weights;
+use crate::core::quantization::{LinearLayer, QuantizationConfig};
 
 /// A feed-forward speaker kernel.
 struct FfKernel {
@@ -30,15 +31,15 @@ struct FfKernel {
 }
 
 impl FfKernel {
+    /// `None` if a non-strict load finds a layer missing.
     fn load(
-        weights: &HashMap<String, Array>,
+        weights: &Weights,
         prefix: &str,
         quant: Option<&QuantizationConfig>,
-    ) -> Result<Self> {
-        Ok(Self {
-            up: require_linear_layer(weights, &format!("{}.0", prefix), quant)?,
-            down: require_linear_layer(weights, &format!("{}.3", prefix), quant)?,
-        })
+    ) -> Result<Option<Self>> {
+        let up = weights.fetch_linear(&format!("{}.0", prefix), quant)?;
+        let down = weights.fetch_linear(&format!("{}.3", prefix), quant)?;
+        Ok(up.zip(down).map(|(up, down)| Self { up, down }))
     }
 
     fn forward(&self, x: &Array) -> Result<Array> {
@@ -59,11 +60,9 @@ impl SpeakerKernels {
     /// Load speaker kernels from a checkpoint.
     ///
     /// Returns `None` if the checkpoint has no `spk_kernels.*` weights (an
-    /// ordinary ASR model), and an error if a kernel is incomplete.
-    pub fn load(
-        weights: &HashMap<String, Array>,
-        quant: Option<&QuantizationConfig>,
-    ) -> Result<Option<Self>> {
+    /// ordinary ASR model), and an error if a strict load finds a kernel
+    /// incomplete (a non-strict one skips it).
+    pub fn load(weights: &Weights, quant: Option<&QuantizationConfig>) -> Result<Option<Self>> {
         let spk = load_kernels(weights, "spk_kernels", quant)?;
         if spk.is_empty() {
             return Ok(None);
@@ -112,7 +111,7 @@ pub struct SpeakerTargets {
 }
 
 fn load_kernels(
-    weights: &HashMap<String, Array>,
+    weights: &Weights,
     prefix: &str,
     quant: Option<&QuantizationConfig>,
 ) -> Result<BTreeMap<usize, FfKernel>> {
@@ -132,9 +131,10 @@ fn load_kernels(
 
     layers
         .into_iter()
-        .map(|layer| {
-            let kernel = FfKernel::load(weights, &format!("{}.{}", prefix, layer), quant)?;
-            Ok((layer, kernel))
+        .filter_map(|layer| {
+            FfKernel::load(weights, &format!("{}.{}", prefix, layer), quant)
+                .map(|kernel| kernel.map(|kernel| (layer, kernel)))
+                .transpose()
         })
         .collect()
 }
@@ -160,6 +160,7 @@ fn align_mask(mask: &Array, time: i32, pad_value: f32) -> Result<Array> {
 mod tests {
     use super::*;
     use crate::core::ArrayExt;
+    use std::collections::HashMap;
 
     #[test]
     fn test_align_mask_pads_left_and_keeps_last() -> Result<()> {
@@ -177,7 +178,7 @@ mod tests {
     #[test]
     fn test_load_returns_none_without_kernels() {
         assert!(
-            SpeakerKernels::load(&HashMap::new(), None)
+            SpeakerKernels::load(&Weights::from(&HashMap::new()), None)
                 .unwrap()
                 .is_none()
         );

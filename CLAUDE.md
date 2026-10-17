@@ -56,6 +56,7 @@ The eval dataset revision is pinned in both `xtask/src/main.rs` and mlx-models `
 - `pytorch.rs`: PyTorch pickle checkpoint loading for model weights
 - `config.rs`: YAML config parsing utilities
 - `error.rs`: Custom error types
+- `loading.rs`: `LoadOptions` / `LoadReport` and the `Weights` context layer loaders take. Loads are strict by default (a missing tensor is an error); `strict(false)` keeps initial values and reports them
 
 ### ASR Collection (`src/asr/`)
 

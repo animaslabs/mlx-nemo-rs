@@ -12,15 +12,14 @@
 //!       ReLU → first_hidden_to_hidden → ReLU → single_hidden_to_spks → Sigmoid
 //!   → preds [B, T, num_spks]
 
-use std::collections::HashMap;
-
 use mlx_rs::Array;
 use mlx_rs::nn;
 use mlx_rs::ops;
 
 use crate::asr::config::SortformerModulesConfig;
 use crate::core::error::Result;
-use crate::core::quantization::{LinearLayer, QuantizationConfig, require_linear_layer};
+use crate::core::loading::Weights;
+use crate::core::quantization::{LinearLayer, QuantizationConfig};
 
 /// SortFormer speaker head modules.
 pub struct SortformerModules {
@@ -120,25 +119,24 @@ impl SortformerModules {
     /// Weight prefix: `sortformer_modules.{submodule}`
     pub fn load_weights(
         &mut self,
-        weights: &HashMap<String, Array>,
+        weights: &Weights,
         prefix: &str,
         quant: Option<&QuantizationConfig>,
     ) -> Result<()> {
-        // Only present when fc_d_model != tf_d_model
-        if self.encoder_proj.is_some() {
-            self.encoder_proj = Some(require_linear_layer(
-                weights,
-                &format!("{}.encoder_proj", prefix),
-                quant,
-            )?);
+        // encoder_proj only exists when fc_d_model != tf_d_model
+        if let Some(encoder_proj) = &mut self.encoder_proj
+            && let Some(layer) = weights.fetch_linear(&format!("{prefix}.encoder_proj"), quant)?
+        {
+            *encoder_proj = layer;
         }
-        self.first_hidden_to_hidden = require_linear_layer(
-            weights,
-            &format!("{}.first_hidden_to_hidden", prefix),
-            quant,
-        )?;
-        self.single_hidden_to_spks =
-            require_linear_layer(weights, &format!("{}.single_hidden_to_spks", prefix), quant)?;
+        for (name, layer) in [
+            ("first_hidden_to_hidden", &mut self.first_hidden_to_hidden),
+            ("single_hidden_to_spks", &mut self.single_hidden_to_spks),
+        ] {
+            if let Some(loaded) = weights.fetch_linear(&format!("{prefix}.{name}"), quant)? {
+                *layer = loaded;
+            }
+        }
 
         Ok(())
     }
