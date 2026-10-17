@@ -14,6 +14,8 @@
 //! Options:
 //!   --beam <size>     Use beam search decoding with given beam size (default: greedy)
 //!   --format <fmt>    Weight format: "mlx" or "pytorch" (default: auto-detect)
+//!   --language <lang> Target language of a multilingual model, e.g. en-US, de, auto (default)
+//!   --keep-lang-tags  Keep the detected-language tags (e.g. <en-US>) in the text
 //!
 //! Environment:
 //!   RUST_LOG=mlx_voice=debug   Enable debug logging
@@ -47,6 +49,8 @@ fn main() -> mlx_voice::Result<()> {
         eprintln!("Options:");
         eprintln!("  --beam <size>     Use beam search decoding (default: greedy)");
         eprintln!("  --format <fmt>    Weight format: mlx or pytorch (default: auto)");
+        eprintln!("  --language <lang> Target language of a multilingual model (default: auto)");
+        eprintln!("  --keep-lang-tags  Keep detected-language tags (e.g. <en-US>) in the text");
         std::process::exit(1);
     }
 
@@ -55,6 +59,8 @@ fn main() -> mlx_voice::Result<()> {
     // Parse optional flags
     let mut beam_size: Option<usize> = None;
     let mut weight_format: Option<WeightFormat> = None;
+    let mut language: Option<String> = None;
+    let mut keep_lang_tags = false;
     let mut audio_start_idx = 3;
 
     let mut i = 3;
@@ -81,6 +87,16 @@ fn main() -> mlx_voice::Result<()> {
                 } else {
                     i += 1;
                 }
+            }
+            "--language" => {
+                language = args.get(i + 1).cloned();
+                i += 2;
+                audio_start_idx = i;
+            }
+            "--keep-lang-tags" => {
+                keep_lang_tags = true;
+                i += 1;
+                audio_start_idx = i;
             }
             _ => break,
         }
@@ -110,6 +126,14 @@ fn main() -> mlx_voice::Result<()> {
             "Stateless"
         }
     );
+
+    if let Some(language) = &language {
+        model.set_language(language)?;
+    }
+    if let Some(language) = model.language() {
+        println!("Target language: {language}");
+    }
+    model.set_strip_lang_tags(!keep_lang_tags);
 
     // Set decoding strategy
     if let Some(beam) = beam_size {

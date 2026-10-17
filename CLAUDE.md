@@ -33,6 +33,7 @@ cargo test --release --test multitalker -- --ignored --test-threads=1 --nocaptur
 # Download models from Hugging Face
 cargo xtask download nvidia/parakeet-ctc-0.6b
 cargo xtask download nvidia/nemotron-speech-streaming-en-0.6b --token $HF_TOKEN
+cargo xtask download nvidia/nemotron-3.5-asr-streaming-0.6b --file nemotron-3.5-asr-streaming-0.6b.nemo
 cargo xtask download nvidia/multitalker-parakeet-streaming-0.6b-v1
 cargo xtask download nvidia/diar_streaming_sortformer_4spk-v2.1
 
@@ -69,6 +70,7 @@ The eval dataset revision is pinned in both `xtask/src/main.rs` and mlx-models `
 - `RNNTJoint`: Joint network for RNN-T
 - `SpeakerKernels`: Multitalker speaker kernels, applied by `ConformerEncoder` before selected layers when speaker targets are set
 - `SortformerModules`: SortFormer speaker head (diarization)
+- `LanguagePrompt`: Language-ID prompt (`prompt_kernel`) of multilingual prompt models; `RNNTJoint::project_encoder` applies it before the encoder projection, so every decode path is conditioned
 - `PredictionNetwork`: RNN-T decoder/prediction network
 
 **Pipeline** (`pipeline/`):
@@ -104,10 +106,11 @@ Models are stored in `models/nvidia/` and downloaded via xtask:
 - `parakeet-ctc-0.6b/`: Non-streaming CTC model
 - `parakeet-rnnt-0.6b/`: Non-streaming RNN-T model
 - `nemotron-speech-streaming-en-0.6b/`: Streaming RNN-T model (gated, requires HF token)
+- `nemotron-3.5-asr-streaming-0.6b/`: Multilingual streaming RNN-T with a language-ID prompt (`set_language`, default `auto`; `<xx-XX>` tags stripped from text by default)
 - `multitalker-parakeet-streaming-0.6b-v1/`: Streaming multitalker RNN-T (Nemotron streaming + speaker kernels)
 - `diar_streaming_sortformer_4spk-v2.1/`: Streaming SortFormer diarizer (up to 4 speakers)
 
-`.nemo` files are uncompressed TAR archives containing:
+`.nemo` files are TAR archives (usually uncompressed; some, like nemotron-3.5, are gzip-compressed) containing:
 - `model_config.yaml`: Full model configuration
 - `model_weights.ckpt`: PyTorch checkpoint with weights
 - `*.model`: SentencePiece tokenizer files

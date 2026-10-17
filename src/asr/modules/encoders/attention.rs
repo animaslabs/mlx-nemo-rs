@@ -199,6 +199,73 @@ fn query_block_size(batch_heads: i32, seq_len: i32, max_score_elements: i64) -> 
     (max_score_elements / per_row.max(1)).clamp(1, seq_len.max(1) as i64) as i32
 }
 
+/// Which keys each query sees in offline attention: NeMo's `_create_masks`
+/// for an `att_context_size` of (left, right) frames.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AttentionContext {
+    left: i32,
+    right: i32,
+    /// `chunked_limited` style: queries see whole chunks of `right + 1` frames
+    chunked: bool,
+}
+
+impl AttentionContext {
+    /// The context for `size` and `style`, or `None` when every key is visible.
+    pub fn new(size: (i32, i32), style: &str) -> Option<Self> {
+        let (left, right) = size;
+        (left >= 0 || right >= 0).then_some(Self {
+            left,
+            right,
+            chunked: style == "chunked_limited",
+        })
+    }
+
+    /// Additive mask (0 visible, -inf hidden) for query rows `start..end` over
+    /// `seq_len` keys: [rows, seq_len]. Every query sees itself, so no row is
+    /// fully hidden.
+    fn block_mask(
+        &self,
+        start: i32,
+        end: i32,
+        seq_len: i32,
+        dtype: mlx_rs::Dtype,
+    ) -> Result<Array> {
+        let rows = ops::arange::<_, i32>(start, end, 1)?.reshape(&[end - start, 1])?;
+        let cols = ops::arange::<_, i32>(0, seq_len, 1)?.reshape(&[1, seq_len])?;
+        let visible = if self.chunked && self.right >= 0 {
+            let chunk_size = Array::from_int(self.right + 1);
+            let left_chunks = if self.left >= 0 {
+                self.left / (self.right + 1)
+            } else {
+                10000
+            };
+            let diff = ops::subtract(
+                &ops::floor_divide(&rows, &chunk_size)?,
+                &ops::floor_divide(&cols, &chunk_size)?,
+            )?;
+            ops::logical_and(
+                &ops::ge(&diff, &Array::from_int(0))?,
+                &ops::le(&diff, &Array::from_int(left_chunks))?,
+            )?
+        } else {
+            // offset = key - query; chunked_limited with unlimited right context
+            // only limits the left side
+            let offset = ops::subtract(&cols, &rows)?;
+            let mut visible = ops::ge(&offset, &Array::from_int(-self.left.max(0)))?;
+            if self.left < 0 {
+                visible = ops::ones_like(&visible)?;
+            }
+            if !self.chunked && self.right >= 0 {
+                visible =
+                    ops::logical_and(&visible, &ops::le(&offset, &Array::from_int(self.right))?)?;
+            }
+            visible
+        };
+        let hidden = Array::from_f32(f32::NEG_INFINITY);
+        Ok(ops::select(&visible, &Array::from_f32(0.0), &hidden)?.as_dtype(dtype)?)
+    }
+}
+
 /// `softmax(((Q + u) @ K^T + bd + mask) / sqrt(head_dim)) @ V` with the content
 /// term fused into `fast::scaled_dot_product_attention`; the position scores
 /// `bd` (and an optional additive mask) go in as its additive mask.
@@ -337,11 +404,17 @@ impl RelPositionMultiHeadAttention {
     /// # Arguments
     /// * `x` - Input tensor [batch, seq_len, d_model]
     /// * `pos_emb` - Positional embeddings [1, 2*seq_len-1, d_model]
+    /// * `context` - Limited attention context, or `None` for full attention
     ///
     /// # Returns
     /// Output tensor [batch, seq_len, d_model]
-    pub fn forward(&mut self, x: &Array, pos_emb: &Array) -> Result<Array> {
-        self.forward_blocked(x, pos_emb, MAX_SCORE_ELEMENTS)
+    pub fn forward(
+        &mut self,
+        x: &Array,
+        pos_emb: &Array,
+        context: Option<AttentionContext>,
+    ) -> Result<Array> {
+        self.forward_blocked(x, pos_emb, context, MAX_SCORE_ELEMENTS)
     }
 
     /// `forward` with queries processed in blocks whose score matrices stay
@@ -350,6 +423,7 @@ impl RelPositionMultiHeadAttention {
         &mut self,
         x: &Array,
         pos_emb: &Array,
+        context: Option<AttentionContext>,
         max_score_elements: i64,
     ) -> Result<Array> {
         let batch_size = x.dim(0) as i32;
@@ -401,7 +475,8 @@ impl RelPositionMultiHeadAttention {
         // Full attention over a long file needs [batch, n_heads, seq_len, 2*seq_len-1]
         // position scores (tens of GB at ~10k frames), so queries are processed in
         // blocks that keep each block's score matrix under max_score_elements. Every
-        // block still attends to all keys, so the result is exact full attention.
+        // block still scores all keys (masked to `context` when limited), so the
+        // result is exact.
         let block = query_block_size(batch_size * n_heads, seq_len, max_score_elements);
         let mut contexts = Vec::new();
         for start in (0..seq_len).step_by(block as usize) {
@@ -422,7 +497,10 @@ impl RelPositionMultiHeadAttention {
 
             // softmax(((Q + u) @ K^T + bd) / sqrt(d)) @ V with the content term
             // fused: [batch, n_heads, rows, head_dim]
-            let context = attend(&q_u, &k, &v, &matrix_bd, None, head_dim)?;
+            let mask = context
+                .map(|c| c.block_mask(start, end, seq_len, matrix_bd.dtype()))
+                .transpose()?;
+            let context = attend(&q_u, &k, &v, &matrix_bd, mask.as_ref(), head_dim)?;
             if block < seq_len {
                 // Submit each block so its score matrices are freed before the next
                 // one is built; a lazy graph could otherwise hold several at once.
@@ -906,15 +984,62 @@ mod tests {
             .get_encoding(seq_len as usize)
             .unwrap();
 
-        // i64::MAX: one block covering every query row (the unblocked computation).
-        let full = attn.forward_blocked(&x, &pos_emb, i64::MAX).unwrap();
-        // 2 batch * 2 heads * 2*13 per row: a budget of 5 rows gives blocks of 5, 5, 3.
-        let blocked = attn.forward_blocked(&x, &pos_emb, 2 * 2 * 2 * 13 * 5).unwrap();
-        assert_eq!(blocked.shape(), full.shape());
-        let a: Vec<f32> = full.to_vec_row_major().unwrap();
-        let b: Vec<f32> = blocked.to_vec_row_major().unwrap();
-        let max_diff = a.iter().zip(&b).map(|(x, y)| (x - y).abs()).fold(0.0, f32::max);
-        assert!(max_diff < 1e-5, "max diff {max_diff}");
+        let contexts = [
+            None,
+            AttentionContext::new((4, 1), "chunked_limited"),
+            AttentionContext::new((3, 2), "regular"),
+        ];
+        for context in contexts {
+            // i64::MAX: one block covering every query row (the unblocked computation).
+            let full = attn.forward_blocked(&x, &pos_emb, context, i64::MAX).unwrap();
+            // 2 batch * 2 heads * 2*13 per row: a budget of 5 rows gives blocks of 5, 5, 3.
+            let blocked = attn
+                .forward_blocked(&x, &pos_emb, context, 2 * 2 * 2 * 13 * 5)
+                .unwrap();
+            assert_eq!(blocked.shape(), full.shape());
+            let a: Vec<f32> = full.to_vec_row_major().unwrap();
+            let b: Vec<f32> = blocked.to_vec_row_major().unwrap();
+            let max_diff = a.iter().zip(&b).map(|(x, y)| (x - y).abs()).fold(0.0, f32::max);
+            assert!(max_diff < 1e-5, "{context:?}: max diff {max_diff}");
+        }
+    }
+
+    #[test]
+    fn test_attention_context_mask_matches_nemo() {
+        // Brute-force port of NeMo's ConformerEncoder._create_masks.
+        let nemo = |(left, right): (i32, i32), style: &str, i: i32, j: i32| -> bool {
+            if style == "chunked_limited" && right >= 0 {
+                let chunk = right + 1;
+                let left_chunks = if left >= 0 { left / chunk } else { 10000 };
+                let diff = i / chunk - j / chunk;
+                (0..=left_chunks).contains(&diff)
+            } else {
+                let right_ok = style == "chunked_limited" || right < 0 || j - i <= right;
+                (left < 0 || j - i >= -left) && right_ok
+            }
+        };
+        let seq_len = 23;
+        let cases = [
+            ((56, 3), "chunked_limited"),
+            ((5, 1), "chunked_limited"),
+            ((-1, 2), "chunked_limited"),
+            ((4, -1), "chunked_limited"),
+            ((3, 2), "regular"),
+            ((-1, 0), "regular"),
+        ];
+        for (size, style) in cases {
+            let context = AttentionContext::new(size, style).unwrap();
+            let mask = context.block_mask(7, 19, seq_len, mlx_rs::Dtype::Float32).unwrap();
+            assert_eq!(mask.shape(), &[12, seq_len]);
+            let mask: Vec<f32> = mask.to_vec_row_major().unwrap();
+            for i in 7..19 {
+                for j in 0..seq_len {
+                    let visible = mask[((i - 7) * seq_len + j) as usize] == 0.0;
+                    assert_eq!(visible, nemo(size, style, i, j), "{size:?} {style} q{i} k{j}");
+                }
+            }
+        }
+        assert!(AttentionContext::new((-1, -1), "chunked_limited").is_none());
     }
 
     #[test]

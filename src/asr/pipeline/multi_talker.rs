@@ -46,6 +46,7 @@ use mlx_rs::ops::indexing::IndexOp;
 use mlx_rs::Array;
 
 use super::cache_aware_rnnt::CacheAwareRNNTPipeline;
+use crate::asr::decoding::decode_text;
 use crate::asr::models::{DecoderState, SortformerEncLabelModel};
 use crate::asr::modules::SpeakerTargets;
 use crate::asr::streaming::{EncoderCache, FeatureBuffer, StreamingSortformerState};
@@ -570,8 +571,8 @@ impl MultiTalkerPipeline {
 
     fn make_word(&self, instance: usize, tokens: &[(usize, usize)]) -> Option<SpeakerWord> {
         let tokenizer = self.asr.tokenizer.as_ref()?;
-        let ids: Vec<u32> = tokens.iter().map(|&(t, _)| t as u32).collect();
-        let text = tokenizer.decode_piece_ids(&ids).ok()?.trim().to_string();
+        let ids: Vec<usize> = tokens.iter().map(|&(t, _)| t).collect();
+        let text = decode_text(tokenizer, &ids, self.asr.strip_lang_tags).trim().to_string();
         if text.is_empty() {
             return None;
         }
