@@ -3,6 +3,7 @@
 
 use std::borrow::BorrowMut;
 use std::sync::Arc;
+use std::time::Duration;
 
 use mlx_rs::Array;
 use mlx_rs::ops::indexing::IndexOp;
@@ -14,27 +15,122 @@ use crate::asr::decoding::{
 use crate::asr::models::EncDecRnntModel;
 use crate::asr::modules::{DecoderState, SpectrumTransform, StreamingMel, StreamingMelConfig};
 use crate::asr::streaming::{
-    EncoderCache, FeatureBuffer, StreamingConfig, compute_streaming_config,
+    EncoderCache, FeatureBuffer, StreamingConfig, StreamingModeInfo, compute_streaming_config,
 };
 use crate::asr::transcript::{DecoderType, Token, Transcript};
 use crate::audio::StreamResampler;
 use crate::core::ArrayExt;
 use crate::core::error::{Error, Result};
 
+/// Which of a checkpoint's streaming modes a session uses.
+///
+/// Cache-aware checkpoints list their modes in `att_context_size`, each a
+/// left context and a lookahead (see [`EncDecRnntModel::streaming_modes`]).
+/// The list differs between checkpoints, so prefer choosing by latency over
+/// a fixed index. A `usize` converts to [`StreamingMode::Index`].
+///
+/// ```no_run
+/// # use std::time::Duration;
+/// # use mlx_voice::asr::{StreamingMode, StreamingOptions};
+/// let fastest = StreamingOptions::default().mode(StreamingMode::LowestLatency);
+/// let budget = StreamingOptions::default().mode(StreamingMode::MaxLatency(Duration::from_millis(500)));
+/// let fourth = StreamingOptions::default().mode(3);
+/// ```
+///
+/// [`StreamingSession::streaming_config`] reports the mode a session chose
+/// (`mode_idx`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub enum StreamingMode {
+    /// The checkpoint's default, its first `att_context_size` entry, as in
+    /// NeMo. Checkpoints list modes from most to least lookahead, so this is
+    /// usually the most accurate mode and the one with the highest latency.
+    #[default]
+    Default,
+    /// The mode with the least lookahead
+    LowestLatency,
+    /// The mode with the most lookahead whose lookahead latency
+    /// ([`StreamingModeInfo::latency_ms`]) is at most this; starting a session
+    /// fails if no mode fits
+    MaxLatency(Duration),
+    /// An index into the checkpoint's `att_context_size` list
+    Index(usize),
+}
+
+impl From<usize> for StreamingMode {
+    fn from(index: usize) -> Self {
+        Self::Index(index)
+    }
+}
+
+impl StreamingMode {
+    /// The index of the mode to use among a model's `modes`.
+    pub(crate) fn resolve(self, modes: &[StreamingModeInfo]) -> Result<usize> {
+        // Among modes tied on latency, prefer more left context, then the
+        // earlier entry
+        let left = |m: &StreamingModeInfo| {
+            if m.left_context < 0 {
+                i64::MAX
+            } else {
+                i64::from(m.left_context)
+            }
+        };
+        let better = |a: &&StreamingModeInfo, b: &&StreamingModeInfo| {
+            left(a).cmp(&left(b)).then(b.mode_idx.cmp(&a.mode_idx))
+        };
+        match self {
+            Self::Default => Ok(modes.first().map_or(0, |m| m.mode_idx)),
+            Self::Index(index) => {
+                if !modes.is_empty() && !modes.iter().any(|m| m.mode_idx == index) {
+                    return Err(Error::config(format!(
+                        "streaming mode {index} is out of range: the model has {} modes",
+                        modes.len()
+                    )));
+                }
+                Ok(index)
+            }
+            Self::LowestLatency => modes
+                .iter()
+                .min_by(|a, b| a.latency_ms.total_cmp(&b.latency_ms).then(better(b, a)))
+                .map(|m| m.mode_idx)
+                .ok_or_else(|| Error::config("the model has no streaming modes")),
+            Self::MaxLatency(budget) => {
+                let budget_ms = budget.as_secs_f32() * 1000.0;
+                modes
+                    .iter()
+                    .filter(|m| m.latency_ms <= budget_ms + 1e-3)
+                    .max_by(|a, b| a.latency_ms.total_cmp(&b.latency_ms).then(better(a, b)))
+                    .map(|m| m.mode_idx)
+                    .ok_or_else(|| {
+                        let latencies: Vec<String> = modes
+                            .iter()
+                            .map(|m| format!("{:.0} ms", m.latency_ms))
+                            .collect();
+                        Error::config(format!(
+                            "no streaming mode has at most {budget_ms:.0} ms of lookahead \
+                             (the model's modes: {})",
+                            latencies.join(", ")
+                        ))
+                    })
+            }
+        }
+    }
+}
+
 /// Options for a [`StreamingSession`].
 ///
 /// ```no_run
-/// # use mlx_voice::asr::StreamingOptions;
-/// let options = StreamingOptions::default().mode(3).blank_threshold(0.5);
+/// # use mlx_voice::asr::{StreamingMode, StreamingOptions};
+/// let options = StreamingOptions::default()
+///     .mode(StreamingMode::LowestLatency)
+///     .blank_threshold(0.5);
 /// ```
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
 pub struct StreamingOptions {
-    /// Streaming mode: an index into the checkpoint's `att_context_size` list
-    /// (see [`EncDecRnntModel::streaming_modes`] for each mode's latency).
-    /// NeMo checkpoints list modes from most to least lookahead, so mode 0,
-    /// the default, has the highest latency and accuracy.
-    pub mode: usize,
+    /// Streaming mode; the default is the checkpoint's default mode, usually
+    /// the most accurate and the one with the highest latency.
+    pub mode: StreamingMode,
     /// Decoder to use; `None` uses RNN-T. [`DecoderType::Ctc`] needs a hybrid
     /// RNN-T/CTC model (see [`EncDecRnntModel::has_ctc_decoder`]).
     pub decoder_type: Option<DecoderType>,
@@ -54,7 +150,7 @@ pub struct StreamingOptions {
 impl Default for StreamingOptions {
     fn default() -> Self {
         Self {
-            mode: 0,
+            mode: StreamingMode::Default,
             decoder_type: None,
             strip_lang_tags: true,
             suppress_punctuation: false,
@@ -65,9 +161,10 @@ impl Default for StreamingOptions {
 }
 
 impl StreamingOptions {
-    /// Use streaming mode `mode`.
-    pub fn mode(mut self, mode: usize) -> Self {
-        self.mode = mode;
+    /// Use streaming mode `mode`: a [`StreamingMode`], or an index into the
+    /// checkpoint's `att_context_size` list.
+    pub fn mode(mut self, mode: impl Into<StreamingMode>) -> Self {
+        self.mode = mode.into();
         self
     }
 
@@ -264,8 +361,9 @@ impl<M: BorrowMut<EncDecRnntModel>> StreamingSession<M> {
     pub fn new(mut model: M, options: StreamingOptions) -> Result<Self> {
         let m = model.borrow_mut();
         let decoder_type = m.resolve_decoder_type(options.decoder_type)?;
-        m.encoder.set_streaming_mode(options.mode);
-        let streaming_config = compute_streaming_config(m.encoder.config(), options.mode, 10000)?;
+        let mode_idx = options.mode.resolve(&m.streaming_modes())?;
+        m.encoder.set_streaming_mode(mode_idx);
+        let streaming_config = compute_streaming_config(m.encoder.config(), mode_idx, 10000)?;
         m.encoder.setup_streaming(streaming_config.cache_drop_size);
 
         let encoder_cache = EncoderCache::new(
@@ -788,6 +886,48 @@ mod tests {
         assert_eq!(appended_text("héllo", "héllo!"), "!");
     }
 
+    /// Nemotron's modes: [[70, 13], [70, 6], [70, 1], [70, 0]] at 80 ms a frame
+    fn nemotron_modes() -> Vec<StreamingModeInfo> {
+        [(70, 13), (70, 6), (70, 1), (70, 0)]
+            .into_iter()
+            .enumerate()
+            .map(|(i, (left, right))| StreamingModeInfo::from_context(i, left, right, 80.0))
+            .collect()
+    }
+
+    #[test]
+    fn test_streaming_mode_resolve() {
+        let modes = nemotron_modes();
+        let resolve = |mode: StreamingMode| mode.resolve(&modes);
+        let ms = |ms| StreamingMode::MaxLatency(Duration::from_millis(ms));
+        assert_eq!(resolve(StreamingMode::Default).unwrap(), 0);
+        assert_eq!(resolve(StreamingMode::LowestLatency).unwrap(), 3);
+        assert_eq!(resolve(2.into()).unwrap(), 2);
+        assert!(resolve(4.into()).is_err());
+        assert_eq!(resolve(ms(2000)).unwrap(), 0);
+        assert_eq!(resolve(ms(1040)).unwrap(), 0);
+        assert_eq!(resolve(ms(500)).unwrap(), 1);
+        assert_eq!(resolve(ms(80)).unwrap(), 2);
+        assert_eq!(resolve(ms(79)).unwrap(), 3);
+        assert_eq!(resolve(ms(0)).unwrap(), 3);
+
+        // Ties on latency go to more left context, then the earlier entry
+        let tied: Vec<StreamingModeInfo> = [(70, 0), (-1, 0), (-1, 0), (70, 6)]
+            .into_iter()
+            .enumerate()
+            .map(|(i, (left, right))| StreamingModeInfo::from_context(i, left, right, 80.0))
+            .collect();
+        assert_eq!(StreamingMode::LowestLatency.resolve(&tied).unwrap(), 1);
+        assert_eq!(ms(100).resolve(&tied).unwrap(), 1);
+
+        // Without a list, only the default and indexes make sense
+        let none: Vec<StreamingModeInfo> = Vec::new();
+        assert_eq!(StreamingMode::Default.resolve(&none).unwrap(), 0);
+        assert_eq!(StreamingMode::Index(1).resolve(&none).unwrap(), 1);
+        assert!(StreamingMode::LowestLatency.resolve(&none).is_err());
+        assert!(ms(1000).resolve(&none).is_err());
+    }
+
     #[test]
     fn test_options_builder() {
         let options = StreamingOptions::default()
@@ -795,7 +935,8 @@ mod tests {
             .decoder_type(DecoderType::Ctc)
             .blank_threshold(0.5)
             .suppress_punctuation(true);
-        assert_eq!(options.mode, 2);
+        assert_eq!(options.mode, StreamingMode::Index(2));
+        assert_eq!(StreamingOptions::default().mode, StreamingMode::Default);
         assert_eq!(options.decoder_type, Some(DecoderType::Ctc));
         assert_eq!(options.blank_threshold, 0.5);
         assert!(options.suppress_punctuation);

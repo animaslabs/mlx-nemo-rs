@@ -8,8 +8,9 @@
 use std::path::Path;
 
 use mlx_voice::asr::{
-    AudioInput, DecoderType, EncDecClassificationModel, EncDecRnntModel, StreamingOptions,
-    StreamingSession, TranscribeOptions, Transcript, VadPostProcessConfig, VadPostProcessor,
+    AudioInput, DecoderType, EncDecClassificationModel, EncDecRnntModel, StreamingMode,
+    StreamingOptions, StreamingSession, TranscribeOptions, Transcript, VadPostProcessConfig,
+    VadPostProcessor,
 };
 
 // ---------------------------------------------------------------------------
@@ -414,6 +415,20 @@ fn test_streaming_modes_are_independent() {
         .unwrap();
     assert_eq!(mode_0, fresh_0);
     println!("mode 0: {mode_0}\nmode 2: {mode_2}");
+
+    // Modes chosen by latency resolve against the checkpoint's list
+    let mode_idx = |model: &mut EncDecRnntModel, mode: StreamingMode| {
+        let options = StreamingOptions::default().mode(mode);
+        model.stream(options).map(|s| s.streaming_config().mode_idx)
+    };
+    let lowest = mode_idx(&mut fresh, StreamingMode::LowestLatency).unwrap();
+    assert_eq!(fresh.streaming_modes()[lowest].latency_ms, 0.0);
+    let half_second = StreamingMode::MaxLatency(std::time::Duration::from_millis(500));
+    let within = mode_idx(&mut fresh, half_second).unwrap();
+    assert!(fresh.streaming_modes()[within].latency_ms <= 500.0);
+    assert_eq!(mode_idx(&mut fresh, StreamingMode::Default).unwrap(), 0);
+    let count = fresh.streaming_modes().len();
+    assert!(mode_idx(&mut fresh, StreamingMode::Index(count)).is_err());
 
     // An owned session hands its model back
     let session = StreamingSession::new(fresh, StreamingOptions::default()).unwrap();
