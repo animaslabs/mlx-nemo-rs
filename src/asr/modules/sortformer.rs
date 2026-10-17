@@ -22,6 +22,7 @@ use crate::core::loading::Weights;
 use crate::core::quantization::{LinearLayer, QuantizationConfig};
 
 /// SortFormer speaker head modules.
+#[derive(Debug)]
 pub struct SortformerModules {
     /// Optional projection from conformer dim to transformer dim
     pub encoder_proj: Option<LinearLayer>,

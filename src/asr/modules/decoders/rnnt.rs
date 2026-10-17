@@ -21,6 +21,7 @@ use crate::core::quantization::{EmbeddingLayer, LinearLayer, QuantizationConfig}
 /// and simply concatenates/sums embeddings of the context window.
 ///
 /// This is the decoder used by Parakeet RNNT models.
+#[derive(Debug)]
 pub struct StatelessTransducerDecoder {
     /// Embedding layer: vocab_size + 1 (blank) -> pred_hidden (supports quantized weights)
     embedding: EmbeddingLayer,
@@ -329,6 +330,7 @@ impl StatelessTransducerDecoder {
 /// - LSTM layers (typically 2 layers)
 ///
 /// State consists of (hidden, cell) tensors for each LSTM layer.
+#[derive(Debug)]
 pub struct RNNTDecoder {
     /// Embedding layer: vocab_size + 1 (blank) -> pred_hidden (supports quantized weights)
     embedding: EmbeddingLayer,
@@ -345,6 +347,7 @@ pub struct RNNTDecoder {
 }
 
 /// Weights for a single LSTM layer.
+#[derive(Debug)]
 struct LstmLayer {
     /// Input-hidden weight: [4 * hidden_size, input_size]
     weight_ih: Array,
@@ -387,7 +390,7 @@ impl LstmLayer {
 
 /// LSTM decoder state for a single batch item.
 /// Contains hidden and cell states for each layer.
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct LstmState {
     /// Hidden states per layer: [num_layers, batch, hidden_size]
     pub hidden: Array,
@@ -706,8 +709,11 @@ impl RNNTDecoder {
 /// Activation function for joint network.
 #[derive(Debug, Clone, Copy)]
 pub enum JointActivation {
+    /// `max(x, 0)`
     Relu,
+    /// `tanh(x)`
     Tanh,
+    /// `1 / (1 + e^-x)`
     Sigmoid,
 }
 
@@ -748,6 +754,7 @@ impl JointActivation {
 /// ```
 ///
 /// where h is encoder output and g is prediction network output.
+#[derive(Debug)]
 pub struct RNNTJoint {
     /// Language-ID conditioning applied to encoder frames before `encoder_proj`
     /// (prompt-conditioned models only)

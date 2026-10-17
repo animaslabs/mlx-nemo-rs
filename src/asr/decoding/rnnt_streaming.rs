@@ -31,7 +31,7 @@ const DEFAULT_MAX_SYMBOLS_PER_STEP: usize = 10;
 const DEFAULT_BLANK_THRESHOLD: f32 = 0.0;
 
 /// Output from a streaming decode step.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DecodeStepOutput {
     /// New tokens emitted in this step
     pub new_tokens: Vec<usize>,

@@ -127,6 +127,58 @@ fn test_full_file_transcription_rnnt() {
 
 #[test]
 #[ignore]
+fn test_transcribe_samples_matches_file() {
+    let model_dir = "models/animaslabs/parakeet-rnnt-0.6b-mlx";
+    if !require_model(model_dir) {
+        return;
+    }
+    let mut model =
+        EncDecRNNTModel::restore_from_directory(model_dir).expect("Failed to load RNNT model");
+
+    let from_file = model
+        .transcribe(&[TEST_AUDIO])
+        .expect("Transcription failed");
+    let (samples, sample_rate) = mlx_voice::audio::load_wav(TEST_AUDIO).unwrap();
+    let from_samples = model
+        .transcribe_samples(&samples, sample_rate)
+        .expect("Transcription failed");
+    assert_eq!(from_samples, from_file[0]);
+
+    // A different input rate is resampled to the model's
+    let resampled = mlx_voice::audio::resample(&samples, sample_rate, 48_000).unwrap();
+    let from_48k = model.transcribe_samples(&resampled, 48_000).unwrap();
+    let wer = word_error_rate(&normalize_text(EXPECTED_TEXT), &normalize_text(&from_48k));
+    assert!(
+        wer < 0.10,
+        "WER {:.1}% at 48 kHz: {}",
+        wer * 100.0,
+        from_48k
+    );
+
+    assert_eq!(model.transcribe_samples(&[], sample_rate).unwrap(), "");
+}
+
+#[test]
+#[ignore]
+fn test_tokenizer_round_trip() {
+    let model_dir = "models/animaslabs/parakeet-rnnt-0.6b-mlx";
+    if !require_model(model_dir) {
+        return;
+    }
+    let model =
+        EncDecRNNTModel::restore_from_directory(model_dir).expect("Failed to load RNNT model");
+    let tokenizer = model.tokenizer().expect("model has a tokenizer");
+
+    assert_eq!(tokenizer.vocab_size(), model.blank_id());
+    let ids = tokenizer.encode("well i don't wish to see it").unwrap();
+    assert!(tokenizer.is_word_start(ids[0]));
+    assert_eq!(tokenizer.decode(&ids, true), "well i don't wish to see it");
+    assert_eq!(tokenizer.piece_to_id("▁well"), Some(ids[0]));
+    assert_eq!(tokenizer.detected_language(&ids), None);
+}
+
+#[test]
+#[ignore]
 fn test_multilingual_streaming_transcription() {
     let model_path =
         "models/nvidia/nemotron-3.5-asr-streaming-0.6b/nemotron-3.5-asr-streaming-0.6b.nemo";

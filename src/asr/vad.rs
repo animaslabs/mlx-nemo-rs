@@ -4,7 +4,7 @@
 //! into speech segments with onset/offset hysteresis, filtering, and padding.
 
 /// Configuration for VAD post-processing.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct VadPostProcessConfig {
     /// Speech probability threshold for onset (start of speech).
     pub onset: f32,
@@ -34,7 +34,7 @@ impl Default for VadPostProcessConfig {
 }
 
 /// A detected speech segment with start and end timestamps.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SpeechSegment {
     /// Start time in seconds.
     pub start: f32,
@@ -50,6 +50,7 @@ impl SpeechSegment {
 }
 
 /// Post-processor that converts frame-level speech probabilities to speech segments.
+#[derive(Debug)]
 pub struct VadPostProcessor {
     config: VadPostProcessConfig,
 }

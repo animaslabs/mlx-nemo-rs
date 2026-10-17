@@ -6,7 +6,6 @@
 use std::path::Path;
 
 use mlx_rs::Array;
-use sentencepiece::SentencePieceProcessor;
 
 use crate::asr::config::AsrModelConfig;
 
@@ -14,10 +13,10 @@ use crate::asr::config::AsrModelConfig;
 ///
 /// Returns IDs of tokens where the decoded piece consists entirely of
 /// punctuation and/or whitespace, with at least one punctuation character.
-fn find_punctuation_tokens(tokenizer: &SentencePieceProcessor) -> Vec<usize> {
-    (0..tokenizer.len())
+fn find_punctuation_tokens(tokenizer: &Tokenizer) -> Vec<usize> {
+    (0..tokenizer.vocab_size())
         .filter(|&id| {
-            let piece = tokenizer.decode_piece_ids(&[id as u32]).unwrap_or_default();
+            let piece = tokenizer.decode(&[id], false);
             // Must have at least one punctuation char and only contain punctuation/whitespace
             piece
                 .chars()
@@ -26,9 +25,8 @@ fn find_punctuation_tokens(tokenizer: &SentencePieceProcessor) -> Vec<usize> {
         })
         .collect()
 }
-use crate::asr::decoding::{
-    IncrementalDetokenizer, RnntStreamingDecoder, lang_tag_table, last_lang_tag, word_start_table,
-};
+use crate::asr::Tokenizer;
+use crate::asr::decoding::{IncrementalDetokenizer, RnntStreamingDecoder};
 use crate::asr::models::{DecoderState, PredictionNetwork};
 use crate::asr::modules::{
     ConformerEncoder, LanguagePrompt, MelProcessor, StreamingMel, StreamingMelConfig,
@@ -37,6 +35,7 @@ use crate::asr::streaming::{
     EncoderCache, FeatureBuffer, StreamingConfig, StreamingModeInfo, compute_streaming_config,
     get_streaming_modes,
 };
+use crate::audio::{load_wav, resample};
 use crate::core::ArrayExt;
 use crate::core::checkpoint::NemoCheckpoint;
 use crate::core::error::{Error, Result};
@@ -46,7 +45,7 @@ use crate::core::loading::{LoadOptions, Weights};
 use crate::asr::modules::MelProcessor as MelSpectrogram;
 
 /// Output from a transcription step.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TranscribeOutput {
     /// Transcribed text (accumulated since stream start)
     pub text: String,
@@ -109,83 +108,6 @@ fn is_silent(audio: &[f32], threshold: f32) -> bool {
     rms < threshold
 }
 
-/// Load a WAV file and return samples and sample rate.
-#[cfg(feature = "asr")]
-fn load_wav(path: &Path) -> Result<(Vec<f32>, u32)> {
-    use hound::WavReader;
-
-    tracing::debug!(path = %path.display(), "Loading WAV file");
-
-    let reader = WavReader::open(path)
-        .map_err(|e| Error::audio(format!("Failed to open WAV file: {}", e)))?;
-
-    let spec = reader.spec();
-    let sample_rate = spec.sample_rate;
-    let channels = spec.channels as usize;
-
-    let samples: Vec<f32> = match spec.sample_format {
-        hound::SampleFormat::Float => {
-            let samples: Vec<f32> = reader
-                .into_samples::<f32>()
-                .collect::<std::result::Result<Vec<_>, _>>()
-                .map_err(|e| Error::audio(format!("Failed to read samples: {}", e)))?;
-
-            if channels > 1 {
-                samples
-                    .chunks(channels)
-                    .map(|chunk| chunk.iter().sum::<f32>() / channels as f32)
-                    .collect()
-            } else {
-                samples
-            }
-        }
-        hound::SampleFormat::Int => {
-            let bits = spec.bits_per_sample;
-            let max_val = (1 << (bits - 1)) as f32;
-
-            let samples: Vec<i32> = reader
-                .into_samples::<i32>()
-                .collect::<std::result::Result<Vec<_>, _>>()
-                .map_err(|e| Error::audio(format!("Failed to read samples: {}", e)))?;
-
-            if channels > 1 {
-                samples
-                    .chunks(channels)
-                    .map(|chunk| {
-                        chunk.iter().map(|&s| s as f32).sum::<f32>() / (channels as f32 * max_val)
-                    })
-                    .collect()
-            } else {
-                samples.iter().map(|&s| s as f32 / max_val).collect()
-            }
-        }
-    };
-
-    tracing::debug!(
-        num_samples = samples.len(),
-        sample_rate,
-        duration_secs = samples.len() as f32 / sample_rate as f32,
-        "WAV file loaded"
-    );
-
-    Ok((samples, sample_rate))
-}
-
-#[cfg(not(feature = "asr"))]
-fn load_wav(_path: &Path) -> Result<(Vec<f32>, u32)> {
-    Err(Error::not_implemented(
-        "Audio loading requires the 'asr' feature",
-    ))
-}
-
-/// Resample audio to target sample rate.
-fn resample_audio(samples: &[f32], from_rate: u32, to_rate: u32) -> Result<Vec<f32>> {
-    if from_rate != to_rate {
-        tracing::debug!(from_rate, to_rate, "Resampling audio");
-    }
-    crate::audio::resample(samples, from_rate, to_rate)
-}
-
 /// Cache-aware RNN-T streaming pipeline.
 ///
 /// This pipeline handles:
@@ -222,7 +144,7 @@ pub struct CacheAwareRNNTPipeline {
     pub(super) encoder: ConformerEncoder,
     pub(super) decoder: PredictionNetwork,
     pub(super) joint: crate::asr::modules::RNNTJoint,
-    pub(super) tokenizer: Option<SentencePieceProcessor>,
+    pub(super) tokenizer: Option<Tokenizer>,
 
     // Streaming components
     pub(super) streaming_decoder: RnntStreamingDecoder,
@@ -250,10 +172,6 @@ pub struct CacheAwareRNNTPipeline {
     // Punctuation suppression
     pub(super) suppress_punctuation: bool,
     pub(super) punctuation_token_ids: Vec<usize>,
-    /// For each token id, whether it starts a new word
-    pub(super) word_start: Vec<bool>,
-    /// For each token id, whether it is a language tag such as `<en-US>`
-    pub(super) lang_tags: Vec<bool>,
     /// Leave language tags out of the text
     pub(super) strip_lang_tags: bool,
 
@@ -264,12 +182,28 @@ pub struct CacheAwareRNNTPipeline {
     silence_threshold: f32,
 }
 
+impl std::fmt::Debug for CacheAwareRNNTPipeline {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CacheAwareRNNTPipeline")
+            .field("sample_rate", &self.sample_rate())
+            .field("mode_idx", &self.streaming_config.mode_idx)
+            .field("blank_id", &self.blank_id)
+            .field("tokenizer", &self.tokenizer)
+            .field("language", &self.language())
+            .field("is_done", &self.is_done)
+            .finish_non_exhaustive()
+    }
+}
+
 impl CacheAwareRNNTPipeline {
     /// Restore a pipeline from a .nemo checkpoint.
     ///
     /// # Arguments
     /// * `path` - Path to the .nemo checkpoint file
-    /// * `mode_idx` - Streaming mode index (0 = highest latency)
+    /// * `mode_idx` - Streaming mode index into the checkpoint's `att_context_size` list (see
+    ///   `streaming_modes()` for each mode's latency). NeMo checkpoints list modes
+    ///   from most to least lookahead, so mode 0, the model's default, has the
+    ///   highest latency and accuracy
     ///
     /// Fails if the checkpoint lacks a tokenizer or any weight the model has;
     /// [`restore_with`](Self::restore_with) can allow that.
@@ -303,7 +237,7 @@ impl CacheAwareRNNTPipeline {
 
         // Load tokenizer
         let tokenizer = match checkpoint.find_tokenizer() {
-            Some(tokenizer_path) => Some(open_tokenizer(&tokenizer_path)?),
+            Some(tokenizer_path) => Some(Tokenizer::open(&tokenizer_path)?),
             None => {
                 options.missing_tokenizer(path)?;
                 None
@@ -313,7 +247,7 @@ impl CacheAwareRNNTPipeline {
         // Determine vocabulary size
         let vocab_size = tokenizer
             .as_ref()
-            .map(|t| t.len())
+            .map(|t| t.vocab_size())
             .unwrap_or(config.decoder.num_classes as usize);
 
         // Create decoder (prediction network)
@@ -422,9 +356,6 @@ impl CacheAwareRNNTPipeline {
             detokenizer: IncrementalDetokenizer::default(),
         };
 
-        let word_start = tokenizer.as_ref().map(word_start_table).unwrap_or_default();
-        let lang_tags = tokenizer.as_ref().map(lang_tag_table).unwrap_or_default();
-
         Ok(Self {
             config,
             preprocessor,
@@ -449,8 +380,6 @@ impl CacheAwareRNNTPipeline {
             n_mels,
             suppress_punctuation: false,
             punctuation_token_ids,
-            word_start,
-            lang_tags,
             strip_lang_tags: true,
             blank_threshold: 0.0,
             silence_threshold: 0.0,
@@ -466,7 +395,10 @@ impl CacheAwareRNNTPipeline {
     /// * `weights_path` - Path to the safetensors weights file
     /// * `config_path` - Path to the config file (YAML or JSON with NeMo AsrModelConfig schema)
     /// * `tokenizer_path` - Optional path to the SentencePiece tokenizer file
-    /// * `mode_idx` - Streaming mode index (0 = highest latency)
+    /// * `mode_idx` - Streaming mode index into the checkpoint's `att_context_size` list (see
+    ///   `streaming_modes()` for each mode's latency). NeMo checkpoints list modes
+    ///   from most to least lookahead, so mode 0, the model's default, has the
+    ///   highest latency and accuracy
     /// * `format` - Optional weight format. If None, auto-detects from safetensors metadata
     ///
     /// # Example
@@ -526,7 +458,10 @@ impl CacheAwareRNNTPipeline {
     ///
     /// # Arguments
     /// * `dir` - Path to the directory containing model files
-    /// * `mode_idx` - Streaming mode index (0 = highest latency)
+    /// * `mode_idx` - Streaming mode index into the checkpoint's `att_context_size` list (see
+    ///   `streaming_modes()` for each mode's latency). NeMo checkpoints list modes
+    ///   from most to least lookahead, so mode 0, the model's default, has the
+    ///   highest latency and accuracy
     ///
     /// # Example
     ///
@@ -579,7 +514,7 @@ impl CacheAwareRNNTPipeline {
 
         // Load tokenizer
         let tokenizer = match loader.tokenizer_path() {
-            Some(tokenizer_path) => Some(open_tokenizer(tokenizer_path)?),
+            Some(tokenizer_path) => Some(Tokenizer::open(tokenizer_path)?),
             None => {
                 options
                     .missing_tokenizer(loader.weights_path.parent().unwrap_or(Path::new(".")))?;
@@ -590,7 +525,7 @@ impl CacheAwareRNNTPipeline {
         // Determine vocabulary size
         let vocab_size = tokenizer
             .as_ref()
-            .map(|t| t.len())
+            .map(|t| t.vocab_size())
             .unwrap_or(config.decoder.num_classes as usize);
 
         // Create decoder (prediction network)
@@ -703,9 +638,6 @@ impl CacheAwareRNNTPipeline {
             detokenizer: IncrementalDetokenizer::default(),
         };
 
-        let word_start = tokenizer.as_ref().map(word_start_table).unwrap_or_default();
-        let lang_tags = tokenizer.as_ref().map(lang_tag_table).unwrap_or_default();
-
         Ok(Self {
             config,
             preprocessor,
@@ -730,8 +662,6 @@ impl CacheAwareRNNTPipeline {
             n_mels,
             suppress_punctuation: false,
             punctuation_token_ids,
-            word_start,
-            lang_tags,
             strip_lang_tags: true,
             blank_threshold: 0.0,
             silence_threshold: 0.0,
@@ -772,10 +702,16 @@ impl CacheAwareRNNTPipeline {
         self.state.detokenizer.reset();
     }
 
+    /// The pipeline's tokenizer, for turning token ids into text (`None` only
+    /// if a non-strict load found no tokenizer).
+    pub fn tokenizer(&self) -> Option<&Tokenizer> {
+        self.tokenizer.as_ref()
+    }
+
     /// The language named by the last language tag in `tokens`, e.g. `"en-US"`
     /// (see [`TranscribeOutput::tokens`]).
     pub fn detected_language(&self, tokens: &[usize]) -> Option<String> {
-        last_lang_tag(self.tokenizer.as_ref()?, &self.lang_tags, tokens)
+        self.tokenizer.as_ref()?.detected_language(tokens)
     }
 
     /// Get the sample rate expected by this pipeline.
@@ -882,7 +818,7 @@ impl CacheAwareRNNTPipeline {
     pub fn set_audio_file(&mut self, path: impl AsRef<Path>) -> Result<()> {
         self.reset();
 
-        let (samples, file_sample_rate) = load_wav(path.as_ref())?;
+        let (samples, file_sample_rate) = load_wav(path)?;
 
         // Resample if needed
         let samples = if file_sample_rate != self.sample_rate() {
@@ -891,7 +827,7 @@ impl CacheAwareRNNTPipeline {
                 to = self.sample_rate(),
                 "Resampling audio"
             );
-            resample_audio(&samples, file_sample_rate, self.sample_rate())?
+            resample(&samples, file_sample_rate, self.sample_rate())?
         } else {
             samples
         };
@@ -1356,8 +1292,8 @@ impl CacheAwareRNNTPipeline {
 
         let text = match &self.tokenizer {
             Some(tokenizer) => self.state.detokenizer.update(
-                tokenizer,
-                &self.word_start,
+                tokenizer.processor(),
+                tokenizer.word_start_table(),
                 self.strip_lang_tags,
                 &self.state.accumulated_tokens,
             ),
@@ -1452,12 +1388,6 @@ impl CacheAwareRNNTPipeline {
         self.process_audio_chunk(&audio)?;
         Ok(())
     }
-}
-
-/// Open a SentencePiece tokenizer model.
-fn open_tokenizer(path: &Path) -> Result<SentencePieceProcessor> {
-    SentencePieceProcessor::open(path)
-        .map_err(|e| Error::tokenizer(format!("Failed to load tokenizer: {}", e)))
 }
 
 #[cfg(test)]

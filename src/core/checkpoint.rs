@@ -322,6 +322,7 @@ impl NemoCheckpoint {
 }
 
 /// Builder for creating .nemo checkpoint files.
+#[derive(Debug)]
 pub struct NemoCheckpointWriter {
     config_yaml: Option<String>,
     weights: Option<HashMap<String, Array>>,

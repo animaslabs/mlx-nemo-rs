@@ -212,7 +212,7 @@ impl EncoderCache {
 }
 
 /// Information about a streaming mode.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct StreamingModeInfo {
     /// Index of this streaming mode.
     pub mode_idx: usize,

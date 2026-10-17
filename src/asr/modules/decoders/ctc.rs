@@ -11,6 +11,7 @@ use crate::core::loading::Weights;
 use crate::core::quantization::{LinearLayer, QuantizationConfig, load_linear_layer};
 
 /// CTC decoder that projects encoder output to vocabulary logits.
+#[derive(Debug)]
 pub struct CTCDecoder {
     #[allow(dead_code)]
     config: DecoderConfig,

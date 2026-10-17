@@ -18,6 +18,7 @@ use crate::core::ArrayExt;
 use crate::core::error::Result;
 
 /// Streaming state for the SortFormer diarizer (batch size 1).
+#[derive(Debug)]
 pub struct StreamingSortformerState {
     /// Long-term speaker memory [1, spkcache frames, d_model]
     pub spkcache: Array,

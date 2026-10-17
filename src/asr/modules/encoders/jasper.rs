@@ -19,6 +19,7 @@ use crate::core::loading::{Weights, load_batch_norm, load_conv1d};
 ///
 /// For separable convolutions: DepthwiseConv1d -> PointwiseConv1d(1x1) -> BatchNorm
 /// For regular convolutions: Conv1d -> BatchNorm
+#[derive(Debug)]
 struct SubBlock {
     /// Depthwise conv (only for separable blocks)
     dw_conv: Option<nn::Conv1d>,
@@ -100,6 +101,7 @@ impl SubBlock {
 }
 
 /// Residual connection branch: PointwiseConv1d(1x1) -> BatchNorm
+#[derive(Debug)]
 struct ResidualBranch {
     conv: nn::Conv1d,
     bn: nn::BatchNorm,
@@ -124,6 +126,7 @@ impl ResidualBranch {
 }
 
 /// A Jasper block containing multiple sub-blocks and optional residual connection.
+#[derive(Debug)]
 struct JasperBlock {
     sub_blocks: Vec<SubBlock>,
     residual: Option<Vec<ResidualBranch>>,
@@ -293,6 +296,7 @@ impl JasperBlock {
 ///
 /// Consists of a sequence of JasperBlocks, each containing depthwise separable
 /// or regular 1D convolutions with batch normalization.
+#[derive(Debug)]
 pub struct JasperEncoder {
     blocks: Vec<JasperBlock>,
     output_dim: usize,

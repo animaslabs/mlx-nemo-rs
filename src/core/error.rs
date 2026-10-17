@@ -16,7 +16,9 @@ pub enum Error {
     /// Error parsing configuration files.
     #[error("Configuration error: {message}")]
     Config {
+        /// What went wrong
         message: String,
+        /// The underlying error, if any
         #[source]
         source: Option<Box<dyn std::error::Error + Send + Sync>>,
     },
@@ -24,7 +26,9 @@ pub enum Error {
     /// Error loading or saving checkpoints.
     #[error("Checkpoint error: {message}")]
     Checkpoint {
+        /// What went wrong
         message: String,
+        /// The checkpoint file or directory, if known
         path: Option<PathBuf>,
     },
 
@@ -35,13 +39,20 @@ pub enum Error {
     /// Tensor shape mismatch.
     #[error("Shape mismatch: expected {expected:?}, got {actual:?}")]
     ShapeMismatch {
+        /// Expected shape
         expected: Vec<i32>,
+        /// Actual shape
         actual: Vec<i32>,
     },
 
     /// Type mismatch error.
     #[error("Type mismatch: expected {expected}, got {actual}")]
-    TypeMismatch { expected: String, actual: String },
+    TypeMismatch {
+        /// Expected type
+        expected: String,
+        /// Actual type
+        actual: String,
+    },
 
     /// MLX operation error.
     #[error("MLX error: {0}")]
