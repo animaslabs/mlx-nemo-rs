@@ -32,7 +32,7 @@ Add the crate from crates.io:
 mlx-voice = "0.1"
 ```
 
-ASR support is behind the `asr` feature, which is on by default.
+ASR support is behind the `asr` feature, which is on by default. The `internals` feature exposes the building blocks (encoder layers, decoders, streaming caches, checkpoint parsing) for research and debugging; their API may change in any release.
 
 ## Getting models
 

@@ -27,10 +27,10 @@ fn find_punctuation_tokens(tokenizer: &Tokenizer) -> Vec<usize> {
 }
 use crate::asr::Tokenizer;
 use crate::asr::decoding::{IncrementalDetokenizer, RnntStreamingDecoder};
-use crate::asr::models::{DecoderState, PredictionNetwork};
 use crate::asr::modules::{
     ConformerEncoder, LanguagePrompt, MelProcessor, StreamingMel, StreamingMelConfig,
 };
+use crate::asr::modules::{DecoderState, PredictionNetwork};
 use crate::asr::streaming::{
     EncoderCache, FeatureBuffer, StreamingConfig, StreamingModeInfo, compute_streaming_config,
     get_streaming_modes,
@@ -41,11 +41,9 @@ use crate::core::checkpoint::NemoCheckpoint;
 use crate::core::error::{Error, Result};
 use crate::core::loading::{LoadOptions, Weights};
 
-// Type alias for backwards compatibility
-use crate::asr::modules::MelProcessor as MelSpectrogram;
-
 /// Output from a transcription step.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct TranscribeOutput {
     /// Transcribed text (accumulated since stream start)
     pub text: String,
@@ -227,10 +225,9 @@ impl CacheAwareRNNTPipeline {
 
         // Create preprocessor with dither disabled for inference
         // NeMo only applies dither during training, not inference
-        let mut preproc_config: crate::asr::modules::MelSpectrogramConfig =
-            config.preprocessor.clone().into();
+        let mut preproc_config: crate::asr::modules::MelConfig = config.preprocessor.clone().into();
         preproc_config.dither = 0.0;
-        let preprocessor = MelSpectrogram::new(preproc_config.clone())?;
+        let preprocessor = MelProcessor::new(preproc_config.clone())?;
 
         // Create encoder
         let mut encoder = ConformerEncoder::new(config.encoder.clone())?;
@@ -295,7 +292,7 @@ impl CacheAwareRNNTPipeline {
         // Load weights (.nemo files are not quantized)
         let tensors = checkpoint.load_weights()?;
         let weights = Weights::new(&tensors, options);
-        // Note: MelSpectrogram doesn't need weight loading (uses fixed mel filterbanks)
+        // Note: MelProcessor doesn't need weight loading (uses fixed mel filterbanks)
         encoder.load_weights(&weights, None)?;
         decoder.load_weights(&weights, "decoder", None)?;
         joint.load_weights(&weights, "joint", None)?;
@@ -504,10 +501,9 @@ impl CacheAwareRNNTPipeline {
         config.validate()?;
 
         // Create preprocessor with dither disabled for inference
-        let mut preproc_config: crate::asr::modules::MelSpectrogramConfig =
-            config.preprocessor.clone().into();
+        let mut preproc_config: crate::asr::modules::MelConfig = config.preprocessor.clone().into();
         preproc_config.dither = 0.0;
-        let preprocessor = MelSpectrogram::new(preproc_config.clone())?;
+        let preprocessor = MelProcessor::new(preproc_config.clone())?;
 
         // Create encoder
         let mut encoder = ConformerEncoder::new(config.encoder.clone())?;
@@ -517,7 +513,7 @@ impl CacheAwareRNNTPipeline {
             Some(tokenizer_path) => Some(Tokenizer::open(tokenizer_path)?),
             None => {
                 options
-                    .missing_tokenizer(loader.weights_path.parent().unwrap_or(Path::new(".")))?;
+                    .missing_tokenizer(loader.weights_path().parent().unwrap_or(Path::new(".")))?;
                 None
             }
         };
@@ -577,7 +573,7 @@ impl CacheAwareRNNTPipeline {
         tracing::debug!(
             "Loading {} weight tensors (format: {:?}, quantized: {})",
             weights.len(),
-            loader.weight_format,
+            loader.weight_format(),
             quant.is_some()
         );
         encoder.load_weights(&weights, quant)?;
@@ -1340,21 +1336,24 @@ impl CacheAwareRNNTPipeline {
     }
 
     /// Get a reference to the encoder.
+    #[cfg(feature = "internals")]
     pub fn encoder(&self) -> &ConformerEncoder {
         &self.encoder
     }
 
     /// Get a reference to the preprocessor.
-    pub fn preprocessor(&self) -> &MelSpectrogram {
+    pub fn preprocessor(&self) -> &MelProcessor {
         &self.preprocessor
     }
 
     /// Get a reference to the prediction network (decoder).
+    #[cfg(feature = "internals")]
     pub fn prediction_network(&self) -> &PredictionNetwork {
         &self.decoder
     }
 
     /// Get a reference to the joint network.
+    #[cfg(feature = "internals")]
     pub fn joint(&self) -> &crate::asr::modules::RNNTJoint {
         &self.joint
     }

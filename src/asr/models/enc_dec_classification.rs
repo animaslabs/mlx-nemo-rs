@@ -23,12 +23,11 @@ use mlx_rs::ops;
 use mlx_rs::Array;
 
 use crate::asr::config::ClassificationModelConfig;
-use crate::asr::modules::MelSpectrogram;
+use crate::asr::modules::MelProcessor;
 use crate::asr::modules::encoders::JasperEncoder;
 use crate::audio::{load_wav, resample};
 use crate::core::ArrayExt;
 use crate::core::checkpoint::NemoCheckpoint;
-use crate::core::config::from_yaml_str;
 use crate::core::error::Result;
 use crate::core::loading::{LoadOptions, LoadReport, Weights};
 use crate::core::quantization::LinearLayer;
@@ -41,7 +40,7 @@ use crate::core::quantization::LinearLayer;
 /// 3. Linear decoder for frame-level classification
 pub struct EncDecClassificationModel {
     config: ClassificationModelConfig,
-    preprocessor: MelSpectrogram,
+    preprocessor: MelProcessor,
     encoder: JasperEncoder,
     decoder: LinearLayer,
     num_classes: usize,
@@ -62,7 +61,7 @@ impl EncDecClassificationModel {
         // Disable dithering for inference to ensure deterministic mel output
         let mut mel_config: crate::asr::modules::MelConfig = config.preprocessor.clone().into();
         mel_config.dither = 0.0;
-        let preprocessor = MelSpectrogram::new(mel_config)?;
+        let preprocessor = MelProcessor::new(mel_config)?;
         let encoder = JasperEncoder::new(&config.encoder)?;
 
         let feat_in = encoder.output_dim();
@@ -95,9 +94,9 @@ impl EncDecClassificationModel {
         let path = path.as_ref();
         tracing::info!("Loading classification model from: {}", path.display());
 
-        let checkpoint = NemoCheckpoint::open(path).or_else(|_| NemoCheckpoint::open_gzip(path))?;
+        let checkpoint = NemoCheckpoint::open(path)?;
 
-        let config: ClassificationModelConfig = from_yaml_str(&checkpoint.config_yaml)?;
+        let config: ClassificationModelConfig = checkpoint.load_config()?;
 
         tracing::debug!(
             "Classification model config loaded, {} jasper blocks",

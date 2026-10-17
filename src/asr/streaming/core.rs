@@ -49,6 +49,7 @@ use crate::core::error::{Error, Result};
 ///
 /// This mirrors NeMo's `CacheAwareStreamingConfig` dataclass.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct StreamingConfig {
     /// Size of each chunk at each step (frames after subsampling).
     /// Tuple of (first_chunk_size, subsequent_chunk_size).
@@ -213,6 +214,7 @@ impl EncoderCache {
 
 /// Information about a streaming mode.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct StreamingModeInfo {
     /// Index of this streaming mode.
     pub mode_idx: usize,
@@ -267,6 +269,7 @@ impl StreamingModeInfo {
 
 /// Output from streaming inference.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct StreamingOutput {
     /// Log probabilities (if requested): [batch, time, vocab]
     pub log_probs: Option<Array>,

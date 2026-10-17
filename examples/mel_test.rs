@@ -1,6 +1,6 @@
 //! Test mel spectrogram computation for comparison with Python NeMo.
 
-use mlx_voice::asr::modules::{MelSpectrogram, MelSpectrogramConfig};
+use mlx_voice::asr::modules::{MelConfig, MelProcessor};
 use mlx_voice::asr::streaming::StreamingMelBuffer;
 
 fn main() -> mlx_voice::Result<()> {
@@ -17,26 +17,25 @@ fn main() -> mlx_voice::Result<()> {
     // Create preprocessor with NeMo config
     // NeMo's FilterbankFeatures has a hardcoded default of preemph=0.97
     // Python NeMo only applies dither in training mode, not inference
-    let config = MelSpectrogramConfig {
-        sample_rate: 16000,
-        window_size: 0.025,
-        window_stride: 0.01,
-        window: "hann".to_string(),
-        features: 128,
-        n_fft: 512,
-        log: true,
-        normalize: "NA".to_string(),
-        dither: 0.0,         // Disable dither (Python only dithers in training mode)
-        preemph: Some(0.97), // NeMo default - FilterbankFeatures has preemph=0.97 hardcoded
-        fmin: 0.0,
-        fmax: None,
-    };
+    let mut config = MelConfig::default();
+    config.sample_rate = 16000;
+    config.window_size = 0.025;
+    config.window_stride = 0.01;
+    config.window = "hann".to_string();
+    config.features = 128;
+    config.n_fft = 512;
+    config.log = true;
+    config.normalize = "NA".to_string();
+    config.dither = 0.0; // Disable dither (Python only dithers in training mode)
+    config.preemph = Some(0.97); // NeMo default - FilterbankFeatures has preemph=0.97 hardcoded
+    config.fmin = 0.0;
+    config.fmax = None;
 
     println!("\nPreprocessor config:");
     println!("  preemph: {:?}", config.preemph);
     println!("  dither: {}", config.dither);
 
-    let mel_proc = MelSpectrogram::new(config)?;
+    let mel_proc = MelProcessor::new(config)?;
 
     // Process first chunk (same as Python streaming: 19360 samples for 121 mel frames)
     let chunk_samples = 19360;
@@ -152,22 +151,21 @@ fn main() -> mlx_voice::Result<()> {
     // ===== Test multiple chunks like streaming =====
     println!("\n=== Testing Multi-chunk Streaming ===");
 
-    let config2 = MelSpectrogramConfig {
-        sample_rate: 16000,
-        window_size: 0.025,
-        window_stride: 0.01,
-        window: "hann".to_string(),
-        features: 128,
-        n_fft: 512,
-        log: true,
-        normalize: "NA".to_string(),
-        dither: 0.0,
-        preemph: Some(0.97), // NeMo default
-        fmin: 0.0,
-        fmax: None,
-    };
+    let mut config2 = MelConfig::default();
+    config2.sample_rate = 16000;
+    config2.window_size = 0.025;
+    config2.window_stride = 0.01;
+    config2.window = "hann".to_string();
+    config2.features = 128;
+    config2.n_fft = 512;
+    config2.log = true;
+    config2.normalize = "NA".to_string();
+    config2.dither = 0.0;
+    config2.preemph = Some(0.97); // NeMo default
+    config2.fmin = 0.0;
+    config2.fmax = None;
 
-    let mel_proc2 = MelSpectrogram::new(config2)?;
+    let mel_proc2 = MelProcessor::new(config2)?;
     let mut buffer2 = StreamingMelBuffer::new(16000, 0.025, 0.01, 128, 512);
 
     // Process audio in multiple chunks (simulating streaming)

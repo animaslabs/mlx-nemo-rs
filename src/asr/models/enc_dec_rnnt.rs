@@ -35,8 +35,8 @@ use crate::asr::Tokenizer;
 use crate::asr::config::{AsrModelConfig, JointConfig};
 use crate::asr::decoding::{RnntStreamingDecoder, rnnt_beam_decode};
 use crate::asr::modules::{
-    ConformerEncoder, LanguagePrompt, LstmState, MelSpectrogram, MelSpectrogramConfig, RNNTDecoder,
-    RNNTJoint, StatelessTransducerDecoder,
+    ConformerEncoder, DecoderState, LanguagePrompt, MelConfig, MelProcessor, PredictionNetwork,
+    RNNTDecoder, RNNTJoint, StatelessTransducerDecoder,
 };
 use crate::asr::streaming::{
     EncoderCache, StreamingConfig, StreamingMelBuffer, StreamingModeInfo, StreamingOutput,
@@ -45,7 +45,6 @@ use crate::asr::streaming::{
 use crate::audio::resample;
 use crate::core::ArrayExt;
 use crate::core::checkpoint::NemoCheckpoint;
-use crate::core::config::from_yaml_str;
 use crate::core::error::{Error, Result};
 use crate::core::loading::{LoadOptions, LoadReport, Weights};
 use crate::core::quantization::QuantizationConfig;
@@ -57,6 +56,7 @@ use mlx_rs::ops::indexing::IndexOp;
 /// Applies to [`EncDecRNNTModel::transcribe`]. Streaming decoding is always
 /// greedy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub enum RnntDecodingStrategy {
     /// Greedy decoding (fast)
     #[default]
@@ -67,163 +67,6 @@ pub enum RnntDecodingStrategy {
         /// Number of hypotheses kept per frame
         beam_size: usize,
     },
-}
-
-/// Prediction network type (stateless or LSTM-based).
-#[derive(Debug)]
-pub enum PredictionNetwork {
-    /// Stateless decoder (embedding-based)
-    Stateless(StatelessTransducerDecoder),
-    /// LSTM-based decoder
-    Lstm(RNNTDecoder),
-}
-
-/// Decoder state type.
-#[derive(Debug, Clone)]
-pub enum DecoderState {
-    /// Stateless decoder state (context buffer)
-    Stateless(Array),
-    /// LSTM decoder state (hidden + cell)
-    Lstm(LstmState),
-}
-
-impl DecoderState {
-    /// Compute a summary norm of the decoder state for debugging.
-    pub fn compute_norm(&self) -> f32 {
-        match self {
-            DecoderState::Stateless(arr) => {
-                arr.eval().ok();
-                let data = arr.to_vec_row_major::<f32>().unwrap_or_default();
-                if !data.is_empty() {
-                    // Sample first 100 values for efficiency
-                    let sample_len = data.len().min(100);
-                    data[..sample_len].iter().map(|v| v * v).sum::<f32>().sqrt()
-                } else {
-                    0.0
-                }
-            }
-            DecoderState::Lstm(lstm_state) => {
-                // Compute norm of hidden state
-                lstm_state.hidden.eval().ok();
-                let data = lstm_state
-                    .hidden
-                    .to_vec_row_major::<f32>()
-                    .unwrap_or_default();
-                if !data.is_empty() {
-                    let sample_len = data.len().min(100);
-                    data[..sample_len].iter().map(|v| v * v).sum::<f32>().sqrt()
-                } else {
-                    0.0
-                }
-            }
-        }
-    }
-}
-
-impl PredictionNetwork {
-    /// Get the prediction network hidden dimension.
-    pub fn pred_hidden(&self) -> usize {
-        match self {
-            Self::Stateless(d) => d.pred_hidden(),
-            Self::Lstm(d) => d.pred_hidden(),
-        }
-    }
-
-    /// Get the blank token index.
-    pub fn blank_idx(&self) -> usize {
-        match self {
-            Self::Stateless(d) => d.blank_idx(),
-            Self::Lstm(d) => d.blank_idx(),
-        }
-    }
-
-    /// Get the vocabulary size (excluding blank).
-    pub fn vocab_size(&self) -> usize {
-        match self {
-            Self::Stateless(d) => d.vocab_size(),
-            Self::Lstm(d) => d.vocab_size(),
-        }
-    }
-
-    /// Initialize decoder state for a batch.
-    pub fn initialize_state(&self, batch_size: usize) -> Result<DecoderState> {
-        match self {
-            Self::Stateless(d) => Ok(DecoderState::Stateless(d.initialize_state(batch_size)?)),
-            Self::Lstm(d) => Ok(DecoderState::Lstm(d.initialize_state(batch_size)?)),
-        }
-    }
-
-    /// Initialize decoder state with warmup, matching NeMo's add_sos=True behavior.
-    ///
-    /// NeMo's decoder.predict(y=None, state=None, add_sos=True) runs the LSTM twice
-    /// with blank inputs to "warm up" the state before decoding. This method
-    /// replicates that behavior by:
-    /// 1. Initialize state with zeros
-    /// 2. Run predict_one(None) to get first output and updated state
-    /// 3. Run predict_one(None) again to get the warmed up state
-    ///
-    /// Returns the prediction output and state after the warmup.
-    pub fn initialize_state_with_warmup(&self, batch_size: usize) -> Result<(Array, DecoderState)> {
-        // Initialize with zeros
-        let state = self.initialize_state(batch_size)?;
-
-        // First pass: blank input with zeros state
-        let (_, state1) = self.predict_one(None, &state)?;
-
-        // Second pass: blank input with updated state (matches NeMo's add_sos=True output[-1])
-        let (output, state2) = self.predict_one(None, &state1)?;
-
-        Ok((output, state2))
-    }
-
-    /// Run a single-step prediction for decoding.
-    ///
-    /// # Arguments
-    /// * `y` - Single token index [batch, 1] or None for blank/SOS
-    /// * `state` - Previous decoder state
-    ///
-    /// # Returns
-    /// * `(output, new_state)` where output is [batch, 1, pred_hidden]
-    pub fn predict_one(
-        &self,
-        y: Option<&Array>,
-        state: &DecoderState,
-    ) -> Result<(Array, DecoderState)> {
-        match (self, state) {
-            (Self::Stateless(decoder), DecoderState::Stateless(s)) => {
-                let (output, new_state) = decoder.predict_one(y, s)?;
-                Ok((output, DecoderState::Stateless(new_state)))
-            }
-            (Self::Lstm(decoder), DecoderState::Lstm(s)) => {
-                let (output, new_state) = decoder.predict_one(y, s)?;
-                Ok((output, DecoderState::Lstm(new_state)))
-            }
-            _ => Err(Error::model("Decoder and state type mismatch".to_string())),
-        }
-    }
-
-    /// Load weights from a checkpoint.
-    ///
-    /// # Arguments
-    /// * `weights` - Weight dictionary
-    /// * `prefix` - Key prefix for this layer
-    /// * `quant` - Optional quantization config for quantized models
-    pub fn load_weights(
-        &mut self,
-        weights: &Weights,
-        prefix: &str,
-        quant: Option<&QuantizationConfig>,
-    ) -> Result<()> {
-        match self {
-            Self::Stateless(d) => d.load_weights(weights, prefix, quant),
-            Self::Lstm(d) => d.load_weights(weights, prefix, quant),
-        }
-    }
-
-    /// Check if this is an LSTM-based decoder.
-    pub fn is_lstm(&self) -> bool {
-        matches!(self, Self::Lstm(_))
-    }
 }
 
 /// Encoder-Decoder RNN-T ASR Model.
@@ -250,7 +93,7 @@ impl PredictionNetwork {
 /// ```
 pub struct EncDecRNNTModel {
     config: AsrModelConfig,
-    preprocessor: MelSpectrogram,
+    preprocessor: MelProcessor,
     encoder: ConformerEncoder,
     decoder: PredictionNetwork,
     joint: RNNTJoint,
@@ -262,6 +105,13 @@ pub struct EncDecRNNTModel {
     chunk_count: usize,
     /// Leave language tags out of transcribed text
     strip_lang_tags: bool,
+}
+
+impl RnntStreamingSession {
+    /// The session's streaming configuration (chunk and cache sizes).
+    pub fn config(&self) -> &StreamingConfig {
+        &self.config
+    }
 }
 
 impl std::fmt::Debug for EncDecRNNTModel {
@@ -284,9 +134,9 @@ impl EncDecRNNTModel {
         config.validate()?;
         // NeMo only dithers during training; at inference it would make the
         // output random
-        let mut preproc_config: MelSpectrogramConfig = config.preprocessor.clone().into();
+        let mut preproc_config: MelConfig = config.preprocessor.clone().into();
         preproc_config.dither = 0.0;
-        let preprocessor = MelSpectrogram::new(preproc_config)?;
+        let preprocessor = MelProcessor::new(preproc_config)?;
         let encoder = ConformerEncoder::new(config.encoder.clone())?;
 
         // Determine vocabulary size from config or default
@@ -383,13 +233,10 @@ impl EncDecRNNTModel {
         tracing::info!("Loading RNNT model from: {}", path.display());
 
         // Open the checkpoint
-        let checkpoint = NemoCheckpoint::open(path).or_else(|_| {
-            // Try gzip format for older checkpoints
-            NemoCheckpoint::open_gzip(path)
-        })?;
+        let checkpoint = NemoCheckpoint::open(path)?;
 
         // Parse the configuration
-        let config: AsrModelConfig = from_yaml_str(&checkpoint.config_yaml)?;
+        let config: AsrModelConfig = checkpoint.load_config()?;
 
         // Verify this is an RNNT model
         if !config.is_rnnt() {
@@ -522,7 +369,7 @@ impl EncDecRNNTModel {
         tracing::debug!(
             "Loading {} weight tensors (format: {:?}, quantized: {})",
             weights.len(),
-            loader.weight_format,
+            loader.weight_format(),
             quant.is_some()
         );
         model.load_weights(&weights, quant)?;
@@ -601,7 +448,7 @@ impl EncDecRNNTModel {
         tracing::debug!(
             "Loading {} weight tensors (format: {:?}, quantized: {})",
             weights.len(),
-            loader.weight_format,
+            loader.weight_format(),
             quant.is_some()
         );
         model.load_weights_with(&weights, quant, options)?;
@@ -908,21 +755,24 @@ impl EncDecRNNTModel {
     }
 
     /// Get a reference to the preprocessor.
-    pub fn preprocessor(&self) -> &MelSpectrogram {
+    pub fn preprocessor(&self) -> &MelProcessor {
         &self.preprocessor
     }
 
     /// Get a reference to the encoder.
+    #[cfg(feature = "internals")]
     pub fn encoder(&self) -> &ConformerEncoder {
         &self.encoder
     }
 
     /// Get a reference to the prediction network.
+    #[cfg(feature = "internals")]
     pub fn prediction_network(&self) -> &PredictionNetwork {
         &self.decoder
     }
 
     /// Get a reference to the joint network.
+    #[cfg(feature = "internals")]
     pub fn joint(&self) -> &RNNTJoint {
         &self.joint
     }
@@ -1337,25 +1187,25 @@ impl EncDecRNNTModel {
 #[derive(Debug)]
 pub struct RnntStreamingSession {
     /// Streaming configuration
-    pub config: StreamingConfig,
+    config: StreamingConfig,
 
     /// Encoder cache state
-    pub encoder_cache: EncoderCache,
+    encoder_cache: EncoderCache,
 
     /// Mel spectrogram buffer (stores pre-computed mel frames)
-    pub mel_buffer: StreamingMelBuffer,
+    mel_buffer: StreamingMelBuffer,
 
     /// Decoder states for each batch sample
-    pub decoder_states: Vec<DecoderState>,
+    decoder_states: Vec<DecoderState>,
 
     /// Last emitted token for each batch sample
-    pub last_tokens: Vec<Option<usize>>,
+    last_tokens: Vec<Option<usize>>,
 
     /// All accumulated tokens for each batch sample
-    pub accumulated_tokens: Vec<Vec<usize>>,
+    accumulated_tokens: Vec<Vec<usize>>,
 
     /// Whether this is the first chunk (determines chunk_size and pre_encode_cache)
-    pub is_first_chunk: bool,
+    is_first_chunk: bool,
 
     /// Blank token ID
     blank_id: usize,

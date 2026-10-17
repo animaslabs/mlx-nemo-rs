@@ -5,7 +5,7 @@
 
 use mlx_rs::Array;
 use mlx_voice::asr::config::AsrModelConfig;
-use mlx_voice::asr::modules::{ConformerEncoder, MelSpectrogram, MelSpectrogramConfig};
+use mlx_voice::asr::modules::{ConformerEncoder, MelConfig, MelProcessor};
 use mlx_voice::core::checkpoint::NemoCheckpoint;
 
 fn main() -> mlx_voice::Result<()> {
@@ -41,9 +41,9 @@ fn main() -> mlx_voice::Result<()> {
     let config: AsrModelConfig = checkpoint.load_config()?;
 
     // Create preprocessor
-    let mut preproc_config: MelSpectrogramConfig = config.preprocessor.clone().into();
+    let mut preproc_config: MelConfig = config.preprocessor.clone().into();
     preproc_config.dither = 0.0;
-    let mel_proc = MelSpectrogram::new(preproc_config.clone())?;
+    let mel_proc = MelProcessor::new(preproc_config.clone())?;
 
     // Create encoder
     let mut encoder = ConformerEncoder::new(config.encoder.clone())?;
