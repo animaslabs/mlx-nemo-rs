@@ -9,13 +9,13 @@
 //! `[spkcache, fifo, chunk]`, which is what keeps speaker indices stable
 //! across chunks.
 
+use mlx_rs::Array;
 use mlx_rs::ops;
 use mlx_rs::ops::indexing::IndexOp;
-use mlx_rs::Array;
 
 use crate::asr::config::SortformerModulesConfig;
-use crate::core::error::Result;
 use crate::core::ArrayExt;
+use crate::core::error::Result;
 
 /// Streaming state for the SortFormer diarizer (batch size 1).
 pub struct StreamingSortformerState {

@@ -9,6 +9,7 @@ mlx-voice loads NeMo checkpoints (`.nemo` archives) or converted MLX safetensors
 - **CTC ASR**: `EncDecCTCModel` (e.g. `nvidia/parakeet-ctc-0.6b`)
 - **RNN-T / Transducer ASR**: `EncDecRNNTModel` with greedy or beam search decoding (e.g. `nvidia/parakeet-rnnt-0.6b`)
 - **Cache-aware streaming**: `CacheAwareRNNTPipeline` for low-latency incremental transcription with selectable latency modes (e.g. `nvidia/nemotron-speech-streaming-en-0.6b`)
+- **Multilingual streaming**: language-ID prompt conditioning for `nvidia/nemotron-3.5-asr-streaming-0.6b` (40 language-locales), with a chosen target language or automatic language detection
 - **Voice activity detection**: `EncDecClassificationModel` with NeMo-style post-processing (e.g. `nvidia/Frame_VAD_Multilingual_MarbleNet_v2.0`)
 - **Multi-talker transcription**: `MultiTalkerPipeline` combines streaming ASR with streaming Sortformer diarization (e.g. `nvidia/diar_streaming_sortformer_4spk-v2.1`). With a multitalker model (`nvidia/multitalker-parakeet-streaming-0.6b-v1`) it runs one speaker-conditioned ASR instance per speaker and transcribes overlapping speech; with an ordinary streaming model it attributes a single transcript to speakers
 - **FastConformer encoder**, mel-spectrogram preprocessing, and SentencePiece tokenization matching NeMo
@@ -43,6 +44,7 @@ cargo xtask download nvidia/parakeet-rnnt-0.6b
 
 # Gated models need a Hugging Face token (or set HF_TOKEN)
 cargo xtask download nvidia/nemotron-speech-streaming-en-0.6b --token $HF_TOKEN
+cargo xtask download nvidia/nemotron-3.5-asr-streaming-0.6b --file nemotron-3.5-asr-streaming-0.6b.nemo
 
 # Download only specific files
 cargo xtask download nvidia/parakeet-ctc-0.6b --file parakeet-ctc-0.6b.nemo
@@ -50,7 +52,7 @@ cargo xtask download nvidia/parakeet-ctc-0.6b --file parakeet-ctc-0.6b.nemo
 
 Models can be loaded from:
 
-- a `.nemo` file (a TAR archive with `model_config.yaml`, `model_weights.ckpt` and the tokenizer)
+- a `.nemo` file (a TAR archive, plain or gzip-compressed, with `model_config.yaml`, `model_weights.ckpt` and the tokenizer)
 - a `.safetensors` file with `config.yaml` and a tokenizer next to it
 - a directory containing `model.safetensors`, a config, and `tokenizer.model`
 
@@ -103,6 +105,22 @@ fn main() -> mlx_voice::Result<()> {
 ```
 
 For a whole file, `pipeline.set_audio_file("audio.wav")?` followed by `pipeline.run()?` returns the full transcript.
+
+### Multilingual transcription
+
+`nvidia/nemotron-3.5-asr-streaming-0.6b` conditions its output on a target language. It starts in `"auto"` mode, where the model detects the language and emits a tag such as `<de-DE>` after each sentence's terminal punctuation. Tags are stripped from the text by default but stay in the token ids:
+
+```rust
+let mut pipeline = CacheAwareRNNTPipeline::restore(
+    "models/nvidia/nemotron-3.5-asr-streaming-0.6b/nemotron-3.5-asr-streaming-0.6b.nemo",
+    3, // [56, 13]: 1.12 s chunks
+)?;
+pipeline.set_language("de-DE")?; // or "de", "auto"; see pipeline.languages()
+pipeline.set_audio_file("audio.wav")?;
+let text = pipeline.run()?;
+```
+
+`set_strip_lang_tags(false)` keeps the tags in the text, and `detected_language(&output.tokens)` returns the last detected language. `EncDecRNNTModel` has the same `set_language` / `set_strip_lang_tags` / `detected_language` methods. The `streaming`, `transcribe_rnnt` and `eval` examples take `--language` (`--target-lang` for `eval`).
 
 ### Multi-talker transcription
 

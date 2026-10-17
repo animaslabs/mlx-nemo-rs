@@ -8,15 +8,15 @@
 //! - Processes chunks of encoder output incrementally
 //! - Tracks labels including blanks (for future endpointing support)
 
-use mlx_rs::ops::indexing::{argmax_axis, IndexOp};
-use mlx_rs::ops::{self, max_axis};
 use mlx_rs::Array;
+use mlx_rs::ops::indexing::{IndexOp, argmax_axis};
+use mlx_rs::ops::{self, max_axis};
 use tracing::debug;
 
 use crate::asr::models::{DecoderState, PredictionNetwork};
 use crate::asr::modules::RNNTJoint;
-use crate::core::error::Result;
 use crate::core::ArrayExt;
+use crate::core::error::Result;
 
 /// Encoder frames scored per GPU round trip while the prediction is unchanged.
 const DECODE_WINDOW: usize = 32;

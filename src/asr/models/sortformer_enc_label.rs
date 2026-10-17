@@ -28,19 +28,19 @@
 use std::collections::HashMap;
 use std::path::Path;
 
+use mlx_rs::Array;
 use mlx_rs::ops;
 use mlx_rs::ops::indexing::IndexOp;
-use mlx_rs::Array;
 
 use crate::asr::config::{SortformerConfig, SortformerModulesConfig};
 use crate::asr::modules::encoders::transformer::TransformerEncoder;
 use crate::asr::modules::sortformer::SortformerModules;
 use crate::asr::modules::{ConformerEncoder, MelConfig, MelProcessor};
 use crate::asr::streaming::StreamingSortformerState;
+use crate::core::ArrayExt;
 use crate::core::checkpoint::NemoCheckpoint;
 use crate::core::config::from_yaml_str;
 use crate::core::error::Result;
-use crate::core::ArrayExt;
 
 /// SortFormer diarization model.
 pub struct SortformerEncLabelModel {

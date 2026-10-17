@@ -49,12 +49,12 @@
 use std::sync::Arc;
 
 use mlx_rs::ops::indexing::IndexOp;
-use mlx_rs::{ops, Array};
+use mlx_rs::{Array, ops};
 
 use crate::asr::config::PreprocessorConfig;
 use crate::asr::dsp;
-use crate::core::error::{Error, Result};
 use crate::core::ArrayExt;
+use crate::core::error::{Error, Result};
 
 /// Hook for modifying the power spectrum between STFT and mel filterbank.
 ///
@@ -902,11 +902,7 @@ impl StreamingMelConfig {
 
     /// Minimum new frames a final, shorter chunk needs (NeMo's sampling frames).
     pub fn min_frames_for_chunk(&self, is_first: bool) -> usize {
-        if is_first {
-            1
-        } else {
-            self.subsampling_factor
-        }
+        if is_first { 1 } else { self.subsampling_factor }
     }
 }
 

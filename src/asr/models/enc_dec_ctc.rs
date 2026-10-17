@@ -46,8 +46,8 @@ use crate::asr::config::AsrModelConfig;
 use crate::asr::decoding::{greedy_ctc_merge, greedy_decode, lcs_merge_buffer};
 use crate::asr::modules::{CTCDecoder, ConformerEncoder, MelSpectrogram};
 use crate::asr::streaming::{
-    compute_streaming_config, get_streaming_modes, EncoderCache, StreamingConfig,
-    StreamingModeInfo, StreamingOutput,
+    EncoderCache, StreamingConfig, StreamingModeInfo, StreamingOutput, compute_streaming_config,
+    get_streaming_modes,
 };
 use crate::audio::resample;
 use crate::core::checkpoint::NemoCheckpoint;

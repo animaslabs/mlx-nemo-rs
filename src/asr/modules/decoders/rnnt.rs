@@ -6,14 +6,15 @@
 
 use std::collections::HashMap;
 
-use mlx_rs::ops::{self, indexing::IndexOp};
 use mlx_rs::Array;
+use mlx_rs::ops::{self, indexing::IndexOp};
 use tracing::{debug, instrument, trace, trace_span};
 
 use crate::asr::config::{DecoderConfig, JointConfig};
+use crate::asr::modules::LanguagePrompt;
 use crate::core::error::{Error, Result};
 use crate::core::quantization::{
-    load_embedding_layer, load_linear_layer, EmbeddingLayer, LinearLayer, QuantizationConfig,
+    EmbeddingLayer, LinearLayer, QuantizationConfig, load_embedding_layer, load_linear_layer,
 };
 
 /// Stateless Transducer Decoder (Prediction Network).
@@ -843,6 +844,9 @@ impl JointActivation {
 ///
 /// where h is encoder output and g is prediction network output.
 pub struct RNNTJoint {
+    /// Language-ID conditioning applied to encoder frames before `encoder_proj`
+    /// (prompt-conditioned models only)
+    prompt: Option<LanguagePrompt>,
     /// Projection from encoder hidden to joint hidden (supports quantized weights)
     encoder_proj: LinearLayer,
     /// Projection from prediction hidden to joint hidden (supports quantized weights)
@@ -893,6 +897,7 @@ impl RNNTJoint {
         let joint_proj = create_linear(vocab_size, joint_hidden)?;
 
         Ok(Self {
+            prompt: None,
             encoder_proj,
             pred_proj,
             joint_proj,
@@ -905,6 +910,21 @@ impl RNNTJoint {
     /// Get vocabulary size (including blank).
     pub fn vocab_size(&self) -> usize {
         self.vocab_size
+    }
+
+    /// Condition every encoder frame on a language prompt before projecting it.
+    pub fn set_prompt(&mut self, prompt: Option<LanguagePrompt>) {
+        self.prompt = prompt;
+    }
+
+    /// The language prompt, for prompt-conditioned models.
+    pub fn prompt(&self) -> Option<&LanguagePrompt> {
+        self.prompt.as_ref()
+    }
+
+    /// Mutable language prompt, e.g. to change the target language.
+    pub fn prompt_mut(&mut self) -> Option<&mut LanguagePrompt> {
+        self.prompt.as_mut()
     }
 
     /// Joint forward pass.
@@ -942,7 +962,7 @@ impl RNNTJoint {
 
         // Project encoder: [B, T, joint_hidden]
         trace!("Projecting encoder output");
-        let enc_proj = self.encoder_proj.forward(encoder_output)?;
+        let enc_proj = self.project_encoder(encoder_output)?;
         trace!(enc_proj_shape = ?enc_proj.shape(), "Encoder projection complete");
 
         // Project prediction: [B, U, joint_hidden]
@@ -1018,8 +1038,12 @@ impl RNNTJoint {
     /// Project encoder output into the joint space: [..., encoder_hidden] -> [..., joint_hidden].
     ///
     /// Greedy decoding projects every frame once up front instead of per step.
+    /// Prompt-conditioned models apply the language prompt first.
     pub fn project_encoder(&self, encoder_output: &Array) -> Result<Array> {
-        self.encoder_proj.forward(encoder_output)
+        match &self.prompt {
+            Some(prompt) => self.encoder_proj.forward(&prompt.forward(encoder_output)?),
+            None => self.encoder_proj.forward(encoder_output),
+        }
     }
 
     /// Project prediction output into the joint space: [..., pred_hidden] -> [..., joint_hidden].

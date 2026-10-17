@@ -9,8 +9,8 @@
 
 use std::collections::HashMap;
 
-use mlx_rs::ops::{self, indexing};
 use mlx_rs::Array;
+use mlx_rs::ops::{self, indexing};
 
 use crate::core::error::Result;
 

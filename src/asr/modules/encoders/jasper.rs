@@ -8,10 +8,10 @@
 
 use std::collections::HashMap;
 
+use mlx_rs::Array;
 use mlx_rs::builder::Builder;
 use mlx_rs::module::Module;
 use mlx_rs::nn;
-use mlx_rs::Array;
 
 use crate::asr::config::{JasperBlockConfig, JasperEncoderConfig};
 use crate::core::error::Result;

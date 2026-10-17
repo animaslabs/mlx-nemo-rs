@@ -14,6 +14,8 @@
 //!   --mode <idx>         Streaming mode index (0 = lowest latency, default: 0)
 //!   --chunk-ms <ms>      Audio chunk size in milliseconds (default: 100)
 //!   --no-punctuation     Strip punctuation from output
+//!   --language <lang>    Target language of a multilingual model, e.g. en-US, de, auto (default)
+//!   --keep-lang-tags     Keep the detected-language tags (e.g. <en-US>) in the text
 //!   --blank-threshold <f>  Blank probability threshold (0.0 = disabled, try 0.5-2.0)
 //!   --list-modes         List available streaming modes and exit
 //!   --vad <path>         VAD model (.nemo) to suppress non-speech audio
@@ -29,7 +31,7 @@ use mlx_voice::asr::{
     CacheAwareRNNTPipeline, EncDecClassificationModel, StreamingModeInfo, VadPostProcessConfig,
     VadPostProcessor,
 };
-use tracing_subscriber::{fmt, EnvFilter};
+use tracing_subscriber::{EnvFilter, fmt};
 
 fn main() -> mlx_voice::Result<()> {
     // Initialize tracing subscriber
@@ -48,6 +50,8 @@ fn main() -> mlx_voice::Result<()> {
     let mut chunk_ms: u32 = 100;
     let mut list_modes = false;
     let mut no_punctuation = false;
+    let mut language: Option<&str> = None;
+    let mut keep_lang_tags = false;
     let mut blank_threshold: f32 = 0.0;
     let mut vad_model_path: Option<&str> = None;
     let mut vad_onset: f32 = 0.5;
@@ -95,6 +99,13 @@ fn main() -> mlx_voice::Result<()> {
             "--no-punctuation" => {
                 no_punctuation = true;
             }
+            "--language" => {
+                i += 1;
+                language = Some(&args[i]);
+            }
+            "--keep-lang-tags" => {
+                keep_lang_tags = true;
+            }
             arg if !arg.starts_with('-') => {
                 audio_path = Some(arg);
             }
@@ -114,6 +125,8 @@ fn main() -> mlx_voice::Result<()> {
         eprintln!("  --mode <idx>         Streaming mode index (default: 0)");
         eprintln!("  --chunk-ms <ms>      Audio chunk size in milliseconds (default: 100)");
         eprintln!("  --no-punctuation     Strip punctuation from output");
+        eprintln!("  --language <lang>    Target language of a multilingual model (default: auto)");
+        eprintln!("  --keep-lang-tags     Keep detected-language tags (e.g. <en-US>) in the text");
         eprintln!("  --blank-threshold <f>  Blank probability threshold (default: 0.0 = disabled)");
         eprintln!("                         Try 0.5-2.0 to reduce missed sentences");
         eprintln!("  --list-modes         List available streaming modes and exit");
@@ -134,6 +147,14 @@ fn main() -> mlx_voice::Result<()> {
         CacheAwareRNNTPipeline::restore(model_path_ref, mode_idx)?
     };
     println!("Pipeline loaded in {:.2}s", start.elapsed().as_secs_f32());
+
+    if let Some(language) = language {
+        pipeline.set_language(language)?;
+    }
+    if let Some(language) = pipeline.language() {
+        println!("Target language: {language}");
+    }
+    pipeline.set_strip_lang_tags(!keep_lang_tags);
 
     // Enable punctuation suppression if requested
     if no_punctuation {
@@ -332,6 +353,9 @@ fn main() -> mlx_voice::Result<()> {
 
             if output.is_final {
                 println!("Total tokens: {}", output.token_count);
+                if let Some(detected) = pipeline.detected_language(&output.tokens) {
+                    println!("Detected language: {detected}");
+                }
                 // println!(); // New line after final output
             }
         }

@@ -14,13 +14,13 @@
 
 use std::collections::HashMap;
 
+use mlx_rs::Array;
 use mlx_rs::nn;
 use mlx_rs::ops;
-use mlx_rs::Array;
 
 use crate::asr::config::SortformerModulesConfig;
 use crate::core::error::Result;
-use crate::core::quantization::{load_linear_layer, LinearLayer, QuantizationConfig};
+use crate::core::quantization::{LinearLayer, QuantizationConfig, load_linear_layer};
 
 /// SortFormer speaker head modules.
 pub struct SortformerModules {

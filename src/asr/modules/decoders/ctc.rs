@@ -4,12 +4,12 @@
 
 use std::collections::HashMap;
 
-use mlx_rs::ops;
 use mlx_rs::Array;
+use mlx_rs::ops;
 
 use crate::asr::config::DecoderConfig;
 use crate::core::error::Result;
-use crate::core::quantization::{load_linear_layer, LinearLayer, QuantizationConfig};
+use crate::core::quantization::{LinearLayer, QuantizationConfig, load_linear_layer};
 
 /// CTC decoder that projects encoder output to vocabulary logits.
 pub struct CTCDecoder {

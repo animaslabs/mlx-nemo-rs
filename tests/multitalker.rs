@@ -12,15 +12,14 @@
 
 use std::path::Path;
 
+use mlx_voice::Array;
 use mlx_voice::asr::{
     MultiTalkerMode, MultiTalkerPipeline, SortformerEncLabelModel, SpeakerSegment,
 };
-use mlx_voice::Array;
 
 const DIAR_MODEL: &str =
     "models/nvidia/diar_streaming_sortformer_4spk-v2.1/diar_streaming_sortformer_4spk-v2.1.nemo";
-const MT_ASR_MODEL: &str =
-    "models/nvidia/multitalker-parakeet-streaming-0.6b-v1/multitalker-parakeet-streaming-0.6b-v1.nemo";
+const MT_ASR_MODEL: &str = "models/nvidia/multitalker-parakeet-streaming-0.6b-v1/multitalker-parakeet-streaming-0.6b-v1.nemo";
 
 const SINGLE_SPEAKER_AUDIO: &str = "samples/Speaker26_004_16k.wav";
 const SINGLE_SPEAKER_TRANSCRIPT: &str = "samples/Speaker26_004_16k-transcript.txt";

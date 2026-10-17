@@ -16,12 +16,12 @@
 
 use std::collections::{BTreeMap, HashMap};
 
+use mlx_rs::Array;
 use mlx_rs::ops;
 use mlx_rs::ops::indexing::IndexOp;
-use mlx_rs::Array;
 
 use crate::core::error::Result;
-use crate::core::quantization::{load_linear_layer, LinearLayer, QuantizationConfig};
+use crate::core::quantization::{LinearLayer, QuantizationConfig, load_linear_layer};
 
 /// A feed-forward speaker kernel.
 struct FfKernel {

@@ -20,8 +20,8 @@
 use std::path::Path;
 use std::time::Instant;
 
-use mlx_voice::asr::EncDecCTCModel;
 use mlx_voice::WeightFormat;
+use mlx_voice::asr::EncDecCTCModel;
 
 fn main() -> mlx_voice::Result<()> {
     // Parse command line arguments

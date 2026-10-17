@@ -3,7 +3,7 @@
 //! Run with: RUST_LOG=info cargo run --example trace_streaming --release
 
 use mlx_voice::asr::CacheAwareRNNTPipeline;
-use tracing_subscriber::{fmt, EnvFilter};
+use tracing_subscriber::{EnvFilter, fmt};
 
 fn main() -> mlx_voice::Result<()> {
     // Initialize tracing

@@ -6,7 +6,7 @@
 use std::f32::consts::PI;
 
 use mlx_rs::ops::indexing::IndexOp;
-use mlx_rs::{ops, Array};
+use mlx_rs::{Array, ops};
 
 use crate::core::error::{Error, Result};
 

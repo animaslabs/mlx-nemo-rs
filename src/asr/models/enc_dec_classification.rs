@@ -23,14 +23,14 @@ use mlx_rs::ops;
 use mlx_rs::Array;
 
 use crate::asr::config::ClassificationModelConfig;
-use crate::asr::modules::encoders::JasperEncoder;
 use crate::asr::modules::MelSpectrogram;
+use crate::asr::modules::encoders::JasperEncoder;
 use crate::audio::resample;
+use crate::core::ArrayExt;
 use crate::core::checkpoint::NemoCheckpoint;
 use crate::core::config::from_yaml_str;
 use crate::core::error::{Error, Result};
 use crate::core::quantization::LinearLayer;
-use crate::core::ArrayExt;
 
 /// Encoder-Decoder Classification Model.
 ///
@@ -154,7 +154,7 @@ impl EncDecClassificationModel {
         }
 
         Err(Error::model(
-            "Could not find decoder weights in checkpoint (tried decoder.decoder_layers.0.*, decoder._layer0.*, decoder.layer0.*)"
+            "Could not find decoder weights in checkpoint (tried decoder.decoder_layers.0.*, decoder._layer0.*, decoder.layer0.*)",
         ))
     }
 

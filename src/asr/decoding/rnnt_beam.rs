@@ -5,12 +5,12 @@
 
 use std::cmp::Ordering;
 
-use mlx_rs::ops::indexing::IndexOp;
 use mlx_rs::Array;
+use mlx_rs::ops::indexing::IndexOp;
 
 use crate::asr::modules::{RNNTJoint, StatelessTransducerDecoder};
-use crate::core::error::Result;
 use crate::core::ArrayExt;
+use crate::core::error::Result;
 
 /// Maximum number of symbols that can be emitted per encoder frame.
 const DEFAULT_MAX_SYMBOLS_PER_STEP: usize = 10;

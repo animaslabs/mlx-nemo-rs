@@ -19,7 +19,7 @@ use std::path::Path;
 use std::time::Instant;
 
 use mlx_voice::asr::pipeline::{MultiTalkerConfig, MultiTalkerPipeline};
-use tracing_subscriber::{fmt, EnvFilter};
+use tracing_subscriber::{EnvFilter, fmt};
 
 fn main() -> mlx_voice::Result<()> {
     fmt()

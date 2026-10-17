@@ -20,16 +20,16 @@
 //! Press Ctrl+C to stop and see the final transcription.
 
 use std::io::{self, Write};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{SampleFormat, StreamConfig};
 use ringbuf::{
-    traits::{Consumer, Producer, Split},
     HeapRb,
+    traits::{Consumer, Producer, Split},
 };
 
 use mlx_voice::asr::{EncDecRNNTModel, StreamingModeInfo};
@@ -464,7 +464,7 @@ fn create_resampler(from_rate: u32, to_rate: u32) -> mlx_voice::Result<rubato::F
 
 /// Resample a chunk of audio.
 fn resample_chunk(resampler: &mut rubato::Fft<f32>, input: &[f32]) -> mlx_voice::Result<Vec<f32>> {
-    use rubato::{audioadapter_buffers::direct::InterleavedSlice, Resampler};
+    use rubato::{Resampler, audioadapter_buffers::direct::InterleavedSlice};
 
     if input.is_empty() {
         return Ok(Vec::new());

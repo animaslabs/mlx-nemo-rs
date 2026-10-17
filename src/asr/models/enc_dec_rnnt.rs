@@ -31,26 +31,26 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use mlx_rs::ops::indexing::IndexOp;
 use mlx_rs::Array;
+use mlx_rs::ops::indexing::IndexOp;
 use sentencepiece::SentencePieceProcessor;
 
 use crate::asr::config::{AsrModelConfig, JointConfig};
-use crate::asr::decoding::RnntStreamingDecoder;
+use crate::asr::decoding::{RnntStreamingDecoder, decode_text, lang_tag_table, last_lang_tag};
 use crate::asr::modules::{
-    ConformerEncoder, LstmState, MelSpectrogram, MelSpectrogramConfig, RNNTDecoder, RNNTJoint,
-    StatelessTransducerDecoder,
+    ConformerEncoder, LanguagePrompt, LstmState, MelSpectrogram, MelSpectrogramConfig, RNNTDecoder,
+    RNNTJoint, StatelessTransducerDecoder,
 };
 use crate::asr::streaming::{
-    compute_streaming_config, get_streaming_modes, EncoderCache, StreamingConfig,
-    StreamingMelBuffer, StreamingModeInfo, StreamingOutput,
+    EncoderCache, StreamingConfig, StreamingMelBuffer, StreamingModeInfo, StreamingOutput,
+    compute_streaming_config, get_streaming_modes,
 };
 use crate::audio::resample;
+use crate::core::ArrayExt;
 use crate::core::checkpoint::NemoCheckpoint;
 use crate::core::config::from_yaml_str;
 use crate::core::error::{Error, Result};
 use crate::core::quantization::QuantizationConfig;
-use crate::core::ArrayExt;
 
 /// Decoding strategy for RNNT models.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -256,6 +256,10 @@ pub struct EncDecRNNTModel {
     /// Decoding strategy
     decoding_strategy: RnntDecodingStrategy,
     chunk_count: usize,
+    /// For each token id, whether it is a language tag such as `<en-US>`
+    lang_tags: Vec<bool>,
+    /// Leave language tags out of transcribed text
+    strip_lang_tags: bool,
 }
 
 impl EncDecRNNTModel {
@@ -345,6 +349,8 @@ impl EncDecRNNTModel {
             blank_id,
             decoding_strategy,
             chunk_count: 0,
+            lang_tags: Vec::new(),
+            strip_lang_tags: true,
         })
     }
 
@@ -616,6 +622,7 @@ impl EncDecRNNTModel {
             vocab_size + 1,
         )?;
 
+        self.lang_tags = lang_tag_table(&tokenizer);
         self.tokenizer = Some(tokenizer);
         Ok(())
     }
@@ -639,7 +646,60 @@ impl EncDecRNNTModel {
         // Load joint network weights (linear layers may be quantized)
         self.joint.load_weights(weights, "joint", quant)?;
 
+        // Language-ID prompt (prompt-conditioned models only)
+        self.joint
+            .set_prompt(LanguagePrompt::from_config(&self.config, weights, quant)?);
+
         Ok(())
+    }
+
+    /// Whether the model takes a target language (prompt-conditioned models
+    /// such as nemotron-3.5-asr-streaming-0.6b).
+    pub fn is_multilingual(&self) -> bool {
+        self.joint.prompt().is_some()
+    }
+
+    /// Select the target language, e.g. `"en-US"`, `"de"`, or `"auto"` to let
+    /// the model detect it (the default).
+    ///
+    /// Applies to offline transcription and to streaming chunks processed
+    /// afterwards. Fails for models without a language prompt.
+    pub fn set_language(&mut self, language: &str) -> Result<()> {
+        self.joint
+            .prompt_mut()
+            .ok_or_else(|| Error::config("this model has no language prompt"))?
+            .set_language(language)
+    }
+
+    /// The selected target language, for prompt-conditioned models.
+    pub fn language(&self) -> Option<&str> {
+        self.joint.prompt().map(|p| p.language())
+    }
+
+    /// Every accepted target language key (empty for models without a prompt).
+    pub fn languages(&self) -> Vec<&str> {
+        self.joint
+            .prompt()
+            .map(|p| p.languages().collect())
+            .unwrap_or_default()
+    }
+
+    /// Keep or strip the language tags (e.g. `<en-US>`) that prompt-conditioned
+    /// models emit after each utterance's terminal punctuation.
+    ///
+    /// Tags are stripped from text by default; token ids always keep them.
+    pub fn set_strip_lang_tags(&mut self, strip: bool) {
+        self.strip_lang_tags = strip;
+    }
+
+    /// The language named by the last language tag in `tokens`, e.g. `"en-US"`.
+    pub fn detected_language(&self, tokens: &[usize]) -> Option<String> {
+        last_lang_tag(self.tokenizer.as_ref()?, &self.lang_tags, tokens)
+    }
+
+    /// Text of `tokens`, without language tags unless they are kept.
+    fn tokens_to_text(&self, tokenizer: &SentencePieceProcessor, tokens: &[usize]) -> String {
+        decode_text(tokenizer, tokens, self.strip_lang_tags)
     }
 
     /// Set the decoding strategy.
@@ -794,11 +854,7 @@ impl EncDecRNNTModel {
         let mut texts = Vec::with_capacity(token_sequences.len());
 
         for tokens in token_sequences {
-            let token_ids: Vec<u32> = tokens.iter().map(|&t| t as u32).collect();
-            let text = tokenizer
-                .decode_piece_ids(&token_ids)
-                .map_err(|e| Error::tokenizer(format!("Failed to decode tokens: {}", e)))?;
-            texts.push(text);
+            texts.push(self.tokens_to_text(tokenizer, tokens));
         }
 
         Ok(texts)
@@ -1144,11 +1200,7 @@ impl EncDecRNNTModel {
         let mut texts = Vec::with_capacity(batch_size);
         for b in 0..batch_size {
             let text = if let Some(tokenizer) = &self.tokenizer {
-                let token_ids: Vec<u32> = session.accumulated_tokens[b]
-                    .iter()
-                    .map(|&t| t as u32)
-                    .collect();
-                tokenizer.decode_piece_ids(&token_ids).unwrap_or_default()
+                self.tokens_to_text(tokenizer, &session.accumulated_tokens[b])
             } else {
                 String::new()
             };
@@ -1223,8 +1275,7 @@ impl EncDecRNNTModel {
 
         for tokens in &session.accumulated_tokens {
             let text = if let Some(tokenizer) = &self.tokenizer {
-                let token_ids: Vec<u32> = tokens.iter().map(|&t| t as u32).collect();
-                tokenizer.decode_piece_ids(&token_ids).unwrap_or_default()
+                self.tokens_to_text(tokenizer, tokens)
             } else {
                 String::new()
             };

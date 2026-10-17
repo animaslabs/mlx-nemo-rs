@@ -51,7 +51,9 @@ fn main() -> mlx_voice::Result<()> {
     println!("  {:?}", first_10);
 
     println!("\nExpected from Python:");
-    println!("  [-0.00382, -0.04477, 0.06805, 0.03125, -0.06471, 0.00307, 0.03036, 0.10786, -0.04205, 0.11384]");
+    println!(
+        "  [-0.00382, -0.04477, 0.06805, 0.03125, -0.06471, 0.00307, 0.03036, 0.10786, -0.04205, 0.11384]"
+    );
 
     // Check if values match (within tolerance)
     let expected = [

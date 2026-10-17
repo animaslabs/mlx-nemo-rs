@@ -127,6 +127,59 @@ fn test_full_file_transcription_rnnt() {
 
 #[test]
 #[ignore]
+fn test_multilingual_streaming_transcription() {
+    let model_path =
+        "models/nvidia/nemotron-3.5-asr-streaming-0.6b/nemotron-3.5-asr-streaming-0.6b.nemo";
+    if !require_model(model_path) {
+        return;
+    }
+
+    let mut pipeline =
+        CacheAwareRNNTPipeline::restore(model_path, 3).expect("Failed to load streaming pipeline");
+    assert_eq!(pipeline.language(), Some("auto"));
+    assert!(pipeline.languages().contains(&"de-DE"));
+    assert!(pipeline.set_language("xx-YY").is_err());
+
+    // Auto mode: the model tags the language, and the tag stays out of the text
+    pipeline
+        .set_audio_file(TEST_AUDIO)
+        .expect("Failed to load audio file");
+    let mut final_output = None;
+    while let Some(output) = pipeline.transcribe_step().expect("transcribe_step failed") {
+        if output.is_final {
+            final_output = Some(output);
+        }
+    }
+    let output = final_output.expect("no final output");
+    assert_eq!(
+        pipeline.detected_language(&output.tokens).as_deref(),
+        Some("en-US")
+    );
+    assert!(
+        !output.text.contains('<'),
+        "language tag in text: {}",
+        output.text
+    );
+    let wer = word_error_rate(
+        &normalize_text(EXPECTED_TEXT),
+        &normalize_text(&output.text),
+    );
+    println!("auto:  {} (WER {:.1}%)", output.text, wer * 100.0);
+    assert!(wer < 0.15, "WER {:.1}%: {}", wer * 100.0, output.text);
+
+    // An explicit target language
+    pipeline.set_language("en-US").unwrap();
+    pipeline
+        .set_audio_file(TEST_AUDIO)
+        .expect("Failed to load audio file");
+    let text = pipeline.run().expect("run failed");
+    let wer = word_error_rate(&normalize_text(EXPECTED_TEXT), &normalize_text(&text));
+    println!("en-US: {} (WER {:.1}%)", text, wer * 100.0);
+    assert!(wer < 0.15, "WER {:.1}%: {}", wer * 100.0, text);
+}
+
+#[test]
+#[ignore]
 fn test_streaming_transcription() {
     let model_dir = "models/animaslabs/nemotron-speech-streaming-en-0.6b-mlx-8bit";
     if !require_model(model_dir) {
@@ -175,8 +228,7 @@ fn test_streaming_transcription() {
 #[test]
 #[ignore]
 fn test_vad_speech_detection() {
-    let model_path =
-        "models/nvidia/Frame_VAD_Multilingual_MarbleNet_v2.0/frame_vad_multilingual_marblenet_v2.0.nemo";
+    let model_path = "models/nvidia/Frame_VAD_Multilingual_MarbleNet_v2.0/frame_vad_multilingual_marblenet_v2.0.nemo";
     if !require_model(model_path) {
         return;
     }

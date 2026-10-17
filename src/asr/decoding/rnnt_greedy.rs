@@ -4,13 +4,13 @@
 //! At each encoder timestep, the decoder predicts tokens until a blank
 //! is emitted, then advances to the next encoder frame.
 
-use mlx_rs::ops::indexing::{argmax_axis, IndexOp};
 use mlx_rs::Array;
+use mlx_rs::ops::indexing::{IndexOp, argmax_axis};
 use tracing::{debug, instrument, trace};
 
 use crate::asr::modules::{RNNTJoint, StatelessTransducerDecoder};
-use crate::core::error::Result;
 use crate::core::ArrayExt;
+use crate::core::error::Result;
 
 /// Maximum number of symbols that can be emitted per encoder frame.
 /// This is a safety limit to prevent infinite loops.

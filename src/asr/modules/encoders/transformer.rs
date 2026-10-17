@@ -8,14 +8,14 @@
 
 use std::collections::HashMap;
 
+use mlx_rs::Array;
 use mlx_rs::module::Module;
 use mlx_rs::nn;
 use mlx_rs::ops;
-use mlx_rs::Array;
 
 use crate::asr::config::TransformerEncoderConfig;
 use crate::core::error::Result;
-use crate::core::quantization::{load_linear_layer, LinearLayer, QuantizationConfig};
+use crate::core::quantization::{LinearLayer, QuantizationConfig, load_linear_layer};
 
 /// Multi-head attention (standard, no relative positional encoding).
 ///

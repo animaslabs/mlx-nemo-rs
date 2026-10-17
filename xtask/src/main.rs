@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use hf_hub::{api::sync::ApiBuilder, Repo, RepoType};
+use hf_hub::{Repo, RepoType, api::sync::ApiBuilder};
 use std::{fs, path::PathBuf};
 
 /// Shared eval set (audio + references), built by mlx-models `samples/fetch_eval.py`.
