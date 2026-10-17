@@ -9,7 +9,7 @@ use mlx_rs::ops::indexing::IndexOp;
 use mlx_rs::{ops, Array};
 
 use crate::core::error::{Error, Result};
-use crate::core::quantization::{LinearLayer, QuantizationConfig, load_linear_layer};
+use crate::core::quantization::{load_linear_layer, LinearLayer, QuantizationConfig};
 
 /// Relative positional encoding generator.
 ///
@@ -130,10 +130,16 @@ impl RelPositionalEncoding {
     /// same sinusoids, so `max_len` (`pos_emb_max_len`) only sets what's cached.
     pub fn get_encoding(&self, seq_len: usize) -> Result<Array> {
         if seq_len == 0 {
-            return Err(Error::model("positional encoding requested for an empty sequence"));
+            return Err(Error::model(
+                "positional encoding requested for an empty sequence",
+            ));
         }
         if seq_len > self.max_len {
-            tracing::debug!(seq_len, max_len = self.max_len, "extending positional encoding");
+            tracing::debug!(
+                seq_len,
+                max_len = self.max_len,
+                "extending positional encoding"
+            );
             // A table of exactly seq_len covers (seq_len-1)..=-(seq_len-1): the whole slice.
             return Ok(Self::create_pe(self.d_model, seq_len)?.as_dtype(self.pe.dtype())?);
         }
@@ -211,11 +217,16 @@ fn attend(
     head_dim: i32,
 ) -> Result<Array> {
     let scale = 1.0 / (head_dim as f32).sqrt();
-    let mut mask = ops::multiply(matrix_bd, &Array::from_f32(scale).as_dtype(matrix_bd.dtype())?)?;
+    let mut mask = ops::multiply(
+        matrix_bd,
+        &Array::from_f32(scale).as_dtype(matrix_bd.dtype())?,
+    )?;
     if let Some(additive_mask) = additive_mask {
         mask = ops::add(&mask, additive_mask)?;
     }
-    Ok(mlx_rs::fast::scaled_dot_product_attention(q_u, k, v, scale, &mask, None)?)
+    Ok(mlx_rs::fast::scaled_dot_product_attention(
+        q_u, k, v, scale, &mask, None,
+    )?)
 }
 
 /// Relative position multi-head attention.
@@ -414,8 +425,7 @@ impl RelPositionMultiHeadAttention {
             // start..end need p[seq_len-end .. 2*seq_len-1-start] (seq_len+rows-1
             // columns). rel_shift on that slice yields the same alignment as on the
             // full matrix: out[r][j] = x[r][j + rows-1-r].
-            let p_slice =
-                p_t.index((.., .., .., (seq_len - end)..(2 * seq_len - 1 - start)));
+            let p_slice = p_t.index((.., .., .., (seq_len - end)..(2 * seq_len - 1 - start)));
             let matrix_bd = ops::matmul(&q_v, &p_slice)?;
             let matrix_bd = Self::rel_shift(&matrix_bd)?;
             let matrix_bd = matrix_bd.index((.., .., .., ..seq_len));
@@ -751,8 +761,9 @@ impl RelPositionMultiHeadAttention {
         // abs_pos encoder) would otherwise run with zero-initialized position terms.
         let linear = |name: &str| {
             let key = format!("{}.{}", prefix, name);
-            load_linear_layer(weights, &key, quant)
-                .ok_or_else(|| Error::checkpoint(format!("missing attention weight `{}.weight`", key)))
+            load_linear_layer(weights, &key, quant).ok_or_else(|| {
+                Error::checkpoint(format!("missing attention weight `{}.weight`", key))
+            })
         };
 
         // Load linear projections (supports both standard and quantized)
@@ -909,11 +920,17 @@ mod tests {
         // i64::MAX: one block covering every query row (the unblocked computation).
         let full = attn.forward_blocked(&x, &pos_emb, i64::MAX).unwrap();
         // 2 batch * 2 heads * 2*13 per row: a budget of 5 rows gives blocks of 5, 5, 3.
-        let blocked = attn.forward_blocked(&x, &pos_emb, 2 * 2 * 2 * 13 * 5).unwrap();
+        let blocked = attn
+            .forward_blocked(&x, &pos_emb, 2 * 2 * 2 * 13 * 5)
+            .unwrap();
         assert_eq!(blocked.shape(), full.shape());
         let a: Vec<f32> = full.to_vec_row_major().unwrap();
         let b: Vec<f32> = blocked.to_vec_row_major().unwrap();
-        let max_diff = a.iter().zip(&b).map(|(x, y)| (x - y).abs()).fold(0.0, f32::max);
+        let max_diff = a
+            .iter()
+            .zip(&b)
+            .map(|(x, y)| (x - y).abs())
+            .fold(0.0, f32::max);
         assert!(max_diff < 1e-5, "max diff {max_diff}");
     }
 
@@ -928,7 +945,11 @@ mod tests {
         assert_eq!(extended.shape(), &[1, 49, 16]);
         let a: Vec<f32> = extended.to_vec_row_major().unwrap();
         let b: Vec<f32> = reference.to_vec_row_major().unwrap();
-        let max_diff = a.iter().zip(&b).map(|(x, y)| (x - y).abs()).fold(0.0, f32::max);
+        let max_diff = a
+            .iter()
+            .zip(&b)
+            .map(|(x, y)| (x - y).abs())
+            .fold(0.0, f32::max);
         assert!(max_diff < 1e-6, "max diff {max_diff}");
     }
 
@@ -1026,10 +1047,7 @@ mod tests {
                 input_data.push((i * pos_len + j) as f32);
             }
         }
-        let x = Array::from_slice(
-            &input_data,
-            &[1, 1, seq_len as i32, pos_len as i32],
-        );
+        let x = Array::from_slice(&input_data, &[1, 1, seq_len as i32, pos_len as i32]);
 
         let shifted = RelPositionMultiHeadAttention::rel_shift(&x).unwrap();
         mlx_rs::transforms::eval([&shifted]).unwrap();
@@ -1086,10 +1104,7 @@ mod tests {
                 input_data.push(100.0 + (i * pos_len + j) as f32);
             }
         }
-        let x = Array::from_slice(
-            &input_data,
-            &[1, 1, seq_len as i32, pos_len as i32],
-        );
+        let x = Array::from_slice(&input_data, &[1, 1, seq_len as i32, pos_len as i32]);
 
         let shifted = RelPositionMultiHeadAttention::rel_shift(&x).unwrap();
         mlx_rs::transforms::eval([&shifted]).unwrap();

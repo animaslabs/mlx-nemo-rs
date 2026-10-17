@@ -14,8 +14,8 @@ use mlx_rs::ops::indexing::IndexOp;
 use mlx_rs::Array;
 
 use crate::asr::config::SortformerModulesConfig;
-use crate::core::ArrayExt;
 use crate::core::error::Result;
+use crate::core::ArrayExt;
 
 /// Streaming state for the SortFormer diarizer (batch size 1).
 pub struct StreamingSortformerState {
@@ -147,7 +147,11 @@ impl StreamingSortformerState {
         let sil_mask: Vec<f32> = (0..n_frames)
             .map(|t| {
                 let sum: f32 = preds_data[t * n_spk..(t + 1) * n_spk].iter().sum();
-                if sum < self.params.sil_threshold { 1.0 } else { 0.0 }
+                if sum < self.params.sil_threshold {
+                    1.0
+                } else {
+                    0.0
+                }
             })
             .collect();
         let sil_count = sil_mask.iter().filter(|&&m| m > 0.0).count();
@@ -157,7 +161,10 @@ impl StreamingSortformerState {
 
         let mask = Array::from_slice(&sil_mask, &[1, n_frames as i32, 1]);
         let sil_sum = ops::multiply(embs, &mask)?.sum_axis(1, false)?; // [1, d_model]
-        let old_sum = ops::multiply(&self.mean_sil_emb, Array::from_f32(self.n_sil_frames as f32))?;
+        let old_sum = ops::multiply(
+            &self.mean_sil_emb,
+            Array::from_f32(self.n_sil_frames as f32),
+        )?;
         self.n_sil_frames += sil_count;
         self.mean_sil_emb = ops::divide(
             &ops::add(&old_sum, &sil_sum)?,
@@ -217,12 +224,7 @@ impl StreamingSortformerState {
         let padded_frames = n_frames + sil;
 
         // Top spkcache_len over the speaker-major flattened scores
-        let mut flat: Vec<(usize, f32)> = scores
-            .iter()
-            .flatten()
-            .copied()
-            .enumerate()
-            .collect();
+        let mut flat: Vec<(usize, f32)> = scores.iter().flatten().copied().enumerate().collect();
         flat.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         let mut topk: Vec<Option<usize>> = flat
             .iter()
@@ -359,7 +361,11 @@ mod tests {
             let chunk = ops::ones::<f32>(&[1, 4, 3])?;
             let total = (state.spkcache_len() + state.fifo_len() + 4) as i32;
             // Alternate which speaker is active
-            let row = if step % 2 == 0 { [0.9f32, 0.1] } else { [0.1, 0.9] };
+            let row = if step % 2 == 0 {
+                [0.9f32, 0.1]
+            } else {
+                [0.1, 0.9]
+            };
             let data: Vec<f32> = (0..total).flat_map(|_| row).collect();
             let preds = Array::from_slice(&data, &[1, total, 2]);
             let chunk_preds = state.update(&chunk, &preds, 0, 0)?;

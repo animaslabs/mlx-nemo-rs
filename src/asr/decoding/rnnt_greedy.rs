@@ -9,8 +9,8 @@ use mlx_rs::Array;
 use tracing::{debug, instrument, trace};
 
 use crate::asr::modules::{RNNTJoint, StatelessTransducerDecoder};
-use crate::core::ArrayExt;
 use crate::core::error::Result;
+use crate::core::ArrayExt;
 
 /// Maximum number of symbols that can be emitted per encoder frame.
 /// This is a safety limit to prevent infinite loops.

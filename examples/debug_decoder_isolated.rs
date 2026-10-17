@@ -6,11 +6,12 @@
 //!
 //! Run with: cargo run --example debug_decoder_isolated
 
-use mlx_voice::asr::CacheAwareRNNTPipeline;
 use mlx_rs::Array;
+use mlx_voice::asr::CacheAwareRNNTPipeline;
 
 fn main() -> mlx_voice::Result<()> {
-    let model_path = "models/nvidia/nemotron-speech-streaming-en-0.6b/nemotron-speech-streaming-en-0.6b.nemo";
+    let model_path =
+        "models/nvidia/nemotron-speech-streaming-en-0.6b/nemotron-speech-streaming-en-0.6b.nemo";
 
     println!("Loading pipeline from: {}", model_path);
     let pipeline = CacheAwareRNNTPipeline::restore(model_path, 2)?;
@@ -53,10 +54,18 @@ fn main() -> mlx_voice::Result<()> {
     println!("  [-0.00382, -0.04477, 0.06805, 0.03125, -0.06471, 0.00307, 0.03036, 0.10786, -0.04205, 0.11384]");
 
     // Check if values match (within tolerance)
-    let expected = [-0.003824716666713357, -0.044768139719963074, 0.06804525852203369,
-                    0.03125034272670746, -0.06471093744039536, 0.003071495098993182,
-                    0.03035961091518402, 0.10786266624927521, -0.04204889014363289,
-                    0.11384092271327972];
+    let expected = [
+        -0.003824716666713357,
+        -0.044768139719963074,
+        0.06804525852203369,
+        0.03125034272670746,
+        -0.06471093744039536,
+        0.003071495098993182,
+        0.03035961091518402,
+        0.10786266624927521,
+        -0.04204889014363289,
+        0.11384092271327972,
+    ];
 
     let mut max_diff: f32 = 0.0;
     for (i, (&actual, &exp)) in pred_slice.iter().take(10).zip(expected.iter()).enumerate() {
@@ -65,7 +74,10 @@ fn main() -> mlx_voice::Result<()> {
             max_diff = diff;
         }
         if diff > 0.001 {
-            println!("  [{}] MISMATCH: actual={:.6}, expected={:.6}, diff={:.6}", i, actual, exp, diff);
+            println!(
+                "  [{}] MISMATCH: actual={:.6}, expected={:.6}, diff={:.6}",
+                i, actual, exp, diff
+            );
         }
     }
     println!("\nMax difference (first 10): {:.6e}", max_diff);
@@ -178,22 +190,38 @@ fn main() -> mlx_voice::Result<()> {
 
     // Expected from Python (output[0,1] from add_sos=True):
     // [0.0011212689569219947, 0.0056362031027674675, 0.023998918011784554, ...]
-    let expected_warmup = [0.0011212689569219947, 0.0056362031027674675, 0.023998918011784554,
-                          0.04137953370809555, -0.01906406320631504, 0.00014715063199400902,
-                          0.0006426768959499896, 0.021843202784657478, -0.04307417199015617,
-                          0.03243801742792129];
+    let expected_warmup = [
+        0.0011212689569219947,
+        0.0056362031027674675,
+        0.023998918011784554,
+        0.04137953370809555,
+        -0.01906406320631504,
+        0.00014715063199400902,
+        0.0006426768959499896,
+        0.021843202784657478,
+        -0.04307417199015617,
+        0.03243801742792129,
+    ];
 
     println!("\nExpected from Python (add_sos=True output[-1]):");
     println!("  {:?}", &expected_warmup[..10]);
 
     let mut warmup_max_diff: f32 = 0.0;
-    for (i, (&actual, &exp)) in warmup_slice.iter().take(10).zip(expected_warmup.iter()).enumerate() {
+    for (i, (&actual, &exp)) in warmup_slice
+        .iter()
+        .take(10)
+        .zip(expected_warmup.iter())
+        .enumerate()
+    {
         let diff = (actual - exp).abs();
         if diff > warmup_max_diff {
             warmup_max_diff = diff;
         }
         if diff > 0.001 {
-            println!("  [{}] MISMATCH: actual={:.6}, expected={:.6}, diff={:.6}", i, actual, exp, diff);
+            println!(
+                "  [{}] MISMATCH: actual={:.6}, expected={:.6}, diff={:.6}",
+                i, actual, exp, diff
+            );
         }
     }
     println!("\nMax difference (first 10): {:.6e}", warmup_max_diff);

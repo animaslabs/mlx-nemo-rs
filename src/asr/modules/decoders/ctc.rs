@@ -9,7 +9,7 @@ use mlx_rs::Array;
 
 use crate::asr::config::DecoderConfig;
 use crate::core::error::Result;
-use crate::core::quantization::{LinearLayer, QuantizationConfig, load_linear_layer};
+use crate::core::quantization::{load_linear_layer, LinearLayer, QuantizationConfig};
 
 /// CTC decoder that projects encoder output to vocabulary logits.
 pub struct CTCDecoder {
@@ -98,7 +98,9 @@ impl CTCDecoder {
             // We need to squeeze the last dimension for Linear: [vocab_size, d_model]
             let weight = if weight.ndim() == 3 {
                 // Squeeze kernel dimension: [O, I, 1] -> [O, I]
-                weight.squeeze_axes(&[-1]).unwrap_or_else(|_| weight.clone())
+                weight
+                    .squeeze_axes(&[-1])
+                    .unwrap_or_else(|_| weight.clone())
             } else {
                 weight.clone()
             };

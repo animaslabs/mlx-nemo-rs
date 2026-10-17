@@ -1226,7 +1226,6 @@ pub struct SortformerConfig {
     extra: std::collections::HashMap<String, yaml_serde::Value>,
 }
 
-
 /// Adds typed access to the config fields this crate does not model explicitly.
 macro_rules! impl_extra_accessor {
     ($($ty:ty),* $(,)?) => {$(
@@ -1311,7 +1310,9 @@ mod tests {
 
     #[test]
     fn test_model_validate() {
-        assert!(asr_config("nemo.collections.asr.models.EncDecRNNTBPEModel").validate().is_ok());
+        assert!(asr_config("nemo.collections.asr.models.EncDecRNNTBPEModel")
+            .validate()
+            .is_ok());
         assert!(asr_config(
             "nemo.collections.asr.models.rnnt_bpe_models_prompt.EncDecRNNTBPEModelWithPrompt"
         )

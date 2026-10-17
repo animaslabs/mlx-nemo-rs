@@ -45,12 +45,12 @@ use crate::asr::streaming::{
     compute_streaming_config, get_streaming_modes, EncoderCache, StreamingConfig,
     StreamingMelBuffer, StreamingModeInfo, StreamingOutput,
 };
-use crate::core::ArrayExt;
+use crate::audio::resample;
 use crate::core::checkpoint::NemoCheckpoint;
 use crate::core::config::from_yaml_str;
-use crate::audio::resample;
 use crate::core::error::{Error, Result};
 use crate::core::quantization::QuantizationConfig;
+use crate::core::ArrayExt;
 
 /// Decoding strategy for RNNT models.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -101,7 +101,10 @@ impl DecoderState {
             DecoderState::Lstm(lstm_state) => {
                 // Compute norm of hidden state
                 lstm_state.hidden.eval().ok();
-                let data = lstm_state.hidden.to_vec_row_major::<f32>().unwrap_or_default();
+                let data = lstm_state
+                    .hidden
+                    .to_vec_row_major::<f32>()
+                    .unwrap_or_default();
                 if !data.is_empty() {
                     let sample_len = data.len().min(100);
                     data[..sample_len].iter().map(|v| v * v).sum::<f32>().sqrt()
@@ -689,7 +692,9 @@ impl EncDecRNNTModel {
         encoder_output: &Array,
         encoder_lengths: &Array,
     ) -> Result<Vec<Vec<usize>>> {
-        let lengths: Vec<i32> = encoder_lengths.as_dtype(mlx_rs::Dtype::Int32)?.to_vec_row_major()?;
+        let lengths: Vec<i32> = encoder_lengths
+            .as_dtype(mlx_rs::Dtype::Int32)?
+            .to_vec_row_major()?;
         let greedy = RnntStreamingDecoder::new(self.blank_id);
 
         // Each sequence decodes independently from a fresh decoder state
@@ -1333,4 +1338,3 @@ fn load_wav(_path: &Path) -> Result<(Vec<f32>, u32)> {
         "Audio loading requires the 'asr' feature",
     ))
 }
-

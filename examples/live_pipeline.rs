@@ -40,7 +40,7 @@ use rubato::{
 };
 
 use mlx_voice::asr::{CacheAwareRNNTPipeline, StreamingModeInfo};
-use tracing_subscriber::{EnvFilter, fmt};
+use tracing_subscriber::{fmt, EnvFilter};
 
 fn main() -> mlx_voice::Result<()> {
     // Initialize tracing subscriber
@@ -124,7 +124,9 @@ fn main() -> mlx_voice::Result<()> {
         eprintln!("Usage: {} --model <model> [options]", args[0]);
         eprintln!();
         eprintln!("Options:");
-        eprintln!("  --model <path>      Path to NeMo streaming model (.nemo file or MLX directory)");
+        eprintln!(
+            "  --model <path>      Path to NeMo streaming model (.nemo file or MLX directory)"
+        );
         eprintln!("  --mode <idx>        Streaming mode index (default: 0)");
         eprintln!("  --device <name>     Audio input device name (default: system default)");
         eprintln!("  --list-devices      List available audio input devices and exit");
@@ -304,7 +306,8 @@ fn main() -> mlx_voice::Result<()> {
 
             // Log chunk info (matching streaming.rs debug output)
             if debug {
-                let preview: Vec<String> = chunk.iter().take(5).map(|s| format!("{:.6}", s)).collect();
+                let preview: Vec<String> =
+                    chunk.iter().take(5).map(|s| format!("{:.6}", s)).collect();
                 let max_abs = chunk.iter().map(|s| s.abs()).fold(0.0f32, f32::max);
                 let time_offset = chunks_fed as f32 * chunk_ms as f32 / 1000.0;
                 eprintln!(
@@ -371,7 +374,10 @@ fn main() -> mlx_voice::Result<()> {
     // Process any remaining audio in buffer
     if !audio_buffer.is_empty() {
         if debug {
-            eprintln!("Processing {} remaining samples in buffer", audio_buffer.len());
+            eprintln!(
+                "Processing {} remaining samples in buffer",
+                audio_buffer.len()
+            );
         }
         let chunk = if let Some(ref mut rs) = resampler {
             resample_chunk(rs, &audio_buffer)?
@@ -551,10 +557,7 @@ fn create_resampler(
 }
 
 /// Resample a chunk of audio using the same approach as streaming.rs.
-fn resample_chunk(
-    resampler: &mut Async<f32>,
-    input: &[f32],
-) -> mlx_voice::Result<Vec<f32>> {
+fn resample_chunk(resampler: &mut Async<f32>, input: &[f32]) -> mlx_voice::Result<Vec<f32>> {
     if input.is_empty() {
         return Ok(Vec::new());
     }

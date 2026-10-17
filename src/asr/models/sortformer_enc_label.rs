@@ -86,12 +86,13 @@ impl SortformerEncLabelModel {
     /// Restore a model from a .nemo checkpoint file.
     pub fn restore(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
-        tracing::info!("Loading SortFormer diarization model from: {}", path.display());
+        tracing::info!(
+            "Loading SortFormer diarization model from: {}",
+            path.display()
+        );
 
         // Open the checkpoint
-        let checkpoint = NemoCheckpoint::open(path).or_else(|_| {
-            NemoCheckpoint::open_gzip(path)
-        })?;
+        let checkpoint = NemoCheckpoint::open(path).or_else(|_| NemoCheckpoint::open_gzip(path))?;
 
         // Parse the configuration
         let config: SortformerConfig = from_yaml_str(&checkpoint.config_yaml)?;
@@ -128,10 +129,12 @@ impl SortformerEncLabelModel {
         self.encoder.load_weights(weights, None)?;
 
         // Load transformer encoder weights
-        self.transformer_encoder.load_weights(weights, "transformer_encoder", None)?;
+        self.transformer_encoder
+            .load_weights(weights, "transformer_encoder", None)?;
 
         // Load sortformer modules weights
-        self.sortformer_modules.load_weights(weights, "sortformer_modules", None)?;
+        self.sortformer_modules
+            .load_weights(weights, "sortformer_modules", None)?;
 
         tracing::info!("SortFormer model weights loaded successfully");
         Ok(())
@@ -162,7 +165,8 @@ impl SortformerEncLabelModel {
         let hidden_out = self.transformer_encoder.forward(&projected, None)?;
 
         // Speaker sigmoids: [B, T', num_spks]
-        self.sortformer_modules.forward_speaker_sigmoids(&hidden_out)
+        self.sortformer_modules
+            .forward_speaker_sigmoids(&hidden_out)
     }
 
     /// One streaming diarization step (port of NeMo's `forward_streaming_step`).
@@ -193,8 +197,9 @@ impl SortformerEncLabelModel {
         // Pre-encode (subsampling only): [1, n_mels, T] -> [1, T', d_model]
         let mel_btf = ops::transpose_axes(mel_chunk, &[0, 2, 1])?;
         let mel_lengths = Array::from_slice(&[mel_length as i32], &[1]);
-        let (mut chunk_embs, chunk_lengths) =
-            self.encoder.forward_subsampling_only(&mel_btf, &mel_lengths)?;
+        let (mut chunk_embs, chunk_lengths) = self
+            .encoder
+            .forward_subsampling_only(&mel_btf, &mel_lengths)?;
         let mut chunk_valid = chunk_lengths.to_vec_row_major::<i32>()?[0].max(0) as usize;
 
         if drop_extra_pre_encoded > 0 {
@@ -213,13 +218,17 @@ impl SortformerEncLabelModel {
         let full_embs = state.concat_with_chunk(&chunk_embs)?;
         let total_len = full_embs.dim(1);
         let full_lengths = Array::from_slice(&[total_len], &[1]);
-        let (enc_out, _) = self.encoder.forward_from_embeddings(&full_embs, &full_lengths)?;
+        let (enc_out, _) = self
+            .encoder
+            .forward_from_embeddings(&full_embs, &full_lengths)?;
         let emb_seq = ops::transpose_axes(&enc_out, &[0, 2, 1])?;
 
         // Projection, transformer and speaker head
         let projected = self.sortformer_modules.project_encoder_output(&emb_seq)?;
         let hidden_out = self.transformer_encoder.forward(&projected, None)?;
-        let preds = self.sortformer_modules.forward_speaker_sigmoids(&hidden_out)?;
+        let preds = self
+            .sortformer_modules
+            .forward_speaker_sigmoids(&hidden_out)?;
 
         // Zero predictions past the valid chunk frames
         let valid_len = (state.spkcache_len() + state.fifo_len() + chunk_valid) as i32;
@@ -257,7 +266,10 @@ impl SortformerEncLabelModel {
         let params = &self.config.sortformer_modules;
         let sub = self.subsampling_factor();
         let chunk_frames = params.chunk_len * sub;
-        let (left_ctx, right_ctx) = (params.chunk_left_context * sub, params.chunk_right_context * sub);
+        let (left_ctx, right_ctx) = (
+            params.chunk_left_context * sub,
+            params.chunk_right_context * sub,
+        );
 
         let mut state = self.create_streaming_state()?;
         let mut chunk_preds = Vec::new();
@@ -267,13 +279,23 @@ impl SortformerEncLabelModel {
             let end = (stt + chunk_frames).min(feat_len);
             let right_offset = right_ctx.min(feat_len - end);
 
-            let chunk = mel.index((.., .., (stt - left_offset) as i32..(end + right_offset) as i32));
+            let chunk = mel.index((
+                ..,
+                ..,
+                (stt - left_offset) as i32..(end + right_offset) as i32,
+            ));
             let chunk_valid = (valid_len + left_offset)
                 .saturating_sub(stt)
                 .min(chunk.dim(2) as usize);
 
-            let preds =
-                self.forward_streaming_step(&chunk, chunk_valid, &mut state, 0, left_offset, right_offset)?;
+            let preds = self.forward_streaming_step(
+                &chunk,
+                chunk_valid,
+                &mut state,
+                0,
+                left_offset,
+                right_offset,
+            )?;
             preds.eval()?;
             chunk_preds.push(preds);
             stt = end;
@@ -286,7 +308,10 @@ impl SortformerEncLabelModel {
 
     /// Create a new streaming state for this model.
     pub fn create_streaming_state(&self) -> Result<StreamingSortformerState> {
-        StreamingSortformerState::new(self.config.sortformer_modules.clone(), self.encoder.d_model())
+        StreamingSortformerState::new(
+            self.config.sortformer_modules.clone(),
+            self.encoder.d_model(),
+        )
     }
 
     /// Override streaming parameters (speaker cache, FIFO, chunk geometry).

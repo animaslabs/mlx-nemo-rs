@@ -463,10 +463,7 @@ fn create_resampler(from_rate: u32, to_rate: u32) -> mlx_voice::Result<rubato::F
 }
 
 /// Resample a chunk of audio.
-fn resample_chunk(
-    resampler: &mut rubato::Fft<f32>,
-    input: &[f32],
-) -> mlx_voice::Result<Vec<f32>> {
+fn resample_chunk(resampler: &mut rubato::Fft<f32>, input: &[f32]) -> mlx_voice::Result<Vec<f32>> {
     use rubato::{audioadapter_buffers::direct::InterleavedSlice, Resampler};
 
     if input.is_empty() {

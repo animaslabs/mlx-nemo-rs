@@ -460,7 +460,6 @@ impl StreamingMelBuffer {
         shift_size: usize,
         pre_encode_cache: usize,
     ) -> Option<(Array, usize, usize)> {
-
         // Check if we have enough frames for this chunk
         // For the first chunk (buffer_idx=0), we just need chunk_size frames (no overlap yet)
         // For subsequent chunks, we need chunk_size new frames (pre_encode_cache comes from overlap)

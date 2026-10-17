@@ -19,7 +19,9 @@ fn find_punctuation_tokens(tokenizer: &SentencePieceProcessor) -> Vec<usize> {
         .filter(|&id| {
             let piece = tokenizer.decode_piece_ids(&[id as u32]).unwrap_or_default();
             // Must have at least one punctuation char and only contain punctuation/whitespace
-            piece.chars().all(|c| c.is_ascii_punctuation() || c.is_whitespace())
+            piece
+                .chars()
+                .all(|c| c.is_ascii_punctuation() || c.is_whitespace())
                 && piece.chars().any(|c| c.is_ascii_punctuation())
         })
         .collect()
@@ -31,9 +33,9 @@ use crate::asr::streaming::{
     compute_streaming_config, get_streaming_modes, EncoderCache, FeatureBuffer, StreamingConfig,
     StreamingModeInfo,
 };
-use crate::core::ArrayExt;
 use crate::core::checkpoint::NemoCheckpoint;
 use crate::core::error::{Error, Result};
+use crate::core::ArrayExt;
 
 // Type alias for backwards compatibility
 use crate::asr::modules::MelProcessor as MelSpectrogram;
@@ -1266,10 +1268,11 @@ impl CacheAwareRNNTPipeline {
         self.state.is_first_chunk = false;
 
         let text = match &self.tokenizer {
-            Some(tokenizer) => self
-                .state
-                .detokenizer
-                .update(tokenizer, &self.word_start, &self.state.accumulated_tokens),
+            Some(tokenizer) => self.state.detokenizer.update(
+                tokenizer,
+                &self.word_start,
+                &self.state.accumulated_tokens,
+            ),
             None => String::new(),
         };
 

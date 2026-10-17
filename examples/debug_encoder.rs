@@ -3,10 +3,10 @@
 //! Usage:
 //!   cargo run --release --example debug_encoder -- --model path/to/model.nemo audio.wav
 
-use mlx_voice::asr::modules::{ConformerEncoder, MelSpectrogram, MelSpectrogramConfig};
-use mlx_voice::asr::config::AsrModelConfig;
-use mlx_voice::core::checkpoint::NemoCheckpoint;
 use mlx_rs::Array;
+use mlx_voice::asr::config::AsrModelConfig;
+use mlx_voice::asr::modules::{ConformerEncoder, MelSpectrogram, MelSpectrogramConfig};
+use mlx_voice::core::checkpoint::NemoCheckpoint;
 
 fn main() -> mlx_voice::Result<()> {
     // Parse args
@@ -61,8 +61,8 @@ fn main() -> mlx_voice::Result<()> {
     let hop_samples = 160;
     let chunk_size = 112;
     let pre_encode_cache = 9;
-    let first_chunk_audio = (chunk_size + pre_encode_cache) * hop_samples;  // 19360
-    let subsequent_chunk_audio = chunk_size * hop_samples;  // 17920
+    let first_chunk_audio = (chunk_size + pre_encode_cache) * hop_samples; // 19360
+    let subsequent_chunk_audio = chunk_size * hop_samples; // 17920
 
     println!("\n=== Processing Audio ===");
 
@@ -108,7 +108,10 @@ fn main() -> mlx_voice::Result<()> {
         let valid_mel_len = (chunk.len() as f32 / 160.0).ceil() as i32;
         let mel_len = Array::from_slice(&[valid_mel_len], &[1]);
 
-        println!("  Using mel_len: {} (actual frames: {})", valid_mel_len, num_mel_frames);
+        println!(
+            "  Using mel_len: {} (actual frames: {})",
+            valid_mel_len, num_mel_frames
+        );
 
         // For first encoder call, use debug forward to get intermediate values
         if encoder_call == 0 {
@@ -123,20 +126,32 @@ fn main() -> mlx_voice::Result<()> {
             let sub_slice: &[f32] = sub_flat.as_slice();
             let d_model = debug_out.after_subsampling.dim(2) as usize;
             let t_dim = debug_out.after_subsampling.dim(1) as usize;
-            println!("  After subsampling: shape={:?}", debug_out.after_subsampling.shape());
+            println!(
+                "  After subsampling: shape={:?}",
+                debug_out.after_subsampling.shape()
+            );
             let t0_sub: Vec<String> = sub_slice[..5].iter().map(|x| format!("{:.6}", x)).collect();
-            let t1_sub: Vec<String> = sub_slice[d_model..d_model+5].iter().map(|x| format!("{:.6}", x)).collect();
+            let t1_sub: Vec<String> = sub_slice[d_model..d_model + 5]
+                .iter()
+                .map(|x| format!("{:.6}", x))
+                .collect();
             println!("    T00[0:5]: [{}]", t0_sub.join(", "));
             println!("    T01[0:5]: [{}]", t1_sub.join(", "));
             // Also print T15 (last valid position) and T16 (padding)
             if t_dim > 15 {
                 let t15_offset = 15 * d_model;
-                let t15_sub: Vec<String> = sub_slice[t15_offset..t15_offset+5].iter().map(|x| format!("{:.6}", x)).collect();
+                let t15_sub: Vec<String> = sub_slice[t15_offset..t15_offset + 5]
+                    .iter()
+                    .map(|x| format!("{:.6}", x))
+                    .collect();
                 println!("    T15[0:5]: [{}]", t15_sub.join(", "));
             }
             if t_dim > 16 {
                 let t16_offset = 16 * d_model;
-                let t16_sub: Vec<String> = sub_slice[t16_offset..t16_offset+5].iter().map(|x| format!("{:.6}", x)).collect();
+                let t16_sub: Vec<String> = sub_slice[t16_offset..t16_offset + 5]
+                    .iter()
+                    .map(|x| format!("{:.6}", x))
+                    .collect();
                 println!("    T16[0:5]: [{}]", t16_sub.join(", "));
             }
 
@@ -147,13 +162,22 @@ fn main() -> mlx_voice::Result<()> {
             let scale_flat = debug_out.after_scaling.reshape(&[-1])?;
             scale_flat.eval()?;
             let scale_slice: &[f32] = scale_flat.as_slice();
-            println!("  After scaling: shape={:?}", debug_out.after_scaling.shape());
-            let t0_scale: Vec<String> = scale_slice[..5].iter().map(|x| format!("{:.6}", x)).collect();
+            println!(
+                "  After scaling: shape={:?}",
+                debug_out.after_scaling.shape()
+            );
+            let t0_scale: Vec<String> = scale_slice[..5]
+                .iter()
+                .map(|x| format!("{:.6}", x))
+                .collect();
             println!("    T00[0:5]: [{}]", t0_scale.join(", "));
             // Also print T16 (last valid position)
             if t_dim > 16 {
                 let t16_offset = 16 * d_model;
-                let t16_scale: Vec<String> = scale_slice[t16_offset..t16_offset+5].iter().map(|x| format!("{:.6}", x)).collect();
+                let t16_scale: Vec<String> = scale_slice[t16_offset..t16_offset + 5]
+                    .iter()
+                    .map(|x| format!("{:.6}", x))
+                    .collect();
                 println!("    T16[0:5]: [{}]", t16_scale.join(", "));
             }
 
@@ -165,7 +189,10 @@ fn main() -> mlx_voice::Result<()> {
             let pe_t0: Vec<String> = pe_slice[..5].iter().map(|x| format!("{:.6}", x)).collect();
             println!("    PE[0][0:5]: [{}]", pe_t0.join(", "));
             let pe_d = debug_out.pos_emb.dim(2) as usize;
-            let pe_t1: Vec<String> = pe_slice[pe_d..pe_d+5].iter().map(|x| format!("{:.6}", x)).collect();
+            let pe_t1: Vec<String> = pe_slice[pe_d..pe_d + 5]
+                .iter()
+                .map(|x| format!("{:.6}", x))
+                .collect();
             println!("    PE[1][0:5]: [{}]", pe_t1.join(", "));
 
             // Layer outputs
@@ -173,8 +200,14 @@ fn main() -> mlx_voice::Result<()> {
                 let layer_flat = layer_out.reshape(&[-1])?;
                 layer_flat.eval()?;
                 let layer_slice: &[f32] = layer_flat.as_slice();
-                let t0_layer: Vec<String> = layer_slice[..5].iter().map(|x| format!("{:.6}", x)).collect();
-                let t1_layer: Vec<String> = layer_slice[d_model..d_model+5].iter().map(|x| format!("{:.6}", x)).collect();
+                let t0_layer: Vec<String> = layer_slice[..5]
+                    .iter()
+                    .map(|x| format!("{:.6}", x))
+                    .collect();
+                let t1_layer: Vec<String> = layer_slice[d_model..d_model + 5]
+                    .iter()
+                    .map(|x| format!("{:.6}", x))
+                    .collect();
                 println!("  After layer {}: T00[0:5]: [{}]", i, t0_layer.join(", "));
                 println!("                  T01[0:5]: [{}]", t1_layer.join(", "));
             }
@@ -200,24 +233,41 @@ fn main() -> mlx_voice::Result<()> {
 
         println!("\nEncoder call {}:", encoder_call);
         println!("  Audio samples: {}", chunk.len());
-        println!("  MEL shape: [{}, {}, {}], mel_len: {}", 1, n_mels, num_mel_frames, num_mel_frames);
-        println!("  Encoded shape: [{}, {}, {}], encoded_len: {}", 1, d_dim, t_dim, valid_t);
+        println!(
+            "  MEL shape: [{}, {}, {}], mel_len: {}",
+            1, n_mels, num_mel_frames, num_mel_frames
+        );
+        println!(
+            "  Encoded shape: [{}, {}, {}], encoded_len: {}",
+            1, d_dim, t_dim, valid_t
+        );
         println!("  Valid time steps: {}", valid_t);
 
         // Statistics
         let enc_min = enc_slice.iter().cloned().fold(f32::INFINITY, f32::min);
         let enc_max = enc_slice.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
         let enc_mean: f32 = enc_slice.iter().sum::<f32>() / enc_slice.len() as f32;
-        let enc_std: f32 = (enc_slice.iter().map(|&v| (v - enc_mean).powi(2)).sum::<f32>() / enc_slice.len() as f32).sqrt();
+        let enc_std: f32 = (enc_slice
+            .iter()
+            .map(|&v| (v - enc_mean).powi(2))
+            .sum::<f32>()
+            / enc_slice.len() as f32)
+            .sqrt();
 
-        println!("  Stats: min={:.6}, max={:.6}, mean={:.6}, std={:.6}", enc_min, enc_max, enc_mean, enc_std);
+        println!(
+            "  Stats: min={:.6}, max={:.6}, mean={:.6}, std={:.6}",
+            enc_min, enc_max, enc_mean, enc_std
+        );
 
         // Print first few time steps
         println!("\n  === Valid encoder output ===");
         let print_count = valid_t.min(8);
         for t in 0..print_count {
             let offset = t * d_dim;
-            let vals: Vec<String> = enc_slice[offset..offset+5].iter().map(|x| format!("{:.6}", x)).collect();
+            let vals: Vec<String> = enc_slice[offset..offset + 5]
+                .iter()
+                .map(|x| format!("{:.6}", x))
+                .collect();
             println!("  T{:02} [0:5]: [{}]", t, vals.join(", "));
         }
 
@@ -226,7 +276,10 @@ fn main() -> mlx_voice::Result<()> {
             // Last valid time step
             let t = valid_t - 1;
             let offset = t * d_dim;
-            let vals: Vec<String> = enc_slice[offset..offset+5].iter().map(|x| format!("{:.6}", x)).collect();
+            let vals: Vec<String> = enc_slice[offset..offset + 5]
+                .iter()
+                .map(|x| format!("{:.6}", x))
+                .collect();
             println!("  T{:02} [0:5]: [{}]", t, vals.join(", "));
         }
 

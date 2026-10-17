@@ -126,7 +126,10 @@ fn download_eval(output: Option<PathBuf>, revision: String, token: Option<String
     let output_dir = output.unwrap_or_else(|| project_root().join("samples").join("eval"));
     fs::create_dir_all(&output_dir).context("Failed to create output directory")?;
 
-    println!("Downloading {EVAL_REPO}@{}...", &revision[..revision.len().min(8)]);
+    println!(
+        "Downloading {EVAL_REPO}@{}...",
+        &revision[..revision.len().min(8)]
+    );
     let info = repo.info().with_context(|| {
         format!("Failed to get repo info for {EVAL_REPO}. It's private: run `hf auth login`, or pass --token / set HF_TOKEN")
     })?;

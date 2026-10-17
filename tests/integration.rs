@@ -41,7 +41,13 @@ fn normalize_text(s: &str) -> String {
     let lower = s.to_lowercase();
     let cleaned: String = lower
         .chars()
-        .map(|c| if c.is_alphanumeric() || c == ' ' { c } else { ' ' })
+        .map(|c| {
+            if c.is_alphanumeric() || c == ' ' {
+                c
+            } else {
+                ' '
+            }
+        })
         .collect();
     cleaned.split_whitespace().collect::<Vec<_>>().join(" ")
 }
@@ -237,10 +243,7 @@ mod helper_tests {
 
     #[test]
     fn test_normalize_text_punctuation() {
-        assert_eq!(
-            normalize_text("It's a test—really."),
-            "it s a test really"
-        );
+        assert_eq!(normalize_text("It's a test—really."), "it s a test really");
     }
 
     #[test]

@@ -8,7 +8,9 @@ use tracing_subscriber::{fmt, EnvFilter};
 fn main() -> mlx_voice::Result<()> {
     // Initialize tracing
     fmt()
-        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+        )
         .init();
     let model_path =
         "models/nvidia/nemotron-speech-streaming-en-0.6b/nemotron-speech-streaming-en-0.6b.nemo";
@@ -29,10 +31,7 @@ fn main() -> mlx_voice::Result<()> {
     println!("shift_size: {:?}", config.shift_size);
     println!("valid_out_len: {}", config.valid_out_len);
     println!("pre_encode_cache_size: {:?}", config.pre_encode_cache_size);
-    println!(
-        "drop_extra_pre_encoded: {}",
-        config.drop_extra_pre_encoded
-    );
+    println!("drop_extra_pre_encoded: {}", config.drop_extra_pre_encoded);
     println!("cache_drop_size: {}", config.cache_drop_size);
     println!(
         "last_channel_cache_size: {}",
@@ -58,12 +57,15 @@ fn main() -> mlx_voice::Result<()> {
     while let Some(output) = pipeline.transcribe_step()? {
         println!("\n--- Chunk {} ---", chunk_idx);
         println!("New tokens: {:?}", output.new_tokens);
-        println!("All tokens ({} total): {:?}", output.tokens.len(),
+        println!(
+            "All tokens ({} total): {:?}",
+            output.tokens.len(),
             if output.tokens.len() > 20 {
                 format!("{:?}...", &output.tokens[..20])
             } else {
                 format!("{:?}", output.tokens)
-            });
+            }
+        );
 
         if !output.text.is_empty() {
             println!("Text: '{}'", output.text);

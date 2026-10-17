@@ -518,15 +518,22 @@ impl SafetensorsLoader {
     /// Parse quantization configuration from config content.
     ///
     /// Looks for `"quantization": { "bits": N, "group_size": M }` in JSON config.
-    fn parse_quantization_config(config_content: &str) -> Option<crate::core::quantization::QuantizationConfig> {
+    fn parse_quantization_config(
+        config_content: &str,
+    ) -> Option<crate::core::quantization::QuantizationConfig> {
         // Try parsing as JSON first
         if let Ok(json) = serde_json::from_str::<serde_json::Value>(config_content) {
             if let Some(quant) = json.get("quantization") {
                 let bits = quant.get("bits").and_then(|v| v.as_i64()).unwrap_or(8) as i32;
-                let group_size = quant.get("group_size").and_then(|v| v.as_i64()).unwrap_or(64) as i32;
+                let group_size = quant
+                    .get("group_size")
+                    .and_then(|v| v.as_i64())
+                    .unwrap_or(64) as i32;
 
                 tracing::info!(bits, group_size, "detected quantized model");
-                return Some(crate::core::quantization::QuantizationConfig::new(bits, group_size));
+                return Some(crate::core::quantization::QuantizationConfig::new(
+                    bits, group_size,
+                ));
             }
         }
 
@@ -534,10 +541,15 @@ impl SafetensorsLoader {
         if let Ok(yaml) = yaml_serde::from_str::<yaml_serde::Value>(config_content) {
             if let Some(quant) = yaml.get("quantization") {
                 let bits = quant.get("bits").and_then(|v| v.as_i64()).unwrap_or(8) as i32;
-                let group_size = quant.get("group_size").and_then(|v| v.as_i64()).unwrap_or(64) as i32;
+                let group_size = quant
+                    .get("group_size")
+                    .and_then(|v| v.as_i64())
+                    .unwrap_or(64) as i32;
 
                 tracing::info!(bits, group_size, "detected quantized model");
-                return Some(crate::core::quantization::QuantizationConfig::new(bits, group_size));
+                return Some(crate::core::quantization::QuantizationConfig::new(
+                    bits, group_size,
+                ));
             }
         }
 
@@ -621,8 +633,12 @@ impl SafetensorsLoader {
             return Ok(config);
         }
 
-        serde_json::from_str(&self.config_content)
-            .map_err(|e| Error::config(format!("Failed to parse config (tried YAML and JSON): {}", e)))
+        serde_json::from_str(&self.config_content).map_err(|e| {
+            Error::config(format!(
+                "Failed to parse config (tried YAML and JSON): {}",
+                e
+            ))
+        })
     }
 
     /// Get the raw config content.

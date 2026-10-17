@@ -25,12 +25,12 @@ use mlx_rs::Array;
 use crate::asr::config::ClassificationModelConfig;
 use crate::asr::modules::encoders::JasperEncoder;
 use crate::asr::modules::MelSpectrogram;
-use crate::core::ArrayExt;
+use crate::audio::resample;
 use crate::core::checkpoint::NemoCheckpoint;
 use crate::core::config::from_yaml_str;
-use crate::audio::resample;
 use crate::core::error::{Error, Result};
 use crate::core::quantization::LinearLayer;
+use crate::core::ArrayExt;
 
 /// Encoder-Decoder Classification Model.
 ///
@@ -126,7 +126,10 @@ impl EncDecClassificationModel {
         // Try decoder weight paths in order of likelihood
         let decoder_key_pairs = [
             // ConvASRDecoderClassification (NeMo EncDecClassificationModel)
-            ("decoder.decoder_layers.0.weight", "decoder.decoder_layers.0.bias"),
+            (
+                "decoder.decoder_layers.0.weight",
+                "decoder.decoder_layers.0.bias",
+            ),
             // MultiLayerPerceptron decoder
             ("decoder._layer0.weight", "decoder._layer0.bias"),
             // Simple linear decoder (Frame_VAD_Multilingual_MarbleNet)
@@ -137,7 +140,9 @@ impl EncDecClassificationModel {
             if let Some(weight) = weights.get(*weight_key) {
                 // NeMo may store as Conv1d [out, in, 1], squeeze if needed
                 let weight = if weight.ndim() == 3 {
-                    weight.squeeze_axes(&[-1]).unwrap_or_else(|_| weight.clone())
+                    weight
+                        .squeeze_axes(&[-1])
+                        .unwrap_or_else(|_| weight.clone())
                 } else {
                     weight.clone()
                 };
@@ -364,4 +369,3 @@ fn load_wav(_path: &Path) -> Result<(Vec<f32>, u32)> {
         "Audio loading requires the 'asr' feature",
     ))
 }
-

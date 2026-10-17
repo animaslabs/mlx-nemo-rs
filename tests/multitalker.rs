@@ -12,7 +12,9 @@
 
 use std::path::Path;
 
-use mlx_voice::asr::{MultiTalkerMode, MultiTalkerPipeline, SortformerEncLabelModel, SpeakerSegment};
+use mlx_voice::asr::{
+    MultiTalkerMode, MultiTalkerPipeline, SortformerEncLabelModel, SpeakerSegment,
+};
 use mlx_voice::Array;
 
 const DIAR_MODEL: &str =
@@ -45,7 +47,13 @@ fn normalize_text(s: &str) -> String {
     let cleaned: String = s
         .to_lowercase()
         .chars()
-        .map(|c| if c.is_alphanumeric() || c == ' ' { c } else { ' ' })
+        .map(|c| {
+            if c.is_alphanumeric() || c == ' ' {
+                c
+            } else {
+                ' '
+            }
+        })
         .collect();
     cleaned.split_whitespace().collect::<Vec<_>>().join(" ")
 }
@@ -98,12 +106,20 @@ fn test_streaming_diarization_single_speaker() {
     // Print activity per second for inspection
     for (sec, frames) in preds.chunks(25).enumerate() {
         let means: Vec<String> = (0..frames[0].len())
-            .map(|s| format!("{:.2}", frames.iter().map(|f| f[s]).sum::<f32>() / frames.len() as f32))
+            .map(|s| {
+                format!(
+                    "{:.2}",
+                    frames.iter().map(|f| f[s]).sum::<f32>() / frames.len() as f32
+                )
+            })
             .collect();
         println!("{:3}s {}", sec * 2, means.join(" "));
     }
 
-    let speech: Vec<&Vec<f32>> = preds.iter().filter(|f| f.iter().any(|&p| p > 0.5)).collect();
+    let speech: Vec<&Vec<f32>> = preds
+        .iter()
+        .filter(|f| f.iter().any(|&p| p > 0.5))
+        .collect();
     let spk0 = speech.iter().filter(|f| f[0] > 0.5).count();
     assert!(
         spk0 as f32 >= 0.95 * speech.len() as f32,
@@ -122,10 +138,15 @@ fn test_multitalker_single_speaker_wer() {
     let mut pipeline = MultiTalkerPipeline::restore(MT_ASR_MODEL, DIAR_MODEL, 0).expect("load");
     assert_eq!(pipeline.mode(), MultiTalkerMode::Parallel);
 
-    pipeline.set_audio_file(SINGLE_SPEAKER_AUDIO).expect("audio");
+    pipeline
+        .set_audio_file(SINGLE_SPEAKER_AUDIO)
+        .expect("audio");
     let segments = pipeline.run().expect("run");
 
-    assert!(segments.iter().all(|s| s.speaker == 0), "expected only speaker 0");
+    assert!(
+        segments.iter().all(|s| s.speaker == 0),
+        "expected only speaker 0"
+    );
     let hypothesis: Vec<&str> = segments.iter().map(|s| s.text.as_str()).collect();
     let hypothesis = normalize_text(&hypothesis.join(" "));
     let reference = normalize_text(&std::fs::read_to_string(SINGLE_SPEAKER_TRANSCRIPT).unwrap());
@@ -148,13 +169,19 @@ fn overlap_mix() -> Vec<f32> {
     mix.iter().map(|v| (v * 0.7).clamp(-1.0, 1.0)).collect()
 }
 
-fn transcribe_samples(asr_model: &str, samples: Vec<f32>) -> (MultiTalkerMode, Vec<SpeakerSegment>) {
+fn transcribe_samples(
+    asr_model: &str,
+    samples: Vec<f32>,
+) -> (MultiTalkerMode, Vec<SpeakerSegment>) {
     let mut pipeline = MultiTalkerPipeline::restore(asr_model, DIAR_MODEL, 0).expect("load");
     pipeline.add_audio(&samples);
     pipeline.end_stream();
     let segments = pipeline.run().expect("run");
     for s in &segments {
-        println!("[{:6.2}-{:6.2}] speaker_{}: {}", s.start_time, s.end_time, s.speaker, s.text);
+        println!(
+            "[{:6.2}-{:6.2}] speaker_{}: {}",
+            s.start_time, s.end_time, s.speaker, s.text
+        );
     }
     (pipeline.mode(), segments)
 }
@@ -177,7 +204,12 @@ fn speaker_texts(segments: &[SpeakerSegment]) -> Vec<String> {
 #[test]
 #[ignore]
 fn test_multitalker_overlapping_speakers() {
-    if !require(&[DIAR_MODEL, MT_ASR_MODEL, SINGLE_SPEAKER_AUDIO, SECOND_SPEAKER_AUDIO]) {
+    if !require(&[
+        DIAR_MODEL,
+        MT_ASR_MODEL,
+        SINGLE_SPEAKER_AUDIO,
+        SECOND_SPEAKER_AUDIO,
+    ]) {
         return;
     }
     let (mode, segments) = transcribe_samples(MT_ASR_MODEL, overlap_mix());
@@ -190,15 +222,27 @@ fn test_multitalker_overlapping_speakers() {
     // transcribed on its own
     let second_wer = word_error_rate(&normalize_text(SECOND_SPEAKER_TEXT), &texts[1]);
     println!("second speaker WER: {:.3}", second_wer);
-    assert!(second_wer < 0.25, "second speaker WER too high: {:.3}", second_wer);
+    assert!(
+        second_wer < 0.25,
+        "second speaker WER too high: {:.3}",
+        second_wer
+    );
     assert!(texts[0].contains("raised one of his dishes towards his mouth"));
-    assert!(!texts[0].contains("phoebe"), "second speaker leaked into the first");
+    assert!(
+        !texts[0].contains("phoebe"),
+        "second speaker leaked into the first"
+    );
 }
 
 #[test]
 #[ignore]
 fn test_serial_mode_attributes_speakers() {
-    if !require(&[DIAR_MODEL, SERIAL_ASR_MODEL, SINGLE_SPEAKER_AUDIO, SECOND_SPEAKER_AUDIO]) {
+    if !require(&[
+        DIAR_MODEL,
+        SERIAL_ASR_MODEL,
+        SINGLE_SPEAKER_AUDIO,
+        SECOND_SPEAKER_AUDIO,
+    ]) {
         return;
     }
     let (mode, segments) = transcribe_samples(SERIAL_ASR_MODEL, overlap_mix());

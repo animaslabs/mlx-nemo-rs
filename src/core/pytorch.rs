@@ -245,7 +245,8 @@ fn gather_tensor_bytes(data: &[u8], info: &TensorInfo, elem_size: usize) -> Resu
     let mut out = Vec::with_capacity(numel * elem_size);
     let mut index = vec![0i64; info.shape.len()];
     for _ in 0..numel {
-        let elem = info.offset as i64 + index.iter().zip(&stride).map(|(&i, &s)| i * s).sum::<i64>();
+        let elem =
+            info.offset as i64 + index.iter().zip(&stride).map(|(&i, &s)| i * s).sum::<i64>();
         let start = elem as usize * elem_size;
         out.extend_from_slice(&data[start..start + elem_size]);
         // Advance the multi-dimensional index
@@ -926,7 +927,10 @@ mod tests {
     }
 
     fn values(bytes: &[u8]) -> Vec<f32> {
-        bytes.chunks(4).map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect()
+        bytes
+            .chunks(4)
+            .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
+            .collect()
     }
 
     #[test]

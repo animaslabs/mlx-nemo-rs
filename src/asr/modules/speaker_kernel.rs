@@ -60,7 +60,10 @@ impl SpeakerKernels {
     ///
     /// Returns `None` if the checkpoint has no `spk_kernels.*` weights (an
     /// ordinary ASR model).
-    pub fn load(weights: &HashMap<String, Array>, quant: Option<&QuantizationConfig>) -> Option<Self> {
+    pub fn load(
+        weights: &HashMap<String, Array>,
+        quant: Option<&QuantizationConfig>,
+    ) -> Option<Self> {
         let spk = load_kernels(weights, "spk_kernels", quant);
         if spk.is_empty() {
             return None;
@@ -116,7 +119,13 @@ fn load_kernels(
     let layer_prefix = format!("{}.", prefix);
     let mut layers: Vec<usize> = weights
         .keys()
-        .filter_map(|k| k.strip_prefix(&layer_prefix)?.split('.').next()?.parse().ok())
+        .filter_map(|k| {
+            k.strip_prefix(&layer_prefix)?
+                .split('.')
+                .next()?
+                .parse()
+                .ok()
+        })
         .collect();
     layers.sort_unstable();
     layers.dedup();

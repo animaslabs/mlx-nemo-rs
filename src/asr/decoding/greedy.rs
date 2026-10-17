@@ -5,8 +5,8 @@
 use mlx_rs::ops::indexing::argmax_axis;
 use mlx_rs::Array;
 
-use crate::core::ArrayExt;
 use crate::core::error::Result;
+use crate::core::ArrayExt;
 
 /// Perform greedy CTC decoding.
 ///
