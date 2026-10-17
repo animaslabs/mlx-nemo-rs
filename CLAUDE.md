@@ -40,7 +40,7 @@ cargo xtask download nvidia/diar_streaming_sortformer_4spk-v2.1
 cargo xtask download-eval
 cargo run --release --example eval -- --model <model.nemo> --out hypotheses.jsonl
 (cd ../mlx-models && uv run samples/score.py ../mlx-voice-rs/hypotheses.jsonl)
-# eval also takes --offline (whole-file RNN-T), --warmup N, --repeats N
+# eval also takes --offline (whole-file RNN-T), --dtype bfloat16 (offline encoder), --warmup N, --repeats N
 
 # Speed + WER benchmark vs parakeet-mlx, mlx-audio and NeMo (lives in mlx-models; builds and runs examples/eval)
 (cd ../mlx-models && uv run bench/bench.py)

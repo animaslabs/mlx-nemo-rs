@@ -24,7 +24,7 @@ fn find_punctuation_tokens(tokenizer: &SentencePieceProcessor) -> Vec<usize> {
         })
         .collect()
 }
-use crate::asr::decoding::RnntStreamingDecoder;
+use crate::asr::decoding::{word_start_table, IncrementalDetokenizer, RnntStreamingDecoder};
 use crate::asr::models::{DecoderState, PredictionNetwork};
 use crate::asr::modules::{ConformerEncoder, MelProcessor, StreamingMel, StreamingMelConfig};
 use crate::asr::streaming::{
@@ -74,9 +74,8 @@ struct StreamingState {
     step_count: usize,
     /// Cumulative statistics
     cumulative_stats: CumulativeStats,
-    /// Last extracted mel chunk's overlap region (for boundary verification)
-    /// Stores the last `pre_encode_cache` frames of the previous extraction
-    last_overlap_norms: Vec<f32>,
+    /// Text of the accumulated tokens
+    detokenizer: IncrementalDetokenizer,
 }
 
 /// Cumulative statistics for debugging alignment.
@@ -244,6 +243,8 @@ pub struct CacheAwareRNNTPipeline {
     // Punctuation suppression
     pub(super) suppress_punctuation: bool,
     pub(super) punctuation_token_ids: Vec<usize>,
+    /// For each token id, whether it starts a new word
+    pub(super) word_start: Vec<bool>,
 
     // Blank threshold
     blank_threshold: f32,
@@ -360,7 +361,11 @@ impl CacheAwareRNNTPipeline {
 
         // Create mel streaming components
         let n_mels = preproc_config.features;
-        let mel_stream_config = StreamingMelConfig::new(preproc_config.clone(), &streaming_config);
+        let mel_stream_config = StreamingMelConfig::new(
+            preproc_config.clone(),
+            &streaming_config,
+            encoder.subsampling_factor(),
+        );
         let streaming_mel = StreamingMel::new(preproc_config)?;
 
         // Create streaming decoder
@@ -387,8 +392,10 @@ impl CacheAwareRNNTPipeline {
             is_first_chunk: true,
             step_count: 0,
             cumulative_stats: CumulativeStats::default(),
-            last_overlap_norms: Vec::new(),
+            detokenizer: IncrementalDetokenizer::default(),
         };
+
+        let word_start = tokenizer.as_ref().map(word_start_table).unwrap_or_default();
 
         Ok(Self {
             config,
@@ -414,6 +421,7 @@ impl CacheAwareRNNTPipeline {
             n_mels,
             suppress_punctuation: false,
             punctuation_token_ids,
+            word_start,
             blank_threshold: 0.0,
             silence_threshold: 0.0,
         })
@@ -616,7 +624,11 @@ impl CacheAwareRNNTPipeline {
 
         // Create mel streaming components
         let n_mels = preproc_config.features;
-        let mel_stream_config = StreamingMelConfig::new(preproc_config.clone(), &streaming_config);
+        let mel_stream_config = StreamingMelConfig::new(
+            preproc_config.clone(),
+            &streaming_config,
+            encoder.subsampling_factor(),
+        );
         let streaming_mel = StreamingMel::new(preproc_config)?;
 
         // Create streaming decoder
@@ -642,8 +654,10 @@ impl CacheAwareRNNTPipeline {
             is_first_chunk: true,
             step_count: 0,
             cumulative_stats: CumulativeStats::default(),
-            last_overlap_norms: Vec::new(),
+            detokenizer: IncrementalDetokenizer::default(),
         };
+
+        let word_start = tokenizer.as_ref().map(word_start_table).unwrap_or_default();
 
         Ok(Self {
             config,
@@ -669,6 +683,7 @@ impl CacheAwareRNNTPipeline {
             n_mels,
             suppress_punctuation: false,
             punctuation_token_ids,
+            word_start,
             blank_threshold: 0.0,
             silence_threshold: 0.0,
         })
@@ -890,7 +905,7 @@ impl CacheAwareRNNTPipeline {
         self.state.is_first_chunk = true;
         self.state.step_count = 0;
         self.state.cumulative_stats = CumulativeStats::default();
-        self.state.last_overlap_norms.clear();
+        self.state.detokenizer.reset();
     }
 
     /// Get audio chunk size in samples for the current streaming config.
@@ -1022,132 +1037,64 @@ impl CacheAwareRNNTPipeline {
     }
 
     /// Try to extract a mel chunk from the streaming mel buffer.
+    ///
+    /// Mirrors NeMo's `CacheAwareStreamingAudioBuffer`: the first chunk is
+    /// `chunk_size_first` frames with no pre-encode cache; every later chunk is
+    /// the `pre_encode_cache` frames before it plus `chunk_size` new frames.
+    /// The last chunk is shorter rather than padded.
     fn try_extract_chunk(&mut self) -> Result<Option<FeatureBuffer>> {
-        let chunk_size = self.mel_stream_config.chunk_size;
-        let shift_size = self.mel_stream_config.shift_size;
-        let pre_encode_cache = self
-            .mel_stream_config
-            .pre_encode_cache_for_chunk(self.is_first_chunk);
+        let is_first = self.is_first_chunk;
+        let config = &self.mel_stream_config;
+        let chunk_size = config.chunk_size_for_chunk(is_first);
+        let pre_encode_cache = config.pre_encode_cache_for_chunk(is_first);
+        let shift_size = config.shift_size_for_chunk(is_first);
+        let next_pre_encode_cache = config.pre_encode_cache;
+        let min_frames = config.min_frames_for_chunk(is_first);
+        let min_frames_next = config.min_frames_for_chunk(false);
 
+        // The buffer starts with this chunk's pre-encode cache
         let available = self.streaming_mel.total_frames();
-
-        tracing::debug!(
-            available,
-            chunk_size,
-            shift_size,
-            pre_encode_cache,
-            is_first_chunk = self.is_first_chunk,
-            stream_ended = self.stream_ended,
-            is_done = self.is_done,
-            "try_extract_chunk: checking state"
-        );
-
-        // For the first chunk, we need chunk_size frames of real data.
-        // For subsequent chunks, we need chunk_size + pre_encode_cache frames
-        // (pre_encode_cache frames are overlap from previous chunk that we kept).
-        // let required = chunk_size;
-        let required = if self.is_first_chunk {
-            chunk_size
-        } else {
-            chunk_size + pre_encode_cache
-        };
-
-        // Not enough frames yet
+        let required = pre_encode_cache + chunk_size;
         if available < required {
-            if self.stream_ended && available > 0 {
-                // Pad final chunk - handled below via get_frames_padded
-                tracing::debug!(
-                    available,
-                    required,
-                    "Padding final chunk"
-                );
-            } else {
-                tracing::debug!(
-                    available,
-                    required,
-                    stream_ended = self.stream_ended,
-                    "try_extract_chunk: not enough frames, returning None"
-                );
-                if self.stream_ended && available == 0 {
-                    self.is_done = true;
-                }
+            if !self.stream_ended {
+                return Ok(None);
+            }
+            // NeMo stops once a chunk has too few new frames for one encoder frame
+            if available.saturating_sub(pre_encode_cache) < min_frames {
+                self.is_done = true;
                 return Ok(None);
             }
         }
 
-        // Extract mel chunk
-        // LOG_MEL_ZERO = ln(2^-24) ≈ -16.6355 (matches NeMo's log_zero_guard)
-        const LOG_MEL_ZERO: f32 = -16.635532;
+        let total = available.min(required);
+        let mel_chunk = self.streaming_mel.get_frames(0, total)?;
+        let new_frames = total - pre_encode_cache;
 
-        const LOOKAHEAD_FRAMES: usize = 0;
-
-        let mel_chunk = if self.is_first_chunk && pre_encode_cache > 0 {
-            // First chunk: prepend silence for pre_encode_cache, then real frames
-            let silence = mlx_rs::ops::full::<f32>(
-                &[self.n_mels as i32, pre_encode_cache as i32],
-                &Array::from_f32(LOG_MEL_ZERO),
-            )?;
-            let real_frames = self
-                .streaming_mel
-                .get_frames_padded(0, chunk_size + LOOKAHEAD_FRAMES, LOG_MEL_ZERO)?;
-            mlx_rs::ops::concatenate(&[&silence, &real_frames], 1)?
-        } else if self.is_first_chunk {
-            // First chunk, no pre_encode_cache
-            self.streaming_mel
-                .get_frames_padded(0, chunk_size + LOOKAHEAD_FRAMES, LOG_MEL_ZERO)?
-        } else {
-            // Subsequent chunks: first pre_encode_cache frames are overlap from previous
-            self.streaming_mel
-                .get_frames_padded(0, chunk_size + pre_encode_cache + LOOKAHEAD_FRAMES, LOG_MEL_ZERO)?
-        };
-
-        let total_extract = mel_chunk.dim(1) as usize;
-
-        tracing::debug!(
-            total_extract,
-            pre_encode_cache,
-            chunk_size,
-            "try_extract_chunk: extracted frames"
-        );
-
-        // Trim by shift_size to advance the window
-        // The remaining pre_encode_cache frames become overlap for the next chunk
-        let trim_amount = if self.is_first_chunk {
-            // First chunk: we only have real data starting at 0, advance by shift_size
-            shift_size - pre_encode_cache
-        } else {
-            // Subsequent: we had pre_encode_cache + chunk_size frames, advance by shift_size
-            shift_size
-        };
-        self.streaming_mel.trim(trim_amount);
-
-        let is_first = self.is_first_chunk;
+        // Advance to the next chunk, keeping its pre-encode cache
+        self.streaming_mel
+            .trim(pre_encode_cache + shift_size - next_pre_encode_cache);
         self.is_first_chunk = false;
 
-        let remaining_after = self.streaming_mel.total_frames();
-        let next_required = chunk_size + self.mel_stream_config.pre_encode_cache;
-        let is_last = self.stream_ended && remaining_after < next_required;
+        let next_new_frames = self
+            .streaming_mel
+            .total_frames()
+            .saturating_sub(next_pre_encode_cache);
+        let is_last = self.stream_ended && next_new_frames < min_frames_next;
         if is_last {
             self.is_done = true;
-            tracing::info!(
-                remaining_after,
-                next_required,
-                "Final chunk extracted - stream complete"
-            );
         }
 
         tracing::debug!(
             is_first,
             is_last,
-            total_extract,
+            total,
             pre_encode_cache,
-            shift_size,
-            remaining_after,
-            "try_extract_chunk: extraction complete"
+            new_frames,
+            "try_extract_chunk: extracted chunk"
         );
 
         Ok(Some(
-            FeatureBuffer::new(mel_chunk, chunk_size)
+            FeatureBuffer::new(mel_chunk, new_frames)
                 .with_first(is_first)
                 .with_last(is_last)
                 .with_pre_encode_cache(pre_encode_cache),
@@ -1219,142 +1166,33 @@ impl CacheAwareRNNTPipeline {
         self.process_feature_buffer(feature_buffer)
     }
 
-    /// Run one additional encoder+decoder pass with silence mel input after the
-    /// last real chunk. The encoder cache from the last real audio provides left
-    /// context, while the silence input provides "future context" showing that
-    /// speech has ended, allowing deferred tokens (e.g. punctuation) to be emitted.
-    fn flush_decode_with_silence(&mut self) -> Result<Vec<usize>> {
-        const LOG_MEL_ZERO: f32 = -16.635532;
-
-        let chunk_size = self.mel_stream_config.chunk_size;
-        let pre_encode_cache = self.mel_stream_config.pre_encode_cache;
-        let total_frames = chunk_size + pre_encode_cache;
-
-        // Create silence mel chunk: [1, n_mels, chunk_size + pre_encode_cache]
-        let silence = mlx_rs::ops::full::<f32>(
-            &[1, self.n_mels as i32, total_frames as i32],
-            &Array::from_f32(LOG_MEL_ZERO),
-        )?;
-
-        let lengths = Array::from_slice(&[chunk_size as i32], &[1]);
-        let drop_extra = self.streaming_config.drop_extra_pre_encoded;
-
-        // Run encoder with existing cache
-        let (encoded, encoded_lengths, cache_channel_next, cache_time_next, cache_len_next) =
-            self.encoder.forward_streaming(
-                &silence,
-                &lengths,
-                &self.encoder_cache.last_channel,
-                &self.encoder_cache.last_time,
-                &self.encoder_cache.last_channel_len,
-                drop_extra,
-            )?;
-
-        // Update encoder cache
-        self.encoder_cache.last_channel = cache_channel_next;
-        self.encoder_cache.last_time = cache_time_next;
-        self.encoder_cache.last_channel_len = cache_len_next;
-
-        // Transpose [B, D, T] -> [B, T, D]
-        let encoded = mlx_rs::ops::transpose_axes(&encoded, &[0, 2, 1])?;
-        encoded.eval()?;
-        encoded_lengths.eval()?;
-
-        // Use ALL encoder output frames (keep_all_outputs for flush)
-        let raw_enc_len = encoded_lengths.to_vec_row_major::<i32>()?[0] as usize;
-        let actual_tensor_frames = encoded.shape()[1] as usize;
-        let enc_seq_len = raw_enc_len.min(actual_tensor_frames);
-
-        tracing::debug!(
-            enc_seq_len,
-            raw_enc_len,
-            actual_tensor_frames,
-            "flush_decode_with_silence: encoder output"
-        );
-
-        // Decode with optional punctuation masking
-        let masked_ids = if self.suppress_punctuation {
-            Some(self.punctuation_token_ids.as_slice())
-        } else {
-            None
-        };
-
-        let decode_output = self.streaming_decoder.decode_frames(
-            &encoded,
-            enc_seq_len,
-            &self.decoder,
-            &mut self.state.decoder_state,
-            &self.joint,
-            &mut self.state.last_token,
-            masked_ids,
-        )?;
-
-        if !decode_output.new_tokens.is_empty() {
-            tracing::debug!(
-                new_tokens = decode_output.new_tokens.len(),
-                blanks = decode_output.blank_count,
-                "flush_decode_with_silence: emitted tokens"
-            );
-        }
-
-        Ok(decode_output.new_tokens)
-    }
-
     /// Process a feature buffer and return transcription output.
     fn process_feature_buffer(&mut self, fb: FeatureBuffer) -> Result<Option<TranscribeOutput>> {
-        let is_first = fb.is_first || self.state.is_first_chunk;
         let is_last = fb.is_last;
 
-        // Always apply drop_extra_pre_encoded in streaming mode.
-        // NeMo applies this whenever cache_last_channel is not None, which in
-        // streaming mode is always true (cache is pre-initialized to zeros).
-        // This corrects for extra frames produced by strided subsampling at chunk boundaries.
-        let drop_extra = self.streaming_config.drop_extra_pre_encoded;
+        // NeMo drops the extra pre-encoded frames on every chunk but the first
+        let drop_extra = self.streaming_config.drop_extra_for_step(fb.is_first);
 
         // Add batch dimension: [n_mels, time] -> [1, n_mels, time]
         let chunk_len = fb.features.dim(1) as usize;
-        let valid_len = fb.valid_size;
         let features = fb
             .features
             .reshape(&[1, self.n_mels as i32, chunk_len as i32])?;
-        // Python uses mel_len (valid_size) for the lengths parameter, not tensor dimension.
-        // The tensor has chunk_len frames, but only valid_len are considered valid.
-        // The encoder uses lengths for attention masking.
-        let lengths = Array::from_slice(&[valid_len as i32], &[1]);
+        // Like NeMo, the length covers the pre-encode cache plus the new frames
+        let lengths = Array::from_slice(&[chunk_len as i32], &[1]);
 
-        // Calculate audio time position based on mel frames processed
-        // Each mel frame = hop_length samples = 160 samples at 16kHz = 10ms
-        let hop_length = 160; // TODO: get from config
-        let sample_rate = self.sample_rate() as f32;
-        let audio_samples_this_chunk = valid_len * hop_length;
-        let audio_time_start =
-            self.state.cumulative_stats.total_audio_samples as f32 / sample_rate;
-        let audio_time_end = (self.state.cumulative_stats.total_audio_samples
-            + audio_samples_this_chunk) as f32
-            / sample_rate;
+        let hop_length = self.preprocessor.hop_samples();
+        let audio_samples_this_chunk = fb.valid_size * hop_length;
 
-        // Debug: Log feature buffer details with audio position
         tracing::debug!(
             step = self.state.step_count,
-            is_first,
+            is_first = fb.is_first,
             is_last,
             pre_encode_cache = fb.pre_encode_cache,
             chunk_len,
-            valid_len,
-            audio_time_start = %format!("{:.3}s", audio_time_start),
-            audio_time_end = %format!("{:.3}s", audio_time_end),
+            drop_extra,
             "PIPELINE: received feature buffer"
         );
-
-        // Save the encoder cache before processing the last chunk.
-        // flush_decode_with_silence needs the speech-context cache (not the
-        // cache updated with silence) to give the decoder the best chance
-        // of emitting deferred tokens like sentence-ending punctuation.
-        let pre_silence_cache = if is_last {
-            Some(self.encoder_cache.clone())
-        } else {
-            None
-        };
 
         // Run encoder with cache
         let (encoded, encoded_lengths, cache_channel_next, cache_time_next, cache_len_next) =
@@ -1367,90 +1205,25 @@ impl CacheAwareRNNTPipeline {
                 drop_extra,
             )?;
 
-        // Log encoder cache state AFTER processing (before updating)
-        {
-            cache_len_next.eval().ok();
-            let cache_len_after = cache_len_next.to_vec_row_major::<i64>()?[0];
-            let cache_size = self.encoder_cache.last_channel.dim(2) as i64;
-
-            // Compute new cache channel norm (sample from END where real data lives)
-            // Cache is right-aligned: zeros on left, real data on right
-            let new_cache_channel_norm: f32 = {
-                cache_channel_next.eval().ok();
-                let data = cache_channel_next.to_vec_row_major::<f32>()?;
-                if !data.is_empty() {
-                    let sample_len = data.len().min(100);
-                    let start = data.len().saturating_sub(sample_len);
-                    data[start..].iter().map(|v| v * v).sum::<f32>().sqrt()
-                } else {
-                    0.0
-                }
-            };
-
-            tracing::debug!(
-                step = self.state.step_count,
-                audio_time = %format!("{:.3}s", audio_time_end),
-                cache_filled = %format!("{}/{}", cache_len_after, cache_size),
-                cache_norm = %format!("{:.4}", new_cache_channel_norm),
-                "PIPELINE: encoder step complete"
-            );
-        }
-
-        // Update encoder cache
         self.encoder_cache.last_channel = cache_channel_next;
         self.encoder_cache.last_time = cache_time_next;
         self.encoder_cache.last_channel_len = cache_len_next;
 
         // Transpose encoder output from [B, D, T] to [B, T, D]
         let encoded = mlx_rs::ops::transpose_axes(&encoded, &[0, 2, 1])?;
-        encoded.eval()?;
-        encoded_lengths.eval()?;
 
-        // Get valid output length
-        // For chunked_limited style, keep all outputs (matches NeMo's keep_all_outputs=True)
-        // For regular style, clip to valid_out_len
-        let raw_enc_len = encoded_lengths.to_vec_row_major::<i32>()?[0] as usize;
+        // chunked_limited keeps every output (NeMo's keep_all_outputs); regular
+        // style clips to valid_out_len except on the last chunk
         let actual_tensor_frames = encoded.shape()[1] as usize;
-        let valid_out_len = self.streaming_config.valid_out_len;
+        // A host array, so this doesn't wait on the GPU
+        let encoded_lengths = encoded_lengths.to_vec_row_major::<i32>()?[0].max(0) as usize;
         let enc_seq_len = if self.encoder.is_chunked_limited() || is_last {
-            // chunked_limited or last chunk: use all encoder outputs (keep_all_outputs=True)
-            raw_enc_len.min(actual_tensor_frames)
+            encoded_lengths.min(actual_tensor_frames)
         } else {
-            // regular style: clip to valid_out_len
-            raw_enc_len.min(valid_out_len).min(actual_tensor_frames)
+            encoded_lengths
+                .min(self.streaming_config.valid_out_len)
+                .min(actual_tensor_frames)
         };
-
-        // Debug encoder output
-        self.encoder_cache.last_channel_len.eval()?;
-        let cache_len = self.encoder_cache.last_channel_len.to_vec_row_major::<i64>()?[0];
-
-        // Detailed debug for alignment diagnosis
-        tracing::debug!(
-            step = self.state.step_count,
-            mel_chunk_len = chunk_len,
-            mel_valid_len = valid_len,
-            drop_extra,
-            enc_raw_len = raw_enc_len,
-            enc_tensor_frames = actual_tensor_frames,
-            enc_valid_out_config = valid_out_len,
-            enc_seq_len_to_decode = enc_seq_len,
-            enc_cache_len = cache_len,
-            "PIPELINE: encoder output"
-        );
-
-        tracing::trace!(
-            is_first,
-            is_last,
-            chunk_len,
-            valid_len,
-            drop_extra,
-            raw_enc_len,
-            actual_tensor_frames,
-            valid_out_len,
-            enc_seq_len,
-            cache_len,
-            "processing feature buffer"
-        );
 
         // Decode with optional punctuation masking
         let masked_ids = if self.suppress_punctuation {
@@ -1458,7 +1231,7 @@ impl CacheAwareRNNTPipeline {
         } else {
             None
         };
-        let mut decode_output = self.streaming_decoder.decode_frames(
+        let decode_output = self.streaming_decoder.decode_frames(
             &encoded,
             enc_seq_len,
             &self.decoder,
@@ -1469,87 +1242,35 @@ impl CacheAwareRNNTPipeline {
         )?;
 
         // Update cumulative statistics
-        self.state.cumulative_stats.total_audio_samples += audio_samples_this_chunk;
-        self.state.cumulative_stats.total_mel_frames += valid_len;
-        self.state.cumulative_stats.total_encoder_frames += enc_seq_len;
-        self.state.cumulative_stats.total_blanks += decode_output.blank_count;
-        self.state.cumulative_stats.total_tokens += decode_output.new_tokens.len();
+        let stats = &mut self.state.cumulative_stats;
+        stats.total_audio_samples += audio_samples_this_chunk;
+        stats.total_mel_frames += fb.valid_size;
+        stats.total_encoder_frames += enc_seq_len;
+        stats.total_blanks += decode_output.blank_count;
+        stats.total_tokens += decode_output.new_tokens.len();
 
-        // Detailed decode summary
         tracing::debug!(
             step = self.state.step_count,
             frames_decoded = enc_seq_len,
             blanks = decode_output.blank_count,
             new_tokens = decode_output.new_tokens.len(),
-            total_tokens = self.state.accumulated_tokens.len() + decode_output.new_tokens.len(),
-            last_token = ?self.state.last_token,
+            cum_audio_samples = stats.total_audio_samples,
+            cum_encoder_frames = stats.total_encoder_frames,
+            cum_tokens = stats.total_tokens,
             "PIPELINE: decode complete"
         );
 
-        // Cumulative statistics
-        tracing::debug!(
-            step = self.state.step_count,
-            cum_audio_samples = self.state.cumulative_stats.total_audio_samples,
-            cum_audio_time = %format!("{:.3}s", self.state.cumulative_stats.total_audio_samples as f32 / sample_rate),
-            cum_mel_frames = self.state.cumulative_stats.total_mel_frames,
-            cum_encoder_frames = self.state.cumulative_stats.total_encoder_frames,
-            cum_blanks = self.state.cumulative_stats.total_blanks,
-            cum_tokens = self.state.cumulative_stats.total_tokens,
-            "PIPELINE: cumulative stats"
-        );
-
-        // Log when all frames produce blank (potential stuck state)
-        if decode_output.new_tokens.is_empty() && decode_output.blank_count > 0 {
-            tracing::trace!(
-                step = self.state.step_count,
-                last_token = ?self.state.last_token,
-                blank_count = decode_output.blank_count,
-                total_tokens = self.state.accumulated_tokens.len(),
-                "all frames produced blank"
-            );
-        }
-
-        // Accumulate tokens
         self.state
             .accumulated_tokens
             .extend(&decode_output.new_tokens);
-
-        // On the last chunk, run one additional decode pass with silence input.
-        // This gives the model "future context" showing that speech has ended,
-        // allowing it to emit deferred tokens like sentence-ending punctuation.
-        //
-        // Use the speech-context encoder cache (saved before the encoder forward
-        // pass) so the flush decode sees the cache from real speech, not the
-        // cache already updated with the last chunk's output. This gives the
-        // decoder better context for emitting deferred punctuation.
-        if is_last {
-            let post_chunk_cache = self.encoder_cache.clone();
-            if let Some(speech_cache) = pre_silence_cache {
-                self.encoder_cache = speech_cache;
-            }
-            let flush_tokens = self.flush_decode_with_silence()?;
-            // Restore post-chunk cache
-            self.encoder_cache = post_chunk_cache;
-            if !flush_tokens.is_empty() {
-                tracing::info!(flush_tokens = flush_tokens.len(), "flush decode emitted tokens");
-                self.state.accumulated_tokens.extend(&flush_tokens);
-                decode_output.new_tokens.extend(flush_tokens);
-            }
-        }
-
         self.state.is_first_chunk = false;
 
-        // Generate text
-        let text = if let Some(tokenizer) = &self.tokenizer {
-            let token_ids: Vec<u32> = self
+        let text = match &self.tokenizer {
+            Some(tokenizer) => self
                 .state
-                .accumulated_tokens
-                .iter()
-                .map(|&t| t as u32)
-                .collect();
-            tokenizer.decode_piece_ids(&token_ids).unwrap_or_default()
-        } else {
-            String::new()
+                .detokenizer
+                .update(tokenizer, &self.word_start, &self.state.accumulated_tokens),
+            None => String::new(),
         };
 
         // Only clone accumulated_tokens on final output to avoid O(N²) memory usage

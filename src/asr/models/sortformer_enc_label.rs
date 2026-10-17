@@ -60,7 +60,9 @@ impl SortformerEncLabelModel {
     /// Create a new SortFormer model from configuration.
     pub fn new(config: SortformerConfig) -> Result<Self> {
         // Create preprocessor from PreprocessorConfig → MelConfig
-        let mel_config = MelConfig::from(config.preprocessor.clone());
+        let mut mel_config = MelConfig::from(config.preprocessor.clone());
+        // NeMo only dithers during training
+        mel_config.dither = 0.0;
         let preprocessor = MelProcessor::new(mel_config)?;
 
         // Create conformer encoder

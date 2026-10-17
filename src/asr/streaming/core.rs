@@ -74,7 +74,8 @@ pub struct StreamingConfig {
     /// Tuple of (first_chunk_cache, subsequent_chunk_cache).
     pub pre_encode_cache_size: (usize, usize),
 
-    /// Number of extra pre-encoded frames to drop.
+    /// Number of extra pre-encoded frames to drop on chunks that carry a
+    /// pre-encode cache (every chunk but the first).
     pub drop_extra_pre_encoded: usize,
 
     /// Lookahead frames required (future context).
@@ -115,6 +116,18 @@ impl StreamingConfig {
             self.pre_encode_cache_size.0
         } else {
             self.pre_encode_cache_size.1
+        }
+    }
+
+    /// Encoder frames to drop after subsampling for a given step.
+    ///
+    /// The first chunk has no pre-encode cache, so nothing is dropped
+    /// (NeMo passes `drop_extra_pre_encoded=0` on step 0).
+    pub fn drop_extra_for_step(&self, is_first: bool) -> usize {
+        if is_first {
+            0
+        } else {
+            self.drop_extra_pre_encoded
         }
     }
 }
@@ -167,7 +180,8 @@ impl EncoderCache {
             time_cache_size as i32,
         ])?;
 
-        let last_channel_len = mlx_rs::ops::zeros::<i64>(&[batch_size as i32])?;
+        // A host array, so reading the fill level never waits on the GPU
+        let last_channel_len = Array::from_slice(&vec![0i64; batch_size], &[batch_size as i32]);
 
         Ok(Self {
             last_channel,
@@ -429,7 +443,7 @@ impl StreamingMelBuffer {
     /// Extract a chunk of mel frames for processing.
     ///
     /// This mirrors NeMo's CacheAwareStreamingAudioBuffer iteration:
-    /// - Extracts `pre_encode_cache + chunk_size` frames
+    /// - Extracts the `pre_encode_cache` frames before `buffer_idx` plus `chunk_size` new frames
     /// - Advances `buffer_idx` by `shift_size`
     ///
     /// # Arguments
@@ -471,8 +485,10 @@ impl StreamingMelBuffer {
         //
         // buffer_idx tracks the extraction start position. By advancing by shift_size
         // (not the full extraction size), we maintain proper overlap between chunks.
-        let extract_start = self.buffer_idx;
-        let extract_end = self.total_frames.min(extract_start + chunk_size + pre_encode_cache);
+        // The pre-encode cache is the `pre_encode_cache` frames before buffer_idx
+        // (NeMo's CacheAwareStreamingAudioBuffer), kept by `trim_old_frames`.
+        let extract_start = self.buffer_idx.saturating_sub(pre_encode_cache);
+        let extract_end = self.total_frames.min(self.buffer_idx + chunk_size);
 
         // Total frames to extract
         let total_extract = extract_end - extract_start;
@@ -639,41 +655,37 @@ pub fn compute_streaming_config(
     // Time cache size is conv_kernel - 1 for causal convolutions
     let last_time_cache_size = conv_context.0;
 
-    // Compute sampling frames from subsampling
-    // NeMo's ConvSubsampling.get_sampling_frames() returns [1, subsampling_factor]
-    let sampling_frames = (subsampling_factor, subsampling_factor);
+    // NeMo's ConvSubsampling.get_sampling_frames() returns [1, subsampling_factor]:
+    // the first chunk has no pre-encode cache, so one mel frame already yields
+    // an encoder frame.
+    let sampling_frames = (1, subsampling_factor);
 
-    // Chunk size in pre-subsampled frames
+    // Chunk size in mel frames
     // NeMo: chunk_size = [sampling_frames[0] + subsampling_factor * lookahead_steps,
     //                     sampling_frames[1] + subsampling_factor * lookahead_steps]
     let chunk_size = (
-        sampling_frames.1 + subsampling_factor * lookahead_steps,
+        sampling_frames.0 + subsampling_factor * lookahead_steps,
         sampling_frames.1 + subsampling_factor * lookahead_steps,
     );
 
-    // Shift size - how many pre-subsampled frames to advance each step
+    // Shift size - how many mel frames to advance each step
+    let shift_steps = lookahead_steps.saturating_sub(cache_drop_size);
     let shift_size = (
-        sampling_frames.1 + subsampling_factor * lookahead_steps.saturating_sub(cache_drop_size),
-        sampling_frames.1 + subsampling_factor * lookahead_steps.saturating_sub(cache_drop_size),
+        sampling_frames.0 + sampling_frames.1 * shift_steps,
+        sampling_frames.1 + sampling_frames.1 * shift_steps,
     );
 
     // Valid output length - how many OUTPUT frames are valid per chunk
-    let valid_out_len = if sampling_frames.1 > 0 {
-        (shift_size.1 - sampling_frames.1) / subsampling_factor + 1
-    } else {
-        shift_size.1 / subsampling_factor
-    };
+    let valid_out_len = (shift_size.1 - sampling_frames.1) / subsampling_factor + 1;
 
-    // Pre-encode cache size (mel frames to prepend for streaming)
-    // NeMo's dw_striding subsampling.get_streaming_cache_size() returns [0, subsampling_factor + 1]
-    // For 8x subsampling: [0, 9]
-    // For 4x subsampling: [0, 5]
-    let pre_encode_cache = (subsampling_factor + 1, subsampling_factor + 1);
+    // Pre-encode cache size (mel frames prepended to each chunk)
+    // NeMo's ConvSubsampling.get_streaming_cache_size() returns [0, subsampling_factor + 1]
+    let pre_encode_cache = (0, subsampling_factor + 1);
 
-    // Drop extra pre-encoded frames after subsampling
-    // NeMo: drop_extra_pre_encoded = 1 + (pre_encode_cache_size[1] - 1) // subsampling_factor
-    // For 9 frames with 8x subsampling: 1 + (9-1)//8 = 1 + 1 = 2
-    let drop_extra = 2;
+    // Encoder frames to drop after subsampling on chunks that carry a pre-encode
+    // cache. NeMo: drop_extra_pre_encoded = 1 + (pre_encode_cache_size[1] - 1) // subsampling_factor
+    // The first chunk has no cache and drops nothing.
+    let drop_extra = 1 + (pre_encode_cache.1 - 1) / subsampling_factor;
 
     tracing::debug!(
         "Streaming config: mode={}, style={}, lookahead_steps={}, cache_drop={}, \
@@ -833,19 +845,18 @@ mod tests {
         assert_eq!(buffer.buffer_idx, 20);
         assert_eq!(buffer.remaining_frames(), 30);
 
-        // Extract another chunk with pre_encode_cache=5
-        // Extracts from buffer_idx (20) to buffer_idx + chunk_size + pre_encode_cache (45)
+        // Extract another chunk with pre_encode_cache=5: the 5 frames before
+        // buffer_idx (15-19) plus 20 new frames (20-39)
         let (chunk2, total2, valid2) = buffer.extract_chunk(20, 20, 5).unwrap();
-        // Should get 20 + 5 = 25 frames (frames 20-44)
         assert_eq!(total2, 25);
         assert_eq!(valid2, 25);
         assert_eq!(chunk2.shape(), &[80, 25]);
 
-        // Verify extracted values start at frame 20
+        // Verify extracted values start at frame 15
         chunk2.eval().unwrap();
         let chunk2_data: Vec<f32> = chunk2.to_vec_row_major().unwrap();
-        assert_eq!(chunk2_data[0] as i32, 20); // First frame is 20
-        assert_eq!(chunk2_data[24] as i32, 44); // Last frame is 44
+        assert_eq!(chunk2_data[0] as i32, 15); // First frame is 15
+        assert_eq!(chunk2_data[24] as i32, 39); // Last frame is 39
     }
 
     #[test]

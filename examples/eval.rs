@@ -14,6 +14,7 @@
 //! Options:
 //!   --model <path>       RNN-T model (.nemo file or MLX directory)
 //!   --offline            Transcribe whole files with EncDecRNNTModel instead of streaming
+//!   --dtype <dtype>      Offline encoder dtype: float32 (default), bfloat16 or float16
 //!   --mode <idx>         Streaming mode index (default: 0)
 //!   --eval-dir <dir>     Eval set directory (default: samples/eval)
 //!   --out <path>         Output JSONL (default: hypotheses.jsonl)
@@ -48,6 +49,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut offline = false;
     let mut warmup: usize = 1;
     let mut repeats: usize = 1;
+    let mut dtype = String::from("float32");
 
     let mut i = 1;
     while i < args.len() {
@@ -59,6 +61,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 continue;
             }
             "--warmup" => warmup = value().parse()?,
+            "--dtype" => dtype = value(),
             "--repeats" => repeats = value().parse::<usize>()?.max(1),
             "--model" => model_path = Some(value()),
             "--mode" => mode_idx = value().parse()?,
@@ -72,7 +75,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let Some(model_path) = model_path else {
         eprintln!(
-            "Usage: {} --model <model.nemo|dir> [--offline] [--mode N] [--eval-dir DIR] \
+            "Usage: {} --model <model.nemo|dir> [--offline] [--dtype DTYPE] [--mode N] [--eval-dir DIR] \
              [--out FILE] [--language en,de] [--clip NAME]... [--warmup N] [--repeats N]",
             args[0]
         );
@@ -110,6 +113,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         )?),
         (false, false) => Model::Streaming(CacheAwareRNNTPipeline::restore(path, mode_idx)?),
     };
+    let encoder_dtype = match dtype.as_str() {
+        "float32" => None,
+        "bfloat16" => Some(mlx_voice::mlx_rs::Dtype::Bfloat16),
+        "float16" => Some(mlx_voice::mlx_rs::Dtype::Float16),
+        other => return Err(format!("unsupported --dtype: {other}").into()),
+    };
+    if let Some(encoder_dtype) = encoder_dtype {
+        match &mut model {
+            Model::Offline(model) => model.set_encoder_dtype(encoder_dtype)?,
+            Model::Streaming(_) => return Err("--dtype applies to --offline only".into()),
+        }
+    }
     let load_time = load_start.elapsed().as_secs_f64();
     println!("Loaded in {load_time:.2}s");
 
@@ -180,7 +195,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "streaming": !offline,
             "mode": mode_idx,
             "device": "metal",
-            "dtype": "float32",
+            "dtype": dtype,
             "duration": duration,
             "elapsed": round(elapsed, 3),
             "load_time": round(load_time, 2),

@@ -84,6 +84,26 @@ impl LinearLayer {
         matches!(self, Self::Quantized { .. })
     }
 
+    /// Cast the float parameters to `dtype` (packed quantized weights stay as they are).
+    pub fn cast(&mut self, dtype: mlx_rs::Dtype) -> Result<()> {
+        match self {
+            Self::Standard { weight, bias } => {
+                *weight = weight.as_dtype(dtype)?;
+                if let Some(b) = bias {
+                    *b = b.as_dtype(dtype)?;
+                }
+            }
+            Self::Quantized { scales, biases, bias, .. } => {
+                *scales = scales.as_dtype(dtype)?;
+                *biases = biases.as_dtype(dtype)?;
+                if let Some(b) = bias {
+                    *b = b.as_dtype(dtype)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Forward pass through the linear layer.
     ///
     /// For quantized layers, uses `mlx_rs::ops::quantized_matmul`.

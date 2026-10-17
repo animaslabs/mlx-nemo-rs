@@ -11,7 +11,6 @@ use mlx_rs::Array;
 use tracing::{debug, instrument, trace, trace_span};
 
 use crate::asr::config::{DecoderConfig, JointConfig};
-use crate::core::ArrayExt;
 use crate::core::error::{Error, Result};
 use crate::core::quantization::{
     EmbeddingLayer, LinearLayer, QuantizationConfig, load_embedding_layer, load_linear_layer,
@@ -370,6 +369,34 @@ struct LstmLayer {
     bias_ih: Array,
     /// Hidden-hidden bias: [4 * hidden_size]
     bias_hh: Array,
+    /// `[weight_ih, weight_hh]` transposed: [input_size + hidden_size, 4 * hidden_size]
+    fused_weight_t: Array,
+    /// `bias_ih + bias_hh`: [4 * hidden_size]
+    fused_bias: Array,
+}
+
+impl LstmLayer {
+    fn new(input_size: usize, hidden_size: usize) -> Result<Self> {
+        let gate_size = (4 * hidden_size) as i32;
+        let mut layer = Self {
+            weight_ih: Array::zeros::<f32>(&[gate_size, input_size as i32])?,
+            weight_hh: Array::zeros::<f32>(&[gate_size, hidden_size as i32])?,
+            bias_ih: Array::zeros::<f32>(&[gate_size])?,
+            bias_hh: Array::zeros::<f32>(&[gate_size])?,
+            fused_weight_t: Array::zeros::<f32>(&[(input_size + hidden_size) as i32, gate_size])?,
+            fused_bias: Array::zeros::<f32>(&[gate_size])?,
+        };
+        layer.fuse()?;
+        Ok(layer)
+    }
+
+    /// Combine the input and hidden projections so a step is one matmul.
+    fn fuse(&mut self) -> Result<()> {
+        self.fused_weight_t = ops::concatenate(&[&self.weight_ih, &self.weight_hh], 1)?.transpose()?;
+        self.fused_bias = ops::add(&self.bias_ih, &self.bias_hh)?;
+        mlx_rs::transforms::eval([&self.fused_weight_t, &self.fused_bias])?;
+        Ok(())
+    }
 }
 
 /// LSTM decoder state for a single batch item.
@@ -409,17 +436,10 @@ impl RNNTDecoder {
         let embedding = EmbeddingLayer::standard(embedding_weight);
 
         // Initialize LSTM layers (not quantized)
-        let mut lstm_layers = Vec::with_capacity(num_layers);
-        for _ in 0..num_layers {
-            // All layers have the same input/hidden size for NeMo models
-            let gate_size = 4 * pred_hidden;
-            lstm_layers.push(LstmLayer {
-                weight_ih: Array::zeros::<f32>(&[gate_size as i32, pred_hidden as i32])?,
-                weight_hh: Array::zeros::<f32>(&[gate_size as i32, pred_hidden as i32])?,
-                bias_ih: Array::zeros::<f32>(&[gate_size as i32])?,
-                bias_hh: Array::zeros::<f32>(&[gate_size as i32])?,
-            });
-        }
+        // All layers have the same input/hidden size for NeMo models
+        let lstm_layers = (0..num_layers)
+            .map(|_| LstmLayer::new(pred_hidden, pred_hidden))
+            .collect::<Result<Vec<_>>>()?;
 
         Ok(Self {
             embedding,
@@ -590,23 +610,14 @@ impl RNNTDecoder {
             "Computing LSTM cell gates"
         );
 
-        // Compute gates: i, f, g, o
-        // gates = x @ weight_ih^T + bias_ih + h @ weight_hh^T + bias_hh
-        let weight_ih_t = layer.weight_ih.transpose()?;
-        let weight_hh_t = layer.weight_hh.transpose()?;
-
-        let gates_ih = ops::add(&ops::matmul(x, &weight_ih_t)?, &layer.bias_ih)?;
-        let gates_hh = ops::add(&ops::matmul(h, &weight_hh_t)?, &layer.bias_hh)?;
-        let gates = ops::add(&gates_ih, &gates_hh)?;
-
-        trace!(gates_shape = ?gates.shape(), "Gates computed");
-
-        // Split into 4 gates: [batch, hidden_size] each
-        let hidden_size = self.pred_hidden as i32;
-        let i = ops::sigmoid(&gates.index((.., 0..hidden_size)))?;
-        let f = ops::sigmoid(&gates.index((.., hidden_size..(2 * hidden_size))))?;
-        let g = ops::tanh(&gates.index((.., (2 * hidden_size)..(3 * hidden_size))))?;
-        let o = ops::sigmoid(&gates.index((.., (3 * hidden_size)..)))?;
+        // gates = [x, h] @ [weight_ih, weight_hh]^T + (bias_ih + bias_hh), split into i, f, g, o
+        let xh = ops::concatenate(&[x, h], -1)?;
+        let gates = ops::addmm(&layer.fused_bias, &xh, &layer.fused_weight_t, None, None)?;
+        let parts = gates.split_equal(4, -1)?;
+        let i = ops::sigmoid(&parts[0])?;
+        let f = ops::sigmoid(&parts[1])?;
+        let g = ops::tanh(&parts[2])?;
+        let o = ops::sigmoid(&parts[3])?;
 
         // New cell state: c_new = f * c + i * g
         let new_c = ops::add(&ops::multiply(&f, c)?, &ops::multiply(&i, &g)?)?;
@@ -737,6 +748,7 @@ impl RNNTDecoder {
             if weight_ih_loaded && weight_hh_loaded && bias_loaded {
                 tracing::info!("Successfully loaded LSTM layer {}", layer_idx);
             }
+            self.lstm_layers[layer_idx].fuse()?;
         }
 
         Ok(())
@@ -940,97 +952,44 @@ impl RNNTJoint {
     ///
     /// # Returns
     /// * Log probabilities [batch, vocab_size]
-    #[instrument(skip(self, encoder_output, pred_output), level = "trace", fields(
-        encoder_shape = ?encoder_output.shape(),
-        pred_shape = ?pred_output.shape(),
-        joint_hidden = self.joint_hidden,
-        vocab_size = self.vocab_size
-    ))]
     pub fn forward_one(&self, encoder_output: &Array, pred_output: &Array) -> Result<Array> {
-        let _span = trace_span!("rnnt_joint_forward_one").entered();
-
         // encoder_output: [B, 1, H_enc] or [B, H_enc]
         // pred_output: [B, 1, H_pred] or [B, H_pred]
-
-        trace!(
-            encoder_ndim = encoder_output.ndim(),
-            pred_ndim = pred_output.ndim(),
-            "Single-step joint forward"
-        );
-
-        // Ensure 2D for linear
         let enc = if encoder_output.ndim() == 3 {
             encoder_output.squeeze_axes(&[1])?
         } else {
             encoder_output.clone()
         };
-
         let pred = if pred_output.ndim() == 3 {
             pred_output.squeeze_axes(&[1])?
         } else {
             pred_output.clone()
         };
 
-        trace!(enc_shape = ?enc.shape(), pred_shape = ?pred.shape(), "Inputs prepared");
+        let logits =
+            self.logits_from_projections(&self.project_encoder(&enc)?, &self.project_prediction(&pred)?)?;
+        Ok(mlx_rs::nn::log_softmax(&logits, -1)?)
+    }
 
-        // Project encoder: [B, joint_hidden]
-        let enc_proj = self.encoder_proj.forward(&enc)?;
+    /// Project encoder output into the joint space: [..., encoder_hidden] -> [..., joint_hidden].
+    ///
+    /// Greedy decoding projects every frame once up front instead of per step.
+    pub fn project_encoder(&self, encoder_output: &Array) -> Result<Array> {
+        self.encoder_proj.forward(encoder_output)
+    }
 
-        // Project prediction: [B, joint_hidden]
-        let pred_proj = self.pred_proj.forward(&pred)?;
+    /// Project prediction output into the joint space: [..., pred_hidden] -> [..., joint_hidden].
+    pub fn project_prediction(&self, pred_output: &Array) -> Result<Array> {
+        self.pred_proj.forward(pred_output)
+    }
 
-        // Debug: compare encoder vs prediction projection magnitudes
-        if std::env::var("DEBUG_JOINT").is_ok() {
-            enc_proj.eval()?;
-            pred_proj.eval()?;
-            let enc_flat = enc_proj.reshape(&[-1])?;
-            let pred_flat = pred_proj.reshape(&[-1])?;
-            enc_flat.eval()?;
-            pred_flat.eval()?;
-            let enc_slice: Vec<f32> = enc_flat.to_vec_row_major()?;
-            let pred_slice: Vec<f32> = pred_flat.to_vec_row_major()?;
-            let enc_std = {
-                let mean: f32 = enc_slice.iter().sum::<f32>() / enc_slice.len() as f32;
-                (enc_slice.iter().map(|&v| (v - mean).powi(2)).sum::<f32>()
-                    / enc_slice.len() as f32)
-                    .sqrt()
-            };
-            let pred_std = {
-                let mean: f32 = pred_slice.iter().sum::<f32>() / pred_slice.len() as f32;
-                (pred_slice.iter().map(|&v| (v - mean).powi(2)).sum::<f32>()
-                    / pred_slice.len() as f32)
-                    .sqrt()
-            };
-            let enc_norm: f32 = enc_slice.iter().map(|v| v.powi(2)).sum::<f32>().sqrt();
-            let pred_norm: f32 = pred_slice.iter().map(|v| v.powi(2)).sum::<f32>().sqrt();
-            trace!(
-                enc_proj_std = enc_std,
-                enc_proj_norm = enc_norm,
-                pred_proj_std = pred_std,
-                pred_proj_norm = pred_norm,
-                ratio = enc_norm / (pred_norm + 1e-8),
-                "Joint network projection magnitudes"
-            );
-        }
-
-        // Add
-        let joint = ops::add(&enc_proj, &pred_proj)?;
-
-        // Apply activation
-        trace!(activation = ?self.activation, "Applying activation");
+    /// Logits (not normalized) from projected encoder and prediction outputs.
+    ///
+    /// The projections broadcast against each other, e.g. [T, H] + [1, H] -> [T, vocab_size].
+    pub fn logits_from_projections(&self, enc_proj: &Array, pred_proj: &Array) -> Result<Array> {
+        let joint = ops::add(enc_proj, pred_proj)?;
         let activated = self.activation.apply(&joint)?;
-
-        // Output projection: [B, vocab_size]
-        trace!("Computing output logits");
-        let logits = self.joint_proj.forward(&activated)?;
-
-        // Log softmax
-        trace!("Applying log softmax");
-        let log_probs = mlx_rs::nn::log_softmax(&logits, -1)?;
-
-        trace!(output_shape = ?log_probs.shape(), "Single-step joint forward complete");
-
-        Ok(log_probs)
+        self.joint_proj.forward(&activated)
     }
 
     /// Load weights from a checkpoint.

@@ -135,7 +135,7 @@ impl RelPositionalEncoding {
         if seq_len > self.max_len {
             tracing::debug!(seq_len, max_len = self.max_len, "extending positional encoding");
             // A table of exactly seq_len covers (seq_len-1)..=-(seq_len-1): the whole slice.
-            return Self::create_pe(self.d_model, seq_len);
+            return Ok(Self::create_pe(self.d_model, seq_len)?.as_dtype(self.pe.dtype())?);
         }
 
         // Calculate slice indices to extract the relevant portion
@@ -170,6 +170,12 @@ impl RelPositionalEncoding {
         Ok(pe_slice)
     }
 
+    /// Cast the cached table to `dtype`.
+    pub fn set_dtype(&mut self, dtype: mlx_rs::Dtype) -> Result<()> {
+        self.pe = self.pe.as_dtype(dtype)?;
+        Ok(())
+    }
+
     /// Get the scale factor for input scaling.
     pub fn xscale(&self) -> f32 {
         self.xscale
@@ -191,6 +197,25 @@ fn query_block_size(batch_heads: i32, seq_len: i32, max_score_elements: i64) -> 
     let per_row = batch_heads as i64 * 2 * seq_len as i64;
     // Clamp before narrowing: a large budget would otherwise wrap past i32.
     (max_score_elements / per_row.max(1)).clamp(1, seq_len.max(1) as i64) as i32
+}
+
+/// `softmax(((Q + u) @ K^T + bd + mask) / sqrt(head_dim)) @ V` with the content
+/// term fused into `fast::scaled_dot_product_attention`; the position scores
+/// `bd` (and an optional additive mask) go in as its additive mask.
+fn attend(
+    q_u: &Array,
+    k: &Array,
+    v: &Array,
+    matrix_bd: &Array,
+    additive_mask: Option<&Array>,
+    head_dim: i32,
+) -> Result<Array> {
+    let scale = 1.0 / (head_dim as f32).sqrt();
+    let mut mask = ops::multiply(matrix_bd, &Array::from_f32(scale).as_dtype(matrix_bd.dtype())?)?;
+    if let Some(additive_mask) = additive_mask {
+        mask = ops::add(&mask, additive_mask)?;
+    }
+    Ok(mlx_rs::fast::scaled_dot_product_attention(q_u, k, v, scale, &mask, None)?)
 }
 
 /// Relative position multi-head attention.
@@ -227,6 +252,9 @@ pub struct RelPositionMultiHeadAttention {
     /// Attention context size (left, right) for streaming masking
     /// This is stored here for debugging but masking is done at encoder level
     pub att_context_size: Option<(i32, i32)>,
+
+    /// Streaming position projections, transposed, with their position length
+    streaming_pos: Option<(i32, Array)>,
 }
 
 impl RelPositionMultiHeadAttention {
@@ -273,7 +301,25 @@ impl RelPositionMultiHeadAttention {
             pos_bias_v,
             cache_drop_size: 0,
             att_context_size: None,
+            streaming_pos: None,
         })
+    }
+
+    /// Cast all parameters to `dtype`.
+    pub fn set_dtype(&mut self, dtype: mlx_rs::Dtype) -> Result<()> {
+        for linear in [
+            &mut self.linear_q,
+            &mut self.linear_k,
+            &mut self.linear_v,
+            &mut self.linear_out,
+            &mut self.linear_pos,
+        ] {
+            linear.cast(dtype)?;
+        }
+        self.pos_bias_u = self.pos_bias_u.as_dtype(dtype)?;
+        self.pos_bias_v = self.pos_bias_v.as_dtype(dtype)?;
+        self.streaming_pos = None;
+        Ok(())
     }
 
     /// Get head dimension.
@@ -350,9 +396,7 @@ impl RelPositionMultiHeadAttention {
         let q_with_bias_u = &q + &bias_u;
         let q_with_bias_v = &q + &bias_v;
 
-        let k_t = ops::transpose_axes(&k, &[0, 1, 3, 2])?;
         let p_t = ops::transpose_axes(&p, &[0, 1, 3, 2])?;
-        let scale = Array::from_f32((head_dim as f32).sqrt());
 
         // Full attention over a long file needs [batch, n_heads, seq_len, 2*seq_len-1]
         // position scores (tens of GB at ~10k frames), so queries are processed in
@@ -365,9 +409,6 @@ impl RelPositionMultiHeadAttention {
             let q_u = q_with_bias_u.index((.., .., start..end, ..));
             let q_v = q_with_bias_v.index((.., .., start..end, ..));
 
-            // Content attention: (Q + u) @ K^T -> [batch, n_heads, rows, seq_len]
-            let matrix_ac = ops::matmul(&q_u, &k_t)?;
-
             // Position attention: (Q + v) @ P^T. Row i of the full matrix only reads
             // positions (seq_len-1-i)..(2*seq_len-1-i) after rel_shift, so rows
             // start..end need p[seq_len-end .. 2*seq_len-1-start] (seq_len+rows-1
@@ -379,14 +420,13 @@ impl RelPositionMultiHeadAttention {
             let matrix_bd = Self::rel_shift(&matrix_bd)?;
             let matrix_bd = matrix_bd.index((.., .., .., ..seq_len));
 
-            // Combine, scale, softmax, and apply to values: [batch, n_heads, rows, head_dim]
-            let scores = (&matrix_ac + &matrix_bd) / &scale;
-            let attn_weights = ops::softmax_axis(&scores, -1, None)?;
-            let context = ops::matmul(&attn_weights, &v)?;
+            // softmax(((Q + u) @ K^T + bd) / sqrt(d)) @ V with the content term
+            // fused: [batch, n_heads, rows, head_dim]
+            let context = attend(&q_u, &k, &v, &matrix_bd, None, head_dim)?;
             if block < seq_len {
-                // Materialize each block so its score matrices are freed before the
-                // next one is built; a lazy graph could otherwise hold several at once.
-                context.eval()?;
+                // Submit each block so its score matrices are freed before the next
+                // one is built; a lazy graph could otherwise hold several at once.
+                mlx_rs::transforms::async_eval([&context])?;
             }
             contexts.push(context);
         }
@@ -438,7 +478,8 @@ impl RelPositionMultiHeadAttention {
     /// * `cache` - Optional full cache buffer [batch, cache_size, d_model] containing
     ///             previous chunks' attention inputs (h values)
     /// * `cache_filled_len` - How many frames of cache are valid (0 if no cache)
-    /// * `att_mask` - Optional attention mask [batch, seq_len, total_len] where True=masked
+    /// * `att_mask` - Optional attention mask [batch, seq_len, total_len]: boolean
+    ///   (true = visible) or additive f32
     ///
     /// # Returns
     /// * Output tensor [batch, seq_len, d_model]
@@ -586,17 +627,19 @@ impl RelPositionMultiHeadAttention {
             "reshaped and transposed to multi-head"
         );
 
-        // Project positional embeddings
-        let p = self.linear_pos.forward(pos_emb)?;
+        // Projected positional embeddings [1, n_heads, head_dim, pos_len]. Every
+        // chunk of a stream has the same length, so reuse them across chunks.
         let pos_len = pos_emb.dim(1) as i32;
-        let p = p.reshape(&[1, pos_len, n_heads, head_dim])?;
-        let p = ops::transpose_axes(&p, &[0, 2, 1, 3])?;
-
-        tracing::trace!(
-            pos_emb_shape = ?pos_emb.shape(),
-            p_shape = ?p.shape(),
-            "projected positional embeddings"
-        );
+        let p_t = match &self.streaming_pos {
+            Some((len, p_t)) if *len == pos_len => p_t.clone(),
+            _ => {
+                let p = self.linear_pos.forward(pos_emb)?;
+                let p = p.reshape(&[1, pos_len, n_heads, head_dim])?;
+                let p_t = ops::transpose_axes(&p, &[0, 2, 3, 1])?;
+                self.streaming_pos = Some((pos_len, p_t.clone()));
+                p_t
+            }
+        };
 
         // Add position biases to query
         let bias_u = self.pos_bias_u.reshape(&[1, n_heads, 1, head_dim])?;
@@ -604,80 +647,31 @@ impl RelPositionMultiHeadAttention {
         let q_with_bias_u = &q + &bias_u;
         let q_with_bias_v = &q + &bias_v;
 
-        // Content attention: (Q + u) @ K^T -> [batch, n_heads, seq_len, total_len]
-        let k_t = ops::transpose_axes(&k, &[0, 1, 3, 2])?;
-        let matrix_ac = ops::matmul(&q_with_bias_u, &k_t)?;
-
-        // Position attention: (Q + v) @ P^T
-        let p_t = ops::transpose_axes(&p, &[0, 1, 3, 2])?;
+        // Position attention: (Q + v) @ P^T, rel_shift, truncated to total_len
         let matrix_bd = ops::matmul(&q_with_bias_v, &p_t)?;
-
-        tracing::trace!(
-            matrix_ac_shape = ?matrix_ac.shape(),
-            matrix_bd_shape = ?matrix_bd.shape(),
-            "content and position attention scores"
-        );
-
-        // Apply rel_shift and truncate to total_len
         let matrix_bd = Self::rel_shift(&matrix_bd)?;
-
-        tracing::trace!(
-            matrix_bd_truncated = ?matrix_bd.shape(),
-            "rel_shift applied"
-        );
         let matrix_bd = matrix_bd.index((.., .., .., ..total_len));
 
-        tracing::trace!(
-            matrix_bd_truncated = ?matrix_bd.shape(),
-            "truncated to total_len"
-        );
-
-        // Combine and scale
-        let scale = (head_dim as f32).sqrt();
-        let mut scores = (&matrix_ac + &matrix_bd) / Array::from_f32(scale);
-
-        tracing::trace!(
-            scores_shape = ?scores.shape(),
-            scale,
-            "combined scores (ac + bd) / scale"
-        );
-
-        // Apply attention mask if provided
-        let mask_expanded = if let Some(mask) = att_mask {
-            // mask: [batch or 1, seq_len, total_len] -> [batch or 1, 1, seq_len, total_len]
-            // A batch-1 mask is shared by every row (streaming masks are)
-            let mask = mask.reshape(&[mask.dim(0), 1, seq_len, total_len])?;
-            tracing::trace!(
-                mask_shape = ?mask.shape(),
-                "applying attention mask"
-            );
-            // NeMo convention: mask=True means VALID (can attend), False means MASKED
-            // where(mask, scores, -inf) keeps scores where mask=True, sets -inf where mask=False
-            let neg_inf = Array::from_f32(f32::NEG_INFINITY);
-            scores = ops::select(&mask, &scores, &neg_inf)?;
-            Some(mask)
-        } else {
-            None
+        // A boolean mask (true = visible) can hide every key from a query row,
+        // which must then give zero rather than the NaN of an all -inf softmax,
+        // so it takes the unfused path. An f32 mask is additive.
+        let mask = att_mask
+            .map(|mask| mask.reshape(&[mask.dim(0), 1, seq_len, total_len]))
+            .transpose()?;
+        let context = match &mask {
+            Some(mask) if mask.dtype() == mlx_rs::Dtype::Bool => {
+                let scale = Array::from_f32((head_dim as f32).sqrt());
+                let k_t = ops::transpose_axes(&k, &[0, 1, 3, 2])?;
+                let scores = (&ops::matmul(&q_with_bias_u, &k_t)? + &matrix_bd) / &scale;
+                let neg_inf = Array::from_f32(f32::NEG_INFINITY);
+                let scores = ops::select(mask, &scores, &neg_inf)?;
+                let weights = ops::softmax_axis(&scores, -1, None)?;
+                let weights = ops::select(mask, &weights, &Array::from_f32(0.0))?;
+                ops::matmul(&weights, &v)?
+            }
+            Some(mask) => attend(&q_with_bias_u, &k, &v, &matrix_bd, Some(mask), head_dim)?,
+            None => attend(&q_with_bias_u, &k, &v, &matrix_bd, None, head_dim)?,
         };
-
-        // Softmax
-        let mut attn_weights = ops::softmax_axis(&scores, -1, None)?;
-
-        // Zero out attention weights for masked positions (Python: .masked_fill(mask, 0.0))
-        // This handles the case where all positions are masked (softmax produces NaN)
-        // and ensures masked positions don't contribute to the output
-        if let Some(mask) = mask_expanded {
-            let zero = Array::from_f32(0.0);
-            attn_weights = ops::select(&mask, &attn_weights, &zero)?;
-        }
-
-        tracing::trace!(
-            attn_weights_shape = ?attn_weights.shape(),
-            "attention weights after softmax"
-        );
-
-        // Apply attention to values: [batch, n_heads, seq_len, head_dim]
-        let context = ops::matmul(&attn_weights, &v)?;
 
         // Transpose back: [batch, seq_len, n_heads, head_dim]
         let context = ops::transpose_axes(&context, &[0, 2, 1, 3])?;
@@ -725,8 +719,7 @@ impl RelPositionMultiHeadAttention {
 
         // Step 1: Pad with zeros on the left of last dimension
         // [batch, n_heads, seq_len, pos_len] -> [batch, n_heads, seq_len, pos_len+1]
-        let zeros = ops::zeros::<f32>(&[batch, n_heads, seq_len, 1])?;
-        let x_padded = ops::concatenate(&[&zeros, x], -1)?;
+        let x_padded = ops::pad(x, &[(0, 0), (0, 0), (0, 0), (1, 0)], None, None)?;
 
         // Step 2: Reshape to [batch, n_heads, pos_len+1, seq_len]
         // This is a transposition-via-reshape that shifts positions
