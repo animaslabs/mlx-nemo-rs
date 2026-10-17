@@ -7,7 +7,7 @@ anyhow = "1.0"
 
 [package]
 name = "mlx-voice"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "NeMo-compatible ASR and speech AI library for Apple Silicon, built on MLX"
 license = "Apache-2.0"
