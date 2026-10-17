@@ -8,8 +8,8 @@
 use std::path::Path;
 
 use mlx_voice::asr::{
-    CacheAwareRNNTPipeline, EncDecClassificationModel, EncDecRNNTModel, VadPostProcessConfig,
-    VadPostProcessor,
+    AudioInput, CacheAwareRNNTPipeline, EncDecClassificationModel, EncDecRNNTModel,
+    TranscribeOptions, Transcript, VadPostProcessConfig, VadPostProcessor,
 };
 
 // ---------------------------------------------------------------------------
@@ -107,7 +107,7 @@ fn test_full_file_transcription_rnnt() {
         .expect("Transcription failed");
 
     assert_eq!(transcriptions.len(), 1);
-    let hypothesis = normalize_text(&transcriptions[0]);
+    let hypothesis = normalize_text(&transcriptions[0].text);
     let reference = normalize_text(EXPECTED_TEXT);
     let wer = word_error_rate(&reference, &hypothesis);
 
@@ -126,7 +126,7 @@ fn test_full_file_transcription_rnnt() {
 
 #[test]
 #[ignore]
-fn test_transcribe_samples_matches_file() {
+fn test_in_memory_audio_matches_file() {
     let model_dir = "models/animaslabs/parakeet-rnnt-0.6b-mlx";
     if !require_model(model_dir) {
         return;
@@ -134,18 +134,21 @@ fn test_transcribe_samples_matches_file() {
     let mut model = EncDecRNNTModel::from_pretrained(model_dir).expect("Failed to load RNNT model");
 
     let from_file = model
-        .transcribe(&[TEST_AUDIO])
+        .transcribe_one(TEST_AUDIO)
         .expect("Transcription failed");
     let (samples, sample_rate) = mlx_voice::audio::load_wav(TEST_AUDIO).unwrap();
     let from_samples = model
-        .transcribe_samples(&samples, sample_rate)
+        .transcribe_one((&samples, sample_rate))
         .expect("Transcription failed");
-    assert_eq!(from_samples, from_file[0]);
+    assert_eq!(from_samples, from_file);
 
     // A different input rate is resampled to the model's
     let resampled = mlx_voice::audio::resample(&samples, sample_rate, 48_000).unwrap();
-    let from_48k = model.transcribe_samples(&resampled, 48_000).unwrap();
-    let wer = word_error_rate(&normalize_text(EXPECTED_TEXT), &normalize_text(&from_48k));
+    let from_48k = model.transcribe_one((&resampled, 48_000)).unwrap();
+    let wer = word_error_rate(
+        &normalize_text(EXPECTED_TEXT),
+        &normalize_text(&from_48k.text),
+    );
     assert!(
         wer < 0.10,
         "WER {:.1}% at 48 kHz: {}",
@@ -153,7 +156,59 @@ fn test_transcribe_samples_matches_file() {
         from_48k
     );
 
-    assert_eq!(model.transcribe_samples(&[], sample_rate).unwrap(), "");
+    // Mixed inputs in small batches keep their order; empty audio is empty
+    let empty: Vec<f32> = Vec::new();
+    let inputs = [
+        AudioInput::from(TEST_AUDIO),
+        AudioInput::samples(&empty, sample_rate),
+        AudioInput::samples(&samples, sample_rate),
+    ];
+    let batched = model
+        .transcribe_with(inputs, &TranscribeOptions::default().batch_size(2))
+        .unwrap();
+    assert_eq!(batched.len(), 3);
+    assert_eq!(batched[0].text, from_file.text);
+    assert_eq!(batched[1], Transcript::default());
+    assert_eq!(batched[2].text, from_file.text);
+}
+
+#[test]
+#[ignore]
+fn test_word_timestamps() {
+    let model_dir = "models/animaslabs/parakeet-rnnt-0.6b-mlx";
+    if !require_model(model_dir) {
+        return;
+    }
+    let mut model = EncDecRNNTModel::from_pretrained(model_dir).expect("Failed to load RNNT model");
+    let (samples, sample_rate) = mlx_voice::audio::load_wav(TEST_AUDIO).unwrap();
+    let duration = samples.len() as f32 / sample_rate as f32;
+
+    for options in [
+        TranscribeOptions::default(),
+        TranscribeOptions::default().beam_search(4),
+    ] {
+        let transcript = model
+            .transcribe_with([TEST_AUDIO], &options)
+            .unwrap()
+            .remove(0);
+        let words: Vec<&str> = transcript.words.iter().map(|w| w.text.as_str()).collect();
+        assert_eq!(words.join(" "), transcript.text.trim(), "{options:?}");
+        assert_eq!(
+            transcript.tokens.len(),
+            transcript.tokens.iter().filter(|t| t.end > t.start).count()
+        );
+        for pair in transcript.words.windows(2) {
+            assert!(pair[0].start <= pair[1].start, "{:?}", pair);
+        }
+        let first = transcript.words.first().unwrap();
+        let last = transcript.words.last().unwrap();
+        assert!(first.start < 2.0, "first word at {}", first.start);
+        assert!(
+            last.end <= duration + 0.1 && last.end > duration - 3.0,
+            "last word ends at {} of {duration}",
+            last.end
+        );
+    }
 }
 
 #[test]
@@ -172,6 +227,44 @@ fn test_tokenizer_round_trip() {
     assert_eq!(tokenizer.decode(&ids, true), "well i don't wish to see it");
     assert_eq!(tokenizer.piece_to_id("▁well"), Some(ids[0]));
     assert_eq!(tokenizer.detected_language(&ids), None);
+}
+
+#[test]
+#[ignore]
+fn test_multilingual_offline_transcription() {
+    let model_path =
+        "models/nvidia/nemotron-3.5-asr-streaming-0.6b/nemotron-3.5-asr-streaming-0.6b.nemo";
+    if !require_model(model_path) {
+        return;
+    }
+    let mut model = EncDecRNNTModel::from_pretrained(model_path).expect("Failed to load model");
+
+    // Auto mode detects the language and keeps the tag out of text and words
+    let auto = model.transcribe_one(TEST_AUDIO).unwrap();
+    assert_eq!(auto.language.as_deref(), Some("en-US"));
+    assert!(!auto.text.contains('<'), "{auto}");
+    assert!(auto.words.iter().all(|w| !w.text.contains('<')));
+    assert!(auto.tokens.iter().any(|t| t.text == "<en-US>"));
+
+    // A per-call language leaves the model's selection unchanged
+    let options = TranscribeOptions::default()
+        .language("en-US")
+        .strip_lang_tags(false);
+    let english = model
+        .transcribe_with([TEST_AUDIO], &options)
+        .unwrap()
+        .remove(0);
+    assert!(english.text.contains("<en-US>"), "{english}");
+    assert_eq!(model.language(), Some("auto"));
+    assert!(
+        model
+            .transcribe_with(
+                [TEST_AUDIO],
+                &TranscribeOptions::default().language("xx-YY")
+            )
+            .is_err()
+    );
+    assert_eq!(model.language(), Some("auto"));
 }
 
 #[test]

@@ -127,4 +127,5 @@ Models are stored in `models/nvidia/` and downloaded via xtask:
 - `AsrModelConfig`: Top-level config with preprocessor, encoder, decoder sections
 - `NemoCheckpoint`: Handles .nemo archive extraction and loading
 - `StreamingModeInfo`: Describes streaming mode latency/context settings
+- `Transcript` / `Token` / `Word`: Offline transcription result with token and word timestamps (`asr::transcript`), from `transcribe(inputs)` / `transcribe_with(inputs, &TranscribeOptions)`; inputs are `AudioInput` (paths or `(samples, rate)`)
 - `TranscribeOutput`: Streaming transcription result with partial text and tokens

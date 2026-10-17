@@ -33,6 +33,7 @@ use std::path::Path;
 
 use crate::asr::Tokenizer;
 use crate::asr::config::{AsrModelConfig, JointConfig};
+use crate::asr::decoding::TimedToken;
 use crate::asr::decoding::{RnntStreamingDecoder, rnnt_beam_decode};
 use crate::asr::modules::{
     ConformerEncoder, DecoderState, LanguagePrompt, MelConfig, MelProcessor, PredictionNetwork,
@@ -42,7 +43,7 @@ use crate::asr::streaming::{
     EncoderCache, StreamingConfig, StreamingMelBuffer, StreamingModeInfo, StreamingOutput,
     compute_streaming_config, get_streaming_modes,
 };
-use crate::audio::resample;
+use crate::asr::transcript::{AudioInput, DecodingStrategy, TranscribeOptions, Transcript};
 use crate::core::ArrayExt;
 use crate::core::checkpoint::NemoCheckpoint;
 use crate::core::error::{Error, Result};
@@ -51,24 +52,6 @@ use crate::core::quantization::QuantizationConfig;
 use crate::core::source::{LocalModel, ModelSource};
 use mlx_rs::Array;
 use mlx_rs::ops::indexing::IndexOp;
-
-/// Decoding strategy for offline RNNT transcription.
-///
-/// Applies to [`EncDecRNNTModel::transcribe`]. Streaming decoding is always
-/// greedy.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-#[non_exhaustive]
-pub enum RnntDecodingStrategy {
-    /// Greedy decoding (fast)
-    #[default]
-    Greedy,
-    /// Beam search decoding, NeMo's default algorithm (slower, usually
-    /// slightly more accurate). `beam_size` must be at least 1.
-    BeamSearch {
-        /// Number of hypotheses kept per frame
-        beam_size: usize,
-    },
-}
 
 /// Encoder-Decoder RNN-T ASR Model.
 ///
@@ -102,7 +85,7 @@ pub struct EncDecRNNTModel {
     /// Blank token ID (typically vocab_size, last token)
     blank_id: usize,
     /// Decoding strategy
-    decoding_strategy: RnntDecodingStrategy,
+    decoding_strategy: DecodingStrategy,
     chunk_count: usize,
     /// Leave language tags out of transcribed text
     strip_lang_tags: bool,
@@ -197,13 +180,13 @@ impl EncDecRNNTModel {
         // Determine decoding strategy from config
         let decoding_strategy = if let Some(ref decoding) = config.decoding {
             match decoding.strategy.as_str() {
-                "beam" | "beam_search" => RnntDecodingStrategy::BeamSearch {
+                "beam" | "beam_search" => DecodingStrategy::BeamSearch {
                     beam_size: decoding.beam_size.unwrap_or(4),
                 },
-                _ => RnntDecodingStrategy::Greedy,
+                _ => DecodingStrategy::Greedy,
             }
         } else {
-            RnntDecodingStrategy::Greedy
+            DecodingStrategy::Greedy
         };
 
         Ok(Self {
@@ -577,14 +560,6 @@ impl EncDecRNNTModel {
             .unwrap_or_default()
     }
 
-    /// Keep or strip the language tags (e.g. `<en-US>`) that prompt-conditioned
-    /// models emit after each utterance's terminal punctuation.
-    ///
-    /// Tags are stripped from text by default; token ids always keep them.
-    pub fn set_strip_lang_tags(&mut self, strip: bool) {
-        self.strip_lang_tags = strip;
-    }
-
     /// The language named by the last language tag in `tokens`, e.g. `"en-US"`.
     pub fn detected_language(&self, tokens: &[usize]) -> Option<String> {
         self.tokenizer.as_ref()?.detected_language(tokens)
@@ -593,11 +568,6 @@ impl EncDecRNNTModel {
     /// Text of `tokens`, without language tags unless they are kept.
     fn tokens_to_text(&self, tokenizer: &Tokenizer, tokens: &[usize]) -> String {
         tokenizer.decode(tokens, self.strip_lang_tags)
-    }
-
-    /// Set the decoding strategy used by [`transcribe`](Self::transcribe).
-    pub fn set_decoding_strategy(&mut self, strategy: RnntDecodingStrategy) {
-        self.decoding_strategy = strategy;
     }
 
     /// Run the encoder in `dtype` instead of float32, e.g. `Dtype::Bfloat16`.
@@ -610,58 +580,111 @@ impl EncDecRNNTModel {
         self.encoder.set_dtype(dtype)
     }
 
-    /// Get the current decoding strategy.
-    pub fn decoding_strategy(&self) -> RnntDecodingStrategy {
+    /// The decoding strategy from the model's config, used when
+    /// [`TranscribeOptions::decoding`] is `None`.
+    pub fn decoding_strategy(&self) -> DecodingStrategy {
         self.decoding_strategy
     }
 
-    /// Transcribe audio files.
+    /// Transcribe WAV files or in-memory audio (see [`AudioInput`]) with the
+    /// default [`TranscribeOptions`].
     ///
-    /// # Arguments
-    /// * `paths` - Paths to audio files (WAV format)
-    ///
-    /// # Returns
-    /// * Vector of transcribed text strings
-    pub fn transcribe(&mut self, paths: &[impl AsRef<Path>]) -> Result<Vec<String>> {
-        let clips = super::load_clips(paths, self.sample_rate())?;
-        self.transcribe_clips(&clips)
+    /// ```no_run
+    /// # fn main() -> mlx_voice::Result<()> {
+    /// # use mlx_voice::asr::EncDecRNNTModel;
+    /// let mut model = EncDecRNNTModel::from_pretrained("model.nemo")?;
+    /// for transcript in model.transcribe(["a.wav", "b.wav"])? {
+    ///     println!("{transcript}");
+    ///     for word in &transcript.words {
+    ///         println!("{:6.2}-{:6.2} {}", word.start, word.end, word.text);
+    ///     }
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn transcribe<'a, I>(&mut self, inputs: I) -> Result<Vec<Transcript>>
+    where
+        I: IntoIterator,
+        I::Item: Into<AudioInput<'a>>,
+    {
+        self.transcribe_with(inputs, &TranscribeOptions::default())
     }
 
-    /// Transcribe mono audio samples (in `[-1, 1]`) recorded at
-    /// `sample_rate`, resampling them to the model's rate if needed.
-    pub fn transcribe_samples(&mut self, samples: &[f32], sample_rate: u32) -> Result<String> {
-        if samples.is_empty() {
-            return Ok(String::new());
+    /// Transcribe one WAV file or in-memory clip.
+    pub fn transcribe_one<'a>(&mut self, input: impl Into<AudioInput<'a>>) -> Result<Transcript> {
+        Ok(self.transcribe([input.into()])?.remove(0))
+    }
+
+    /// Transcribe with explicit options (decoding strategy, language, batch
+    /// size).
+    pub fn transcribe_with<'a, I>(
+        &mut self,
+        inputs: I,
+        options: &TranscribeOptions,
+    ) -> Result<Vec<Transcript>>
+    where
+        I: IntoIterator,
+        I::Item: Into<AudioInput<'a>>,
+    {
+        if self.tokenizer.is_none() {
+            return Err(Error::tokenizer(
+                "No tokenizer loaded. Call load_tokenizer first.",
+            ));
         }
-        let clip = resample(samples, sample_rate, self.sample_rate())?;
-        Ok(self.transcribe_clips(&[clip])?.remove(0))
+        let decoding = options.decoding.unwrap_or(self.decoding_strategy);
+
+        // Switch language for this call only
+        let previous_language = match &options.language {
+            Some(language) => {
+                let previous = self.language().map(str::to_owned);
+                self.set_language(language)?;
+                previous
+            }
+            None => None,
+        };
+        let sample_rate = self.sample_rate();
+        let decoded = super::decode_in_batches(inputs, sample_rate, options.batch_size, |clips| {
+            self.decode_clips(clips, decoding)
+        });
+        if let Some(language) = previous_language {
+            self.set_language(&language)?;
+        }
+
+        let frame_sec = self.frame_sec();
+        let tokenizer = self.tokenizer.as_ref().expect("checked above");
+        Ok(decoded?
+            .iter()
+            .map(|tokens| {
+                Transcript::from_tokens(tokenizer, tokens, frame_sec, options.strip_lang_tags)
+            })
+            .collect())
     }
 
-    /// Transcribe clips already at the model's sample rate.
-    fn transcribe_clips(&mut self, clips: &[Vec<f32>]) -> Result<Vec<String>> {
-        let (audio, lengths) = super::pad_batch(clips);
+    /// Seconds per encoder frame.
+    fn frame_sec(&self) -> f32 {
+        self.config.preprocessor.window_stride * self.encoder.subsampling_factor() as f32
+    }
 
-        // Run forward pass to get encoder output
+    /// Decode clips already at the model's sample rate.
+    fn decode_clips(
+        &mut self,
+        clips: &[Vec<f32>],
+        decoding: DecodingStrategy,
+    ) -> Result<Vec<Vec<TimedToken>>> {
+        let (audio, lengths) = super::pad_batch(clips);
         let (encoder_output, encoder_lengths) = self.forward(&audio, Some(&lengths))?;
 
-        let token_sequences = match self.decoding_strategy {
-            RnntDecodingStrategy::Greedy => {
-                self.greedy_decode(&encoder_output, &encoder_lengths)?
-            }
-            RnntDecodingStrategy::BeamSearch { beam_size } => rnnt_beam_decode(
+        match decoding {
+            DecodingStrategy::Greedy => self.greedy_decode(&encoder_output, &encoder_lengths),
+            DecodingStrategy::BeamSearch { beam_size } => rnnt_beam_decode(
                 &encoder_output,
                 &encoder_lengths,
                 &self.decoder,
                 &self.joint,
                 self.blank_id,
                 beam_size,
-            )?,
-        };
-
-        // Convert tokens to text
-        let texts = self.decode_tokens(&token_sequences)?;
-
-        Ok(texts)
+            ),
+        }
     }
 
     /// Perform greedy decoding using the model's decoder.
@@ -669,7 +692,7 @@ impl EncDecRNNTModel {
         &self,
         encoder_output: &Array,
         encoder_lengths: &Array,
-    ) -> Result<Vec<Vec<usize>>> {
+    ) -> Result<Vec<Vec<TimedToken>>> {
         let lengths: Vec<i32> = encoder_lengths
             .as_dtype(mlx_rs::Dtype::Int32)?
             .to_vec_row_major()?;
@@ -692,7 +715,18 @@ impl EncDecRNNTModel {
                 &mut last_token,
                 None,
             )?;
-            results.push(output.new_tokens);
+            results.push(
+                output
+                    .new_tokens
+                    .iter()
+                    .zip(&output.timesteps)
+                    .map(|(&id, &t)| TimedToken {
+                        id,
+                        start_frame: t,
+                        end_frame: t + 1,
+                    })
+                    .collect(),
+            );
         }
 
         Ok(results)
@@ -720,22 +754,6 @@ impl EncDecRNNTModel {
         let encoded_transposed = mlx_rs::ops::transpose_axes(&encoded, &[0, 2, 1])?;
 
         Ok((encoded_transposed, encoded_lengths))
-    }
-
-    /// Decode token sequences to text.
-    fn decode_tokens(&self, token_sequences: &[Vec<usize>]) -> Result<Vec<String>> {
-        let tokenizer = self
-            .tokenizer
-            .as_ref()
-            .ok_or_else(|| Error::tokenizer("No tokenizer loaded. Call load_tokenizer first."))?;
-
-        let mut texts = Vec::with_capacity(token_sequences.len());
-
-        for tokens in token_sequences {
-            texts.push(self.tokens_to_text(tokenizer, tokens));
-        }
-
-        Ok(texts)
     }
 
     /// Get the model configuration.
