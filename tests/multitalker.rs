@@ -12,7 +12,6 @@
 
 use std::path::Path;
 
-use mlx_voice::Array;
 use mlx_voice::asr::{
     MultiTalkerMode, MultiTalkerPipeline, SortformerEncLabelModel, SpeakerSegment,
 };
@@ -82,13 +81,7 @@ fn load_audio(path: &str) -> Vec<f32> {
 /// Per-frame speaker probabilities from streaming diarization of a file.
 fn diarize(path: &str) -> Vec<Vec<f32>> {
     let mut model = SortformerEncLabelModel::from_pretrained(DIAR_MODEL).expect("load diarizer");
-    let audio = load_audio(path);
-    let audio_arr = Array::from_slice(&audio, &[1, audio.len() as i32]);
-    let lengths = Array::from_slice(&[audio.len() as i32], &[1]);
-    let preds = model.diarize(&audio_arr, &lengths).expect("diarize");
-    let n_spk = preds.dim(2) as usize;
-    let flat: Vec<f32> = preds.reshape(&[-1]).unwrap().as_slice::<f32>().to_vec();
-    flat.chunks(n_spk).map(|c| c.to_vec()).collect()
+    model.diarize(path).expect("diarize")
 }
 
 #[test]

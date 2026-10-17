@@ -15,12 +15,10 @@
 //!
 //! ```no_run
 //! # fn main() -> mlx_voice::Result<()> {
-//! # use mlx_voice::{asr::SortformerEncLabelModel, Array};
-//! # let audio_array = Array::from_slice(&[0.0f32; 16000], &[1, 16000]);
-//! # let lengths = Array::from_slice(&[16000i32], &[1]);
+//! # use mlx_voice::asr::SortformerEncLabelModel;
 //! let mut model = SortformerEncLabelModel::from_pretrained("diar_model.nemo")?;
-//! let preds = model.diarize(&audio_array, &lengths)?;
-//! // preds: [1, T, 4] - per-frame speaker probabilities
+//! let frames = model.diarize("meeting.wav")?;
+//! // frames[t][s]: probability that speaker s talks in frame t
 //! # Ok(())
 //! # }
 //! ```
@@ -37,6 +35,7 @@ use crate::asr::modules::encoders::transformer::TransformerEncoder;
 use crate::asr::modules::sortformer::SortformerModules;
 use crate::asr::modules::{ConformerEncoder, MelConfig, MelProcessor};
 use crate::asr::streaming::StreamingSortformerState;
+use crate::asr::transcript::AudioInput;
 use crate::core::ArrayExt;
 use crate::core::checkpoint::NemoCheckpoint;
 use crate::core::error::{Error, Result};
@@ -294,64 +293,100 @@ impl SortformerEncLabelModel {
         state.update(&chunk_embs, &preds, lc, rc)
     }
 
-    /// Diarize a whole recording with the streaming algorithm.
+    /// Diarize a WAV file or in-memory clip (see [`AudioInput`]): the
+    /// probability that each speaker is talking in each frame, as
+    /// `[frame][speaker]` with [`max_num_spks`](Self::max_num_spks) speakers.
+    /// Each frame lasts [`frame_duration`](Self::frame_duration) seconds.
     ///
-    /// Port of NeMo's `forward_streaming`: the mel features are split into
-    /// `chunk_len` encoder-frame chunks with left/right context, and each is
-    /// run through one streaming step with the speaker cache and FIFO.
+    /// Runs NeMo's streaming algorithm over the whole recording: chunks of
+    /// mel frames with left and right context, a speaker cache and a FIFO.
     ///
-    /// # Arguments
-    /// * `audio` - Raw audio samples `[1, samples]`
-    /// * `audio_lengths` - Number of valid samples `[1]`
-    ///
-    /// # Returns
-    /// * Speaker activity probabilities `[1, frames, num_spks]`
-    pub fn diarize(&mut self, audio: &Array, audio_lengths: &Array) -> Result<Array> {
-        let (mel, mel_lengths) = self.preprocessor.forward(audio, Some(audio_lengths))?;
-        let feat_len = mel.dim(2) as usize;
-        let valid_len = (mel_lengths.to_vec_row_major::<i32>()?[0].max(0) as usize).min(feat_len);
-
-        let params = &self.config.sortformer_modules;
-        let sub = self.subsampling_factor();
-        let chunk_frames = params.chunk_len * sub;
-        let (left_ctx, right_ctx) = (
-            params.chunk_left_context * sub,
-            params.chunk_right_context * sub,
-        );
-
-        let mut state = self.create_streaming_state()?;
-        let mut chunk_preds = Vec::new();
-        let mut stt = 0usize;
-        while stt < feat_len {
-            let left_offset = left_ctx.min(stt);
-            let end = (stt + chunk_frames).min(feat_len);
-            let right_offset = right_ctx.min(feat_len - end);
-
-            let chunk = mel.index((
-                ..,
-                ..,
-                (stt - left_offset) as i32..(end + right_offset) as i32,
-            ));
-            let chunk_valid = (valid_len + left_offset)
-                .saturating_sub(stt)
-                .min(chunk.dim(2) as usize);
-
-            let preds = self.forward_streaming_step(
-                &chunk,
-                chunk_valid,
-                &mut state,
-                0,
-                left_offset,
-                right_offset,
-            )?;
-            preds.eval()?;
-            chunk_preds.push(preds);
-            stt = end;
+    /// ```no_run
+    /// # fn main() -> mlx_voice::Result<()> {
+    /// # use mlx_voice::asr::SortformerEncLabelModel;
+    /// let mut model = SortformerEncLabelModel::from_pretrained("diar_model.nemo")?;
+    /// let frames = model.diarize("meeting.wav")?;
+    /// for (i, speakers) in frames.iter().enumerate() {
+    ///     let active: Vec<usize> = (0..speakers.len()).filter(|&s| speakers[s] > 0.5).collect();
+    ///     println!("{:6.2}s {active:?}", i as f32 * model.frame_duration());
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn diarize<'a>(&mut self, input: impl Into<AudioInput<'a>>) -> Result<Vec<Vec<f32>>> {
+        let samples = input.into().load(self.sample_rate())?;
+        if samples.is_empty() {
+            return Ok(Vec::new());
         }
+        let audio = Array::from_slice(&samples, &[1, samples.len() as i32]);
+        let lengths = Array::from_slice(&[samples.len() as i32], &[1]);
+        let preds = self.diarize_array(&audio, &lengths)?;
+        let speakers = preds.dim(2) as usize;
+        let probs: Vec<f32> = preds.to_vec_row_major()?;
+        Ok(probs.chunks(speakers.max(1)).map(<[f32]>::to_vec).collect())
+    }
 
-        let preds = ops::concatenate(&chunk_preds.iter().collect::<Vec<_>>(), 1)?;
-        let output_frames = feat_len.div_ceil(sub) as i32;
-        Ok(preds.index((.., ..output_frames.min(preds.dim(1)), ..)))
+    internal_fn! {
+        /// [`diarize`](Self::diarize) on a tensor: a whole recording through the
+        /// streaming algorithm.
+        ///
+        /// Port of NeMo's `forward_streaming`: the mel features are split into
+        /// `chunk_len` encoder-frame chunks with left/right context, and each is
+        /// run through one streaming step with the speaker cache and FIFO.
+        ///
+        /// # Arguments
+        /// * `audio` - Raw audio samples `[1, samples]`
+        /// * `audio_lengths` - Number of valid samples `[1]`
+        ///
+        /// # Returns
+        /// * Speaker activity probabilities `[1, frames, num_spks]`
+        pub fn diarize_array(&mut self, audio: &Array, audio_lengths: &Array) -> Result<Array> {
+            let (mel, mel_lengths) = self.preprocessor.forward(audio, Some(audio_lengths))?;
+            let feat_len = mel.dim(2) as usize;
+            let valid_len = (mel_lengths.to_vec_row_major::<i32>()?[0].max(0) as usize).min(feat_len);
+
+            let params = &self.config.sortformer_modules;
+            let sub = self.subsampling_factor();
+            let chunk_frames = params.chunk_len * sub;
+            let (left_ctx, right_ctx) = (
+                params.chunk_left_context * sub,
+                params.chunk_right_context * sub,
+            );
+
+            let mut state = self.create_streaming_state()?;
+            let mut chunk_preds = Vec::new();
+            let mut stt = 0usize;
+            while stt < feat_len {
+                let left_offset = left_ctx.min(stt);
+                let end = (stt + chunk_frames).min(feat_len);
+                let right_offset = right_ctx.min(feat_len - end);
+
+                let chunk = mel.index((
+                    ..,
+                    ..,
+                    (stt - left_offset) as i32..(end + right_offset) as i32,
+                ));
+                let chunk_valid = (valid_len + left_offset)
+                    .saturating_sub(stt)
+                    .min(chunk.dim(2) as usize);
+
+                let preds = self.forward_streaming_step(
+                    &chunk,
+                    chunk_valid,
+                    &mut state,
+                    0,
+                    left_offset,
+                    right_offset,
+                )?;
+                preds.eval()?;
+                chunk_preds.push(preds);
+                stt = end;
+            }
+
+            let preds = ops::concatenate(&chunk_preds.iter().collect::<Vec<_>>(), 1)?;
+            let output_frames = feat_len.div_ceil(sub) as i32;
+            Ok(preds.index((.., ..output_frames.min(preds.dim(1)), ..)))
+        }
     }
 
     /// Create a new streaming state for this model.
@@ -367,6 +402,17 @@ impl SortformerEncLabelModel {
     /// Takes effect for states created afterwards.
     pub(crate) fn streaming_params_mut(&mut self) -> &mut SortformerModulesConfig {
         &mut self.config.sortformer_modules
+    }
+
+    /// The sample rate the model expects; [`diarize`](Self::diarize)
+    /// resamples other rates to it.
+    pub fn sample_rate(&self) -> u32 {
+        self.config.sample_rate
+    }
+
+    /// Seconds per output frame of [`diarize`](Self::diarize).
+    pub fn frame_duration(&self) -> f32 {
+        self.config.preprocessor.window_stride * self.subsampling_factor() as f32
     }
 
     /// Get the encoder's subsampling factor.

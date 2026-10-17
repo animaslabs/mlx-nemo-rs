@@ -10,8 +10,8 @@
 //! use mlx_voice::asr::EncDecClassificationModel;
 //!
 //! let mut model = EncDecClassificationModel::from_pretrained("vad_model.nemo")?;
-//! let probs = model.infer(&["audio.wav"])?;
-//! // probs[0] contains per-frame speech probabilities
+//! let probs = model.infer_one("audio.wav")?;
+//! // probs[i] is the speech probability of frame i
 //! # Ok(())
 //! # }
 //! ```
@@ -25,13 +25,16 @@ use mlx_rs::Array;
 use crate::asr::config::ClassificationModelConfig;
 use crate::asr::modules::MelProcessor;
 use crate::asr::modules::encoders::JasperEncoder;
-use crate::audio::{load_wav, resample};
+use crate::asr::transcript::AudioInput;
 use crate::core::ArrayExt;
 use crate::core::checkpoint::NemoCheckpoint;
 use crate::core::error::{Error, Result};
 use crate::core::loading::{LoadOptions, LoadReport, Weights};
 use crate::core::quantization::LinearLayer;
 use crate::core::source::{LocalModel, ModelSource};
+
+/// Clips run through the model at once by [`EncDecClassificationModel::infer`].
+const INFER_BATCH_SIZE: usize = 4;
 
 /// Encoder-Decoder Classification Model.
 ///
@@ -230,70 +233,71 @@ impl EncDecClassificationModel {
         }
     }
 
-    /// Run inference on audio files.
+    /// Per-frame speech probabilities for WAV files or in-memory audio (see
+    /// [`AudioInput`]), one `Vec` per input. Audio is resampled to the
+    /// model's rate, and each frame lasts
+    /// [`frame_duration`](Self::frame_duration) seconds.
     ///
-    /// # Arguments
-    /// * `paths` - Paths to audio files (WAV format)
-    ///
-    /// # Returns
-    /// * Vector of per-frame speech probabilities for each file.
-    ///   Each inner `Vec<f32>` contains the probability of class 1 (speech)
-    ///   for each frame.
-    pub fn infer(&mut self, paths: &[impl AsRef<Path>]) -> Result<Vec<Vec<f32>>> {
-        let audio_batch = self.load_audio_batch(paths)?;
-        let (logits, lengths) = self.forward(&audio_batch.0, Some(&audio_batch.1))?;
-
-        let probs = mlx_rs::ops::softmax_axis(&logits, -1, None)?;
-        probs.eval()?;
-        lengths.eval()?;
-
-        let batch_size = probs.dim(0) as usize;
-        let time_dim = probs.dim(1) as usize;
-        let num_classes = self.num_classes;
-        let lengths_data: Vec<i32> = lengths.to_vec_row_major()?;
-        let probs_data: Vec<f32> = probs.to_vec_row_major()?;
-
-        let mut results = Vec::with_capacity(batch_size);
-        for b in 0..batch_size {
-            let valid_len = lengths_data[b] as usize;
-            let batch_offset = b * time_dim * num_classes;
-            let mut frame_probs = Vec::with_capacity(valid_len);
-            for f in 0..valid_len {
-                let idx = batch_offset + f * num_classes + 1;
-                frame_probs.push(probs_data[idx]);
-            }
-            results.push(frame_probs);
+    /// ```no_run
+    /// # fn main() -> mlx_voice::Result<()> {
+    /// # use mlx_voice::asr::EncDecClassificationModel;
+    /// # let samples = vec![0.0f32; 48_000];
+    /// let mut model = EncDecClassificationModel::from_pretrained("vad_model.nemo")?;
+    /// let from_files = model.infer(["a.wav", "b.wav"])?;
+    /// let from_memory = model.infer_one((&samples[..], 48_000))?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn infer<'a, I>(&mut self, inputs: I) -> Result<Vec<Vec<f32>>>
+    where
+        I: IntoIterator,
+        I::Item: Into<AudioInput<'a>>,
+    {
+        let sample_rate = self.sample_rate();
+        let inputs: Vec<AudioInput<'a>> = inputs.into_iter().map(Into::into).collect();
+        let mut results = Vec::with_capacity(inputs.len());
+        for batch in inputs.chunks(INFER_BATCH_SIZE) {
+            let clips = batch
+                .iter()
+                .map(|input| input.load(sample_rate))
+                .collect::<Result<Vec<_>>>()?;
+            results.extend(self.infer_clips(&clips)?);
         }
-
         Ok(results)
     }
 
-    /// Run inference on raw audio samples.
-    ///
-    /// # Arguments
-    /// * `samples` - Raw audio samples (f32, single channel, at model sample rate)
-    ///
-    /// # Returns
-    /// * Per-frame speech probabilities (class 1).
-    pub fn infer_samples(&mut self, samples: &[f32]) -> Result<Vec<f32>> {
-        let audio = Array::from_slice(samples, &[1, samples.len() as i32]);
-        let lengths = Array::from_slice(&[samples.len() as i32], &[1]);
+    /// Per-frame speech probabilities for one WAV file or in-memory clip.
+    pub fn infer_one<'a>(&mut self, input: impl Into<AudioInput<'a>>) -> Result<Vec<f32>> {
+        Ok(self.infer([input.into()])?.remove(0))
+    }
 
-        let (logits, out_lengths) = self.forward(&audio, Some(&lengths))?;
+    /// Speech probabilities of clips already at the model's sample rate.
+    /// Empty clips give no frames without running the model.
+    fn infer_clips(&mut self, clips: &[Vec<f32>]) -> Result<Vec<Vec<f32>>> {
+        let nonempty: Vec<usize> = (0..clips.len()).filter(|&i| !clips[i].is_empty()).collect();
+        let mut results = vec![Vec::new(); clips.len()];
+        if nonempty.is_empty() {
+            return Ok(results);
+        }
+        let to_run: Vec<Vec<f32>> = nonempty.iter().map(|&i| clips[i].clone()).collect();
+        let (audio, lengths) = super::pad_batch(&to_run);
+        let (logits, lengths) = self.forward(&audio, Some(&lengths))?;
 
         let probs = mlx_rs::ops::softmax_axis(&logits, -1, None)?;
-        probs.eval()?;
-        out_lengths.eval()?;
-
-        let valid_len = out_lengths.to_vec_row_major::<i32>()?[0] as usize;
-        let probs_data: Vec<f32> = probs.to_vec_row_major()?;
+        let time_dim = probs.dim(1) as usize;
         let num_classes = self.num_classes;
-        let mut result = Vec::with_capacity(valid_len);
-        for f in 0..valid_len {
-            let idx = f * num_classes + 1;
-            result.push(probs_data[idx]);
+        let lengths: Vec<i32> = lengths.to_vec_row_major()?;
+        let probs: Vec<f32> = probs.to_vec_row_major()?;
+
+        for (b, &i) in nonempty.iter().enumerate() {
+            let valid_len = lengths[b].max(0) as usize;
+            let offset = b * time_dim * num_classes;
+            // Class 1 is speech
+            results[i] = (0..valid_len)
+                .map(|f| probs[offset + f * num_classes + 1])
+                .collect();
         }
-        Ok(result)
+        Ok(results)
     }
 
     /// Get the frame duration in seconds, accounting for encoder stride.
@@ -316,43 +320,5 @@ impl EncDecClassificationModel {
     /// Get the number of output classes.
     pub fn num_classes(&self) -> usize {
         self.num_classes
-    }
-
-    /// Load audio files and return batched tensors.
-    fn load_audio_batch(&self, paths: &[impl AsRef<Path>]) -> Result<(Array, Array)> {
-        let sample_rate = self.config.sample_rate;
-        let mut audio_samples = Vec::new();
-        let mut lengths = Vec::new();
-
-        for path in paths {
-            let path = path.as_ref();
-            let (samples, file_sample_rate) = load_wav(path)?;
-
-            let samples = if file_sample_rate != sample_rate {
-                resample(&samples, file_sample_rate, sample_rate)?
-            } else {
-                samples
-            };
-
-            lengths.push(samples.len());
-            audio_samples.push(samples);
-        }
-
-        let max_len = lengths.iter().max().copied().unwrap_or(0);
-        let batch_size = audio_samples.len();
-
-        let mut padded_data = vec![0.0f32; batch_size * max_len];
-        for (i, samples) in audio_samples.iter().enumerate() {
-            let offset = i * max_len;
-            padded_data[offset..offset + samples.len()].copy_from_slice(samples);
-        }
-
-        let audio = Array::from_slice(&padded_data, &[batch_size as i32, max_len as i32]);
-        let lengths_arr = Array::from_slice(
-            &lengths.iter().map(|&l| l as i32).collect::<Vec<_>>(),
-            &[batch_size as i32],
-        );
-
-        Ok((audio, lengths_arr))
     }
 }
