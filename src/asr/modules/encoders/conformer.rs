@@ -18,8 +18,8 @@ use crate::asr::config::EncoderConfig;
 use crate::asr::modules::speaker_kernel::{SpeakerKernels, SpeakerTargets};
 use crate::core::ArrayExt;
 use crate::core::error::Result;
-use crate::core::quantization::{LinearLayer, QuantizationConfig, require_linear_layer};
-use crate::core::weights::{load_batch_norm, load_conv1d, load_conv2d, load_layer_norm};
+use crate::core::loading::{Weights, load_batch_norm, load_conv1d, load_conv2d, load_layer_norm};
+use crate::core::quantization::{LinearLayer, QuantizationConfig};
 
 /// Debug switches, read from the environment once rather than on every call
 static DEBUG_MEL_MASK: LazyLock<bool> =
@@ -588,7 +588,7 @@ impl ConformerEncoder {
     /// * `quant` - Optional quantization config for quantized models
     pub fn load_weights(
         &mut self,
-        weights: &HashMap<String, Array>,
+        weights: &Weights,
         quant: Option<&QuantizationConfig>,
     ) -> Result<()> {
         // Load subsampling weights (NeMo uses encoder.pre_encode prefix)
@@ -1554,7 +1554,7 @@ impl Subsampling {
 
     fn load_weights(
         &mut self,
-        weights: &HashMap<String, Array>,
+        weights: &Weights,
         prefix: &str,
         quant: Option<&QuantizationConfig>,
     ) -> Result<()> {
@@ -1577,7 +1577,9 @@ impl Subsampling {
         }
 
         // Load output projection (may be quantized)
-        self.out_proj = require_linear_layer(weights, &format!("{}.out", prefix), quant)?;
+        if let Some(layer) = weights.fetch_linear(&format!("{}.out", prefix), quant)? {
+            self.out_proj = layer;
+        }
 
         Ok(())
     }
@@ -1941,7 +1943,7 @@ impl ConformerBlock {
 
     fn load_weights(
         &mut self,
-        weights: &HashMap<String, Array>,
+        weights: &Weights,
         prefix: &str,
         quant: Option<&QuantizationConfig>,
     ) -> Result<()> {
@@ -2036,12 +2038,16 @@ impl FeedForward {
 
     fn load_weights(
         &mut self,
-        weights: &HashMap<String, Array>,
+        weights: &Weights,
         prefix: &str,
         quant: Option<&QuantizationConfig>,
     ) -> Result<()> {
-        self.linear1 = require_linear_layer(weights, &format!("{}.linear1", prefix), quant)?;
-        self.linear2 = require_linear_layer(weights, &format!("{}.linear2", prefix), quant)?;
+        if let Some(layer) = weights.fetch_linear(&format!("{}.linear1", prefix), quant)? {
+            self.linear1 = layer;
+        }
+        if let Some(layer) = weights.fetch_linear(&format!("{}.linear2", prefix), quant)? {
+            self.linear2 = layer;
+        }
         Ok(())
     }
 }
@@ -2354,13 +2360,14 @@ impl ConvolutionModule {
 
     fn load_weights(
         &mut self,
-        weights: &HashMap<String, Array>,
+        weights: &Weights,
         prefix: &str,
         quant: Option<&QuantizationConfig>,
     ) -> Result<()> {
         // Pointwise convs load as LinearLayer (may be quantized)
-        self.pointwise_conv1 =
-            require_linear_layer(weights, &format!("{}.pointwise_conv1", prefix), quant)?;
+        if let Some(layer) = weights.fetch_linear(&format!("{}.pointwise_conv1", prefix), quant)? {
+            self.pointwise_conv1 = layer;
+        }
 
         // Depthwise conv stays as nn::Conv1d (not quantizable)
         load_conv1d(
@@ -2369,8 +2376,9 @@ impl ConvolutionModule {
             &format!("{}.depthwise_conv", prefix),
         )?;
 
-        self.pointwise_conv2 =
-            require_linear_layer(weights, &format!("{}.pointwise_conv2", prefix), quant)?;
+        if let Some(layer) = weights.fetch_linear(&format!("{}.pointwise_conv2", prefix), quant)? {
+            self.pointwise_conv2 = layer;
+        }
 
         // Load normalization weights based on type
         match &mut self.norm {

@@ -9,13 +9,14 @@
 //!     Linear(d + K -> 2d) -> ReLU -> Linear(2d -> d)
 //! ```
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 
 use mlx_rs::{Array, ops};
 
 use crate::asr::config::AsrModelConfig;
 use crate::core::error::{Error, Result};
-use crate::core::quantization::{LinearLayer, QuantizationConfig, load_linear_layer};
+use crate::core::loading::Weights;
+use crate::core::quantization::{LinearLayer, QuantizationConfig};
 
 /// Prompt name that lets the model detect the spoken language itself.
 pub const AUTO_LANGUAGE: &str = "auto";
@@ -33,20 +34,21 @@ pub struct LanguagePrompt {
 }
 
 impl LanguagePrompt {
-    /// The model's language prompt, or `None` for models without one.
+    /// The model's language prompt, or `None` for models without one (or, in
+    /// a non-strict load, whose checkpoint lacks the prompt weights).
     pub fn from_config(
         config: &AsrModelConfig,
-        weights: &HashMap<String, Array>,
+        weights: &Weights,
         quant: Option<&QuantizationConfig>,
     ) -> Result<Option<Self>> {
         match config.prompt_config() {
-            Some(prompt) => Ok(Some(Self::load(
+            Some(prompt) => Self::load(
                 weights,
                 "prompt_kernel",
                 quant,
                 prompt.dictionary,
                 prompt.num_prompts,
-            )?)),
+            ),
             None => Ok(None),
         }
     }
@@ -54,17 +56,19 @@ impl LanguagePrompt {
     /// Load `prompt_kernel.{0,2}` weights.
     ///
     /// Starts with [`AUTO_LANGUAGE`] selected when the dictionary has it,
-    /// matching NeMo's `transcribe()` default.
+    /// matching NeMo's `transcribe()` default. Returns `None` if a non-strict
+    /// load finds the weights missing.
     pub fn load(
-        weights: &HashMap<String, Array>,
+        weights: &Weights,
         prefix: &str,
         quant: Option<&QuantizationConfig>,
         dictionary: BTreeMap<String, usize>,
         num_prompts: usize,
-    ) -> Result<Self> {
-        let layer = |idx: usize| {
-            load_linear_layer(weights, &format!("{prefix}.{idx}"), quant)
-                .ok_or_else(|| Error::model(format!("missing weights for {prefix}.{idx}")))
+    ) -> Result<Option<Self>> {
+        let proj_in = weights.fetch_linear(&format!("{prefix}.0"), quant)?;
+        let proj_out = weights.fetch_linear(&format!("{prefix}.2"), quant)?;
+        let (Some(proj_in), Some(proj_out)) = (proj_in, proj_out) else {
+            return Ok(None);
         };
         if dictionary.is_empty() {
             return Err(Error::config("prompt model has an empty prompt_dictionary"));
@@ -75,15 +79,15 @@ impl LanguagePrompt {
             dictionary.keys().next().cloned().unwrap_or_default()
         };
         let mut prompt = Self {
-            proj_in: layer(0)?,
-            proj_out: layer(2)?,
+            proj_in,
+            proj_out,
             dictionary,
             num_prompts,
             language: String::new(),
             one_hot: Array::zeros::<f32>(&[num_prompts as i32])?,
         };
         prompt.set_language(&language)?;
-        Ok(prompt)
+        Ok(Some(prompt))
     }
 
     /// Select the target language, e.g. `"en-US"`, `"de"` or [`AUTO_LANGUAGE`].

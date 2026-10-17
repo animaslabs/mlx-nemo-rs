@@ -40,6 +40,7 @@ use crate::asr::streaming::{
 use crate::core::ArrayExt;
 use crate::core::checkpoint::NemoCheckpoint;
 use crate::core::error::{Error, Result};
+use crate::core::loading::{LoadOptions, Weights};
 
 // Type alias for backwards compatibility
 use crate::asr::modules::MelProcessor as MelSpectrogram;
@@ -269,7 +270,19 @@ impl CacheAwareRNNTPipeline {
     /// # Arguments
     /// * `path` - Path to the .nemo checkpoint file
     /// * `mode_idx` - Streaming mode index (0 = highest latency)
+    ///
+    /// Fails if the checkpoint lacks a tokenizer or any weight the model has;
+    /// [`restore_with`](Self::restore_with) can allow that.
     pub fn restore(path: impl AsRef<Path>, mode_idx: usize) -> Result<Self> {
+        Self::restore_with(path, mode_idx, LoadOptions::default())
+    }
+
+    /// Like [`restore`](Self::restore), loading with `options`.
+    pub fn restore_with(
+        path: impl AsRef<Path>,
+        mode_idx: usize,
+        options: LoadOptions,
+    ) -> Result<Self> {
         let path = path.as_ref();
         tracing::info!("Loading pipeline from: {}", path.display());
 
@@ -289,13 +302,13 @@ impl CacheAwareRNNTPipeline {
         let mut encoder = ConformerEncoder::new(config.encoder.clone())?;
 
         // Load tokenizer
-        let tokenizer_path = checkpoint
-            .find_tokenizer()
-            .ok_or_else(|| Error::missing_tokenizer(path))?;
-        let tokenizer = Some(
-            SentencePieceProcessor::open(&tokenizer_path)
-                .map_err(|e| Error::tokenizer(format!("Failed to load tokenizer: {}", e)))?,
-        );
+        let tokenizer = match checkpoint.find_tokenizer() {
+            Some(tokenizer_path) => Some(open_tokenizer(&tokenizer_path)?),
+            None => {
+                options.missing_tokenizer(path)?;
+                None
+            }
+        };
 
         // Determine vocabulary size
         let vocab_size = tokenizer
@@ -346,7 +359,8 @@ impl CacheAwareRNNTPipeline {
         )?;
 
         // Load weights (.nemo files are not quantized)
-        let weights = checkpoint.load_weights()?;
+        let tensors = checkpoint.load_weights()?;
+        let weights = Weights::new(&tensors, options);
         // Note: MelSpectrogram doesn't need weight loading (uses fixed mel filterbanks)
         encoder.load_weights(&weights, None)?;
         decoder.load_weights(&weights, "decoder", None)?;
@@ -503,7 +517,7 @@ impl CacheAwareRNNTPipeline {
         let config: AsrModelConfig = loader.load_config()?;
 
         // Build the pipeline from components
-        Self::build_from_config_and_weights(config, loader, mode_idx)
+        Self::build_from_config_and_weights(config, loader, mode_idx, LoadOptions::default())
     }
 
     /// Restore a pipeline from a directory containing safetensors files.
@@ -524,6 +538,16 @@ impl CacheAwareRNNTPipeline {
     /// # }
     /// ```
     pub fn restore_from_directory(dir: impl AsRef<Path>, mode_idx: usize) -> Result<Self> {
+        Self::restore_from_directory_with(dir, mode_idx, LoadOptions::default())
+    }
+
+    /// Like [`restore_from_directory`](Self::restore_from_directory), loading
+    /// with `options`.
+    pub fn restore_from_directory_with(
+        dir: impl AsRef<Path>,
+        mode_idx: usize,
+        options: LoadOptions,
+    ) -> Result<Self> {
         use crate::core::checkpoint::SafetensorsLoader;
 
         let dir = dir.as_ref();
@@ -532,7 +556,7 @@ impl CacheAwareRNNTPipeline {
         let loader = SafetensorsLoader::from_directory(dir)?;
         let config: AsrModelConfig = loader.load_config()?;
 
-        Self::build_from_config_and_weights(config, loader, mode_idx)
+        Self::build_from_config_and_weights(config, loader, mode_idx, options)
     }
 
     /// Internal helper to build pipeline from config and a SafetensorsLoader.
@@ -540,6 +564,7 @@ impl CacheAwareRNNTPipeline {
         config: AsrModelConfig,
         loader: crate::core::checkpoint::SafetensorsLoader,
         mode_idx: usize,
+        options: LoadOptions,
     ) -> Result<Self> {
         config.validate()?;
 
@@ -553,13 +578,14 @@ impl CacheAwareRNNTPipeline {
         let mut encoder = ConformerEncoder::new(config.encoder.clone())?;
 
         // Load tokenizer
-        let tokenizer_path = loader.tokenizer_path().ok_or_else(|| {
-            Error::missing_tokenizer(loader.weights_path.parent().unwrap_or(Path::new(".")))
-        })?;
-        let tokenizer = Some(
-            SentencePieceProcessor::open(tokenizer_path)
-                .map_err(|e| Error::tokenizer(format!("Failed to load tokenizer: {}", e)))?,
-        );
+        let tokenizer = match loader.tokenizer_path() {
+            Some(tokenizer_path) => Some(open_tokenizer(tokenizer_path)?),
+            None => {
+                options
+                    .missing_tokenizer(loader.weights_path.parent().unwrap_or(Path::new(".")))?;
+                None
+            }
+        };
 
         // Determine vocabulary size
         let vocab_size = tokenizer
@@ -610,7 +636,8 @@ impl CacheAwareRNNTPipeline {
         )?;
 
         // Load weights (may be quantized)
-        let weights = loader.load_weights()?;
+        let tensors = loader.load_weights()?;
+        let weights = Weights::new(&tensors, options);
         let quant = loader.quantization();
         tracing::debug!(
             "Loading {} weight tensors (format: {:?}, quantized: {})",
@@ -1425,6 +1452,12 @@ impl CacheAwareRNNTPipeline {
         self.process_audio_chunk(&audio)?;
         Ok(())
     }
+}
+
+/// Open a SentencePiece tokenizer model.
+fn open_tokenizer(path: &Path) -> Result<SentencePieceProcessor> {
+    SentencePieceProcessor::open(path)
+        .map_err(|e| Error::tokenizer(format!("Failed to load tokenizer: {}", e)))
 }
 
 #[cfg(test)]

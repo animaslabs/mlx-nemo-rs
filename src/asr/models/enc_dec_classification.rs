@@ -30,6 +30,7 @@ use crate::core::ArrayExt;
 use crate::core::checkpoint::NemoCheckpoint;
 use crate::core::config::from_yaml_str;
 use crate::core::error::{Error, Result};
+use crate::core::loading::{LoadOptions, LoadReport, Weights};
 use crate::core::quantization::LinearLayer;
 
 /// Encoder-Decoder Classification Model.
@@ -73,7 +74,15 @@ impl EncDecClassificationModel {
     }
 
     /// Restore a model from a .nemo checkpoint file.
+    ///
+    /// Fails if the checkpoint lacks any weight the model has;
+    /// [`restore_with`](Self::restore_with) can allow that.
     pub fn restore(path: impl AsRef<Path>) -> Result<Self> {
+        Self::restore_with(path, LoadOptions::default())
+    }
+
+    /// Restore a model from a .nemo checkpoint file, loading with `options`.
+    pub fn restore_with(path: impl AsRef<Path>, options: LoadOptions) -> Result<Self> {
         let path = path.as_ref();
         tracing::info!("Loading classification model from: {}", path.display());
 
@@ -90,16 +99,29 @@ impl EncDecClassificationModel {
 
         let weights = checkpoint.load_weights()?;
         tracing::debug!("Loading {} weight tensors", weights.len());
-        model.load_weights(&weights)?;
+        model.load_weights_with(&weights, options)?;
 
         Ok(model)
     }
 
-    /// Load weights from a HashMap.
+    /// Load weights from a checkpoint's tensors, failing if any tensor the
+    /// model has is missing.
     pub fn load_weights(
         &mut self,
         weights: &std::collections::HashMap<String, Array>,
     ) -> Result<()> {
+        self.load_weights_with(weights, LoadOptions::default())
+            .map(|_| ())
+    }
+
+    /// Load weights from a checkpoint's tensors with `options`, returning the
+    /// tensors a non-strict load had to leave at their initial values.
+    pub fn load_weights_with(
+        &mut self,
+        weights: &std::collections::HashMap<String, Array>,
+        options: LoadOptions,
+    ) -> Result<LoadReport> {
+        let weights = Weights::new(weights, options);
         // Load preprocessor filterbank from checkpoint if available.
         // This ensures exact match with the model's training filterbank.
         if let Some(fb) = weights.get("preprocessor.featurizer.fb") {
@@ -113,7 +135,7 @@ impl EncDecClassificationModel {
             self.preprocessor.set_filterbank(fb);
         }
 
-        self.encoder.load_weights(weights)?;
+        self.encoder.load_weights(&weights)?;
 
         // Try decoder weight paths in order of likelihood
         let decoder_key_pairs = [
@@ -141,13 +163,13 @@ impl EncDecClassificationModel {
                 let bias = weights.get(*bias_key).cloned();
                 self.decoder = LinearLayer::standard(weight, bias);
                 tracing::debug!("Loaded decoder from {}", weight_key);
-                return Ok(());
+                return Ok(weights.report());
             }
         }
 
-        Err(Error::model(
-            "Could not find decoder weights in checkpoint (tried decoder.decoder_layers.0.*, decoder._layer0.*, decoder.layer0.*)",
-        ))
+        let keys = decoder_key_pairs.map(|(weight_key, _)| weight_key.to_string());
+        weights.report_missing(&keys)?;
+        Ok(weights.report())
     }
 
     /// Run forward pass on preprocessed audio.

@@ -12,7 +12,7 @@ use std::collections::HashMap;
 use mlx_rs::Array;
 use mlx_rs::ops::{self, indexing};
 
-use crate::core::error::{Error, Result};
+use crate::core::error::Result;
 
 /// Quantization configuration from model config.json.
 #[derive(Debug, Clone)]
@@ -340,16 +340,6 @@ pub fn load_linear_layer(
     }
 }
 
-/// Like [`load_linear_layer`], but an error if the checkpoint lacks the layer.
-pub(crate) fn require_linear_layer(
-    weights: &HashMap<String, Array>,
-    prefix: &str,
-    quant: Option<&QuantizationConfig>,
-) -> Result<LinearLayer> {
-    load_linear_layer(weights, prefix, quant)
-        .ok_or_else(|| Error::missing_weight(&format!("{prefix}.weight")))
-}
-
 /// Load an embedding layer from weights, auto-detecting quantization.
 ///
 /// If `{prefix}.scales` exists in weights, loads as quantized.
@@ -405,16 +395,6 @@ pub fn load_embedding_layer(
     } else {
         None
     }
-}
-
-/// Like [`load_embedding_layer`], but an error if the checkpoint lacks the layer.
-pub(crate) fn require_embedding_layer(
-    weights: &HashMap<String, Array>,
-    prefix: &str,
-    quant: Option<&QuantizationConfig>,
-) -> Result<EmbeddingLayer> {
-    load_embedding_layer(weights, prefix, quant)
-        .ok_or_else(|| Error::missing_weight(&format!("{prefix}.weight")))
 }
 
 #[cfg(test)]

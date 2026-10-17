@@ -3,13 +3,12 @@
 //! This module implements Transformer-XL style relative positional attention
 //! as used in NeMo's Conformer ASR models.
 
-use std::collections::HashMap;
-
 use mlx_rs::ops::indexing::IndexOp;
 use mlx_rs::{Array, ops};
 
 use crate::core::error::{Error, Result};
-use crate::core::quantization::{LinearLayer, QuantizationConfig, load_linear_layer};
+use crate::core::loading::Weights;
+use crate::core::quantization::{LinearLayer, QuantizationConfig};
 
 /// Relative positional encoding generator.
 ///
@@ -831,36 +830,32 @@ impl RelPositionMultiHeadAttention {
     /// * `quant` - Optional quantization config for quantized models
     pub fn load_weights(
         &mut self,
-        weights: &HashMap<String, Array>,
+        weights: &Weights,
         prefix: &str,
         quant: Option<&QuantizationConfig>,
     ) -> Result<()> {
-        // All of these are required: a checkpoint without them (e.g. a RoPE or
-        // abs_pos encoder) would otherwise run with zero-initialized position terms.
-        let linear = |name: &str| {
-            let key = format!("{}.{}", prefix, name);
-            load_linear_layer(weights, &key, quant).ok_or_else(|| {
-                Error::checkpoint(format!("missing attention weight `{}.weight`", key))
-            })
-        };
+        // Linear projections (standard or quantized)
+        for (name, layer) in [
+            ("linear_q", &mut self.linear_q),
+            ("linear_k", &mut self.linear_k),
+            ("linear_v", &mut self.linear_v),
+            ("linear_out", &mut self.linear_out),
+            ("linear_pos", &mut self.linear_pos),
+        ] {
+            if let Some(loaded) = weights.fetch_linear(&format!("{prefix}.{name}"), quant)? {
+                *layer = loaded;
+            }
+        }
 
-        // Load linear projections (supports both standard and quantized)
-        self.linear_q = linear("linear_q")?;
-        self.linear_k = linear("linear_k")?;
-        self.linear_v = linear("linear_v")?;
-        self.linear_out = linear("linear_out")?;
-        self.linear_pos = linear("linear_pos")?;
-
-        // Load position biases (per-layer, not shared, not quantized)
-        let param = |name: &str| {
-            let key = format!("{}.{}", prefix, name);
-            weights
-                .get(&key)
-                .cloned()
-                .ok_or_else(|| Error::checkpoint(format!("missing attention weight `{}`", key)))
-        };
-        self.pos_bias_u = param("pos_bias_u")?;
-        self.pos_bias_v = param("pos_bias_v")?;
+        // Position biases (per-layer, not shared, not quantized)
+        for (name, param) in [
+            ("pos_bias_u", &mut self.pos_bias_u),
+            ("pos_bias_v", &mut self.pos_bias_v),
+        ] {
+            if let Some(loaded) = weights.fetch(&format!("{prefix}.{name}"))? {
+                *param = loaded.clone();
+            }
+        }
 
         Ok(())
     }

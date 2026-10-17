@@ -33,6 +33,7 @@ pub mod audio;
 // Re-export commonly used types
 pub use core::checkpoint::SafetensorsLoader;
 pub use core::error::{Error, Result};
+pub use core::loading::{LoadOptions, LoadReport};
 pub use core::weights::WeightFormat;
 #[doc(no_inline)]
 pub use mlx_rs::Array;

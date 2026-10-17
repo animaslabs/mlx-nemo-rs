@@ -50,7 +50,7 @@ fn main() -> mlx_voice::Result<()> {
 
     // Load weights (.nemo files are not quantized)
     let weights = checkpoint.load_weights()?;
-    encoder.load_weights(&weights, None)?;
+    encoder.load_weights(&mlx_voice::core::Weights::from(&weights), None)?;
 
     println!("\nEncoder config:");
     println!("  d_model: {}", encoder.d_model());

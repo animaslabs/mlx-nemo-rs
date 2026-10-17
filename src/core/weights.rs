@@ -7,7 +7,6 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use mlx_rs::Array;
-use mlx_rs::nn;
 
 use crate::core::error::{Error, Result};
 
@@ -284,87 +283,6 @@ pub fn read_safetensors_metadata(path: impl AsRef<Path>) -> Result<HashMap<Strin
     }
 
     Ok(HashMap::new())
-}
-
-/// The tensor at `key`, or an error if the checkpoint lacks it.
-pub(crate) fn require<'a>(weights: &'a HashMap<String, Array>, key: &str) -> Result<&'a Array> {
-    weights.get(key).ok_or_else(|| Error::missing_weight(key))
-}
-
-/// The tensor at the first of `keys` the checkpoint has, or an error naming
-/// all of them.
-pub(crate) fn require_any<'a>(
-    weights: &'a HashMap<String, Array>,
-    keys: &[String],
-) -> Result<&'a Array> {
-    keys.iter()
-        .find_map(|key| weights.get(key))
-        .ok_or_else(|| Error::missing_weight(&keys.join("` or `")))
-}
-
-/// Load a LayerNorm's affine parameters, each required if the layer has it.
-pub(crate) fn load_layer_norm(
-    layer: &mut nn::LayerNorm,
-    weights: &HashMap<String, Array>,
-    prefix: &str,
-) -> Result<()> {
-    if layer.weight.value.is_some() {
-        layer.weight.value = Some(require(weights, &format!("{prefix}.weight"))?.clone());
-    }
-    if layer.bias.value.is_some() {
-        layer.bias.value = Some(require(weights, &format!("{prefix}.bias"))?.clone());
-    }
-    Ok(())
-}
-
-/// Load Conv1d weights (already in MLX `[O, K, I]` layout); the bias is
-/// required if the layer has one.
-pub(crate) fn load_conv1d(
-    layer: &mut nn::Conv1d,
-    weights: &HashMap<String, Array>,
-    prefix: &str,
-) -> Result<()> {
-    layer.weight.value = require(weights, &format!("{prefix}.weight"))?.clone();
-    if layer.bias.value.is_some() {
-        layer.bias.value = Some(require(weights, &format!("{prefix}.bias"))?.clone());
-    }
-    Ok(())
-}
-
-/// Load Conv2d weights (already in MLX `[O, H, W, I]` layout); the bias is
-/// required if the layer has one.
-pub(crate) fn load_conv2d(
-    layer: &mut nn::Conv2d,
-    weights: &HashMap<String, Array>,
-    prefix: &str,
-) -> Result<()> {
-    layer.weight.value = require(weights, &format!("{prefix}.weight"))?.clone();
-    if layer.bias.value.is_some() {
-        layer.bias.value = Some(require(weights, &format!("{prefix}.bias"))?.clone());
-    }
-    Ok(())
-}
-
-/// Load BatchNorm parameters and running statistics, each required if the
-/// layer has it, and switch the layer to inference mode.
-pub(crate) fn load_batch_norm(
-    layer: &mut nn::BatchNorm,
-    weights: &HashMap<String, Array>,
-    prefix: &str,
-) -> Result<()> {
-    for (name, param) in [
-        ("weight", &mut layer.weight.value),
-        ("bias", &mut layer.bias.value),
-        ("running_mean", &mut layer.running_mean.value),
-        ("running_var", &mut layer.running_var.value),
-    ] {
-        if param.is_some() {
-            *param = Some(require(weights, &format!("{prefix}.{name}"))?.clone());
-        }
-    }
-    // Use the loaded running stats, not batch stats
-    layer.training = false;
-    Ok(())
 }
 
 #[cfg(test)]

@@ -53,6 +53,7 @@ use crate::audio::resample;
 use crate::core::checkpoint::NemoCheckpoint;
 use crate::core::config::from_yaml_str;
 use crate::core::error::{Error, Result};
+use crate::core::loading::{LoadOptions, LoadReport, Weights};
 use crate::core::quantization::QuantizationConfig;
 
 /// Debug output containing all intermediate tensors from forward pass.
@@ -138,7 +139,15 @@ impl EncDecCTCModel {
     }
 
     /// Restore a model from a .nemo checkpoint file.
+    ///
+    /// Fails if the checkpoint lacks a tokenizer or any weight the model has;
+    /// [`restore_with`](Self::restore_with) can allow that.
     pub fn restore(path: impl AsRef<Path>) -> Result<Self> {
+        Self::restore_with(path, LoadOptions::default())
+    }
+
+    /// Restore a model from a .nemo checkpoint file, loading with `options`.
+    pub fn restore_with(path: impl AsRef<Path>, options: LoadOptions) -> Result<Self> {
         let path = path.as_ref();
         tracing::info!("Loading model from: {}", path.display());
 
@@ -159,16 +168,18 @@ impl EncDecCTCModel {
         // Create the model
         let mut model = Self::new(config)?;
 
-        let tokenizer_path = checkpoint
-            .find_tokenizer()
-            .ok_or_else(|| Error::missing_tokenizer(path))?;
-        tracing::debug!("Loading tokenizer from: {}", tokenizer_path.display());
-        model.load_tokenizer(&tokenizer_path)?;
+        match checkpoint.find_tokenizer() {
+            Some(tokenizer_path) => {
+                tracing::debug!("Loading tokenizer from: {}", tokenizer_path.display());
+                model.load_tokenizer(&tokenizer_path)?;
+            }
+            None => options.missing_tokenizer(path)?,
+        }
 
         // Load weights (.nemo files are not quantized)
         let weights = checkpoint.load_weights()?;
         tracing::debug!("Loading {} weight tensors", weights.len());
-        model.load_weights(&weights, None)?;
+        model.load_weights_with(&weights, None, options)?;
 
         Ok(model)
     }
@@ -293,6 +304,15 @@ impl EncDecCTCModel {
     /// # }
     /// ```
     pub fn restore_from_directory(dir: impl AsRef<Path>) -> Result<Self> {
+        Self::restore_from_directory_with(dir, LoadOptions::default())
+    }
+
+    /// Like [`restore_from_directory`](Self::restore_from_directory), loading
+    /// with `options`.
+    pub fn restore_from_directory_with(
+        dir: impl AsRef<Path>,
+        options: LoadOptions,
+    ) -> Result<Self> {
         use crate::core::checkpoint::SafetensorsLoader;
 
         let dir = dir.as_ref();
@@ -310,11 +330,13 @@ impl EncDecCTCModel {
         // Create model
         let mut model = Self::new(config)?;
 
-        let tok_path = loader
-            .tokenizer_path()
-            .ok_or_else(|| Error::missing_tokenizer(dir))?;
-        tracing::debug!("Loading tokenizer from: {}", tok_path.display());
-        model.load_tokenizer(tok_path)?;
+        match loader.tokenizer_path() {
+            Some(tok_path) => {
+                tracing::debug!("Loading tokenizer from: {}", tok_path.display());
+                model.load_tokenizer(tok_path)?;
+            }
+            None => options.missing_tokenizer(dir)?,
+        }
 
         // Load weights (may be quantized)
         let weights = loader.load_weights()?;
@@ -325,7 +347,7 @@ impl EncDecCTCModel {
             loader.weight_format,
             quant.is_some()
         );
-        model.load_weights(&weights, quant)?;
+        model.load_weights_with(&weights, quant, options)?;
 
         Ok(model)
     }
@@ -344,7 +366,8 @@ impl EncDecCTCModel {
         Ok(())
     }
 
-    /// Load weights from a HashMap.
+    /// Load weights from a checkpoint's tensors, failing if any tensor the
+    /// model has is missing.
     ///
     /// # Arguments
     /// * `weights` - Weight dictionary
@@ -354,9 +377,22 @@ impl EncDecCTCModel {
         weights: &std::collections::HashMap<String, Array>,
         quant: Option<&QuantizationConfig>,
     ) -> Result<()> {
-        self.encoder.load_weights(weights, quant)?;
-        self.decoder.load_weights(weights, "decoder", quant)?;
-        Ok(())
+        self.load_weights_with(weights, quant, LoadOptions::default())
+            .map(|_| ())
+    }
+
+    /// Load weights from a checkpoint's tensors with `options`, returning the
+    /// tensors a non-strict load had to leave at their initial values.
+    pub fn load_weights_with(
+        &mut self,
+        weights: &std::collections::HashMap<String, Array>,
+        quant: Option<&QuantizationConfig>,
+        options: LoadOptions,
+    ) -> Result<LoadReport> {
+        let weights = Weights::new(weights, options);
+        self.encoder.load_weights(&weights, quant)?;
+        self.decoder.load_weights(&weights, "decoder", quant)?;
+        Ok(weights.report())
     }
 
     /// Transcribe audio files.

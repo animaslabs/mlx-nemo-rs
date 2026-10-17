@@ -6,8 +6,6 @@
 //! Architecture: sequence of 1D conv blocks with optional depthwise separable
 //! convolutions and residual connections.
 
-use std::collections::HashMap;
-
 use mlx_rs::Array;
 use mlx_rs::builder::Builder;
 use mlx_rs::module::Module;
@@ -15,7 +13,7 @@ use mlx_rs::nn;
 
 use crate::asr::config::{JasperBlockConfig, JasperEncoderConfig};
 use crate::core::error::Result;
-use crate::core::weights::{load_batch_norm, load_conv1d};
+use crate::core::loading::{Weights, load_batch_norm, load_conv1d};
 
 /// A single sub-block within a JasperBlock.
 ///
@@ -210,7 +208,7 @@ impl JasperBlock {
         Ok(out)
     }
 
-    fn load_weights(&mut self, weights: &HashMap<String, Array>, prefix: &str) -> Result<()> {
+    fn load_weights(&mut self, weights: &Weights, prefix: &str) -> Result<()> {
         // NeMo mconv index layout for separable blocks:
         // Per sub-block: dw_conv, pw_conv, bn, relu (no params), dropout (no params)
         // = 5 indices per sub-block (except last sub-block has no relu/dropout = 3 indices)
@@ -368,7 +366,7 @@ impl JasperEncoder {
     }
 
     /// Load weights from a state dict.
-    pub fn load_weights(&mut self, weights: &HashMap<String, Array>) -> Result<()> {
+    pub fn load_weights(&mut self, weights: &Weights) -> Result<()> {
         for (i, block) in self.blocks.iter_mut().enumerate() {
             block.load_weights(weights, &format!("encoder.encoder.{}", i))?;
         }
