@@ -20,37 +20,43 @@
 //! ```no_run
 //! # fn main() -> mlx_voice::Result<()> {
 //! # use mlx_voice::asr::MultiTalkerPipeline;
+//! # let mic_chunks: Vec<Vec<f32>> = Vec::new();
 //! let mut pipeline = MultiTalkerPipeline::from_pretrained(
 //!     "multitalker-parakeet-streaming-0.6b-v1.nemo",
 //!     "diar_streaming_sortformer_4spk-v2.1.nemo",
-//!     0, // streaming mode
 //! )?;
 //!
-//! pipeline.set_audio_file("meeting.wav")?;
-//! while let Some(output) = pipeline.transcribe_step()? {
-//!     for word in &output.new_words {
-//!         println!("[{:.2}s speaker {}] {}", word.start_time, word.speaker, word.text);
-//!     }
-//! }
-//! for segment in pipeline.segments() {
+//! // A whole file
+//! for segment in pipeline.transcribe("meeting.wav")? {
 //!     println!("[Speaker {}] {}", segment.speaker, segment.text);
 //! }
+//!
+//! // Live audio
+//! pipeline.reset()?;
+//! for chunk in &mic_chunks {
+//!     pipeline.push_audio(chunk, 16_000)?;
+//!     while let Some(output) = pipeline.next_update()? {
+//!         for word in &output.new_words {
+//!             println!("[{:.2}s speaker {}] {}", word.start_time, word.speaker, word.text);
+//!         }
+//!     }
+//! }
+//! let segments = pipeline.finish()?;
 //! # Ok(())
 //! # }
 //! ```
-
-use std::path::Path;
 
 use mlx_rs::Array;
 use mlx_rs::ops;
 use mlx_rs::ops::indexing::IndexOp;
 
-use super::cache_aware_rnnt::CacheAwareRNNTPipeline;
+use super::session::{StreamingOptions, StreamingSession};
 use crate::asr::Tokenizer;
-use crate::asr::models::SortformerEncLabelModel;
+use crate::asr::models::{EncDecRNNTModel, SortformerEncLabelModel};
 use crate::asr::modules::DecoderState;
 use crate::asr::modules::SpeakerTargets;
 use crate::asr::streaming::{EncoderCache, FeatureBuffer, StreamingSortformerState};
+use crate::asr::transcript::AudioInput;
 use crate::core::ArrayExt;
 use crate::core::error::Result;
 use crate::core::loading::LoadOptions;
@@ -78,6 +84,8 @@ pub struct MultiTalkerConfig {
     pub diar_fifo_len: usize,
     /// Diarizer speaker cache update period in encoder frames
     pub diar_spkcache_update_period: usize,
+    /// ASR streaming options (mode, thresholds, punctuation suppression)
+    pub streaming: StreamingOptions,
     /// How strictly to load both models' weights
     pub load: LoadOptions,
 }
@@ -91,6 +99,7 @@ impl Default for MultiTalkerConfig {
             sent_break_sec: 1.0,
             diar_fifo_len: 188,
             diar_spkcache_update_period: 144,
+            streaming: StreamingOptions::default(),
             load: LoadOptions::default(),
         }
     }
@@ -157,7 +166,7 @@ struct Instance {
 /// Multi-talker streaming pipeline.
 pub struct MultiTalkerPipeline {
     /// ASR model, audio buffering and mel streaming
-    asr: CacheAwareRNNTPipeline,
+    asr: StreamingSession<EncDecRNNTModel>,
     /// Diarization model
     diar_model: SortformerEncLabelModel,
     /// Diarization streaming state
@@ -202,27 +211,25 @@ impl MultiTalkerPipeline {
     ///   serial mode.
     /// * `diar` - A streaming Sortformer diarization `.nemo` model, local or on
     ///   the Hub
-    /// * `mode_idx` - ASR streaming mode index into the checkpoint's `att_context_size` list (see
-    ///   `streaming_modes()` for each mode's latency). NeMo checkpoints list modes
-    ///   from most to least lookahead, so mode 0, the model's default, has the
-    ///   highest latency and accuracy
+    ///
+    /// The ASR model streams in mode 0; set
+    /// [`MultiTalkerConfig::streaming`] to choose another.
     #[doc(alias = "restore")]
     pub fn from_pretrained(
         asr: impl Into<ModelSource>,
         diar: impl Into<ModelSource>,
-        mode_idx: usize,
     ) -> Result<Self> {
-        Self::from_pretrained_with_config(asr, diar, mode_idx, MultiTalkerConfig::default())
+        Self::from_pretrained_with_config(asr, diar, MultiTalkerConfig::default())
     }
 
     /// Like [`Self::from_pretrained`], with explicit settings.
     pub fn from_pretrained_with_config(
         asr: impl Into<ModelSource>,
         diar: impl Into<ModelSource>,
-        mode_idx: usize,
         config: MultiTalkerConfig,
     ) -> Result<Self> {
-        let asr = CacheAwareRNNTPipeline::from_pretrained_with(asr, mode_idx, config.load)?;
+        let model = EncDecRNNTModel::from_pretrained_with(asr, config.load)?;
+        let asr = StreamingSession::new(model, config.streaming.clone())?;
         let mut diar_model = SortformerEncLabelModel::from_pretrained_with(diar, config.load)?;
 
         // Drive the diarizer with the ASR chunk geometry, as NeMo's
@@ -236,14 +243,14 @@ impl MultiTalkerPipeline {
         params.spkcache_update_period = config.diar_spkcache_update_period;
         let diar_state = diar_model.create_streaming_state()?;
 
-        let mode = if asr.encoder.has_speaker_kernels() {
+        let mode = if asr.model.encoder.has_speaker_kernels() {
             MultiTalkerMode::Parallel
         } else {
             MultiTalkerMode::Serial
         };
         let num_spks = diar_model.max_num_spks();
         let frame_sec =
-            asr.encoder.subsampling_factor() as f32 * asr.mel_stream_config.mel.window_stride;
+            asr.model.encoder.subsampling_factor() as f32 * asr.mel_stream_config.mel.window_stride;
 
         tracing::info!(
             ?mode,
@@ -271,13 +278,16 @@ impl MultiTalkerPipeline {
         Ok(pipeline)
     }
 
-    fn new_encoder_cache(asr: &CacheAwareRNNTPipeline, batch_size: usize) -> Result<EncoderCache> {
+    fn new_encoder_cache(
+        asr: &StreamingSession<EncDecRNNTModel>,
+        batch_size: usize,
+    ) -> Result<EncoderCache> {
         EncoderCache::new(
-            asr.encoder.num_layers(),
+            asr.model.encoder.num_layers(),
             batch_size,
             asr.streaming_config.last_channel_cache_size,
             asr.streaming_config.last_time_cache_size,
-            asr.encoder.d_model(),
+            asr.model.encoder.d_model(),
         )
     }
 
@@ -290,7 +300,7 @@ impl MultiTalkerPipeline {
         self.instances = (0..n_instances)
             .map(|_| {
                 Ok(Instance {
-                    decoder_state: self.asr.decoder.initialize_state(1)?,
+                    decoder_state: self.asr.model.decoder.initialize_state(1)?,
                     last_token: None,
                     pending: Vec::new(),
                 })
@@ -301,7 +311,7 @@ impl MultiTalkerPipeline {
         self.frame_offset = 0;
         self.chunks_since_active = vec![usize::MAX; self.num_spks];
         self.words.clear();
-        self.asr.encoder.clear_speaker_targets();
+        self.asr.model.encoder.clear_speaker_targets();
         Ok(())
     }
 
@@ -310,31 +320,38 @@ impl MultiTalkerPipeline {
         self.mode
     }
 
-    /// Set audio from a WAV file.
-    pub fn set_audio_file(&mut self, path: impl AsRef<Path>) -> Result<()> {
-        self.asr.set_audio_file(path)
+    /// Transcribe a whole WAV file or clip, starting a new stream.
+    pub fn transcribe<'a>(
+        &mut self,
+        input: impl Into<AudioInput<'a>>,
+    ) -> Result<Vec<SpeakerSegment>> {
+        let sample_rate = self.sample_rate();
+        let samples = input.into().load(sample_rate)?;
+        self.reset()?;
+        self.push_audio(&samples, sample_rate)?;
+        self.finish()
     }
 
-    /// Add live audio samples.
-    pub fn add_audio(&mut self, samples: &[f32]) {
-        self.asr.add_audio(samples);
+    /// Add mono audio in `[-1, 1]` recorded at `sample_rate` (resampled to
+    /// the model's rate). Every push must use the same rate.
+    pub fn push_audio(&mut self, samples: &[f32], sample_rate: u32) -> Result<()> {
+        self.asr.push_audio(samples, sample_rate)
     }
 
-    /// Signal end of audio stream.
-    pub fn end_stream(&mut self) {
-        self.asr.end_stream();
+    /// Signal that no more audio will be pushed.
+    pub fn end_audio(&mut self) -> Result<()> {
+        self.asr.end_audio()
     }
 
-    /// Reset the pipeline for new audio.
+    /// Start a new stream.
     pub fn reset(&mut self) -> Result<()> {
-        self.asr.reset();
+        self.asr.reset()?;
         self.reset_state()
     }
 
-    /// Process one chunk, returning the words completed in it.
-    ///
-    /// Returns `None` if not enough audio is buffered yet.
-    pub fn transcribe_step(&mut self) -> Result<Option<MultiTalkerOutput>> {
+    /// Decode the next chunk, returning the words completed in it, or `None`
+    /// if not enough audio is buffered yet (or the stream is done).
+    pub fn next_update(&mut self) -> Result<Option<MultiTalkerOutput>> {
         let fb = match self.asr.try_extract_next()? {
             Some(fb) => fb,
             None => return Ok(None),
@@ -342,13 +359,11 @@ impl MultiTalkerPipeline {
         self.process_chunk(fb).map(Some)
     }
 
-    /// Run transcription over all loaded audio and return the segments.
-    pub fn run(&mut self) -> Result<Vec<SpeakerSegment>> {
-        while let Some(output) = self.transcribe_step()? {
-            if output.is_final {
-                break;
-            }
-        }
+    /// End the audio, decode everything still buffered, and return the
+    /// speaker segments. Call [`reset`](Self::reset) to reuse the pipeline.
+    pub fn finish(&mut self) -> Result<Vec<SpeakerSegment>> {
+        self.end_audio()?;
+        while self.next_update()?.is_some() {}
         Ok(self.segments())
     }
 
@@ -373,7 +388,7 @@ impl MultiTalkerPipeline {
     /// The ASR model's tokenizer (`None` only if a non-strict load found no
     /// tokenizer).
     pub fn tokenizer(&self) -> Option<&Tokenizer> {
-        self.asr.tokenizer()
+        self.asr.model().tokenizer()
     }
 
     fn process_chunk(&mut self, fb: FeatureBuffer) -> Result<MultiTalkerOutput> {
@@ -414,14 +429,14 @@ impl MultiTalkerPipeline {
             MultiTalkerMode::Serial => None,
         };
         if let Some(targets) = &targets {
-            self.asr.encoder.set_speaker_targets(targets.clone());
+            self.asr.model.encoder.set_speaker_targets(targets.clone());
         }
 
         let n_instances = self.instances.len() as i32;
         let features = ops::broadcast_to(&features, &[n_instances, n_mels, chunk_frames])?;
         let lengths = Array::from_slice(&vec![chunk_frames; n_instances as usize], &[n_instances]);
         let (encoded, enc_len) = self.run_encoder(&features, &lengths, drop_extra)?;
-        let enc_seq_len = if self.asr.encoder.is_chunked_limited() || fb.is_last {
+        let enc_seq_len = if self.asr.model.encoder.is_chunked_limited() || fb.is_last {
             enc_len
         } else {
             enc_len.min(self.asr.streaming_config.valid_out_len)
@@ -460,7 +475,7 @@ impl MultiTalkerPipeline {
         drop_extra: usize,
     ) -> Result<(Array, usize)> {
         let (encoded, encoded_lengths, cache_channel, cache_time, cache_len) =
-            self.asr.encoder.forward_streaming(
+            self.asr.model.encoder.forward_streaming(
                 features,
                 lengths,
                 &self.encoder_cache.last_channel,
@@ -553,6 +568,7 @@ impl MultiTalkerPipeline {
     ) -> Result<Vec<Vec<(usize, usize)>>> {
         let masked_ids = self
             .asr
+            .options()
             .suppress_punctuation
             .then_some(self.asr.punctuation_token_ids.as_slice());
         let mut tokens = Vec::with_capacity(self.instances.len());
@@ -566,9 +582,9 @@ impl MultiTalkerPipeline {
             let output = self.asr.streaming_decoder.decode_frames(
                 &row,
                 valid_frames,
-                &self.asr.decoder,
+                &self.asr.model.decoder,
                 &mut instance.decoder_state,
-                &self.asr.joint,
+                &self.asr.model.joint,
                 &mut instance.last_token,
                 masked_ids,
             )?;
@@ -594,6 +610,7 @@ impl MultiTalkerPipeline {
             for (token, frame) in new_tokens {
                 let starts_word = self
                     .asr
+                    .model
                     .tokenizer
                     .as_ref()
                     .is_some_and(|t| t.is_word_start(token));
@@ -612,10 +629,10 @@ impl MultiTalkerPipeline {
     }
 
     fn make_word(&self, instance: usize, tokens: &[(usize, usize)]) -> Option<SpeakerWord> {
-        let tokenizer = self.asr.tokenizer.as_ref()?;
+        let tokenizer = self.asr.model.tokenizer.as_ref()?;
         let ids: Vec<usize> = tokens.iter().map(|&(t, _)| t).collect();
         let text = tokenizer
-            .decode(&ids, self.asr.strip_lang_tags)
+            .decode(&ids, self.asr.options().strip_lang_tags)
             .trim()
             .to_string();
         if text.is_empty() {

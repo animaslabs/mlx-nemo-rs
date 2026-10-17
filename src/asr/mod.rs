@@ -8,7 +8,7 @@
 //! - Conformer/FastConformer encoders
 //! - Audio preprocessing (Mel spectrogram)
 //! - Greedy and beam search decoding
-//! - Streaming pipelines (`CacheAwareRNNTPipeline`)
+//! - Cache-aware streaming (`StreamingSession`) and multi-talker transcription
 //!
 //! # Example (CTC Model)
 //!
@@ -22,15 +22,14 @@
 //! # }
 //! ```
 //!
-//! # Example (RNN-T Streaming Pipeline)
+//! # Example (RNN-T streaming)
 //!
 //! ```no_run
 //! # fn main() -> mlx_voice::Result<()> {
-//! use mlx_voice::asr::CacheAwareRNNTPipeline;
+//! use mlx_voice::asr::{EncDecRNNTModel, StreamingOptions};
 //!
-//! let mut pipeline = CacheAwareRNNTPipeline::from_pretrained("model.nemo", 0)?;
-//! pipeline.set_audio_file("audio.wav")?;
-//! let text = pipeline.run()?;
+//! let mut model = EncDecRNNTModel::from_pretrained("model.nemo")?;
+//! let transcript = model.transcribe_streaming("audio.wav", StreamingOptions::default())?;
 //! # Ok(())
 //! # }
 //! ```
@@ -62,12 +61,12 @@ pub mod vad;
 pub use config::AsrModelConfig;
 pub use models::{
     CtcStreamingSession, EncDecCTCModel, EncDecClassificationModel, EncDecRNNTModel,
-    RnntStreamingSession, SortformerEncLabelModel,
+    SortformerEncLabelModel,
 };
 pub use modules::{MelConfig, MelProcessor, SpectrumTransform, StreamingMel};
 pub use pipeline::{
-    CacheAwareRNNTPipeline, MultiTalkerConfig, MultiTalkerMode, MultiTalkerOutput,
-    MultiTalkerPipeline, SpeakerSegment, SpeakerWord, TranscribeOutput,
+    MultiTalkerConfig, MultiTalkerMode, MultiTalkerOutput, MultiTalkerPipeline, SpeakerSegment,
+    SpeakerWord, StreamUpdate, StreamingOptions, StreamingSession,
 };
 pub use streaming::{StreamingConfig, StreamingModeInfo, StreamingOutput};
 pub use tokenizer::Tokenizer;
@@ -78,7 +77,25 @@ pub use vad::{SpeechSegment, VadPostProcessConfig, VadPostProcessor};
 pub mod prelude {
     pub use super::config::AsrModelConfig;
     pub use super::models::{EncDecCTCModel, EncDecRNNTModel};
-    pub use super::pipeline::CacheAwareRNNTPipeline;
+    pub use super::pipeline::{StreamingOptions, StreamingSession};
     pub use super::tokenizer::Tokenizer;
     pub use super::transcript::{AudioInput, DecodingStrategy, TranscribeOptions, Transcript};
 }
+
+// Models and sessions are moved to worker threads (audio callbacks feed a
+// queue that another thread drains into a session), so keep them `Send`.
+const _: () = {
+    const fn assert_send<T: Send>() {}
+    assert_send::<EncDecCTCModel>();
+    assert_send::<EncDecRNNTModel>();
+    assert_send::<EncDecClassificationModel>();
+    assert_send::<SortformerEncLabelModel>();
+    assert_send::<StreamingSession<EncDecRNNTModel>>();
+    assert_send::<StreamingSession<&mut EncDecRNNTModel>>();
+    assert_send::<MultiTalkerPipeline>();
+    assert_send::<StreamUpdate>();
+    assert_send::<MultiTalkerOutput>();
+    assert_send::<Transcript>();
+    assert_send::<Tokenizer>();
+    assert_send::<crate::audio::StreamResampler>();
+};

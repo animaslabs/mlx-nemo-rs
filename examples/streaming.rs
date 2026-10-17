@@ -1,9 +1,9 @@
-//! Example: Streaming transcription using CacheAwareRNNTPipeline.
+//! Example: Streaming transcription with a StreamingSession.
 //!
 //! This example demonstrates real-time streaming inference by:
 //! 1. Loading audio from a file
 //! 2. Chunking it into small pieces (simulating live audio)
-//! 3. Feeding chunks incrementally to the pipeline
+//! 3. Feeding chunks incrementally to the session
 //! 4. Displaying partial transcriptions as they become available
 //!
 //! Usage:
@@ -11,7 +11,7 @@
 //!
 //! Options:
 //!   --model <path>       Path to NeMo model (.nemo file)
-//!   --mode <idx>         Streaming mode index (0 = lowest latency, default: 0)
+//!   --mode <idx>         Streaming mode index (0 = most lookahead, default: 0)
 //!   --chunk-ms <ms>      Audio chunk size in milliseconds (default: 100)
 //!   --no-punctuation     Strip punctuation from output
 //!   --language <lang>    Target language of a multilingual model, e.g. en-US, de, auto (default)
@@ -27,8 +27,8 @@ use std::io::{self, Write};
 use std::time::Instant;
 
 use mlx_voice::asr::{
-    CacheAwareRNNTPipeline, EncDecClassificationModel, StreamingModeInfo, VadPostProcessConfig,
-    VadPostProcessor,
+    EncDecClassificationModel, EncDecRNNTModel, StreamingModeInfo, StreamingOptions,
+    VadPostProcessConfig, VadPostProcessor,
 };
 use tracing_subscriber::{EnvFilter, fmt};
 
@@ -136,36 +136,32 @@ fn main() -> mlx_voice::Result<()> {
         std::process::exit(1);
     });
 
-    // Load pipeline (detect directory vs .nemo file)
-    println!("Loading pipeline from: {}", model_path);
+    println!("Loading model from: {}", model_path);
     let start = Instant::now();
-    let mut pipeline = CacheAwareRNNTPipeline::from_pretrained(model_path, mode_idx)?;
-    println!("Pipeline loaded in {:.2}s", start.elapsed().as_secs_f32());
+    let mut model = EncDecRNNTModel::from_pretrained(model_path)?;
+    println!("Model loaded in {:.2}s", start.elapsed().as_secs_f32());
 
     if let Some(language) = language {
-        pipeline.set_language(language)?;
+        model.set_language(language)?;
     }
-    if let Some(language) = pipeline.language() {
+    if let Some(language) = model.language() {
         println!("Target language: {language}");
     }
-    pipeline.set_strip_lang_tags(!keep_lang_tags);
 
-    // Enable punctuation suppression if requested
-    if no_punctuation {
-        pipeline.set_suppress_punctuation(true);
-    }
-
-    // Enable blank threshold if requested
+    let options = StreamingOptions::default()
+        .mode(mode_idx)
+        .strip_lang_tags(!keep_lang_tags)
+        .suppress_punctuation(no_punctuation)
+        .blank_threshold(blank_threshold);
     if blank_threshold > 0.0 {
-        pipeline.set_blank_threshold(blank_threshold);
         println!("Blank threshold: {:.2}", blank_threshold);
     }
 
-    let sample_rate = pipeline.sample_rate();
+    let sample_rate = model.sample_rate();
     println!("Sample rate: {} Hz", sample_rate);
 
     // List available modes
-    let modes = pipeline.streaming_modes();
+    let modes = model.streaming_modes();
     if list_modes || modes.is_empty() {
         println!("\nAvailable streaming modes:");
         print_modes(&modes);
@@ -179,8 +175,10 @@ fn main() -> mlx_voice::Result<()> {
         std::process::exit(1);
     });
 
+    let mut stream = model.stream(options)?;
+
     // Print streaming config
-    let config = pipeline.streaming_config();
+    let config = stream.streaming_config();
     println!("\nStreaming configuration (mode {}):", mode_idx);
     println!(
         "  Chunk size: {} frames (first), {} frames (subsequent)",
@@ -315,41 +313,33 @@ fn main() -> mlx_voice::Result<()> {
     let mut transcribe_steps = 0;
 
     for (chunk_idx, chunk) in samples.chunks(chunk_samples).enumerate() {
-        // Feed audio chunk to pipeline
-        pipeline.add_audio(chunk);
+        // Feed audio chunk to the session
+        stream.push_audio(chunk, sample_rate)?;
         chunks_fed += 1;
 
         // Check if this is the last chunk
         let is_last = (chunk_idx + 1) * chunk_samples >= samples.len();
         if is_last {
-            pipeline.end_stream();
+            stream.end_audio()?;
         }
 
         // Process any available transcription steps
-        while let Some(output) = pipeline.transcribe_step()? {
-            // Display step info for debugging
-            // let new_tokens_str: Vec<String> = output.new_tokens.iter().map(|t| t.to_string()).collect();
-            // eprintln!(
-            //     "STEP {} new_tokens=[{}] total_tokens={}",
-            //     transcribe_steps,
-            //     new_tokens_str.join(", "),
-            //     output.token_count
-            // );
+        while let Some(update) = stream.next_update()? {
             transcribe_steps += 1;
 
             // Display partial result if text changed
-            if !output.text.is_empty() && output.text != last_text {
-                print!("{}\n", output.text); // Clear line and print new text
+            if !stream.text().is_empty() && stream.text() != last_text {
+                println!("{}", stream.text());
                 io::stdout().flush().unwrap();
-                last_text = output.text.clone();
+                last_text = stream.text().to_string();
             }
 
-            if output.is_final {
-                println!("Total tokens: {}", output.token_count);
-                if let Some(detected) = pipeline.detected_language(&output.tokens) {
+            if update.is_final {
+                let transcript = stream.transcript();
+                println!("Total tokens: {}", transcript.tokens.len());
+                if let Some(detected) = &transcript.language {
                     println!("Detected language: {detected}");
                 }
-                // println!(); // New line after final output
             }
         }
     }

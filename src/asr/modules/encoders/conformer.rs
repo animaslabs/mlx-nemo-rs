@@ -451,7 +451,11 @@ impl ConformerEncoder {
                 right = ctx_size.1,
                 "Setting encoder streaming mode"
             );
-            self.att_context_size = Some(ctx_size);
+            if self.att_context_size != Some(ctx_size) {
+                self.att_context_size = Some(ctx_size);
+                // Cached masks were built for the previous context
+                self.streaming_masks.clear();
+            }
         } else {
             tracing::warn!(
                 mode_idx,
@@ -556,11 +560,15 @@ impl ConformerEncoder {
     }
 
     /// The attention context offline passes use: NeMo masks whole-file attention
-    /// to the current `att_context_size` (the first configured mode by
-    /// default), so cache-aware models see the same context offline as when
-    /// streaming. `None` (full attention) for [-1, -1] models such as parakeet.
+    /// to the default `att_context_size` (the first configured mode), so
+    /// cache-aware models see the same context offline as when streaming in
+    /// that mode. Streaming in another mode doesn't change it. `None` (full
+    /// attention) for [-1, -1] models such as parakeet.
     fn offline_attention_context(&self) -> Option<AttentionContext> {
-        self.att_context_size
+        self.config
+            .att_context_size
+            .as_ref()
+            .and_then(|cs| cs.get_default())
             .and_then(|size| AttentionContext::new(size, &self.att_context_style))
     }
 

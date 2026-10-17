@@ -105,10 +105,10 @@ fn main() -> mlx_voice::Result<()> {
     tracing::info!("Loading diarization model from: {}", &diar_model_path);
 
     let start = Instant::now();
+    config.streaming = config.streaming.mode(mode_idx);
     let mut pipeline = MultiTalkerPipeline::from_pretrained_with_config(
         &asr_model_path,
         &diar_model_path,
-        mode_idx,
         config,
     )?;
     tracing::info!(
@@ -119,13 +119,15 @@ fn main() -> mlx_voice::Result<()> {
 
     // Load audio
     tracing::info!("Loading audio from: {}", audio_path);
-    pipeline.set_audio_file(audio_path)?;
+    let (samples, sample_rate) = mlx_voice::audio::load_wav(audio_path)?;
+    pipeline.push_audio(&samples, sample_rate)?;
+    pipeline.end_audio()?;
 
     // Stream transcription step-by-step, printing words as they complete
     println!("\n--- Streaming words ---\n");
 
     let start = Instant::now();
-    while let Some(output) = pipeline.transcribe_step()? {
+    while let Some(output) = pipeline.next_update()? {
         for word in &output.new_words {
             println!(
                 "[{:7.2}s - {:7.2}s] speaker_{}: {}",

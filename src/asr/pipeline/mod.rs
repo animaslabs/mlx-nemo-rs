@@ -1,42 +1,36 @@
-//! Streaming ASR pipelines.
+//! Streaming transcription.
 //!
-//! This module provides high-level pipeline abstractions for streaming
-//! ASR inference, mirroring NeMo's `CacheAwareRNNTPipeline`.
-//!
-//! # Example
+//! [`StreamingSession`] transcribes one audio stream incrementally with a
+//! cache-aware RNN-T model, mirroring NeMo's cache-aware streaming inference.
+//! [`MultiTalkerPipeline`] adds a streaming diarizer to attribute words to
+//! speakers.
 //!
 //! ```no_run
 //! # fn main() -> mlx_voice::Result<()> {
-//! # let chunk1: Vec<f32> = Vec::new();
-//! use mlx_voice::asr::pipeline::CacheAwareRNNTPipeline;
+//! # let chunk: Vec<f32> = Vec::new();
+//! use mlx_voice::asr::{EncDecRNNTModel, StreamingOptions};
 //!
-//! // Load model and create pipeline
-//! let mut pipeline = CacheAwareRNNTPipeline::from_pretrained("model.nemo", 0)?;
+//! let mut model = EncDecRNNTModel::from_pretrained("model.nemo")?;
 //!
-//! // File mode
-//! pipeline.set_audio_file("audio.wav")?;
-//! let text = pipeline.run()?;
-//! println!("Transcription: {}", text);
+//! // A whole file, streamed
+//! let transcript = model.transcribe_streaming("audio.wav", StreamingOptions::default())?;
 //!
-//! // Live streaming mode
-//! pipeline.reset();
-//! pipeline.add_audio(&chunk1);
-//! while let Some(output) = pipeline.transcribe_step()? {
-//!     print!("{}", output.text);
+//! // Live audio
+//! let mut stream = model.stream(StreamingOptions::default())?;
+//! stream.push_audio(&chunk, 16_000)?;
+//! while let Some(update) = stream.next_update()? {
+//!     print!("{}", update.delta);
 //! }
-//! pipeline.end_stream();
-//! while let Some(output) = pipeline.transcribe_step()? {
-//!     print!("{}", output.text);
-//! }
+//! let transcript = stream.finish()?;
 //! # Ok(())
 //! # }
 //! ```
 
-mod cache_aware_rnnt;
 mod multi_talker;
+mod session;
 
-pub use cache_aware_rnnt::{CacheAwareRNNTPipeline, TranscribeOutput};
 pub use multi_talker::{
     MultiTalkerConfig, MultiTalkerMode, MultiTalkerOutput, MultiTalkerPipeline, SpeakerSegment,
     SpeakerWord,
 };
+pub use session::{StreamUpdate, StreamingOptions, StreamingSession};

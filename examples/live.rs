@@ -1,13 +1,15 @@
-//! Example: Live microphone transcription using a NeMo streaming ASR model.
+//! Example: Live microphone transcription with a StreamingSession.
 //!
 //! This example captures audio from your microphone in real-time and transcribes
-//! speech continuously, displaying partial results as they become available.
+//! speech continuously, printing text as it is decoded. The session resamples
+//! the microphone's rate to the model's.
 //!
 //! Usage:
-//!   cargo run --example live -- --model path/to/streaming-model.nemo
+//!   cargo run --release --example live -- --model path/to/streaming-model.nemo
+//!   cargo run --release --example live -- --model path/to/mlx-model-directory
 //!
 //! Options:
-//!   --model <path>      Path to NeMo streaming model (.nemo file)
+//!   --model <path>      Path to NeMo streaming model (.nemo file or MLX directory)
 //!   --mode <idx>        Streaming mode index (default: 0)
 //!   --device <name>     Audio input device name (default: system default)
 //!   --list-devices      List available audio input devices and exit
@@ -27,14 +29,21 @@ use std::time::{Duration, Instant};
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{SampleFormat, StreamConfig};
+use mlx_voice::asr::{EncDecRNNTModel, StreamingModeInfo, StreamingOptions};
 use ringbuf::{
     HeapRb,
     traits::{Consumer, Producer, Split},
 };
-
-use mlx_voice::asr::{EncDecRNNTModel, StreamingModeInfo};
+use tracing_subscriber::{EnvFilter, fmt};
 
 fn main() -> mlx_voice::Result<()> {
+    // Initialize tracing subscriber
+    fmt()
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+        )
+        .init();
+
     let args: Vec<String> = std::env::args().collect();
 
     // Parse arguments
@@ -106,10 +115,12 @@ fn main() -> mlx_voice::Result<()> {
 
     // Check for model path
     let model_path = model_path.unwrap_or_else(|| {
-        eprintln!("Usage: {} --model <model.nemo> [options]", args[0]);
+        eprintln!("Usage: {} --model <model> [options]", args[0]);
         eprintln!();
         eprintln!("Options:");
-        eprintln!("  --model <path>      Path to NeMo streaming model (.nemo file)");
+        eprintln!(
+            "  --model <path>      Path to NeMo streaming model (.nemo file or MLX directory)"
+        );
         eprintln!("  --mode <idx>        Streaming mode index (default: 0)");
         eprintln!("  --device <name>     Audio input device name (default: system default)");
         eprintln!("  --list-devices      List available audio input devices and exit");
@@ -117,7 +128,6 @@ fn main() -> mlx_voice::Result<()> {
         std::process::exit(1);
     });
 
-    // Load model
     println!("Loading model from: {}", model_path);
     let start = Instant::now();
     let mut model = EncDecRNNTModel::from_pretrained(model_path)?;
@@ -126,19 +136,27 @@ fn main() -> mlx_voice::Result<()> {
     let target_rate = model.sample_rate();
     println!("Sample rate: {} Hz", target_rate);
 
-    // Check streaming support
-    if !model.supports_streaming() {
-        eprintln!("Error: Model does not support streaming inference.");
-        eprintln!("Use a streaming-capable model like Nemotron.");
-        std::process::exit(1);
-    }
-
     // Show available streaming modes
     let modes = model.streaming_modes();
     if !modes.is_empty() {
         println!("\nAvailable streaming modes:");
         print_modes(&modes);
     }
+
+    let mut session = model.stream(StreamingOptions::default().mode(mode_idx))?;
+
+    // Print streaming config
+    let config = session.streaming_config();
+    println!("\nStreaming configuration (mode {}):", mode_idx);
+    println!(
+        "  Chunk size: {} frames (first), {} frames (subsequent)",
+        config.chunk_size.0, config.chunk_size.1
+    );
+    println!(
+        "  Shift size: {} frames (first), {} frames (subsequent)",
+        config.shift_size.0, config.shift_size.1
+    );
+    println!("  Valid output length: {} frames", config.valid_out_len);
 
     // Get input device
     let device = if let Some(name) = device_name {
@@ -163,7 +181,7 @@ fn main() -> mlx_voice::Result<()> {
     println!("\nAudio device: {}", device_name_str);
 
     // Get audio configuration
-    let (config, source_rate, channels) = get_input_config(&device, target_rate)?;
+    let (audio_config, source_rate, channels) = get_input_config(&device, target_rate)?;
     let needs_resampling = source_rate != target_rate;
 
     println!(
@@ -177,28 +195,11 @@ fn main() -> mlx_voice::Result<()> {
         }
     );
 
-    // Initialize streaming session
-    println!("\nInitializing streaming (mode {})", mode_idx);
-    let mut session = model.init_streaming(mode_idx, 1)?;
+    // Feed the session in chunks of `chunk_ms` at the device rate
+    let source_chunk_samples = (source_rate as f32 * chunk_ms as f32 / 1000.0) as usize;
     println!(
-        "Chunk size: {} frames (first), {} frames (subsequent)",
-        session.config().chunk_size_for_step(true),
-        session.config().chunk_size_for_step(false)
-    );
-    println!(
-        "Shift size: {} frames (first), {} frames (subsequent)",
-        session.config().shift_size_for_step(true),
-        session.config().shift_size_for_step(false)
-    );
-    println!(
-        "Valid output length: {} frames, Lookahead: {} frames",
-        session.config().valid_out_len,
-        session.config().lookahead_frames
-    );
-    println!(
-        "Cache sizes: channel={}, time={}",
-        session.config().last_channel_cache_size,
-        session.config().last_time_cache_size
+        "\nProcessing in {} ms chunks ({} samples at {} Hz)",
+        chunk_ms, source_chunk_samples, source_rate
     );
 
     // Create ring buffer (2 seconds of audio at source rate)
@@ -220,13 +221,13 @@ fn main() -> mlx_voice::Result<()> {
     let channels_clone = channels;
     let stream = device
         .build_input_stream(
-            config,
+            audio_config,
             move |data: &[f32], _: &cpal::InputCallbackInfo| {
-                // Convert to mono if stereo (take first channel only)
+                // Convert to mono if stereo (average channels)
                 if channels_clone > 1 {
                     for chunk in data.chunks(channels_clone as usize) {
-                        // Take first channel, drop if buffer is full
-                        let _ = producer.try_push(chunk[0]);
+                        let mono = chunk.iter().sum::<f32>() / channels_clone as f32;
+                        let _ = producer.try_push(mono);
                     }
                 } else {
                     // Mono: push all samples, drop if buffer is full
@@ -247,23 +248,19 @@ fn main() -> mlx_voice::Result<()> {
         .play()
         .map_err(|e| mlx_voice::Error::audio(format!("Failed to start audio stream: {}", e)))?;
 
-    // Setup resampler if needed
-    let mut resampler = if needs_resampling {
-        Some(create_resampler(source_rate, target_rate)?)
-    } else {
-        None
-    };
-
-    // Processing parameters
-    let chunk_samples = (target_rate as usize * chunk_ms as usize) / 1000;
-    let source_chunk_samples = (source_rate as usize * chunk_ms as usize) / 1000;
+    // Buffer to accumulate samples from ring buffer
+    let mut audio_buffer: Vec<f32> = Vec::with_capacity(source_chunk_samples * 2);
 
     println!("\nListening... Press Ctrl+C to stop.\n");
 
     let start_time = Instant::now();
-    let mut last_text = String::new();
-    let mut chunks_processed = 0;
-    let mut audio_buffer: Vec<f32> = Vec::with_capacity(source_chunk_samples * 2);
+    let mut chunks_fed = 0;
+    let mut transcribe_steps = 0;
+    let mut warned_behind = false;
+
+    let debug = std::env::var("NEMO_DEBUG")
+        .map(|v| v == "1")
+        .unwrap_or(false);
 
     // Main processing loop
     while running.load(Ordering::SeqCst) {
@@ -272,50 +269,37 @@ fn main() -> mlx_voice::Result<()> {
             audio_buffer.push(sample);
         }
 
-        // Process when we have enough samples
-        let required_samples = if needs_resampling {
-            source_chunk_samples
-        } else {
-            chunk_samples
-        };
-
-        if audio_buffer.len() >= required_samples {
-            let chunk: Vec<f32> = audio_buffer.drain(..required_samples).collect();
-            let input_len = chunk.len();
-
-            // Resample if needed
-            let chunk = if let Some(ref mut rs) = resampler {
-                resample_chunk(rs, &chunk)?
-            } else {
-                chunk
-            };
-
-            // Debug: show what we're feeding to the model
-            let debug = std::env::var("NEMO_DEBUG")
-                .map(|v| v == "1")
-                .unwrap_or(false);
+        if audio_buffer.len() >= source_chunk_samples {
+            let chunk: Vec<f32> = audio_buffer.drain(..source_chunk_samples).collect();
             if debug {
+                let max_abs = chunk.iter().map(|s| s.abs()).fold(0.0f32, f32::max);
                 eprintln!(
-                    "[LIVE DEBUG] chunk {}: input {} samples -> resampled {} samples",
-                    chunks_processed,
-                    input_len,
-                    chunk.len()
+                    "CHUNK {} len={} max_abs={:.6}",
+                    chunks_fed,
+                    chunk.len(),
+                    max_abs
                 );
             }
+            session.push_audio(&chunk, source_rate)?;
+            chunks_fed += 1;
+        }
 
-            // Process through model
-            let output = model.process_chunk(&mut session, &chunk)?;
-            chunks_processed += 1;
-
-            // Display partial result if text changed
-            if !output.text.is_empty() && output.text[0] != last_text {
-                if debug {
-                    eprintln!("[LIVE DEBUG] text changed: \"{}\"", output.text[0]);
-                }
-                print!("\r\x1b[K{}", output.text[0]);
-                io::stdout().flush().unwrap();
-                last_text = output.text[0].clone();
+        // Decode whatever the session has buffered
+        while let Some(update) = session.next_update()? {
+            if debug {
+                let ids: Vec<usize> = update.tokens.iter().map(|t| t.id).collect();
+                eprintln!("STEP {} new_tokens={:?}", transcribe_steps, ids);
             }
+            transcribe_steps += 1;
+            print!("{}", update.delta);
+            io::stdout().flush().unwrap();
+        }
+
+        // Decoding slower than real time shows up as a growing backlog
+        let behind = session.buffered_samples() as f32 / target_rate as f32;
+        if behind > 2.0 && !warned_behind {
+            eprintln!("\n(transcription is {behind:.1}s behind real time)");
+            warned_behind = true;
         }
 
         // Small sleep to avoid busy-waiting
@@ -325,36 +309,41 @@ fn main() -> mlx_voice::Result<()> {
     // Stop audio stream
     drop(stream);
 
-    // Process any remaining audio in buffer
-    if !audio_buffer.is_empty() {
-        let chunk = if let Some(ref mut rs) = resampler {
-            resample_chunk(rs, &audio_buffer)?
-        } else {
-            audio_buffer
-        };
-
-        if !chunk.is_empty() {
-            let _ = model.process_chunk(&mut session, &chunk)?;
-        }
+    // Drain remaining samples from ring buffer that weren't popped in the main loop
+    while let Some(sample) = consumer.try_pop() {
+        audio_buffer.push(sample);
     }
 
-    // Finalize and get final result
-    let final_output = model.finalize_streaming(session)?;
+    // Decode the remaining audio
+    if !audio_buffer.is_empty() {
+        session.push_audio(&audio_buffer, source_rate)?;
+        chunks_fed += 1;
+    }
+    session.end_audio()?;
+    while let Some(update) = session.next_update()? {
+        transcribe_steps += 1;
+        print!("{}", update.delta);
+        io::stdout().flush().unwrap();
+    }
+    println!();
 
     let elapsed = start_time.elapsed().as_secs_f32();
 
-    println!("\n\n--- Final Result ---");
-    if !final_output.text.is_empty() && !final_output.text[0].is_empty() {
-        println!("{}", final_output.text[0]);
+    let transcript = session.transcript();
+    println!("\n--- Final Result ---");
+    if !transcript.text.is_empty() {
+        println!("{}", transcript.text);
     } else {
         println!("(no speech detected)");
     }
 
     println!("\n--- Statistics ---");
     println!("Duration: {:.2}s", elapsed);
-    println!("Chunks processed: {}", chunks_processed);
-    if chunks_processed > 0 {
-        let rtf = elapsed / (chunks_processed as f32 * chunk_ms as f32 / 1000.0);
+    println!("Audio chunks fed: {}", chunks_fed);
+    println!("Transcribe steps: {}", transcribe_steps);
+    if chunks_fed > 0 {
+        let audio_duration = chunks_fed as f32 * chunk_ms as f32 / 1000.0;
+        let rtf = elapsed / audio_duration;
         println!("Real-time factor: {:.2}x", rtf);
     }
 
@@ -447,65 +436,4 @@ fn get_device_name(device: &cpal::Device) -> String {
         .description()
         .map(|d| d.name().to_string())
         .unwrap_or_else(|_| "<unknown>".to_string())
-}
-
-/// Create a resampler for converting from source to target sample rate.
-fn create_resampler(from_rate: u32, to_rate: u32) -> mlx_voice::Result<rubato::Fft<f32>> {
-    let chunk_size = 1024;
-    let resampler = rubato::Fft::<f32>::new(
-        from_rate as usize,
-        to_rate as usize,
-        chunk_size,
-        1, // channels
-        rubato::FixedSync::Input,
-    )
-    .map_err(|e| mlx_voice::Error::audio(format!("Failed to create resampler: {}", e)))?;
-
-    Ok(resampler)
-}
-
-/// Resample a chunk of audio.
-fn resample_chunk(resampler: &mut rubato::Fft<f32>, input: &[f32]) -> mlx_voice::Result<Vec<f32>> {
-    use rubato::{Resampler, audioadapter_buffers::direct::InterleavedSlice};
-
-    if input.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    // Fft with FixedSync::Input requires specific input sizes, so we may need to pad
-    let input_frames_needed = resampler.input_frames_next();
-
-    let mut padded_input = input.to_vec();
-    if padded_input.len() < input_frames_needed {
-        padded_input.resize(input_frames_needed, 0.0);
-    }
-
-    // Process in chunks of input_frames_needed
-    let mut output = Vec::new();
-    for chunk in padded_input.chunks(input_frames_needed) {
-        if chunk.len() < input_frames_needed {
-            // Pad the last chunk
-            let mut padded = chunk.to_vec();
-            padded.resize(input_frames_needed, 0.0);
-            let waves_in = InterleavedSlice::new(&padded, 1, padded.len())
-                .map_err(|e| mlx_voice::Error::audio(format!("Invalid resampler input: {}", e)))?;
-            match resampler.process(&waves_in, None) {
-                Ok(waves_out) => output.extend(waves_out.take_data()),
-                Err(e) => {
-                    return Err(mlx_voice::Error::audio(format!("Resampling failed: {}", e)));
-                }
-            }
-        } else {
-            let waves_in = InterleavedSlice::new(chunk, 1, chunk.len())
-                .map_err(|e| mlx_voice::Error::audio(format!("Invalid resampler input: {}", e)))?;
-            match resampler.process(&waves_in, None) {
-                Ok(waves_out) => output.extend(waves_out.take_data()),
-                Err(e) => {
-                    return Err(mlx_voice::Error::audio(format!("Resampling failed: {}", e)));
-                }
-            }
-        }
-    }
-
-    Ok(output)
 }

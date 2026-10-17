@@ -81,8 +81,8 @@ The eval dataset revision is pinned in both `xtask/src/main.rs` and mlx-models `
 - `PredictionNetwork`: RNN-T decoder/prediction network
 
 **Pipeline** (`pipeline/`):
-- `CacheAwareRNNTPipeline`: Main streaming pipeline for RNN-T models, handles audio buffering, cache-aware encoder processing, and incremental decoding
-- `MultiTalkerPipeline`: Wraps `CacheAwareRNNTPipeline` with a streaming SortFormer diarizer fed the same mel chunks. With a multitalker checkpoint (has `spk_kernels.*` weights) it runs one ASR instance per speaker as a batched encoder call (parallel mode); otherwise it attributes one transcript to speakers (serial mode)
+- `StreamingSession`: Cache-aware streaming for RNN-T models (`model.stream(options)` borrows the model, `StreamingSession::new(model, options)` owns it); handles resampling, audio buffering, cache-aware encoder processing, and incremental decoding
+- `MultiTalkerPipeline`: Wraps an owned `StreamingSession` with a streaming SortFormer diarizer fed the same mel chunks. With a multitalker checkpoint (has `spk_kernels.*` weights) it runs one ASR instance per speaker as a batched encoder call (parallel mode); otherwise it attributes one transcript to speakers (serial mode)
 
 **Streaming** (`streaming/`):
 - `EncoderCache`: Manages attention and convolution caches for streaming
@@ -128,4 +128,4 @@ Models are stored in `models/nvidia/` and downloaded via xtask:
 - `NemoCheckpoint`: Handles .nemo archive extraction and loading
 - `StreamingModeInfo`: Describes streaming mode latency/context settings
 - `Transcript` / `Token` / `Word`: Offline transcription result with token and word timestamps (`asr::transcript`), from `transcribe(inputs)` / `transcribe_with(inputs, &TranscribeOptions)`; inputs are `AudioInput` (paths or `(samples, rate)`)
-- `TranscribeOutput`: Streaming transcription result with partial text and tokens
+- `StreamUpdate`: One streaming step's new tokens (with times) and appended text (`delta`)

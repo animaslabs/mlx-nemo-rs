@@ -135,13 +135,12 @@ fn test_multitalker_single_speaker_wer() {
         return;
     }
     let mut pipeline =
-        MultiTalkerPipeline::from_pretrained(MT_ASR_MODEL, DIAR_MODEL, 0).expect("load");
+        MultiTalkerPipeline::from_pretrained(MT_ASR_MODEL, DIAR_MODEL).expect("load");
     assert_eq!(pipeline.mode(), MultiTalkerMode::Parallel);
 
-    pipeline
-        .set_audio_file(SINGLE_SPEAKER_AUDIO)
-        .expect("audio");
-    let segments = pipeline.run().expect("run");
+    let segments = pipeline
+        .transcribe(SINGLE_SPEAKER_AUDIO)
+        .expect("transcribe");
 
     assert!(
         segments.iter().all(|s| s.speaker == 0),
@@ -173,11 +172,9 @@ fn transcribe_samples(
     asr_model: &str,
     samples: Vec<f32>,
 ) -> (MultiTalkerMode, Vec<SpeakerSegment>) {
-    let mut pipeline =
-        MultiTalkerPipeline::from_pretrained(asr_model, DIAR_MODEL, 0).expect("load");
-    pipeline.add_audio(&samples);
-    pipeline.end_stream();
-    let segments = pipeline.run().expect("run");
+    let mut pipeline = MultiTalkerPipeline::from_pretrained(asr_model, DIAR_MODEL).expect("load");
+    pipeline.push_audio(&samples, 16_000).expect("push");
+    let segments = pipeline.finish().expect("finish");
     for s in &segments {
         println!(
             "[{:6.2}-{:6.2}] speaker_{}: {}",

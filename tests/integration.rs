@@ -8,7 +8,7 @@
 use std::path::Path;
 
 use mlx_voice::asr::{
-    AudioInput, CacheAwareRNNTPipeline, EncDecClassificationModel, EncDecRNNTModel,
+    AudioInput, EncDecClassificationModel, EncDecRNNTModel, StreamingOptions, StreamingSession,
     TranscribeOptions, Transcript, VadPostProcessConfig, VadPostProcessor,
 };
 
@@ -276,48 +276,31 @@ fn test_multilingual_streaming_transcription() {
         return;
     }
 
-    let mut pipeline = CacheAwareRNNTPipeline::from_pretrained(model_path, 3)
-        .expect("Failed to load streaming pipeline");
-    assert_eq!(pipeline.language(), Some("auto"));
-    assert!(pipeline.languages().contains(&"de-DE"));
-    assert!(pipeline.set_language("xx-YY").is_err());
+    let mut model = EncDecRNNTModel::from_pretrained(model_path).expect("Failed to load model");
+    assert_eq!(model.language(), Some("auto"));
+    assert!(model.languages().contains(&"de-DE"));
+    assert!(model.set_language("xx-YY").is_err());
 
     // Auto mode: the model tags the language, and the tag stays out of the text
-    pipeline
-        .set_audio_file(TEST_AUDIO)
-        .expect("Failed to load audio file");
-    let mut final_output = None;
-    while let Some(output) = pipeline.transcribe_step().expect("transcribe_step failed") {
-        if output.is_final {
-            final_output = Some(output);
-        }
-    }
-    let output = final_output.expect("no final output");
-    assert_eq!(
-        pipeline.detected_language(&output.tokens).as_deref(),
-        Some("en-US")
-    );
-    assert!(
-        !output.text.contains('<'),
-        "language tag in text: {}",
-        output.text
-    );
-    let wer = word_error_rate(
-        &normalize_text(EXPECTED_TEXT),
-        &normalize_text(&output.text),
-    );
-    println!("auto:  {} (WER {:.1}%)", output.text, wer * 100.0);
-    assert!(wer < 0.15, "WER {:.1}%: {}", wer * 100.0, output.text);
+    let options = StreamingOptions::default().mode(3);
+    let auto = model
+        .transcribe_streaming(TEST_AUDIO, options.clone())
+        .expect("streaming failed");
+    assert_eq!(auto.language.as_deref(), Some("en-US"));
+    assert!(!auto.text.contains('<'), "language tag in text: {auto}");
+    let wer = word_error_rate(&normalize_text(EXPECTED_TEXT), &normalize_text(&auto.text));
+    println!("auto:  {} (WER {:.1}%)", auto, wer * 100.0);
+    assert!(wer < 0.15, "WER {:.1}%: {}", wer * 100.0, auto);
 
     // An explicit target language
-    pipeline.set_language("en-US").unwrap();
-    pipeline
-        .set_audio_file(TEST_AUDIO)
-        .expect("Failed to load audio file");
-    let text = pipeline.run().expect("run failed");
-    let wer = word_error_rate(&normalize_text(EXPECTED_TEXT), &normalize_text(&text));
-    println!("en-US: {} (WER {:.1}%)", text, wer * 100.0);
-    assert!(wer < 0.15, "WER {:.1}%: {}", wer * 100.0, text);
+    model.set_language("en-US").unwrap();
+    let english = model.transcribe_streaming(TEST_AUDIO, options).unwrap();
+    let wer = word_error_rate(
+        &normalize_text(EXPECTED_TEXT),
+        &normalize_text(&english.text),
+    );
+    println!("en-US: {} (WER {:.1}%)", english, wer * 100.0);
+    assert!(wer < 0.15, "WER {:.1}%: {}", wer * 100.0, english);
 }
 
 #[test]
@@ -327,37 +310,49 @@ fn test_streaming_transcription() {
     if !require_model(model_dir) {
         return;
     }
+    let mut model = EncDecRNNTModel::from_pretrained(model_dir).expect("Failed to load model");
 
-    let mut pipeline = CacheAwareRNNTPipeline::from_pretrained(model_dir, 0)
-        .expect("Failed to load streaming pipeline");
-
-    pipeline
-        .set_audio_file(TEST_AUDIO)
-        .expect("Failed to load audio file");
-
-    let mut final_text = String::new();
-    loop {
-        match pipeline.transcribe_step().expect("transcribe_step failed") {
-            Some(output) => {
-                if !output.text.is_empty() {
-                    final_text = output.text.clone();
-                }
-                if output.is_final {
-                    break;
-                }
+    // Live-style input: 100 ms chunks at 48 kHz, resampled by the session
+    let (samples, sample_rate) = mlx_voice::audio::load_wav(TEST_AUDIO).unwrap();
+    let samples = mlx_voice::audio::resample(&samples, sample_rate, 48_000).unwrap();
+    let mut stream = model.stream(StreamingOptions::default()).unwrap();
+    let mut deltas = String::new();
+    let mut last_end = 0.0f32;
+    for chunk in samples.chunks(4_800) {
+        stream.push_audio(chunk, 48_000).unwrap();
+        while let Some(update) = stream.next_update().unwrap() {
+            deltas.push_str(&update.delta);
+            for token in &update.tokens {
+                assert!(
+                    token.start >= last_end - 0.081,
+                    "{token:?} before {last_end}"
+                );
+                last_end = token.end;
             }
-            None => break,
         }
     }
+    assert!(
+        stream.push_audio(&[], 16_000).is_err(),
+        "rate change accepted"
+    );
+    stream.end_audio().unwrap();
+    while let Some(update) = stream.next_update().unwrap() {
+        deltas.push_str(&update.delta);
+    }
+    let transcript = stream.finish().unwrap();
+    assert!(stream.is_done());
+    assert!(
+        stream.push_audio(&[0.0], 48_000).is_err(),
+        "push after end accepted"
+    );
+    assert_eq!(deltas, transcript.text);
 
-    let hypothesis = normalize_text(&final_text);
+    let hypothesis = normalize_text(&transcript.text);
     let reference = normalize_text(EXPECTED_TEXT);
     let wer = word_error_rate(&reference, &hypothesis);
-
     println!("Reference:  {}", reference);
     println!("Hypothesis: {}", hypothesis);
     println!("WER:        {:.1}%", wer * 100.0);
-
     assert!(
         wer < 0.15,
         "WER {:.1}% exceeds 15% threshold\n  ref: {}\n  hyp: {}",
@@ -365,6 +360,64 @@ fn test_streaming_transcription() {
         reference,
         hypothesis,
     );
+    let last_word = transcript.words.last().unwrap();
+    let duration = samples.len() as f32 / 48_000.0;
+    assert!(
+        last_word.end <= duration + 0.2,
+        "{last_word:?} past {duration}"
+    );
+
+    // The session is reusable after a reset. Audio pushed before decoding is
+    // all buffered (at 16 kHz, less what the resampler still holds)
+    stream.reset().unwrap();
+    assert_eq!(stream.buffered_samples(), 0);
+    stream.push_audio(&samples, 48_000).unwrap();
+    let expected = samples.len() / 3;
+    let buffered = stream.buffered_samples();
+    assert!(
+        buffered <= expected && buffered + 1_100 >= expected,
+        "buffered {buffered} of {expected}"
+    );
+    stream.next_update().unwrap().expect("a chunk is ready");
+    assert!(stream.buffered_samples() < buffered);
+    assert_eq!(stream.finish().unwrap(), transcript);
+    assert!(
+        stream.buffered_samples() < 1_600,
+        "{}",
+        stream.buffered_samples()
+    );
+}
+
+#[test]
+#[ignore]
+fn test_streaming_modes_are_independent() {
+    let model_dir = "models/animaslabs/nemotron-speech-streaming-en-0.6b-mlx-8bit";
+    if !require_model(model_dir) {
+        return;
+    }
+    let mut model = EncDecRNNTModel::from_pretrained(model_dir).expect("Failed to load model");
+    let offline = model.transcribe_one(TEST_AUDIO).unwrap();
+
+    // Streaming in another mode leaves offline transcription unchanged
+    let mode_2 = model
+        .transcribe_streaming(TEST_AUDIO, StreamingOptions::default().mode(2))
+        .unwrap();
+    assert_eq!(model.transcribe_one(TEST_AUDIO).unwrap(), offline);
+
+    // Switching modes on one model matches a fresh model in that mode
+    let mode_0 = model
+        .transcribe_streaming(TEST_AUDIO, StreamingOptions::default())
+        .unwrap();
+    let mut fresh = EncDecRNNTModel::from_pretrained(model_dir).unwrap();
+    let fresh_0 = fresh
+        .transcribe_streaming(TEST_AUDIO, StreamingOptions::default())
+        .unwrap();
+    assert_eq!(mode_0, fresh_0);
+    println!("mode 0: {mode_0}\nmode 2: {mode_2}");
+
+    // An owned session hands its model back
+    let session = StreamingSession::new(fresh, StreamingOptions::default()).unwrap();
+    let _model: EncDecRNNTModel = session.into_model();
 }
 
 #[test]
