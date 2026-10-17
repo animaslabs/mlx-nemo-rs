@@ -159,29 +159,26 @@ impl NemoCheckpoint {
     pub fn find_tokenizer(&self) -> Option<PathBuf> {
         // Look for SentencePiece model files
         for name in self.artifacts.keys() {
-            if name.ends_with("_tokenizer.model") || name.ends_with(".model") {
-                if let Some(dir) = &self.temp_dir {
+            if (name.ends_with("_tokenizer.model") || name.ends_with(".model"))
+                && let Some(dir) = &self.temp_dir {
                     let path = dir.path().join(name);
                     if path.exists() {
                         return Some(path);
                     }
                 }
-            }
         }
 
         // Also check the temp directory directly
-        if let Some(dir) = &self.temp_dir {
-            if let Ok(entries) = std::fs::read_dir(dir.path()) {
+        if let Some(dir) = &self.temp_dir
+            && let Ok(entries) = std::fs::read_dir(dir.path()) {
                 for entry in entries.flatten() {
                     let path = entry.path();
-                    if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                        if name.ends_with("_tokenizer.model") || name == "tokenizer.model" {
+                    if let Some(name) = path.file_name().and_then(|n| n.to_str())
+                        && (name.ends_with("_tokenizer.model") || name == "tokenizer.model") {
                             return Some(path);
                         }
-                    }
                 }
             }
-        }
 
         None
     }
@@ -256,11 +253,10 @@ impl NemoCheckpoint {
                         if let Some(found) = search_dir(&path, suffix) {
                             return Some(found);
                         }
-                    } else if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                        if name == suffix || name.ends_with(suffix) {
+                    } else if let Some(name) = path.file_name().and_then(|n| n.to_str())
+                        && (name == suffix || name.ends_with(suffix)) {
                             return Some(path);
                         }
-                    }
                 }
             }
             None
@@ -286,11 +282,10 @@ impl NemoCheckpoint {
         if let Ok(entries) = std::fs::read_dir(dir) {
             for entry in entries.flatten() {
                 let path = entry.path();
-                if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                    if name.ends_with(".safetensors") || name.ends_with(".ckpt") {
+                if let Some(name) = path.file_name().and_then(|n| n.to_str())
+                    && (name.ends_with(".safetensors") || name.ends_with(".ckpt")) {
                         return Some(path);
                     }
-                }
             }
         }
 
@@ -544,8 +539,8 @@ impl SafetensorsLoader {
         config_content: &str,
     ) -> Option<crate::core::quantization::QuantizationConfig> {
         // Try parsing as JSON first
-        if let Ok(json) = serde_json::from_str::<serde_json::Value>(config_content) {
-            if let Some(quant) = json.get("quantization") {
+        if let Ok(json) = serde_json::from_str::<serde_json::Value>(config_content)
+            && let Some(quant) = json.get("quantization") {
                 let bits = quant.get("bits").and_then(|v| v.as_i64()).unwrap_or(8) as i32;
                 let group_size = quant
                     .get("group_size")
@@ -557,11 +552,10 @@ impl SafetensorsLoader {
                     bits, group_size,
                 ));
             }
-        }
 
         // Try parsing as YAML
-        if let Ok(yaml) = yaml_serde::from_str::<yaml_serde::Value>(config_content) {
-            if let Some(quant) = yaml.get("quantization") {
+        if let Ok(yaml) = yaml_serde::from_str::<yaml_serde::Value>(config_content)
+            && let Some(quant) = yaml.get("quantization") {
                 let bits = quant.get("bits").and_then(|v| v.as_i64()).unwrap_or(8) as i32;
                 let group_size = quant
                     .get("group_size")
@@ -573,7 +567,6 @@ impl SafetensorsLoader {
                     bits, group_size,
                 ));
             }
-        }
 
         None
     }
@@ -621,11 +614,10 @@ impl SafetensorsLoader {
         // also check config.json which is where MLX stores quantization info
         if loader.quantization.is_none() {
             let config_json = dir.join("config.json");
-            if config_json.exists() {
-                if let Ok(content) = std::fs::read_to_string(&config_json) {
+            if config_json.exists()
+                && let Ok(content) = std::fs::read_to_string(&config_json) {
                     loader.quantization = Self::parse_quantization_config(&content);
                 }
-            }
         }
 
         Ok(loader)
@@ -724,11 +716,10 @@ impl SafetensorsLoader {
         if let Ok(entries) = std::fs::read_dir(dir) {
             for entry in entries.flatten() {
                 let path = entry.path();
-                if let Some(ext) = path.extension() {
-                    if ext == "safetensors" {
+                if let Some(ext) = path.extension()
+                    && ext == "safetensors" {
                         return Ok(path);
                     }
-                }
             }
         }
 
@@ -781,11 +772,10 @@ impl SafetensorsLoader {
         if let Ok(entries) = std::fs::read_dir(dir) {
             for entry in entries.flatten() {
                 let path = entry.path();
-                if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                    if name.ends_with(".model") || name.ends_with(".spm") {
+                if let Some(name) = path.file_name().and_then(|n| n.to_str())
+                    && (name.ends_with(".model") || name.ends_with(".spm")) {
                         return Some(path);
                     }
-                }
             }
         }
 

@@ -30,11 +30,10 @@ impl WeightFormat {
     /// Looks for a "format" key in the metadata. If it contains "mlx" (case-insensitive),
     /// returns `WeightFormat::Mlx`. Otherwise, defaults to `WeightFormat::PyTorch`.
     pub fn from_safetensors_metadata(metadata: &HashMap<String, String>) -> Self {
-        if let Some(format) = metadata.get("format") {
-            if format.to_lowercase().contains("mlx") {
+        if let Some(format) = metadata.get("format")
+            && format.to_lowercase().contains("mlx") {
                 return Self::Mlx;
             }
-        }
         // Default to PyTorch format (most common)
         Self::PyTorch
     }
@@ -271,8 +270,8 @@ pub fn read_safetensors_metadata(path: impl AsRef<Path>) -> Result<HashMap<Strin
         .map_err(|e| Error::checkpoint(format!("Invalid safetensors header: {}", e)))?;
 
     // Extract metadata if present
-    if let Some(metadata) = header.get("__metadata__") {
-        if let Some(obj) = metadata.as_object() {
+    if let Some(metadata) = header.get("__metadata__")
+        && let Some(obj) = metadata.as_object() {
             let mut result = HashMap::new();
             for (key, value) in obj {
                 if let Some(s) = value.as_str() {
@@ -281,7 +280,6 @@ pub fn read_safetensors_metadata(path: impl AsRef<Path>) -> Result<HashMap<Strin
             }
             return Ok(result);
         }
-    }
 
     Ok(HashMap::new())
 }

@@ -178,7 +178,7 @@ impl JasperBlock {
         for (i, sub) in self.sub_blocks.iter_mut().enumerate() {
             out = sub.forward(&out)?;
             if i < n - 1 {
-                out = mlx_rs::ops::maximum(&out, &Array::from_f32(0.0))?; // ReLU
+                out = mlx_rs::ops::maximum(&out, Array::from_f32(0.0))?; // ReLU
             }
         }
 
@@ -198,7 +198,7 @@ impl JasperBlock {
                 // Use arange + take_axis to produce a contiguous result (stride_by
                 // creates a non-contiguous strided view that can corrupt the
                 // subsequent add on the Metal backend).
-                let t = res.dim(1) as i32;
+                let t = res.dim(1);
                 let indices = Array::arange::<_, i32>(0, t, self.stride as i32)?;
                 res = res.take_axis(&indices, 1)?;
             }
@@ -206,7 +206,7 @@ impl JasperBlock {
         }
 
         // Final ReLU
-        out = mlx_rs::ops::maximum(&out, &Array::from_f32(0.0))?;
+        out = mlx_rs::ops::maximum(&out, Array::from_f32(0.0))?;
 
         Ok(out)
     }
@@ -222,7 +222,7 @@ impl JasperBlock {
         let is_separable = self
             .sub_blocks
             .first()
-            .map_or(false, |s| s.dw_conv.is_some());
+            .is_some_and(|s| s.dw_conv.is_some());
         let n = self.sub_blocks.len();
 
         let mut mconv_idx = 0;

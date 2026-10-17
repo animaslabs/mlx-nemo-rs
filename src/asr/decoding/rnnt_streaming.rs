@@ -129,6 +129,7 @@ impl RnntStreamingDecoder {
     ///
     /// # Returns
     /// * `DecodeStepOutput` containing new tokens and labels
+    #[allow(clippy::too_many_arguments)]
     pub fn decode_frames(
         &self,
         encoder_output: &Array,
@@ -164,6 +165,7 @@ impl RnntStreamingDecoder {
     /// frames at once and the first non-blank frame is found on the host, so
     /// there is one GPU round trip per emitted token or window of blanks rather
     /// than one per frame. The prediction network only reruns after a token.
+    #[allow(clippy::too_many_arguments)]
     pub fn decode_projected(
         &self,
         enc_proj: &Array,
@@ -226,7 +228,7 @@ impl RnntStreamingDecoder {
             let non_blank = ops::add(&logits, &non_blank_mask)?;
             let best = argmax_axis(&non_blank, -1, false)?;
             let margin = ops::subtract(
-                &logits.index((.., blank as i32)),
+                logits.index((.., blank as i32)),
                 &max_axis(&non_blank, -1, false)?,
             )?;
             let choice = ops::select(margin.gt(&threshold)?, &blank_arr, &best)?;

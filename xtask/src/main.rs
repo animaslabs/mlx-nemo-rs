@@ -1,7 +1,10 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use hf_hub::{Repo, RepoType, api::sync::ApiBuilder};
-use std::{fs, path::PathBuf};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+};
 
 /// Shared eval set (audio + references), built by mlx-models `samples/fetch_eval.py`.
 const EVAL_REPO: &str = "animaslabs/asr-eval";
@@ -160,7 +163,7 @@ fn build_api(token: Option<String>) -> Result<hf_hub::api::sync::Api> {
 fn download_file(
     repo: &hf_hub::api::sync::ApiRepo,
     filename: &str,
-    output_dir: &PathBuf,
+    output_dir: &Path,
 ) -> Result<()> {
     println!("  {filename}...");
     let src = repo

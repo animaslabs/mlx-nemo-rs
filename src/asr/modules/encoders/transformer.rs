@@ -175,7 +175,7 @@ impl PositionWiseFF {
 
         h = match self.activation {
             Activation::Gelu => nn::gelu(&h)?,
-            _ => ops::maximum(&h, &Array::from_f32(0.0))?,
+            _ => ops::maximum(&h, Array::from_f32(0.0))?,
         };
 
         self.linear2.forward(&h)

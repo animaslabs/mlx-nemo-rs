@@ -1018,10 +1018,10 @@ impl EncoderConfig {
     /// An unsupported architecture could otherwise share enough weight names
     /// with a supported one to load, and silently produce garbage output.
     pub fn validate(&self) -> Result<()> {
-        if let Some(target) = self.target.as_deref() {
-            if !target.ends_with("ConformerEncoder") {
-                return Err(Error::not_implemented(format!("encoder `{}`", target)));
-            }
+        if let Some(target) = self.target.as_deref()
+            && !target.ends_with("ConformerEncoder")
+        {
+            return Err(Error::not_implemented(format!("encoder `{}`", target)));
         }
 
         if self.self_attention_model != SelfAttentionModel::RelPos {
@@ -1619,8 +1619,10 @@ mod tests {
 
     #[test]
     fn test_encoder_validate_accepts_supported() {
-        let mut config = EncoderConfig::default();
-        config.target = Some("nemo.collections.asr.modules.ConformerEncoder".to_string());
+        let mut config = EncoderConfig {
+            target: Some("nemo.collections.asr.modules.ConformerEncoder".to_string()),
+            ..Default::default()
+        };
         assert!(config.validate().is_ok());
 
         config.att_context_style = AttContextStyle::ChunkedLimited;

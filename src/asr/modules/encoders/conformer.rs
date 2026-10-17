@@ -226,8 +226,8 @@ fn create_attention_mask(
 /// diagonal=0 means main diagonal, negative shifts down.
 fn apply_triu(mask: &Array, diagonal: i32) -> Result<Array> {
     let shape = mask.shape();
-    let rows = shape[1] as i32;
-    let cols = shape[2] as i32;
+    let rows = shape[1];
+    let cols = shape[2];
 
     // Create row indices [0, 1, 2, ...]
     let row_indices: Vec<i32> = (0..rows).collect();
@@ -254,8 +254,8 @@ fn apply_triu(mask: &Array, diagonal: i32) -> Result<Array> {
 /// diagonal=0 means main diagonal, positive shifts up.
 fn apply_tril(mask: &Array, diagonal: i32) -> Result<Array> {
     let shape = mask.shape();
-    let rows = shape[1] as i32;
-    let cols = shape[2] as i32;
+    let rows = shape[1];
+    let cols = shape[2];
 
     // Create row indices [0, 1, 2, ...]
     let row_indices: Vec<i32> = (0..rows).collect();
@@ -509,7 +509,7 @@ impl ConformerEncoder {
             );
         }
 
-        x = mlx_rs::ops::select(&mel_mask, &mlx_rs::Array::from_f32(0.0), &x)?;
+        x = mlx_rs::ops::select(&mel_mask, mlx_rs::Array::from_f32(0.0), &x)?;
 
         if debug_mask {
             x.eval()?;
@@ -524,7 +524,7 @@ impl ConformerEncoder {
 
         // Subsampling
         let x = x.as_dtype(self.dtype)?;
-        let (mut x, lengths) = self.subsampling.forward(&x, &lengths)?;
+        let (mut x, lengths) = self.subsampling.forward(&x, lengths)?;
 
         // Scale input by sqrt(d_model) if xscaling is enabled
         let xscale = self.pos_enc.xscale();
@@ -749,10 +749,10 @@ impl ConformerEncoder {
         let mel_lengths_expanded = lengths.reshape(&[-1, 1])?;
         let mel_mask = mlx_rs::ops::ge(&mel_indices, &mel_lengths_expanded)?;
         let mel_mask = mel_mask.reshape(&[x.dim(0) as i32, mel_time, 1])?;
-        x = mlx_rs::ops::select(&mel_mask, &mlx_rs::Array::from_f32(0.0), &x)?;
+        x = mlx_rs::ops::select(&mel_mask, mlx_rs::Array::from_f32(0.0), &x)?;
 
         // Subsampling
-        let (mut x, lengths) = self.subsampling.forward(&x, &lengths)?;
+        let (mut x, lengths) = self.subsampling.forward(&x, lengths)?;
         x.eval()?;
         let after_subsampling = x.clone();
 
@@ -883,7 +883,7 @@ impl ConformerEncoder {
         // The mask is shared across the batch, so it uses the first stream's lengths
         let tensor_seq_len = x.dim(1) as i32;
         let valid_seq_len = out_lengths[0].min(tensor_seq_len);
-        let cache_size = cache_last_channel.dim(2) as i32;
+        let cache_size = cache_last_channel.dim(2);
         let filled_cache_len = filled_cache_lens[0].clamp(0, cache_size as i64) as i32;
 
         // Keys/values cover the full cache buffer plus the current frames
@@ -915,7 +915,7 @@ impl ConformerEncoder {
                         Some(mask)
                     } else {
                         let hidden = Array::from_f32(f32::NEG_INFINITY);
-                        let additive = mlx_rs::ops::select(&mask, &Array::from_f32(0.0), &hidden)?;
+                        let additive = mlx_rs::ops::select(&mask, Array::from_f32(0.0), &hidden)?;
                         additive.eval()?;
                         Some(additive)
                     };
@@ -981,12 +981,12 @@ impl ConformerEncoder {
             // The attention returns: new_cache = concat(old_filled[q_keep_size:], x[:q_keep_size])
             // We need to place this at the END of the full cache buffer
             if let Some(nc) = new_channel {
-                let nc_len = nc.dim(1) as i32;
+                let nc_len = nc.dim(1);
                 let updated_cache = if nc_len < cache_size {
                     // Pad with zeros at the beginning to maintain cache_size
                     let pad_size = cache_size - nc_len;
-                    let batch = nc.dim(0) as i32;
-                    let d_model = nc.dim(2) as i32;
+                    let batch = nc.dim(0);
+                    let d_model = nc.dim(2);
                     let zeros = mlx_rs::ops::zeros::<f32>(&[batch, pad_size, d_model])?;
                     mlx_rs::ops::concatenate(&[&zeros, &nc], 1)?
                 } else if nc_len > cache_size {
@@ -1244,7 +1244,7 @@ impl Subsampling {
     /// Debug helper to print array statistics
     #[allow(dead_code)]
     fn debug_print_array(name: &str, arr: &Array, show_samples: usize) {
-        if let Err(_) = arr.eval() {
+        if arr.eval().is_err() {
             tracing::info!("DEBUG subsampling {}: failed to eval", name);
             return;
         }
@@ -1305,7 +1305,7 @@ impl Subsampling {
     /// size cancels out.
     fn calc_conv_output_size(input_size: &Array, stride: i32) -> Result<Array> {
         let padded = input_size + Array::from_int(stride - 2);
-        let divided = mlx_rs::ops::floor_divide(&padded, &Array::from_int(stride))?;
+        let divided = mlx_rs::ops::floor_divide(&padded, Array::from_int(stride))?;
         Ok(divided + Array::from_int(1))
     }
 
@@ -1378,7 +1378,7 @@ impl Subsampling {
     #[cfg(test)]
     fn out_proj_in_features(&self) -> i32 {
         match &self.out_proj {
-            LinearLayer::Standard { weight, .. } => weight.dim(1) as i32,
+            LinearLayer::Standard { weight, .. } => weight.dim(1),
             _ => unreachable!("test subsampling uses a standard projection"),
         }
     }
@@ -1394,10 +1394,10 @@ impl Subsampling {
             } else {
                 // Symmetric padding of 1 with kernel 3, stride 2 (NeMo's calc_length):
                 // out = floor((len + 2 - 3) / 2) + 1, which rounds odd lengths up
-                let shrunk = mlx_rs::ops::subtract(&new_lengths, &Array::from_int(1))?;
+                let shrunk = mlx_rs::ops::subtract(&new_lengths, Array::from_int(1))?;
                 mlx_rs::ops::add(
-                    &mlx_rs::ops::floor_divide(&shrunk, &Array::from_int(2))?,
-                    &Array::from_int(1),
+                    &mlx_rs::ops::floor_divide(&shrunk, Array::from_int(2))?,
+                    Array::from_int(1),
                 )?
             };
         }
@@ -1433,7 +1433,7 @@ impl Subsampling {
 
         // Add channel dimension: [B, T, F] -> [B, T, F, 1] for MLX Conv2d
         // MLX Conv2d expects (N, H, W, C) format
-        let mut x = x.reshape(&[-1, x.dim(1) as i32, x.dim(2) as i32, 1])?;
+        let mut x = x.reshape(&[-1, x.dim(1), x.dim(2), 1])?;
 
         if debug_enabled {
             tracing::info!(
@@ -1531,7 +1531,7 @@ impl Subsampling {
         }
 
         // Flatten to [B, T', C*F']
-        let x = x.reshape(&[batch as i32, time as i32, -1])?;
+        let x = x.reshape(&[batch, time, -1])?;
 
         if debug_enabled {
             tracing::info!(
@@ -1889,6 +1889,7 @@ impl ConformerBlock {
     /// * Output tensor [batch, seq_len, d_model]
     /// * Updated MHA cache
     /// * Updated conv cache
+    #[allow(clippy::too_many_arguments)]
     fn forward_with_cache(
         &mut self,
         x: &Array,
@@ -2347,9 +2348,9 @@ impl ConvolutionModule {
             // pad_mask: [batch, seq_len] where True = padding
             // x: [batch, seq_len, d_model]
             // Expand mask to [batch, seq_len, 1] for broadcasting
-            let mask_expanded = mask.reshape(&[mask.dim(0) as i32, mask.dim(1) as i32, 1])?;
+            let mask_expanded = mask.reshape(&[mask.dim(0), mask.dim(1), 1])?;
             // Where mask is True (padding), set to 0.0
-            x = mlx_rs::ops::select(&mask_expanded, &Array::from_f32(0.0), &x)?;
+            x = mlx_rs::ops::select(&mask_expanded, Array::from_f32(0.0), &x)?;
         }
 
         // For streaming: use cache instead of padding
