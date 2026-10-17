@@ -15,6 +15,7 @@ use crate::core::quantization::{LinearLayer, QuantizationConfig};
 /// Generates sinusoidal positional encodings for relative positions.
 /// For a sequence of length L, generates encodings for positions
 /// from (L-1) down to -(L-1), giving 2L-1 total position embeddings.
+#[derive(Debug)]
 pub struct RelPositionalEncoding {
     d_model: usize,
     max_len: usize,
@@ -302,6 +303,7 @@ fn attend(
 /// - Position attention: (Q + bias_v) @ P^T with rel_shift
 ///
 /// Position biases (pos_bias_u, pos_bias_v) are stored per-layer.
+#[derive(Debug)]
 pub struct RelPositionMultiHeadAttention {
     d_model: usize,
     n_heads: usize,

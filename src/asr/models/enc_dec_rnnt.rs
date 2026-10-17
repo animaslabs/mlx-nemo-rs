@@ -31,14 +31,9 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use mlx_rs::Array;
-use mlx_rs::ops::indexing::IndexOp;
-use sentencepiece::SentencePieceProcessor;
-
+use crate::asr::Tokenizer;
 use crate::asr::config::{AsrModelConfig, JointConfig};
-use crate::asr::decoding::{
-    RnntStreamingDecoder, decode_text, lang_tag_table, last_lang_tag, rnnt_beam_decode,
-};
+use crate::asr::decoding::{RnntStreamingDecoder, rnnt_beam_decode};
 use crate::asr::modules::{
     ConformerEncoder, LanguagePrompt, LstmState, MelSpectrogram, MelSpectrogramConfig, RNNTDecoder,
     RNNTJoint, StatelessTransducerDecoder,
@@ -54,27 +49,28 @@ use crate::core::config::from_yaml_str;
 use crate::core::error::{Error, Result};
 use crate::core::loading::{LoadOptions, LoadReport, Weights};
 use crate::core::quantization::QuantizationConfig;
+use mlx_rs::Array;
+use mlx_rs::ops::indexing::IndexOp;
 
 /// Decoding strategy for offline RNNT transcription.
 ///
 /// Applies to [`EncDecRNNTModel::transcribe`]. Streaming decoding is always
 /// greedy.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum RnntDecodingStrategy {
     /// Greedy decoding (fast)
+    #[default]
     Greedy,
     /// Beam search decoding, NeMo's default algorithm (slower, usually
     /// slightly more accurate). `beam_size` must be at least 1.
-    BeamSearch { beam_size: usize },
-}
-
-impl Default for RnntDecodingStrategy {
-    fn default() -> Self {
-        Self::Greedy
-    }
+    BeamSearch {
+        /// Number of hypotheses kept per frame
+        beam_size: usize,
+    },
 }
 
 /// Prediction network type (stateless or LSTM-based).
+#[derive(Debug)]
 pub enum PredictionNetwork {
     /// Stateless decoder (embedding-based)
     Stateless(StatelessTransducerDecoder),
@@ -83,7 +79,7 @@ pub enum PredictionNetwork {
 }
 
 /// Decoder state type.
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub enum DecoderState {
     /// Stateless decoder state (context buffer)
     Stateless(Array),
@@ -258,16 +254,28 @@ pub struct EncDecRNNTModel {
     encoder: ConformerEncoder,
     decoder: PredictionNetwork,
     joint: RNNTJoint,
-    tokenizer: Option<SentencePieceProcessor>,
+    tokenizer: Option<Tokenizer>,
     /// Blank token ID (typically vocab_size, last token)
     blank_id: usize,
     /// Decoding strategy
     decoding_strategy: RnntDecodingStrategy,
     chunk_count: usize,
-    /// For each token id, whether it is a language tag such as `<en-US>`
-    lang_tags: Vec<bool>,
     /// Leave language tags out of transcribed text
     strip_lang_tags: bool,
+}
+
+impl std::fmt::Debug for EncDecRNNTModel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EncDecRNNTModel")
+            .field("sample_rate", &self.sample_rate())
+            .field("encoder_layers", &self.encoder.num_layers())
+            .field("lstm_decoder", &self.is_lstm_decoder())
+            .field("blank_id", &self.blank_id)
+            .field("decoding_strategy", &self.decoding_strategy)
+            .field("tokenizer", &self.tokenizer)
+            .field("language", &self.language())
+            .finish_non_exhaustive()
+    }
 }
 
 impl EncDecRNNTModel {
@@ -357,7 +365,6 @@ impl EncDecRNNTModel {
             blank_id,
             decoding_strategy,
             chunk_count: 0,
-            lang_tags: Vec::new(),
             strip_lang_tags: true,
         })
     }
@@ -605,11 +612,10 @@ impl EncDecRNNTModel {
     /// Load a tokenizer from a SentencePiece model file.
     pub fn load_tokenizer(&mut self, path: impl AsRef<Path>) -> Result<()> {
         let path = path.as_ref();
-        let tokenizer = SentencePieceProcessor::open(path)
-            .map_err(|e| Error::tokenizer(format!("Failed to load tokenizer: {}", e)))?;
+        let tokenizer = Tokenizer::open(path)?;
 
         // Update vocabulary size and blank token
-        let vocab_size = tokenizer.len();
+        let vocab_size = tokenizer.vocab_size();
         self.blank_id = vocab_size; // Blank is typically vocab_size (last index)
 
         // Recreate decoder with correct vocab size
@@ -643,9 +649,14 @@ impl EncDecRNNTModel {
             vocab_size + 1,
         )?;
 
-        self.lang_tags = lang_tag_table(&tokenizer);
         self.tokenizer = Some(tokenizer);
         Ok(())
+    }
+
+    /// The model's tokenizer, for turning token ids into text (`None` only
+    /// if a non-strict load found no tokenizer).
+    pub fn tokenizer(&self) -> Option<&Tokenizer> {
+        self.tokenizer.as_ref()
     }
 
     /// Load weights from a checkpoint's tensors, failing if any tensor the
@@ -730,12 +741,12 @@ impl EncDecRNNTModel {
 
     /// The language named by the last language tag in `tokens`, e.g. `"en-US"`.
     pub fn detected_language(&self, tokens: &[usize]) -> Option<String> {
-        last_lang_tag(self.tokenizer.as_ref()?, &self.lang_tags, tokens)
+        self.tokenizer.as_ref()?.detected_language(tokens)
     }
 
     /// Text of `tokens`, without language tags unless they are kept.
-    fn tokens_to_text(&self, tokenizer: &SentencePieceProcessor, tokens: &[usize]) -> String {
-        decode_text(tokenizer, tokens, self.strip_lang_tags)
+    fn tokens_to_text(&self, tokenizer: &Tokenizer, tokens: &[usize]) -> String {
+        tokenizer.decode(tokens, self.strip_lang_tags)
     }
 
     /// Set the decoding strategy used by [`transcribe`](Self::transcribe).
@@ -766,12 +777,26 @@ impl EncDecRNNTModel {
     /// # Returns
     /// * Vector of transcribed text strings
     pub fn transcribe(&mut self, paths: &[impl AsRef<Path>]) -> Result<Vec<String>> {
-        // Load and preprocess audio
-        let audio_batch = self.load_audio_batch(paths)?;
+        let clips = super::load_clips(paths, self.sample_rate())?;
+        self.transcribe_clips(&clips)
+    }
+
+    /// Transcribe mono audio samples (in `[-1, 1]`) recorded at
+    /// `sample_rate`, resampling them to the model's rate if needed.
+    pub fn transcribe_samples(&mut self, samples: &[f32], sample_rate: u32) -> Result<String> {
+        if samples.is_empty() {
+            return Ok(String::new());
+        }
+        let clip = resample(samples, sample_rate, self.sample_rate())?;
+        Ok(self.transcribe_clips(&[clip])?.remove(0))
+    }
+
+    /// Transcribe clips already at the model's sample rate.
+    fn transcribe_clips(&mut self, clips: &[Vec<f32>]) -> Result<Vec<String>> {
+        let (audio, lengths) = super::pad_batch(clips);
 
         // Run forward pass to get encoder output
-        let (encoder_output, encoder_lengths) =
-            self.forward(&audio_batch.0, Some(&audio_batch.1))?;
+        let (encoder_output, encoder_lengths) = self.forward(&audio, Some(&lengths))?;
 
         let token_sequences = match self.decoding_strategy {
             RnntDecodingStrategy::Greedy => {
@@ -851,46 +876,6 @@ impl EncDecRNNTModel {
         Ok((encoded_transposed, encoded_lengths))
     }
 
-    /// Load audio files and return batched tensors.
-    fn load_audio_batch(&self, paths: &[impl AsRef<Path>]) -> Result<(Array, Array)> {
-        let sample_rate = self.config.sample_rate;
-        let mut audio_samples = Vec::new();
-        let mut lengths = Vec::new();
-
-        for path in paths {
-            let path = path.as_ref();
-            let (samples, file_sample_rate) = load_wav(path)?;
-
-            // Resample if necessary
-            let samples = if file_sample_rate != sample_rate {
-                resample(&samples, file_sample_rate, sample_rate)?
-            } else {
-                samples
-            };
-
-            lengths.push(samples.len());
-            audio_samples.push(samples);
-        }
-
-        // Pad to max length and create batch
-        let max_len = lengths.iter().max().copied().unwrap_or(0);
-        let batch_size = audio_samples.len();
-
-        let mut padded_data = vec![0.0f32; batch_size * max_len];
-        for (i, samples) in audio_samples.iter().enumerate() {
-            let offset = i * max_len;
-            padded_data[offset..offset + samples.len()].copy_from_slice(samples);
-        }
-
-        let audio = Array::from_slice(&padded_data, &[batch_size as i32, max_len as i32]);
-        let lengths_arr = Array::from_slice(
-            &lengths.iter().map(|&l| l as i32).collect::<Vec<_>>(),
-            &[batch_size as i32],
-        );
-
-        Ok((audio, lengths_arr))
-    }
-
     /// Decode token sequences to text.
     fn decode_tokens(&self, token_sequences: &[Vec<usize>]) -> Result<Vec<String>> {
         let tokenizer = self
@@ -965,7 +950,10 @@ impl EncDecRNNTModel {
     /// Initialize a streaming session.
     ///
     /// # Arguments
-    /// * `mode_idx` - Streaming mode index
+    /// * `mode_idx` - Streaming mode index into the checkpoint's `att_context_size` list (see
+    ///   `streaming_modes()` for each mode's latency). NeMo checkpoints list modes
+    ///   from most to least lookahead, so mode 0, the model's default, has the
+    ///   highest latency and accuracy
     /// * `batch_size` - Number of independent audio streams
     pub fn init_streaming(
         &mut self,
@@ -1346,6 +1334,7 @@ impl EncDecRNNTModel {
 /// 1. Audio is incrementally converted to mel frames
 /// 2. Mel frames are stored in a buffer
 /// 3. Chunks are extracted with pre_encode_cache overlap
+#[derive(Debug)]
 pub struct RnntStreamingSession {
     /// Streaming configuration
     pub config: StreamingConfig,
@@ -1373,66 +1362,4 @@ pub struct RnntStreamingSession {
 
     /// Number of mel features
     n_mels: usize,
-}
-
-/// Load a WAV file and return samples and sample rate.
-#[cfg(feature = "asr")]
-fn load_wav(path: &Path) -> Result<(Vec<f32>, u32)> {
-    use hound::WavReader;
-
-    let reader = WavReader::open(path)
-        .map_err(|e| Error::audio(format!("Failed to open WAV file: {}", e)))?;
-
-    let spec = reader.spec();
-    let sample_rate = spec.sample_rate;
-    let channels = spec.channels as usize;
-
-    let samples: Vec<f32> = match spec.sample_format {
-        hound::SampleFormat::Float => {
-            let samples: Vec<f32> = reader
-                .into_samples::<f32>()
-                .collect::<std::result::Result<Vec<_>, _>>()
-                .map_err(|e| Error::audio(format!("Failed to read samples: {}", e)))?;
-
-            // Convert stereo to mono by averaging
-            if channels > 1 {
-                samples
-                    .chunks(channels)
-                    .map(|chunk| chunk.iter().sum::<f32>() / channels as f32)
-                    .collect()
-            } else {
-                samples
-            }
-        }
-        hound::SampleFormat::Int => {
-            let bits = spec.bits_per_sample;
-            let max_val = (1 << (bits - 1)) as f32;
-
-            let samples: Vec<i32> = reader
-                .into_samples::<i32>()
-                .collect::<std::result::Result<Vec<_>, _>>()
-                .map_err(|e| Error::audio(format!("Failed to read samples: {}", e)))?;
-
-            // Convert to float and handle channels
-            if channels > 1 {
-                samples
-                    .chunks(channels)
-                    .map(|chunk| {
-                        chunk.iter().map(|&s| s as f32).sum::<f32>() / (channels as f32 * max_val)
-                    })
-                    .collect()
-            } else {
-                samples.iter().map(|&s| s as f32 / max_val).collect()
-            }
-        }
-    };
-
-    Ok((samples, sample_rate))
-}
-
-#[cfg(not(feature = "asr"))]
-fn load_wav(_path: &Path) -> Result<(Vec<f32>, u32)> {
-    Err(Error::not_implemented(
-        "Audio loading requires the 'asr' feature",
-    ))
 }

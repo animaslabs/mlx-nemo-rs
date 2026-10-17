@@ -178,6 +178,15 @@ pub struct MelProcessor {
     spectrum_transform: Option<Arc<dyn SpectrumTransform>>,
 }
 
+impl std::fmt::Debug for MelProcessor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MelProcessor")
+            .field("config", &self.config)
+            .field("spectrum_transform", &self.spectrum_transform.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
 impl MelProcessor {
     /// Create a new mel spectrogram processor.
     pub fn new(config: MelConfig) -> Result<Self> {
@@ -429,8 +438,9 @@ impl MelProcessor {
     }
 }
 
-// Type aliases for backwards compatibility
+/// Former name of [`MelProcessor`], kept for backwards compatibility.
 pub type MelSpectrogram = MelProcessor;
+/// Former name of [`MelConfig`], kept for backwards compatibility.
 pub type MelSpectrogramConfig = MelConfig;
 
 // ============================================================================
@@ -967,6 +977,15 @@ pub struct StreamingMel {
 
     /// Hop length in samples
     hop_samples: usize,
+}
+
+impl std::fmt::Debug for StreamingMel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StreamingMel")
+            .field("processor", &self.processor)
+            .field("total_frames", &self.total_frames)
+            .finish_non_exhaustive()
+    }
 }
 
 impl StreamingMel {

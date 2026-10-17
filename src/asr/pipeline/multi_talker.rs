@@ -46,7 +46,7 @@ use mlx_rs::ops;
 use mlx_rs::ops::indexing::IndexOp;
 
 use super::cache_aware_rnnt::CacheAwareRNNTPipeline;
-use crate::asr::decoding::decode_text;
+use crate::asr::Tokenizer;
 use crate::asr::models::{DecoderState, SortformerEncLabelModel};
 use crate::asr::modules::SpeakerTargets;
 use crate::asr::streaming::{EncoderCache, FeatureBuffer, StreamingSortformerState};
@@ -60,7 +60,7 @@ const ACTIVITY_THRESHOLD: f32 = 0.5;
 /// Multi-talker pipeline settings.
 ///
 /// Defaults follow NeMo's `MultitalkerTranscriptionConfig`.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct MultiTalkerConfig {
     /// Binarize diarizer outputs at 0.5 before using them as speaker targets
     pub binary_diar_preds: bool,
@@ -94,7 +94,7 @@ impl Default for MultiTalkerConfig {
 }
 
 /// A word attributed to a speaker.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct SpeakerWord {
     /// Speaker index (0-based)
     pub speaker: usize,
@@ -107,7 +107,7 @@ pub struct SpeakerWord {
 }
 
 /// A run of words from one speaker (a SegLST entry).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct SpeakerSegment {
     /// Speaker index (0-based, up to max_num_spks - 1)
     pub speaker: usize,
@@ -120,7 +120,7 @@ pub struct SpeakerSegment {
 }
 
 /// Output from a multi-talker transcription step.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct MultiTalkerOutput {
     /// Words completed during this step, ordered by start time
     pub new_words: Vec<SpeakerWord>,
@@ -169,10 +169,20 @@ pub struct MultiTalkerPipeline {
     frame_sec: f32,
     /// Chunks since each speaker was last active
     chunks_since_active: Vec<usize>,
-    /// Whether each token id starts a new word
-    word_start: Vec<bool>,
     /// All completed words
     words: Vec<SpeakerWord>,
+}
+
+impl std::fmt::Debug for MultiTalkerPipeline {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MultiTalkerPipeline")
+            .field("mode", &self.mode)
+            .field("num_spks", &self.num_spks)
+            .field("asr", &self.asr)
+            .field("diar_model", &self.diar_model)
+            .field("words", &self.words.len())
+            .finish_non_exhaustive()
+    }
 }
 
 impl MultiTalkerPipeline {
@@ -183,7 +193,10 @@ impl MultiTalkerPipeline {
     ///   A multitalker model (with speaker kernels) runs in parallel mode, any
     ///   other in serial mode.
     /// * `diar_path` - Path to the streaming SortFormer diarization .nemo model
-    /// * `mode_idx` - Streaming mode index for the ASR model
+    /// * `mode_idx` - ASR streaming mode index into the checkpoint's `att_context_size` list (see
+    ///   `streaming_modes()` for each mode's latency). NeMo checkpoints list modes
+    ///   from most to least lookahead, so mode 0, the model's default, has the
+    ///   highest latency and accuracy
     pub fn restore(
         asr_path: impl AsRef<Path>,
         diar_path: impl AsRef<Path>,
@@ -227,8 +240,6 @@ impl MultiTalkerPipeline {
         let frame_sec =
             asr.encoder.subsampling_factor() as f32 * asr.mel_stream_config.mel.window_stride;
 
-        let word_start = asr.word_start.clone();
-
         tracing::info!(
             ?mode,
             num_spks,
@@ -249,7 +260,6 @@ impl MultiTalkerPipeline {
             frame_offset: 0,
             frame_sec,
             chunks_since_active: Vec::new(),
-            word_start,
             words: Vec::new(),
         };
         pipeline.reset_state()?;
@@ -353,6 +363,12 @@ impl MultiTalkerPipeline {
     /// Get the sample rate.
     pub fn sample_rate(&self) -> u32 {
         self.asr.sample_rate()
+    }
+
+    /// The ASR model's tokenizer (`None` only if a non-strict load found no
+    /// tokenizer).
+    pub fn tokenizer(&self) -> Option<&Tokenizer> {
+        self.asr.tokenizer()
     }
 
     fn process_chunk(&mut self, fb: FeatureBuffer) -> Result<MultiTalkerOutput> {
@@ -571,7 +587,11 @@ impl MultiTalkerPipeline {
         let mut words = Vec::new();
         for (idx, new_tokens) in tokens.into_iter().enumerate() {
             for (token, frame) in new_tokens {
-                let starts_word = self.word_start.get(token).copied().unwrap_or(false);
+                let starts_word = self
+                    .asr
+                    .tokenizer
+                    .as_ref()
+                    .is_some_and(|t| t.is_word_start(token));
                 if starts_word && !self.instances[idx].pending.is_empty() {
                     let pending = std::mem::take(&mut self.instances[idx].pending);
                     words.extend(self.make_word(idx, &pending));
@@ -589,7 +609,8 @@ impl MultiTalkerPipeline {
     fn make_word(&self, instance: usize, tokens: &[(usize, usize)]) -> Option<SpeakerWord> {
         let tokenizer = self.asr.tokenizer.as_ref()?;
         let ids: Vec<usize> = tokens.iter().map(|&(t, _)| t).collect();
-        let text = decode_text(tokenizer, &ids, self.asr.strip_lang_tags)
+        let text = tokenizer
+            .decode(&ids, self.asr.strip_lang_tags)
             .trim()
             .to_string();
         if text.is_empty() {

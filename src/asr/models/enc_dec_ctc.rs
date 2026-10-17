@@ -40,8 +40,8 @@
 use std::path::Path;
 
 use mlx_rs::Array;
-use sentencepiece::SentencePieceProcessor;
 
+use crate::asr::Tokenizer;
 use crate::asr::config::AsrModelConfig;
 use crate::asr::decoding::{greedy_ctc_merge, greedy_decode, lcs_merge_buffer};
 use crate::asr::modules::{CTCDecoder, ConformerEncoder, MelSpectrogram};
@@ -57,6 +57,7 @@ use crate::core::loading::{LoadOptions, LoadReport, Weights};
 use crate::core::quantization::QuantizationConfig;
 
 /// Debug output containing all intermediate tensors from forward pass.
+#[derive(Debug)]
 pub struct DebugOutput {
     /// Mel spectrogram features BEFORE normalization [batch, n_mels, frames]
     pub mel_pre_norm: Array,
@@ -98,10 +99,21 @@ pub struct EncDecCTCModel {
     preprocessor: MelSpectrogram,
     encoder: ConformerEncoder,
     decoder: CTCDecoder,
-    tokenizer: Option<SentencePieceProcessor>,
+    tokenizer: Option<Tokenizer>,
     /// Blank token ID for CTC (typically last token in vocab)
     blank_id: usize,
     chunk_count: usize,
+}
+
+impl std::fmt::Debug for EncDecCTCModel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EncDecCTCModel")
+            .field("sample_rate", &self.sample_rate())
+            .field("encoder_layers", &self.encoder.num_layers())
+            .field("blank_id", &self.blank_id)
+            .field("tokenizer", &self.tokenizer)
+            .finish_non_exhaustive()
+    }
 }
 
 impl EncDecCTCModel {
@@ -355,15 +367,19 @@ impl EncDecCTCModel {
     /// Load a tokenizer from a SentencePiece model file.
     pub fn load_tokenizer(&mut self, path: impl AsRef<Path>) -> Result<()> {
         let path = path.as_ref();
-        let tokenizer = SentencePieceProcessor::open(path)
-            .map_err(|e| Error::tokenizer(format!("Failed to load tokenizer: {}", e)))?;
+        let tokenizer = Tokenizer::open(path)?;
 
-        // Update vocabulary size and blank token
-        let vocab_size = tokenizer.len() + 1; // +1 for blank token
-        self.blank_id = vocab_size - 1;
+        // Blank comes after the vocabulary
+        self.blank_id = tokenizer.vocab_size();
 
         self.tokenizer = Some(tokenizer);
         Ok(())
+    }
+
+    /// The model's tokenizer, for turning token ids into text (`None` only
+    /// if a non-strict load found no tokenizer).
+    pub fn tokenizer(&self) -> Option<&Tokenizer> {
+        self.tokenizer.as_ref()
     }
 
     /// Load weights from a checkpoint's tensors, failing if any tensor the
@@ -403,11 +419,26 @@ impl EncDecCTCModel {
     /// # Returns
     /// * Vector of transcribed text strings
     pub fn transcribe(&mut self, paths: &[impl AsRef<Path>]) -> Result<Vec<String>> {
-        // Load and preprocess audio
-        let audio_batch = self.load_audio_batch(paths)?;
+        let clips = super::load_clips(paths, self.sample_rate())?;
+        self.transcribe_clips(&clips)
+    }
+
+    /// Transcribe mono audio samples (in `[-1, 1]`) recorded at
+    /// `sample_rate`, resampling them to the model's rate if needed.
+    pub fn transcribe_samples(&mut self, samples: &[f32], sample_rate: u32) -> Result<String> {
+        if samples.is_empty() {
+            return Ok(String::new());
+        }
+        let clip = resample(samples, sample_rate, self.sample_rate())?;
+        Ok(self.transcribe_clips(&[clip])?.remove(0))
+    }
+
+    /// Transcribe clips already at the model's sample rate.
+    fn transcribe_clips(&mut self, clips: &[Vec<f32>]) -> Result<Vec<String>> {
+        let (audio, lengths) = super::pad_batch(clips);
 
         // Run inference
-        let (log_probs, lengths) = self.forward(&audio_batch.0, Some(&audio_batch.1))?;
+        let (log_probs, lengths) = self.forward(&audio, Some(&lengths))?;
 
         // Decode
         let token_sequences = greedy_decode(&log_probs, &lengths, self.blank_id)?;
@@ -440,46 +471,6 @@ impl EncDecCTCModel {
         Ok((log_probs, encoded_lengths))
     }
 
-    /// Load audio files and return batched tensors.
-    fn load_audio_batch(&self, paths: &[impl AsRef<Path>]) -> Result<(Array, Array)> {
-        let sample_rate = self.config.sample_rate;
-        let mut audio_samples = Vec::new();
-        let mut lengths = Vec::new();
-
-        for path in paths {
-            let path = path.as_ref();
-            let (samples, file_sample_rate) = load_wav(path)?;
-
-            // Resample if necessary
-            let samples = if file_sample_rate != sample_rate {
-                resample(&samples, file_sample_rate, sample_rate)?
-            } else {
-                samples
-            };
-
-            lengths.push(samples.len());
-            audio_samples.push(samples);
-        }
-
-        // Pad to max length and create batch
-        let max_len = lengths.iter().max().copied().unwrap_or(0);
-        let batch_size = audio_samples.len();
-
-        let mut padded_data = vec![0.0f32; batch_size * max_len];
-        for (i, samples) in audio_samples.iter().enumerate() {
-            let offset = i * max_len;
-            padded_data[offset..offset + samples.len()].copy_from_slice(samples);
-        }
-
-        let audio = Array::from_slice(&padded_data, &[batch_size as i32, max_len as i32]);
-        let lengths_arr = Array::from_slice(
-            &lengths.iter().map(|&l| l as i32).collect::<Vec<_>>(),
-            &[batch_size as i32],
-        );
-
-        Ok((audio, lengths_arr))
-    }
-
     /// Decode token sequences to text.
     fn decode_tokens(&self, token_sequences: &[Vec<usize>]) -> Result<Vec<String>> {
         let tokenizer = self
@@ -487,17 +478,10 @@ impl EncDecCTCModel {
             .as_ref()
             .ok_or_else(|| Error::tokenizer("No tokenizer loaded. Call load_tokenizer first."))?;
 
-        let mut texts = Vec::with_capacity(token_sequences.len());
-
-        for tokens in token_sequences {
-            let token_ids: Vec<u32> = tokens.iter().map(|&t| t as u32).collect();
-            let text = tokenizer
-                .decode_piece_ids(&token_ids)
-                .map_err(|e| Error::tokenizer(format!("Failed to decode tokens: {}", e)))?;
-            texts.push(text);
-        }
-
-        Ok(texts)
+        Ok(token_sequences
+            .iter()
+            .map(|tokens| tokenizer.decode(tokens, false))
+            .collect())
     }
 
     /// Get the model configuration.
@@ -541,7 +525,10 @@ impl EncDecCTCModel {
     /// Initialize a streaming session for the given mode.
     ///
     /// # Arguments
-    /// * `mode_idx` - Streaming mode index (0 = default, typically lowest latency)
+    /// * `mode_idx` - Streaming mode index into the checkpoint's `att_context_size` list (see
+    ///   `streaming_modes()` for each mode's latency). NeMo checkpoints list modes
+    ///   from most to least lookahead, so mode 0, the model's default, has the
+    ///   highest latency and accuracy
     /// * `batch_size` - Number of independent audio streams to process
     ///
     /// # Returns
@@ -666,12 +653,11 @@ impl EncDecCTCModel {
             let collapsed = greedy_ctc_merge(&merged, session.blank_id);
 
             // Decode to text
-            let text = if let Some(tokenizer) = &self.tokenizer {
-                let token_ids: Vec<u32> = collapsed.iter().map(|&t| t as u32).collect();
-                tokenizer.decode_piece_ids(&token_ids).unwrap_or_default()
-            } else {
-                String::new()
-            };
+            let text = self
+                .tokenizer
+                .as_ref()
+                .map(|tokenizer| tokenizer.decode(&collapsed, false))
+                .unwrap_or_default();
 
             session.prev_tokens[i] = merged;
             merged_tokens.push(collapsed);
@@ -703,12 +689,11 @@ impl EncDecCTCModel {
         for tokens in &session.prev_tokens {
             let collapsed = greedy_ctc_merge(tokens, session.blank_id);
 
-            let text = if let Some(tokenizer) = &self.tokenizer {
-                let token_ids: Vec<u32> = collapsed.iter().map(|&t| t as u32).collect();
-                tokenizer.decode_piece_ids(&token_ids).unwrap_or_default()
-            } else {
-                String::new()
-            };
+            let text = self
+                .tokenizer
+                .as_ref()
+                .map(|tokenizer| tokenizer.decode(&collapsed, false))
+                .unwrap_or_default();
 
             final_tokens.push(collapsed);
             final_texts.push(text);
@@ -726,6 +711,7 @@ impl EncDecCTCModel {
 /// Streaming session state for CTC models.
 ///
 /// Contains all state needed for incremental streaming inference.
+#[derive(Debug)]
 pub struct CtcStreamingSession {
     /// Streaming configuration (chunk sizes, cache sizes, etc.)
     pub config: StreamingConfig,
@@ -741,66 +727,4 @@ pub struct CtcStreamingSession {
 
     /// Blank token ID for CTC decoding
     blank_id: usize,
-}
-
-/// Load a WAV file and return samples and sample rate.
-#[cfg(feature = "asr")]
-fn load_wav(path: &Path) -> Result<(Vec<f32>, u32)> {
-    use hound::WavReader;
-
-    let reader = WavReader::open(path)
-        .map_err(|e| Error::audio(format!("Failed to open WAV file: {}", e)))?;
-
-    let spec = reader.spec();
-    let sample_rate = spec.sample_rate;
-    let channels = spec.channels as usize;
-
-    let samples: Vec<f32> = match spec.sample_format {
-        hound::SampleFormat::Float => {
-            let samples: Vec<f32> = reader
-                .into_samples::<f32>()
-                .collect::<std::result::Result<Vec<_>, _>>()
-                .map_err(|e| Error::audio(format!("Failed to read samples: {}", e)))?;
-
-            // Convert stereo to mono by averaging
-            if channels > 1 {
-                samples
-                    .chunks(channels)
-                    .map(|chunk| chunk.iter().sum::<f32>() / channels as f32)
-                    .collect()
-            } else {
-                samples
-            }
-        }
-        hound::SampleFormat::Int => {
-            let bits = spec.bits_per_sample;
-            let max_val = (1 << (bits - 1)) as f32;
-
-            let samples: Vec<i32> = reader
-                .into_samples::<i32>()
-                .collect::<std::result::Result<Vec<_>, _>>()
-                .map_err(|e| Error::audio(format!("Failed to read samples: {}", e)))?;
-
-            // Convert to float and handle channels
-            if channels > 1 {
-                samples
-                    .chunks(channels)
-                    .map(|chunk| {
-                        chunk.iter().map(|&s| s as f32).sum::<f32>() / (channels as f32 * max_val)
-                    })
-                    .collect()
-            } else {
-                samples.iter().map(|&s| s as f32 / max_val).collect()
-            }
-        }
-    };
-
-    Ok((samples, sample_rate))
-}
-
-#[cfg(not(feature = "asr"))]
-fn load_wav(_path: &Path) -> Result<(Vec<f32>, u32)> {
-    Err(Error::not_implemented(
-        "Audio loading requires the 'asr' feature",
-    ))
 }

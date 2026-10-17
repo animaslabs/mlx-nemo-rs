@@ -31,9 +31,15 @@ impl QuantizationConfig {
 }
 
 /// Linear layer that can be standard (float) or quantized.
+#[derive(Debug)]
 pub enum LinearLayer {
     /// Standard float linear layer
-    Standard { weight: Array, bias: Option<Array> },
+    Standard {
+        /// Weights [out, in]
+        weight: Array,
+        /// Optional layer bias [out]
+        bias: Option<Array>,
+    },
     /// Quantized linear layer
     Quantized {
         /// Packed quantized weights [out, in / (32/bits)]
@@ -156,6 +162,7 @@ impl LinearLayer {
 }
 
 /// Embedding layer that can be standard (float) or quantized.
+#[derive(Debug)]
 pub enum EmbeddingLayer {
     /// Standard float embedding
     Standard(Array),

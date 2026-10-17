@@ -22,6 +22,7 @@ use crate::core::quantization::{LinearLayer, QuantizationConfig};
 pub const AUTO_LANGUAGE: &str = "auto";
 
 /// The `prompt_kernel` projection and the selected language.
+#[derive(Debug)]
 pub struct LanguagePrompt {
     proj_in: LinearLayer,
     proj_out: LinearLayer,

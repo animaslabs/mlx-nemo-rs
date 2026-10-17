@@ -27,7 +27,9 @@ impl AttContextSize {
     /// Get the default (first) context size as (left, right).
     ///
     /// For Single, returns the values directly.
-    /// For Multiple, returns the first mode (typically the largest context / lowest latency).
+    /// For Multiple, returns the first mode, which NeMo uses by default. NeMo
+    /// checkpoints list modes from most to least lookahead (right context), so
+    /// this is the highest-latency, most accurate mode.
     pub fn get_default(&self) -> Option<(i32, i32)> {
         match self {
             AttContextSize::Single(v) if v.len() >= 2 => Some((v[0], v[1])),

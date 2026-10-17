@@ -154,14 +154,18 @@ or unsupported.
 streaming works. When it does, take `&[&[f32]]` (one slice per stream), as
 `MultiTalkerPipeline` already does internally with its batched encoder cache.
 
-### 1.4 What streaming mode 0 means is contradictory
+### 1.4 What streaming mode 0 means was contradictory (docs fixed)
+
+**Done:** every `mode_idx` doc, `AttContextSize::get_default` and the README now say the same thing: the index into the checkpoint's list, where mode 0 is the default and has the most lookahead. The type-safe `StreamingMode` below is still open.
 
 `CacheAwareRNNTPipeline::restore` documents `mode_idx` as "0 = highest latency",
 and `EncDecCTCModel::init_streaming` says "0 = default, typically lowest
 latency". In fact the order is whatever the checkpoint's `att_context_size` list
 holds, so it varies by model. See §4.4 for a type-safe alternative.
 
-### 1.5 Duplicated audio loading
+### 1.5 Duplicated audio loading (fixed)
+
+**Done:** the four private `load_wav` copies and the pipeline's `resample_audio` wrapper are gone; everything uses `crate::audio`.
 
 `enc_dec_rnnt.rs`, `enc_dec_ctc.rs`, `enc_dec_classification.rs` and
 `cache_aware_rnnt.rs` each have a private `load_wav` copy alongside the public
@@ -255,7 +259,9 @@ let model = mlx_voice::asr::load("model.nemo")?;   // -> AnyAsrModel, which impl
 
 ## 3. Offline inference
 
-### 3.1 Accept audio, not only paths
+### 3.1 Accept audio, not only paths (partly done)
+
+**Done:** `EncDecCTCModel` and `EncDecRNNTModel` have `transcribe_samples(&[f32], sample_rate) -> String`, which resamples to the model's rate. The `AudioInput` design below, which would unify paths and samples in `transcribe`, is still open.
 
 `EncDecCTCModel::transcribe` and `EncDecRNNTModel::transcribe` only take file
 paths (`&[impl AsRef<Path>]`). There's no supported way to transcribe samples
@@ -743,7 +749,9 @@ Tools to keep this in check:
 
 ## 10. Tokenizer, audio and features
 
-### 10.1 Public `Tokenizer`
+### 10.1 Public `Tokenizer` (done)
+
+**Done:** `mlx_voice::asr::Tokenizer` has `decode`, `encode`, `piece_to_id`, `vocab_size`, `is_word_start`, `is_lang_tag` and `detected_language`, and `tokenizer()` is available on the CTC and RNN-T models and on both pipelines. Token ids stay `usize` for now (no `TokenId` alias). The free functions in `asr::decoding` that take a `SentencePieceProcessor` are still public.
 
 The models hold a `sentencepiece::SentencePieceProcessor`, but no model exposes
 it, and the crate doesn't re-export `sentencepiece`. Users can get token ids
@@ -791,7 +799,9 @@ replace it later without a breaking change.
 
 ---
 
-## 11. Derives and small conventions
+## 11. Derives and small conventions (partly done)
+
+**Done:** every public type implements `Debug`. Layers and states derive it, and models, pipelines and mel processors have short manual impls that don't print weights. Output types (`TranscribeOutput`, `SpeakerWord`, `SpeakerSegment`, `MultiTalkerOutput`, `MultiTalkerConfig`, `StreamingModeInfo`, `DecodeStepOutput`, `VadPostProcessConfig`) derive `PartialEq`, and `SpeechSegment` derives `Copy`. `RnntDecodingStrategy` derives `Default`. `lib.rs` sets `#![warn(missing_docs, missing_debug_implementations)]`. `#[must_use]` and the `with_*`/`set_*` cleanup are still open.
 
 From the Rust API guidelines interoperability checklist (C-COMMON-TRAITS, C-DEBUG):
 
@@ -826,12 +836,13 @@ release happens.
 **0.1.x (no breaking changes)**
 
 1. ~~Wire up `BeamSearch` (§1.1). Make missing weights and a missing
-   tokenizer an error (§1.2).~~ Done. Still to do: fix the mode-0 docs (§1.4)
-   and remove the duplicate `load_wav` copies (§1.5).
-2. Add the `Tokenizer` wrapper and `model.tokenizer()` (§10.1),
+   tokenizer an error, with an opt-out (§1.2). Fix the mode-0 docs (§1.4) and
+   remove the duplicate `load_wav` copies (§1.5).~~ Done.
+2. ~~Add the `Tokenizer` wrapper and `model.tokenizer()` (§10.1),
    `transcribe_samples(&[f32], sample_rate)` on CTC/RNN-T (§3.1),
-   `Debug`/`PartialEq` derives (§11), `#![warn(missing_docs)]`, and a
-   `cargo public-api` snapshot.
+   `Debug`/`PartialEq` derives (§11), and `#![warn(missing_docs)]`.~~ Done.
+   Still to do: a `cargo public-api` snapshot test, which needs a nightly
+   toolchain in CI.
 
 **0.2.0 (breaking, one release)**
 

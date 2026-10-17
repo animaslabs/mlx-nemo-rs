@@ -347,6 +347,7 @@ fn apply_speaker_kernels(
 ///
 /// This implements the Conformer architecture as used in NeMo's ASR models,
 /// including FastConformer variants with depthwise striding subsampling.
+#[derive(Debug)]
 pub struct ConformerEncoder {
     config: EncoderConfig,
 
@@ -1062,6 +1063,7 @@ const SUBSAMPLING_CHUNK_FRAMES: usize = 4096;
 ///
 /// This implements the `dw_striding` subsampling method used in NeMo's Conformer encoder.
 /// It uses 2D convolutions to downsample the mel spectrogram in both time and frequency.
+#[derive(Debug)]
 struct Subsampling {
     #[allow(dead_code)]
     subsampling_factor: usize,
@@ -1586,6 +1588,7 @@ impl Subsampling {
 }
 
 /// Single Conformer block.
+#[derive(Debug)]
 struct ConformerBlock {
     #[allow(dead_code)]
     d_model: usize,
@@ -1995,6 +1998,7 @@ impl ConformerBlock {
 }
 
 /// Feed-forward module with expansion.
+#[derive(Debug)]
 struct FeedForward {
     linear1: LinearLayer,
     linear2: LinearLayer,
@@ -2053,6 +2057,7 @@ impl FeedForward {
 }
 
 /// Normalization type for convolution module.
+#[derive(Debug)]
 enum ConvNorm {
     BatchNorm(nn::BatchNorm),
     LayerNorm(nn::LayerNorm),
@@ -2068,6 +2073,7 @@ impl ConvNorm {
 }
 
 /// Convolution module for Conformer.
+#[derive(Debug)]
 struct ConvolutionModule {
     d_model: usize,
     pointwise_conv1: LinearLayer,

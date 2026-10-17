@@ -57,6 +57,15 @@ pub struct SortformerEncLabelModel {
     config: SortformerConfig,
 }
 
+impl std::fmt::Debug for SortformerEncLabelModel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SortformerEncLabelModel")
+            .field("max_num_spks", &self.max_num_spks())
+            .field("encoder_layers", &self.encoder.num_layers())
+            .finish_non_exhaustive()
+    }
+}
+
 impl SortformerEncLabelModel {
     /// Create a new SortFormer model from configuration.
     pub fn new(config: SortformerConfig) -> Result<Self> {

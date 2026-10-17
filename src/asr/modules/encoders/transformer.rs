@@ -20,6 +20,7 @@ use crate::core::quantization::{LinearLayer, QuantizationConfig};
 ///
 /// NeMo's MultiHeadAttention uses sqrt(sqrt(head_dim)) scaling applied
 /// to both Q and K (rather than 1/sqrt(head_dim) on the dot product).
+#[derive(Debug)]
 struct MultiHeadAttention {
     num_heads: usize,
     head_dim: usize,
@@ -140,6 +141,7 @@ impl MultiHeadAttention {
 /// Position-wise feed-forward network.
 ///
 /// Linear(hidden→inner) → activation → Linear(inner→hidden)
+#[derive(Debug)]
 struct PositionWiseFF {
     linear1: LinearLayer,
     linear2: LinearLayer,
@@ -194,6 +196,7 @@ impl PositionWiseFF {
 ///
 /// Forward:
 ///   x → MHA(x, x, x) → + x → LayerNorm → FFN → + residual → LayerNorm
+#[derive(Debug)]
 struct TransformerEncoderBlock {
     self_attn: MultiHeadAttention,
     ffn: PositionWiseFF,
@@ -270,6 +273,7 @@ impl TransformerEncoderBlock {
 /// Standard Transformer encoder.
 ///
 /// Stack of N TransformerEncoderBlocks with optional final LayerNorm.
+#[derive(Debug)]
 pub struct TransformerEncoder {
     layers: Vec<TransformerEncoderBlock>,
     final_norm: Option<nn::LayerNorm>,

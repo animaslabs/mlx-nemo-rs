@@ -71,11 +71,17 @@ fn main() -> mlx_voice::Result<()> {
 }
 ```
 
-`EncDecRNNTModel` has the same `restore` / `transcribe` API.
+`EncDecRNNTModel` has the same `restore` / `transcribe` API. Both also take audio already in memory, resampling it to the model's rate, and expose the tokenizer for turning token ids into text:
+
+```rust
+let text = model.transcribe_samples(&samples, 48_000)?;
+let tokenizer = model.tokenizer().expect("loaded with the model");
+println!("{}", tokenizer.decode(&token_ids, true));
+```
 
 ### Streaming transcription
 
-`CacheAwareRNNTPipeline` takes audio incrementally and emits partial results as they become available. The second argument to `restore` picks the streaming mode (`0` is the lowest latency).
+`CacheAwareRNNTPipeline` takes audio incrementally and emits partial results as they become available. The second argument to `restore` picks the streaming mode, an index into the checkpoint's `att_context_size` list. NeMo lists modes from most to least lookahead, so `0`, the model's default, has the highest latency and accuracy; `pipeline.streaming_modes()` gives each mode's latency.
 
 ```rust
 use mlx_voice::asr::CacheAwareRNNTPipeline;

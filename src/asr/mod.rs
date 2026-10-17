@@ -42,6 +42,7 @@ pub mod models;
 pub mod modules;
 pub mod pipeline;
 pub mod streaming;
+pub mod tokenizer;
 pub mod vad;
 
 // Re-exports
@@ -50,6 +51,7 @@ pub use models::{
     CtcStreamingSession, DebugOutput, EncDecCTCModel, EncDecClassificationModel, EncDecRNNTModel,
     RnntDecodingStrategy, RnntStreamingSession, SortformerEncLabelModel,
 };
+pub use tokenizer::Tokenizer;
 pub use vad::{SpeechSegment, VadPostProcessConfig, VadPostProcessor};
 // Primary exports (new names)
 pub use modules::{MelConfig, MelProcessor, SpectrumTransform, StreamingMel};
@@ -69,4 +71,5 @@ pub mod prelude {
     pub use super::config::AsrModelConfig;
     pub use super::models::{EncDecCTCModel, EncDecRNNTModel, RnntDecodingStrategy};
     pub use super::pipeline::CacheAwareRNNTPipeline;
+    pub use super::tokenizer::Tokenizer;
 }

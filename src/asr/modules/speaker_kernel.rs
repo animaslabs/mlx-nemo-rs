@@ -25,6 +25,7 @@ use crate::core::loading::Weights;
 use crate::core::quantization::{LinearLayer, QuantizationConfig};
 
 /// A feed-forward speaker kernel.
+#[derive(Debug)]
 struct FfKernel {
     up: LinearLayer,
     down: LinearLayer,
@@ -51,6 +52,7 @@ impl FfKernel {
 
 /// Speaker and background-speaker kernels, keyed by the conformer layer they
 /// are applied before.
+#[derive(Debug)]
 pub struct SpeakerKernels {
     spk: BTreeMap<usize, FfKernel>,
     bg: BTreeMap<usize, FfKernel>,
@@ -102,7 +104,7 @@ impl SpeakerKernels {
 }
 
 /// Per-frame speaker activity masks for one encoder call.
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct SpeakerTargets {
     /// Target speaker activity [batch, time]
     pub spk: Array,

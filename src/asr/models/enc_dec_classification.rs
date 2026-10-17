@@ -25,11 +25,11 @@ use mlx_rs::Array;
 use crate::asr::config::ClassificationModelConfig;
 use crate::asr::modules::MelSpectrogram;
 use crate::asr::modules::encoders::JasperEncoder;
-use crate::audio::resample;
+use crate::audio::{load_wav, resample};
 use crate::core::ArrayExt;
 use crate::core::checkpoint::NemoCheckpoint;
 use crate::core::config::from_yaml_str;
-use crate::core::error::{Error, Result};
+use crate::core::error::Result;
 use crate::core::loading::{LoadOptions, LoadReport, Weights};
 use crate::core::quantization::LinearLayer;
 
@@ -45,6 +45,15 @@ pub struct EncDecClassificationModel {
     encoder: JasperEncoder,
     decoder: LinearLayer,
     num_classes: usize,
+}
+
+impl std::fmt::Debug for EncDecClassificationModel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EncDecClassificationModel")
+            .field("sample_rate", &self.sample_rate())
+            .field("num_classes", &self.num_classes)
+            .finish_non_exhaustive()
+    }
 }
 
 impl EncDecClassificationModel {
@@ -322,64 +331,4 @@ impl EncDecClassificationModel {
 
         Ok((audio, lengths_arr))
     }
-}
-
-/// Load a WAV file and return samples and sample rate.
-#[cfg(feature = "asr")]
-fn load_wav(path: &Path) -> Result<(Vec<f32>, u32)> {
-    use hound::WavReader;
-
-    let reader = WavReader::open(path)
-        .map_err(|e| Error::audio(format!("Failed to open WAV file: {}", e)))?;
-
-    let spec = reader.spec();
-    let sample_rate = spec.sample_rate;
-    let channels = spec.channels as usize;
-
-    let samples: Vec<f32> = match spec.sample_format {
-        hound::SampleFormat::Float => {
-            let samples: Vec<f32> = reader
-                .into_samples::<f32>()
-                .collect::<std::result::Result<Vec<_>, _>>()
-                .map_err(|e| Error::audio(format!("Failed to read samples: {}", e)))?;
-
-            if channels > 1 {
-                samples
-                    .chunks(channels)
-                    .map(|chunk| chunk.iter().sum::<f32>() / channels as f32)
-                    .collect()
-            } else {
-                samples
-            }
-        }
-        hound::SampleFormat::Int => {
-            let bits = spec.bits_per_sample;
-            let max_val = (1 << (bits - 1)) as f32;
-
-            let samples: Vec<i32> = reader
-                .into_samples::<i32>()
-                .collect::<std::result::Result<Vec<_>, _>>()
-                .map_err(|e| Error::audio(format!("Failed to read samples: {}", e)))?;
-
-            if channels > 1 {
-                samples
-                    .chunks(channels)
-                    .map(|chunk| {
-                        chunk.iter().map(|&s| s as f32).sum::<f32>() / (channels as f32 * max_val)
-                    })
-                    .collect()
-            } else {
-                samples.iter().map(|&s| s as f32 / max_val).collect()
-            }
-        }
-    };
-
-    Ok((samples, sample_rate))
-}
-
-#[cfg(not(feature = "asr"))]
-fn load_wav(_path: &Path) -> Result<(Vec<f32>, u32)> {
-    Err(Error::not_implemented(
-        "Audio loading requires the 'asr' feature",
-    ))
 }
