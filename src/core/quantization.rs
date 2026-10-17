@@ -9,8 +9,8 @@
 
 use std::collections::HashMap;
 
-use mlx_rs::ops::{self, indexing};
 use mlx_rs::Array;
+use mlx_rs::ops::{self, indexing};
 
 use crate::core::error::Result;
 
@@ -33,10 +33,7 @@ impl QuantizationConfig {
 /// Linear layer that can be standard (float) or quantized.
 pub enum LinearLayer {
     /// Standard float linear layer
-    Standard {
-        weight: Array,
-        bias: Option<Array>,
-    },
+    Standard { weight: Array, bias: Option<Array> },
     /// Quantized linear layer
     Quantized {
         /// Packed quantized weights [out, in / (32/bits)]
@@ -93,7 +90,12 @@ impl LinearLayer {
                     *b = b.as_dtype(dtype)?;
                 }
             }
-            Self::Quantized { scales, biases, bias, .. } => {
+            Self::Quantized {
+                scales,
+                biases,
+                bias,
+                ..
+            } => {
                 *scales = scales.as_dtype(dtype)?;
                 *biases = biases.as_dtype(dtype)?;
                 if let Some(b) = bias {
@@ -140,7 +142,7 @@ impl LinearLayer {
                     weight,
                     scales,
                     biases,
-                    true,        // transpose
+                    true, // transpose
                     *group_size,
                     *bits,
                 )?;
@@ -204,11 +206,7 @@ impl EmbeddingLayer {
     pub fn embed_dim(&self) -> usize {
         match self {
             Self::Standard(weight) => weight.dim(-1) as usize,
-            Self::Quantized {
-                weight,
-                bits,
-                ..
-            } => {
+            Self::Quantized { weight, bits, .. } => {
                 // weight shape is [vocab, embed_dim / (32/bits)]
                 // So embed_dim = weight.dim(-1) * (32/bits)
                 let packed_dim = weight.dim(-1) as i32;
@@ -258,13 +256,8 @@ impl EmbeddingLayer {
 
                 // Dequantize: weight_float = scales * (weight_int - biases)
                 // MLX dequantize function handles unpacking
-                let dequantized = ops::dequantize(
-                    &quant_rows,
-                    &scale_rows,
-                    &bias_rows,
-                    *group_size,
-                    *bits,
-                )?;
+                let dequantized =
+                    ops::dequantize(&quant_rows, &scale_rows, &bias_rows, *group_size, *bits)?;
 
                 // Reshape back to [..., embed_dim]
                 let embed_dim = dequantized.dim(-1);
@@ -303,9 +296,7 @@ pub fn load_linear_layer(
     ) {
         // Quantized layer
         let bias = weights.get(&bias_key).cloned();
-        let (bits, group_size) = quant
-            .map(|q| (q.bits, q.group_size))
-            .unwrap_or((8, 64)); // Default to 8-bit, group_size 64
+        let (bits, group_size) = quant.map(|q| (q.bits, q.group_size)).unwrap_or((8, 64)); // Default to 8-bit, group_size 64
 
         tracing::debug!(
             prefix,
@@ -375,9 +366,7 @@ pub fn load_embedding_layer(
         weights.get(&biases_key),
     ) {
         // Quantized embedding
-        let (bits, group_size) = quant
-            .map(|q| (q.bits, q.group_size))
-            .unwrap_or((8, 64));
+        let (bits, group_size) = quant.map(|q| (q.bits, q.group_size)).unwrap_or((8, 64));
 
         tracing::debug!(
             prefix,
@@ -439,10 +428,10 @@ mod tests {
         // Create a 4x3 embedding matrix (4 tokens, 3-dim embeddings)
         let weight = Array::from_slice(
             &[
-                1.0f32, 2.0, 3.0,   // token 0
-                4.0, 5.0, 6.0,      // token 1
-                7.0, 8.0, 9.0,      // token 2
-                10.0, 11.0, 12.0,   // token 3
+                1.0f32, 2.0, 3.0, // token 0
+                4.0, 5.0, 6.0, // token 1
+                7.0, 8.0, 9.0, // token 2
+                10.0, 11.0, 12.0, // token 3
             ],
             &[4, 3],
         );

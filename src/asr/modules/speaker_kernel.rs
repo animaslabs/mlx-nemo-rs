@@ -16,12 +16,12 @@
 
 use std::collections::{BTreeMap, HashMap};
 
+use mlx_rs::Array;
 use mlx_rs::ops;
 use mlx_rs::ops::indexing::IndexOp;
-use mlx_rs::Array;
 
 use crate::core::error::Result;
-use crate::core::quantization::{load_linear_layer, LinearLayer, QuantizationConfig};
+use crate::core::quantization::{LinearLayer, QuantizationConfig, load_linear_layer};
 
 /// A feed-forward speaker kernel.
 struct FfKernel {
@@ -60,7 +60,10 @@ impl SpeakerKernels {
     ///
     /// Returns `None` if the checkpoint has no `spk_kernels.*` weights (an
     /// ordinary ASR model).
-    pub fn load(weights: &HashMap<String, Array>, quant: Option<&QuantizationConfig>) -> Option<Self> {
+    pub fn load(
+        weights: &HashMap<String, Array>,
+        quant: Option<&QuantizationConfig>,
+    ) -> Option<Self> {
         let spk = load_kernels(weights, "spk_kernels", quant);
         if spk.is_empty() {
             return None;
@@ -116,7 +119,13 @@ fn load_kernels(
     let layer_prefix = format!("{}.", prefix);
     let mut layers: Vec<usize> = weights
         .keys()
-        .filter_map(|k| k.strip_prefix(&layer_prefix)?.split('.').next()?.parse().ok())
+        .filter_map(|k| {
+            k.strip_prefix(&layer_prefix)?
+                .split('.')
+                .next()?
+                .parse()
+                .ok()
+        })
         .collect();
     layers.sort_unstable();
     layers.dedup();

@@ -65,14 +65,16 @@ impl WeightFormat {
                 if shape[1] == 1 && shape[2] > 1 && shape[3] > 1 {
                     tracing::debug!(
                         "Detected PyTorch format from {}: shape {:?} (in_channels at dim 1)",
-                        name, shape
+                        name,
+                        shape
                     );
                     return Self::PyTorch;
                 }
                 if shape[3] == 1 && shape[1] > 1 && shape[2] > 1 {
                     tracing::debug!(
                         "Detected MLX format from {}: shape {:?} (in_channels at dim 3)",
-                        name, shape
+                        name,
+                        shape
                     );
                     return Self::Mlx;
                 }
@@ -82,9 +84,7 @@ impl WeightFormat {
         // Fallback: check any Conv2d weight with asymmetric dimensions
         for (name, weight) in weights {
             let name_lower = name.to_lowercase();
-            if weight.ndim() == 4
-                && name_lower.contains("conv")
-                && name_lower.ends_with(".weight")
+            if weight.ndim() == 4 && name_lower.contains("conv") && name_lower.ends_with(".weight")
             {
                 let shape = weight.shape();
                 // For pointwise (1x1) conv: kernel = 1x1
@@ -94,7 +94,8 @@ impl WeightFormat {
                 if shape[1] == 1 && shape[2] == 1 && shape[3] > 1 {
                     tracing::debug!(
                         "Detected MLX format from {}: shape {:?} (pointwise conv)",
-                        name, shape
+                        name,
+                        shape
                     );
                     return Self::Mlx;
                 }
@@ -102,7 +103,8 @@ impl WeightFormat {
                 if shape[2] == 1 && shape[3] == 1 && shape[1] > 1 {
                     tracing::debug!(
                         "Detected PyTorch format from {}: shape {:?} (pointwise conv)",
-                        name, shape
+                        name,
+                        shape
                     );
                     return Self::PyTorch;
                 }
@@ -138,14 +140,20 @@ pub fn transform_weights_to_mlx(weights: HashMap<String, Array>) -> Result<HashM
     for (name, weight) in weights {
         let transformed_weight = if should_transpose_conv1d(&name, &weight) {
             // Transpose Conv1d weight from PyTorch (O, I, K) to MLX (O, K, I)
-            weight
-                .transpose_axes(&[0, 2, 1])
-                .map_err(|e| Error::checkpoint(format!("Failed to transpose Conv1d weight '{}': {}", name, e)))?
+            weight.transpose_axes(&[0, 2, 1]).map_err(|e| {
+                Error::checkpoint(format!(
+                    "Failed to transpose Conv1d weight '{}': {}",
+                    name, e
+                ))
+            })?
         } else if should_transpose_conv2d(&name, &weight) {
             // Transpose Conv2d weight from PyTorch (O, I, H, W) to MLX (O, H, W, I)
-            weight
-                .transpose_axes(&[0, 2, 3, 1])
-                .map_err(|e| Error::checkpoint(format!("Failed to transpose Conv2d weight '{}': {}", name, e)))?
+            weight.transpose_axes(&[0, 2, 3, 1]).map_err(|e| {
+                Error::checkpoint(format!(
+                    "Failed to transpose Conv2d weight '{}': {}",
+                    name, e
+                ))
+            })?
         } else {
             weight
         };
@@ -164,7 +172,9 @@ pub fn transform_weights_to_mlx(weights: HashMap<String, Array>) -> Result<HashM
 fn should_transpose_conv1d(name: &str, weight: &Array) -> bool {
     let name_lower = name.to_lowercase();
     let is_conv_weight = name_lower.ends_with(".weight")
-        && (name_lower.contains("conv") || name_lower.contains("depthwise") || name_lower.contains("pointwise"));
+        && (name_lower.contains("conv")
+            || name_lower.contains("depthwise")
+            || name_lower.contains("pointwise"));
     let has_3_dims = weight.ndim() == 3;
 
     is_conv_weight && has_3_dims
@@ -178,7 +188,9 @@ fn should_transpose_conv1d(name: &str, weight: &Array) -> bool {
 fn should_transpose_conv2d(name: &str, weight: &Array) -> bool {
     let name_lower = name.to_lowercase();
     let is_conv_weight = name_lower.ends_with(".weight")
-        && (name_lower.contains("conv") || name_lower.contains("depthwise") || name_lower.contains("pointwise"));
+        && (name_lower.contains("conv")
+            || name_lower.contains("depthwise")
+            || name_lower.contains("pointwise"));
     let has_4_dims = weight.ndim() == 4;
 
     is_conv_weight && has_4_dims
@@ -327,7 +339,10 @@ mod tests {
         assert!(should_transpose_conv1d("CONV.weight", &weight_3d)); // Case insensitive
 
         // Should NOT transpose
-        assert!(!should_transpose_conv1d("encoder.linear.weight", &weight_3d)); // Not conv
+        assert!(!should_transpose_conv1d(
+            "encoder.linear.weight",
+            &weight_3d
+        )); // Not conv
         assert!(!should_transpose_conv1d("encoder.conv.bias", &weight_3d)); // Not .weight
 
         // 2D tensor (e.g., Linear) should NOT be transposed even if named conv
@@ -336,7 +351,10 @@ mod tests {
 
         // 4D tensor (e.g., Conv2d) should NOT be transposed by this function
         let weight_4d = Array::from_slice(&[0.0f32; 48], &[2, 3, 4, 2]);
-        assert!(!should_transpose_conv1d("encoder.conv2d.weight", &weight_4d));
+        assert!(!should_transpose_conv1d(
+            "encoder.conv2d.weight",
+            &weight_4d
+        ));
     }
 
     #[test]
@@ -351,7 +369,10 @@ mod tests {
         assert!(should_transpose_conv2d("CONV.weight", &weight_4d)); // Case insensitive
 
         // Should NOT transpose
-        assert!(!should_transpose_conv2d("encoder.linear.weight", &weight_4d)); // Not conv
+        assert!(!should_transpose_conv2d(
+            "encoder.linear.weight",
+            &weight_4d
+        )); // Not conv
         assert!(!should_transpose_conv2d("encoder.conv.bias", &weight_4d)); // Not .weight
 
         // 3D tensor (e.g., Conv1d) should NOT be transposed by this function

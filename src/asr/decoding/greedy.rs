@@ -2,8 +2,8 @@
 //!
 //! Simple greedy decoding that selects the most probable token at each timestep.
 
-use mlx_rs::ops::indexing::argmax_axis;
 use mlx_rs::Array;
+use mlx_rs::ops::indexing::argmax_axis;
 
 use crate::core::ArrayExt;
 use crate::core::error::Result;

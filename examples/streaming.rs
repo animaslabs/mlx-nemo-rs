@@ -31,7 +31,7 @@ use mlx_voice::asr::{
     CacheAwareRNNTPipeline, EncDecClassificationModel, StreamingModeInfo, VadPostProcessConfig,
     VadPostProcessor,
 };
-use tracing_subscriber::{fmt, EnvFilter};
+use tracing_subscriber::{EnvFilter, fmt};
 
 fn main() -> mlx_voice::Result<()> {
     // Initialize tracing subscriber
@@ -225,7 +225,10 @@ fn main() -> mlx_voice::Result<()> {
         println!("\nLoading VAD model from: {}", vad_path);
         let vad_start = Instant::now();
         let mut vad_model = EncDecClassificationModel::restore(vad_path)?;
-        println!("VAD model loaded in {:.2}s", vad_start.elapsed().as_secs_f32());
+        println!(
+            "VAD model loaded in {:.2}s",
+            vad_start.elapsed().as_secs_f32()
+        );
         println!(
             "VAD frame duration: {:.1}ms, onset: {}, offset: {}",
             vad_model.frame_duration() * 1000.0,
@@ -279,7 +282,10 @@ fn main() -> mlx_voice::Result<()> {
         for (i, seg) in segments.iter().enumerate() {
             println!(
                 "  [{:3}] {:.3}s - {:.3}s  ({:.3}s)",
-                i, seg.start, seg.end, seg.duration()
+                i,
+                seg.start,
+                seg.end,
+                seg.duration()
             );
         }
 
@@ -354,7 +360,6 @@ fn main() -> mlx_voice::Result<()> {
             }
         }
     }
-
 
     let elapsed = start.elapsed().as_secs_f32();
     let rtf = elapsed / audio_duration;
@@ -442,4 +447,3 @@ fn load_audio(path: &str) -> mlx_voice::Result<(Vec<f32>, u32)> {
 
     Ok((samples, sample_rate))
 }
-

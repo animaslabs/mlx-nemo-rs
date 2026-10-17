@@ -41,9 +41,9 @@
 
 use std::path::Path;
 
+use mlx_rs::Array;
 use mlx_rs::ops;
 use mlx_rs::ops::indexing::IndexOp;
-use mlx_rs::Array;
 
 use super::cache_aware_rnnt::CacheAwareRNNTPipeline;
 use crate::asr::decoding::decode_text;
@@ -52,7 +52,6 @@ use crate::asr::modules::SpeakerTargets;
 use crate::asr::streaming::{EncoderCache, FeatureBuffer, StreamingSortformerState};
 use crate::core::ArrayExt;
 use crate::core::error::Result;
-
 
 /// Speaker activity threshold.
 const ACTIVITY_THRESHOLD: f32 = 0.5;
@@ -221,7 +220,8 @@ impl MultiTalkerPipeline {
             MultiTalkerMode::Serial
         };
         let num_spks = diar_model.max_num_spks();
-        let frame_sec = asr.encoder.subsampling_factor() as f32 * asr.mel_stream_config.mel.window_stride;
+        let frame_sec =
+            asr.encoder.subsampling_factor() as f32 * asr.mel_stream_config.mel.window_stride;
 
         let word_start = asr.word_start.clone();
 
@@ -414,7 +414,8 @@ impl MultiTalkerPipeline {
         new_words.sort_by(|a, b| a.start_time.total_cmp(&b.start_time));
         self.words.extend(new_words.iter().cloned());
         if !new_words.is_empty() {
-            self.words.sort_by(|a, b| a.start_time.total_cmp(&b.start_time));
+            self.words
+                .sort_by(|a, b| a.start_time.total_cmp(&b.start_time));
         }
 
         Ok(MultiTalkerOutput {
@@ -427,7 +428,12 @@ impl MultiTalkerPipeline {
     /// Run the encoder on [instances, n_mels, frames] and update the cache.
     ///
     /// Returns the encoder output [instances, frames, d_model] and its length.
-    fn run_encoder(&mut self, features: &Array, lengths: &Array, drop_extra: usize) -> Result<(Array, usize)> {
+    fn run_encoder(
+        &mut self,
+        features: &Array,
+        lengths: &Array,
+        drop_extra: usize,
+    ) -> Result<(Array, usize)> {
         let (encoded, encoded_lengths, cache_channel, cache_time, cache_len) =
             self.asr.encoder.forward_streaming(
                 features,
@@ -442,7 +448,8 @@ impl MultiTalkerPipeline {
         self.encoder_cache.last_channel_len = cache_len;
 
         let encoded = ops::transpose_axes(&encoded, &[0, 2, 1])?;
-        let enc_len = (encoded_lengths.to_vec_row_major::<i32>()?[0].max(0) as usize).min(encoded.dim(1) as usize);
+        let enc_len = (encoded_lengths.to_vec_row_major::<i32>()?[0].max(0) as usize)
+            .min(encoded.dim(1) as usize);
         Ok((encoded, enc_len))
     }
 
@@ -463,7 +470,9 @@ impl MultiTalkerPipeline {
                 .count();
             if n_active <= 1 {
                 for row in preds.iter_mut() {
-                    row.iter_mut().enumerate().for_each(|(spk, p)| *p = if spk == 0 { 1.0 } else { 0.0 });
+                    row.iter_mut()
+                        .enumerate()
+                        .for_each(|(spk, p)| *p = if spk == 0 { 1.0 } else { 0.0 });
                 }
             }
         }
@@ -550,7 +559,11 @@ impl MultiTalkerPipeline {
     }
 
     /// Group new tokens into words, completing a word when the next one starts.
-    fn collect_words(&mut self, tokens: Vec<Vec<(usize, usize)>>, is_final: bool) -> Vec<SpeakerWord> {
+    fn collect_words(
+        &mut self,
+        tokens: Vec<Vec<(usize, usize)>>,
+        is_final: bool,
+    ) -> Vec<SpeakerWord> {
         let mut words = Vec::new();
         for (idx, new_tokens) in tokens.into_iter().enumerate() {
             for (token, frame) in new_tokens {
@@ -572,7 +585,9 @@ impl MultiTalkerPipeline {
     fn make_word(&self, instance: usize, tokens: &[(usize, usize)]) -> Option<SpeakerWord> {
         let tokenizer = self.asr.tokenizer.as_ref()?;
         let ids: Vec<usize> = tokens.iter().map(|&(t, _)| t).collect();
-        let text = decode_text(tokenizer, &ids, self.asr.strip_lang_tags).trim().to_string();
+        let text = decode_text(tokenizer, &ids, self.asr.strip_lang_tags)
+            .trim()
+            .to_string();
         if text.is_empty() {
             return None;
         }
@@ -617,7 +632,11 @@ fn align_rows(rows: &[Vec<f32>], n: usize, width: usize) -> Vec<Vec<f32>> {
 }
 
 /// Group time-ordered words into per-speaker segments split at long pauses.
-fn build_segments(words: &[SpeakerWord], num_spks: usize, sent_break_sec: f32) -> Vec<SpeakerSegment> {
+fn build_segments(
+    words: &[SpeakerWord],
+    num_spks: usize,
+    sent_break_sec: f32,
+) -> Vec<SpeakerSegment> {
     let mut open: Vec<Option<SpeakerSegment>> = vec![None; num_spks.max(1)];
     let mut segments = Vec::new();
     for word in words {
@@ -677,7 +696,10 @@ mod tests {
             word(0, "again", 3.0, 3.4),
         ];
         let segments = build_segments(&words, 2, 1.0);
-        let summary: Vec<(usize, &str)> = segments.iter().map(|s| (s.speaker, s.text.as_str())).collect();
+        let summary: Vec<(usize, &str)> = segments
+            .iter()
+            .map(|s| (s.speaker, s.text.as_str()))
+            .collect();
         assert_eq!(summary, vec![(0, "hello there"), (1, "hi"), (0, "again")]);
     }
 
@@ -692,6 +714,9 @@ mod tests {
     fn test_align_rows() {
         let rows = vec![vec![1.0], vec![2.0], vec![3.0]];
         assert_eq!(align_rows(&rows, 2, 1), vec![vec![2.0], vec![3.0]]);
-        assert_eq!(align_rows(&rows, 4, 1), vec![vec![0.0], vec![1.0], vec![2.0], vec![3.0]]);
+        assert_eq!(
+            align_rows(&rows, 4, 1),
+            vec![vec![0.0], vec![1.0], vec![2.0], vec![3.0]]
+        );
     }
 }

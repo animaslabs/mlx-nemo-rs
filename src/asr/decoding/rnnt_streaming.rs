@@ -8,9 +8,9 @@
 //! - Processes chunks of encoder output incrementally
 //! - Tracks labels including blanks (for future endpointing support)
 
-use mlx_rs::ops::indexing::{argmax_axis, IndexOp};
-use mlx_rs::ops::{self, max_axis};
 use mlx_rs::Array;
+use mlx_rs::ops::indexing::{IndexOp, argmax_axis};
+use mlx_rs::ops::{self, max_axis};
 use tracing::debug;
 
 use crate::asr::models::{DecoderState, PredictionNetwork};
@@ -186,7 +186,12 @@ impl RnntStreamingDecoder {
         // Additive mask over the logits that keeps only emittable non-blank tokens
         let vocab = joint.vocab_size();
         let mut non_blank_mask = vec![0.0f32; vocab];
-        for id in masked_token_ids.unwrap_or_default().iter().copied().chain([blank]) {
+        for id in masked_token_ids
+            .unwrap_or_default()
+            .iter()
+            .copied()
+            .chain([blank])
+        {
             if id < vocab {
                 non_blank_mask[id] = f32::NEG_INFINITY;
             }
@@ -197,11 +202,15 @@ impl RnntStreamingDecoder {
 
         // Prediction for the current history, and the state after consuming
         // `last_token` (committed only once a new token is emitted)
-        let predict = |token: Option<usize>, state: &DecoderState| -> Result<(Array, DecoderState)> {
-            let token = token.map(|t| Array::from_slice(&[t as i32], &[1, 1]));
-            let (pred, next_state) = decoder.predict_one(token.as_ref(), state)?;
-            Ok((joint.project_prediction(&pred.reshape(&[1, -1])?)?, next_state))
-        };
+        let predict =
+            |token: Option<usize>, state: &DecoderState| -> Result<(Array, DecoderState)> {
+                let token = token.map(|t| Array::from_slice(&[t as i32], &[1, 1]));
+                let (pred, next_state) = decoder.predict_one(token.as_ref(), state)?;
+                Ok((
+                    joint.project_prediction(&pred.reshape(&[1, -1])?)?,
+                    next_state,
+                ))
+            };
         let (mut pred_proj, mut next_state) = predict(*last_token, decoder_state)?;
 
         let mut t = 0;
@@ -320,8 +329,7 @@ mod tests {
 
     #[test]
     fn test_decoder_blank_threshold() {
-        let decoder = RnntStreamingDecoder::new(1024)
-            .with_blank_threshold(1.5);
+        let decoder = RnntStreamingDecoder::new(1024).with_blank_threshold(1.5);
         assert_eq!(decoder.blank_id(), 1024);
         assert_eq!(decoder.blank_threshold(), 1.5);
 

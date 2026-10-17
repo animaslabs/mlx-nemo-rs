@@ -83,8 +83,8 @@ pub fn load_wav(_path: impl AsRef<Path>) -> Result<(Vec<f32>, u32)> {
 #[cfg(feature = "asr")]
 pub fn resample(samples: &[f32], from_rate: u32, to_rate: u32) -> Result<Vec<f32>> {
     use rubato::{
-        audioadapter_buffers::direct::InterleavedSlice, Async, FixedAsync, Resampler,
-        SincInterpolationParameters, SincInterpolationType, WindowFunction,
+        Async, FixedAsync, Resampler, SincInterpolationParameters, SincInterpolationType,
+        WindowFunction, audioadapter_buffers::direct::InterleavedSlice,
     };
 
     if from_rate == to_rate || samples.is_empty() {

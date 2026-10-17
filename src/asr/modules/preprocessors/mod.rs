@@ -10,7 +10,7 @@ pub use mel_spectrogram::{MelConfig, MelProcessor, SpectrumTransform, StreamingM
 
 // Stateless streaming exports (legacy API - use StreamingMel for new code)
 pub use mel_spectrogram::{
-    frames_available, process_audio_streaming, MelStreamState, StreamingMelConfig,
+    MelStreamState, StreamingMelConfig, frames_available, process_audio_streaming,
 };
 
 // Backwards-compatible aliases

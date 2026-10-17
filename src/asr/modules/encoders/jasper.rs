@@ -8,10 +8,10 @@
 
 use std::collections::HashMap;
 
+use mlx_rs::Array;
 use mlx_rs::builder::Builder;
 use mlx_rs::module::Module;
 use mlx_rs::nn;
-use mlx_rs::Array;
 
 use crate::asr::config::{JasperBlockConfig, JasperEncoderConfig};
 use crate::core::error::Result;
@@ -75,17 +75,14 @@ impl SubBlock {
 
         if separable {
             // Depthwise conv: groups = in_channels
-            let dw_conv = nn::Conv1dBuilder::new(
-                in_channels as i32,
-                in_channels as i32,
-                kernel_size as i32,
-            )
-            .padding(padding as i32)
-            .stride(stride as i32)
-            .dilation(dilation as i32)
-            .groups(in_channels as i32)
-            .bias(false)
-            .build()?;
+            let dw_conv =
+                nn::Conv1dBuilder::new(in_channels as i32, in_channels as i32, kernel_size as i32)
+                    .padding(padding as i32)
+                    .stride(stride as i32)
+                    .dilation(dilation as i32)
+                    .groups(in_channels as i32)
+                    .bias(false)
+                    .build()?;
 
             // Pointwise conv: 1x1
             let conv = nn::Conv1dBuilder::new(in_channels as i32, out_channels as i32, 1)
@@ -104,16 +101,13 @@ impl SubBlock {
             })
         } else {
             // Regular conv
-            let conv = nn::Conv1dBuilder::new(
-                in_channels as i32,
-                out_channels as i32,
-                kernel_size as i32,
-            )
-            .padding(padding as i32)
-            .stride(stride as i32)
-            .dilation(dilation as i32)
-            .bias(false)
-            .build()?;
+            let conv =
+                nn::Conv1dBuilder::new(in_channels as i32, out_channels as i32, kernel_size as i32)
+                    .padding(padding as i32)
+                    .stride(stride as i32)
+                    .dilation(dilation as i32)
+                    .bias(false)
+                    .build()?;
 
             // NeMo uses eps=1e-3 for Jasper BatchNorm
             let bn = nn::BatchNormBuilder::new(out_channels as i32)
@@ -147,10 +141,9 @@ struct ResidualBranch {
 
 impl ResidualBranch {
     fn new(in_channels: usize, out_channels: usize) -> Result<Self> {
-        let conv =
-            nn::Conv1dBuilder::new(in_channels as i32, out_channels as i32, 1)
-                .bias(false)
-                .build()?;
+        let conv = nn::Conv1dBuilder::new(in_channels as i32, out_channels as i32, 1)
+            .bias(false)
+            .build()?;
         // NeMo uses eps=1e-3 for Jasper BatchNorm
         let bn = nn::BatchNormBuilder::new(out_channels as i32)
             .eps(1e-3_f32)
@@ -257,7 +250,10 @@ impl JasperBlock {
         // For non-separable blocks:
         // Per sub-block: conv, bn, relu (no params), dropout (no params)
         // = 4 indices per sub-block (except last = 2 indices)
-        let is_separable = self.sub_blocks.first().map_or(false, |s| s.dw_conv.is_some());
+        let is_separable = self
+            .sub_blocks
+            .first()
+            .map_or(false, |s| s.dw_conv.is_some());
         let n = self.sub_blocks.len();
 
         let mut mconv_idx = 0;
@@ -271,17 +267,33 @@ impl JasperBlock {
                     mconv_idx += 1;
                 }
                 // pw_conv
-                load_conv1d(&mut sub.conv, weights, &format!("{}.mconv.{}.conv", prefix, mconv_idx));
+                load_conv1d(
+                    &mut sub.conv,
+                    weights,
+                    &format!("{}.mconv.{}.conv", prefix, mconv_idx),
+                );
                 mconv_idx += 1;
                 // bn
-                load_batch_norm(&mut sub.bn, weights, &format!("{}.mconv.{}", prefix, mconv_idx));
+                load_batch_norm(
+                    &mut sub.bn,
+                    weights,
+                    &format!("{}.mconv.{}", prefix, mconv_idx),
+                );
                 mconv_idx += 1;
             } else {
                 // conv
-                load_conv1d(&mut sub.conv, weights, &format!("{}.mconv.{}.conv", prefix, mconv_idx));
+                load_conv1d(
+                    &mut sub.conv,
+                    weights,
+                    &format!("{}.mconv.{}.conv", prefix, mconv_idx),
+                );
                 mconv_idx += 1;
                 // bn
-                load_batch_norm(&mut sub.bn, weights, &format!("{}.mconv.{}", prefix, mconv_idx));
+                load_batch_norm(
+                    &mut sub.bn,
+                    weights,
+                    &format!("{}.mconv.{}", prefix, mconv_idx),
+                );
                 mconv_idx += 1;
             }
 

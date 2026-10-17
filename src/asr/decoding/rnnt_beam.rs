@@ -5,8 +5,8 @@
 
 use std::cmp::Ordering;
 
-use mlx_rs::ops::indexing::IndexOp;
 use mlx_rs::Array;
+use mlx_rs::ops::indexing::IndexOp;
 
 use crate::asr::modules::{RNNTJoint, StatelessTransducerDecoder};
 use crate::core::ArrayExt;

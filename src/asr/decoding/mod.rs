@@ -23,11 +23,11 @@ mod rnnt_greedy;
 mod rnnt_streaming;
 
 pub use detokenize::{
-    decode_text, is_lang_tag, lang_tag_table, last_lang_tag, strip_lang_tags, word_start_table,
-    IncrementalDetokenizer,
+    IncrementalDetokenizer, decode_text, is_lang_tag, lang_tag_table, last_lang_tag,
+    strip_lang_tags, word_start_table,
 };
 pub use greedy::greedy_decode;
-pub use merge::{greedy_ctc_merge, lcs_merge_buffer, LcsAlignmentResult};
+pub use merge::{LcsAlignmentResult, greedy_ctc_merge, lcs_merge_buffer};
 pub use rnnt_beam::rnnt_beam_decode;
 pub use rnnt_greedy::{rnnt_greedy_decode, rnnt_greedy_decode_batched};
 pub use rnnt_streaming::{DecodeStepOutput, RnntStreamingDecoder};

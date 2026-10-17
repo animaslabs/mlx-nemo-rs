@@ -20,8 +20,8 @@
 use std::path::Path;
 use std::time::Instant;
 
-use mlx_voice::asr::EncDecCTCModel;
 use mlx_voice::WeightFormat;
+use mlx_voice::asr::EncDecCTCModel;
 
 fn main() -> mlx_voice::Result<()> {
     // Parse command line arguments
@@ -107,7 +107,10 @@ fn main() -> mlx_voice::Result<()> {
 }
 
 /// Load model from various formats: .nemo, .safetensors, or directory
-fn load_model(model_path: &str, weight_format: Option<WeightFormat>) -> mlx_voice::Result<EncDecCTCModel> {
+fn load_model(
+    model_path: &str,
+    weight_format: Option<WeightFormat>,
+) -> mlx_voice::Result<EncDecCTCModel> {
     let path = Path::new(model_path);
 
     if path.is_dir() {
@@ -142,7 +145,9 @@ fn load_model(model_path: &str, weight_format: Option<WeightFormat>) -> mlx_voic
                 // Show weight format being used
                 match weight_format {
                     Some(WeightFormat::Mlx) => println!("  Weights: MLX format (no transposition)"),
-                    Some(WeightFormat::PyTorch) => println!("  Weights: PyTorch format (will transpose Conv1d)"),
+                    Some(WeightFormat::PyTorch) => {
+                        println!("  Weights: PyTorch format (will transpose Conv1d)")
+                    }
                     None => println!("  Weights: Auto-detect from metadata"),
                 }
 

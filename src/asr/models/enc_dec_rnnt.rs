@@ -31,26 +31,24 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use mlx_rs::ops::indexing::IndexOp;
 use mlx_rs::Array;
+use mlx_rs::ops::indexing::IndexOp;
 use sentencepiece::SentencePieceProcessor;
 
 use crate::asr::config::{AsrModelConfig, JointConfig};
-use crate::asr::decoding::{
-    decode_text, lang_tag_table, last_lang_tag, RnntStreamingDecoder,
-};
+use crate::asr::decoding::{RnntStreamingDecoder, decode_text, lang_tag_table, last_lang_tag};
 use crate::asr::modules::{
-    ConformerEncoder, LanguagePrompt, LstmState, MelSpectrogram, MelSpectrogramConfig,
-    RNNTDecoder, RNNTJoint, StatelessTransducerDecoder,
+    ConformerEncoder, LanguagePrompt, LstmState, MelSpectrogram, MelSpectrogramConfig, RNNTDecoder,
+    RNNTJoint, StatelessTransducerDecoder,
 };
 use crate::asr::streaming::{
-    compute_streaming_config, get_streaming_modes, EncoderCache, StreamingConfig,
-    StreamingMelBuffer, StreamingModeInfo, StreamingOutput,
+    EncoderCache, StreamingConfig, StreamingMelBuffer, StreamingModeInfo, StreamingOutput,
+    compute_streaming_config, get_streaming_modes,
 };
+use crate::audio::resample;
 use crate::core::ArrayExt;
 use crate::core::checkpoint::NemoCheckpoint;
 use crate::core::config::from_yaml_str;
-use crate::audio::resample;
 use crate::core::error::{Error, Result};
 use crate::core::quantization::QuantizationConfig;
 
@@ -103,7 +101,10 @@ impl DecoderState {
             DecoderState::Lstm(lstm_state) => {
                 // Compute norm of hidden state
                 lstm_state.hidden.eval().ok();
-                let data = lstm_state.hidden.to_vec_row_major::<f32>().unwrap_or_default();
+                let data = lstm_state
+                    .hidden
+                    .to_vec_row_major::<f32>()
+                    .unwrap_or_default();
                 if !data.is_empty() {
                     let sample_len = data.len().min(100);
                     data[..sample_len].iter().map(|v| v * v).sum::<f32>().sqrt()
@@ -677,7 +678,10 @@ impl EncDecRNNTModel {
 
     /// Every accepted target language key (empty for models without a prompt).
     pub fn languages(&self) -> Vec<&str> {
-        self.joint.prompt().map(|p| p.languages().collect()).unwrap_or_default()
+        self.joint
+            .prompt()
+            .map(|p| p.languages().collect())
+            .unwrap_or_default()
     }
 
     /// Keep or strip the language tags (e.g. `<en-US>`) that prompt-conditioned
@@ -748,7 +752,9 @@ impl EncDecRNNTModel {
         encoder_output: &Array,
         encoder_lengths: &Array,
     ) -> Result<Vec<Vec<usize>>> {
-        let lengths: Vec<i32> = encoder_lengths.as_dtype(mlx_rs::Dtype::Int32)?.to_vec_row_major()?;
+        let lengths: Vec<i32> = encoder_lengths
+            .as_dtype(mlx_rs::Dtype::Int32)?
+            .to_vec_row_major()?;
         let greedy = RnntStreamingDecoder::new(self.blank_id);
 
         // Each sequence decodes independently from a fresh decoder state
@@ -1383,4 +1389,3 @@ fn load_wav(_path: &Path) -> Result<(Vec<f32>, u32)> {
         "Audio loading requires the 'asr' feature",
     ))
 }
-

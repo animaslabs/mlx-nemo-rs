@@ -41,7 +41,13 @@ fn normalize_text(s: &str) -> String {
     let lower = s.to_lowercase();
     let cleaned: String = lower
         .chars()
-        .map(|c| if c.is_alphanumeric() || c == ' ' { c } else { ' ' })
+        .map(|c| {
+            if c.is_alphanumeric() || c == ' ' {
+                c
+            } else {
+                ' '
+            }
+        })
         .collect();
     cleaned.split_whitespace().collect::<Vec<_>>().join(" ")
 }
@@ -135,7 +141,9 @@ fn test_multilingual_streaming_transcription() {
     assert!(pipeline.set_language("xx-YY").is_err());
 
     // Auto mode: the model tags the language, and the tag stays out of the text
-    pipeline.set_audio_file(TEST_AUDIO).expect("Failed to load audio file");
+    pipeline
+        .set_audio_file(TEST_AUDIO)
+        .expect("Failed to load audio file");
     let mut final_output = None;
     while let Some(output) = pipeline.transcribe_step().expect("transcribe_step failed") {
         if output.is_final {
@@ -143,15 +151,27 @@ fn test_multilingual_streaming_transcription() {
         }
     }
     let output = final_output.expect("no final output");
-    assert_eq!(pipeline.detected_language(&output.tokens).as_deref(), Some("en-US"));
-    assert!(!output.text.contains('<'), "language tag in text: {}", output.text);
-    let wer = word_error_rate(&normalize_text(EXPECTED_TEXT), &normalize_text(&output.text));
+    assert_eq!(
+        pipeline.detected_language(&output.tokens).as_deref(),
+        Some("en-US")
+    );
+    assert!(
+        !output.text.contains('<'),
+        "language tag in text: {}",
+        output.text
+    );
+    let wer = word_error_rate(
+        &normalize_text(EXPECTED_TEXT),
+        &normalize_text(&output.text),
+    );
     println!("auto:  {} (WER {:.1}%)", output.text, wer * 100.0);
     assert!(wer < 0.15, "WER {:.1}%: {}", wer * 100.0, output.text);
 
     // An explicit target language
     pipeline.set_language("en-US").unwrap();
-    pipeline.set_audio_file(TEST_AUDIO).expect("Failed to load audio file");
+    pipeline
+        .set_audio_file(TEST_AUDIO)
+        .expect("Failed to load audio file");
     let text = pipeline.run().expect("run failed");
     let wer = word_error_rate(&normalize_text(EXPECTED_TEXT), &normalize_text(&text));
     println!("en-US: {} (WER {:.1}%)", text, wer * 100.0);
@@ -208,8 +228,7 @@ fn test_streaming_transcription() {
 #[test]
 #[ignore]
 fn test_vad_speech_detection() {
-    let model_path =
-        "models/nvidia/Frame_VAD_Multilingual_MarbleNet_v2.0/frame_vad_multilingual_marblenet_v2.0.nemo";
+    let model_path = "models/nvidia/Frame_VAD_Multilingual_MarbleNet_v2.0/frame_vad_multilingual_marblenet_v2.0.nemo";
     if !require_model(model_path) {
         return;
     }
@@ -276,10 +295,7 @@ mod helper_tests {
 
     #[test]
     fn test_normalize_text_punctuation() {
-        assert_eq!(
-            normalize_text("It's a test—really."),
-            "it s a test really"
-        );
+        assert_eq!(normalize_text("It's a test—really."), "it s a test really");
     }
 
     #[test]

@@ -137,7 +137,11 @@ impl AsrModelConfig {
             .and_then(|d| d.get("initialize_prompt_feature"))
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
-        initialize || self.target.as_deref().is_some_and(|t| t.contains("WithPrompt"))
+        initialize
+            || self
+                .target
+                .as_deref()
+                .is_some_and(|t| t.contains("WithPrompt"))
     }
 
     /// Language prompt settings from `model_defaults`, if the model has a prompt dictionary.
@@ -156,7 +160,10 @@ impl AsrModelConfig {
             .get("num_prompts")
             .and_then(|v| v.as_u64())
             .map_or(128, |n| n as usize);
-        Some(PromptConfig { dictionary, num_prompts })
+        Some(PromptConfig {
+            dictionary,
+            num_prompts,
+        })
     }
 
     /// Reject model variants that would load without error but decode incorrectly.
@@ -1265,7 +1272,6 @@ pub struct SortformerConfig {
     extra: std::collections::HashMap<String, yaml_serde::Value>,
 }
 
-
 /// Adds typed access to the config fields this crate does not model explicitly.
 macro_rules! impl_extra_accessor {
     ($($ty:ty),* $(,)?) => {$(
@@ -1350,12 +1356,18 @@ mod tests {
 
     #[test]
     fn test_model_validate() {
-        assert!(asr_config("nemo.collections.asr.models.EncDecRNNTBPEModel").validate().is_ok());
-        assert!(asr_config(
-            "nemo.collections.asr.models.rnnt_bpe_models_prompt.EncDecRNNTBPEModelWithPrompt"
-        )
-        .validate()
-        .is_err());
+        assert!(
+            asr_config("nemo.collections.asr.models.EncDecRNNTBPEModel")
+                .validate()
+                .is_ok()
+        );
+        assert!(
+            asr_config(
+                "nemo.collections.asr.models.rnnt_bpe_models_prompt.EncDecRNNTBPEModelWithPrompt"
+            )
+            .validate()
+            .is_err()
+        );
 
         let mut prompt = asr_config(
             "nemo.collections.asr.models.rnnt_bpe_models_prompt.EncDecRNNTBPEModelWithPrompt",

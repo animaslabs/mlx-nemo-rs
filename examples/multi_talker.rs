@@ -19,7 +19,7 @@ use std::path::Path;
 use std::time::Instant;
 
 use mlx_voice::asr::pipeline::{MultiTalkerConfig, MultiTalkerPipeline};
-use tracing_subscriber::{fmt, EnvFilter};
+use tracing_subscriber::{EnvFilter, fmt};
 
 fn main() -> mlx_voice::Result<()> {
     fmt()
@@ -85,12 +85,13 @@ fn main() -> mlx_voice::Result<()> {
 
     let diar_model_path = match diar_model_path {
         Some(p) => p.to_string(),
-        None => find_model("models", "diar_streaming_sortformer")
-            .unwrap_or_else(|| {
-                eprintln!("Error: could not find diarization model in models/. Use --diar-model <path>");
-                print_usage();
-                std::process::exit(1);
-            }),
+        None => find_model("models", "diar_streaming_sortformer").unwrap_or_else(|| {
+            eprintln!(
+                "Error: could not find diarization model in models/. Use --diar-model <path>"
+            );
+            print_usage();
+            std::process::exit(1);
+        }),
     };
 
     let audio_path = audio_path.unwrap_or_else(|| {
@@ -104,8 +105,12 @@ fn main() -> mlx_voice::Result<()> {
     tracing::info!("Loading diarization model from: {}", &diar_model_path);
 
     let start = Instant::now();
-    let mut pipeline =
-        MultiTalkerPipeline::restore_with_config(&asr_model_path, &diar_model_path, mode_idx, config)?;
+    let mut pipeline = MultiTalkerPipeline::restore_with_config(
+        &asr_model_path,
+        &diar_model_path,
+        mode_idx,
+        config,
+    )?;
     tracing::info!(
         "Models loaded in {:.2}s ({:?} mode)",
         start.elapsed().as_secs_f32(),

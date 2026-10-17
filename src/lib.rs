@@ -31,9 +31,9 @@ pub mod asr;
 pub mod audio;
 
 // Re-export commonly used types
+pub use core::checkpoint::SafetensorsLoader;
 pub use core::error::{Error, Result};
 pub use core::weights::WeightFormat;
-pub use core::checkpoint::SafetensorsLoader;
 #[doc(no_inline)]
 pub use mlx_rs::Array;
 

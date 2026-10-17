@@ -11,11 +11,11 @@
 
 use std::collections::{BTreeMap, HashMap};
 
-use mlx_rs::{ops, Array};
+use mlx_rs::{Array, ops};
 
 use crate::asr::config::AsrModelConfig;
 use crate::core::error::{Error, Result};
-use crate::core::quantization::{load_linear_layer, LinearLayer, QuantizationConfig};
+use crate::core::quantization::{LinearLayer, QuantizationConfig, load_linear_layer};
 
 /// Prompt name that lets the model detect the spoken language itself.
 pub const AUTO_LANGUAGE: &str = "auto";

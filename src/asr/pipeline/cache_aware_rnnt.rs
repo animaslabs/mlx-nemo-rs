@@ -19,21 +19,23 @@ fn find_punctuation_tokens(tokenizer: &SentencePieceProcessor) -> Vec<usize> {
         .filter(|&id| {
             let piece = tokenizer.decode_piece_ids(&[id as u32]).unwrap_or_default();
             // Must have at least one punctuation char and only contain punctuation/whitespace
-            piece.chars().all(|c| c.is_ascii_punctuation() || c.is_whitespace())
+            piece
+                .chars()
+                .all(|c| c.is_ascii_punctuation() || c.is_whitespace())
                 && piece.chars().any(|c| c.is_ascii_punctuation())
         })
         .collect()
 }
 use crate::asr::decoding::{
-    lang_tag_table, last_lang_tag, word_start_table, IncrementalDetokenizer, RnntStreamingDecoder,
+    IncrementalDetokenizer, RnntStreamingDecoder, lang_tag_table, last_lang_tag, word_start_table,
 };
 use crate::asr::models::{DecoderState, PredictionNetwork};
 use crate::asr::modules::{
     ConformerEncoder, LanguagePrompt, MelProcessor, StreamingMel, StreamingMelConfig,
 };
 use crate::asr::streaming::{
-    compute_streaming_config, get_streaming_modes, EncoderCache, FeatureBuffer, StreamingConfig,
-    StreamingModeInfo,
+    EncoderCache, FeatureBuffer, StreamingConfig, StreamingModeInfo, compute_streaming_config,
+    get_streaming_modes,
 };
 use crate::core::ArrayExt;
 use crate::core::checkpoint::NemoCheckpoint;
@@ -724,7 +726,10 @@ impl CacheAwareRNNTPipeline {
 
     /// Every accepted target language key (empty for models without a prompt).
     pub fn languages(&self) -> Vec<&str> {
-        self.joint.prompt().map(|p| p.languages().collect()).unwrap_or_default()
+        self.joint
+            .prompt()
+            .map(|p| p.languages().collect())
+            .unwrap_or_default()
     }
 
     /// Keep or strip the language tags (e.g. `<en-US>`) that prompt-conditioned

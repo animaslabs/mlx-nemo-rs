@@ -3,10 +3,10 @@
 //! Usage:
 //!   cargo run --release --example debug_subsampling -- --model path/to/model.nemo audio.wav
 
-use mlx_voice::asr::modules::{ConformerEncoder, MelSpectrogram, MelSpectrogramConfig};
-use mlx_voice::asr::config::AsrModelConfig;
-use mlx_voice::core::checkpoint::NemoCheckpoint;
 use mlx_rs::Array;
+use mlx_voice::asr::config::AsrModelConfig;
+use mlx_voice::asr::modules::{ConformerEncoder, MelSpectrogram, MelSpectrogramConfig};
+use mlx_voice::core::checkpoint::NemoCheckpoint;
 
 fn main() -> mlx_voice::Result<()> {
     // Parse args
@@ -35,7 +35,11 @@ fn main() -> mlx_voice::Result<()> {
     println!("=== Loading Audio: {} ===", audio_path);
     let (samples, sr) = mlx_voice::audio::load_wav(audio_path)?;
     println!("Sample rate: {}", sr);
-    println!("Duration: {:.2}s ({} samples)", samples.len() as f32 / sr as f32, samples.len());
+    println!(
+        "Duration: {:.2}s ({} samples)",
+        samples.len() as f32 / sr as f32,
+        samples.len()
+    );
 
     println!("\n=== Loading Model: {} ===", model_path);
     let checkpoint = NemoCheckpoint::open(model_path)?;
@@ -43,7 +47,7 @@ fn main() -> mlx_voice::Result<()> {
 
     // Create preprocessor
     let mut preproc_config: MelSpectrogramConfig = config.preprocessor.clone().into();
-    preproc_config.dither = 0.0;  // Disable dither for inference
+    preproc_config.dither = 0.0; // Disable dither for inference
     let mel_proc = MelSpectrogram::new(preproc_config.clone())?;
 
     // Create encoder (has subsampling layer)
@@ -54,18 +58,26 @@ fn main() -> mlx_voice::Result<()> {
     encoder.load_weights(&weights, None)?;
 
     // Streaming parameters (matching Python debug script)
-    let hop_samples = 160;  // 10ms at 16kHz
-    let chunk_size = 112;   // MEL frames per encoder chunk
-    let pre_encode_cache = 9;  // subsampling_factor + 1 = 8 + 1 = 9
+    let hop_samples = 160; // 10ms at 16kHz
+    let chunk_size = 112; // MEL frames per encoder chunk
+    let pre_encode_cache = 9; // subsampling_factor + 1 = 8 + 1 = 9
 
-    let first_chunk_audio_samples = (chunk_size + pre_encode_cache) * hop_samples;  // 121 * 160 = 19360
-    let subsequent_chunk_audio_samples = chunk_size * hop_samples;  // 112 * 160 = 17920
+    let first_chunk_audio_samples = (chunk_size + pre_encode_cache) * hop_samples; // 121 * 160 = 19360
+    let subsequent_chunk_audio_samples = chunk_size * hop_samples; // 112 * 160 = 17920
 
     println!("\n=== Streaming Config ===");
     println!("  Chunk size: {} MEL frames", chunk_size);
     println!("  Pre-encode cache: {} frames", pre_encode_cache);
-    println!("  First chunk audio: {} samples ({:.1}ms)", first_chunk_audio_samples, first_chunk_audio_samples as f32 / sr as f32 * 1000.0);
-    println!("  Subsequent chunk audio: {} samples ({:.1}ms)", subsequent_chunk_audio_samples, subsequent_chunk_audio_samples as f32 / sr as f32 * 1000.0);
+    println!(
+        "  First chunk audio: {} samples ({:.1}ms)",
+        first_chunk_audio_samples,
+        first_chunk_audio_samples as f32 / sr as f32 * 1000.0
+    );
+    println!(
+        "  Subsequent chunk audio: {} samples ({:.1}ms)",
+        subsequent_chunk_audio_samples,
+        subsequent_chunk_audio_samples as f32 / sr as f32 * 1000.0
+    );
 
     println!("\n=== Processing Audio ===");
 
@@ -131,32 +143,55 @@ fn main() -> mlx_voice::Result<()> {
 
         // First 5 values
         let n = 5.min(total_elements);
-        let first_samples: Vec<String> = out_slice[..n].iter().map(|x| format!("{:.6}", x)).collect();
+        let first_samples: Vec<String> =
+            out_slice[..n].iter().map(|x| format!("{:.6}", x)).collect();
 
         // Middle 5 values
         let mid_start = total_elements / 2;
         let mid_end = (mid_start + 5).min(total_elements);
-        let mid_samples: Vec<String> = out_slice[mid_start..mid_end].iter().map(|x| format!("{:.6}", x)).collect();
+        let mid_samples: Vec<String> = out_slice[mid_start..mid_end]
+            .iter()
+            .map(|x| format!("{:.6}", x))
+            .collect();
 
         // Last 5 values
         let last_start = total_elements.saturating_sub(5);
-        let last_samples: Vec<String> = out_slice[last_start..].iter().map(|x| format!("{:.6}", x)).collect();
+        let last_samples: Vec<String> = out_slice[last_start..]
+            .iter()
+            .map(|x| format!("{:.6}", x))
+            .collect();
 
         // Statistics
         let out_min = out_slice.iter().cloned().fold(f32::INFINITY, f32::min);
         let out_max = out_slice.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
         let out_mean: f32 = out_slice.iter().sum::<f32>() / total_elements as f32;
-        let out_std: f32 = (out_slice.iter().map(|&v| (v - out_mean).powi(2)).sum::<f32>() / total_elements as f32).sqrt();
+        let out_std: f32 = (out_slice
+            .iter()
+            .map(|&v| (v - out_mean).powi(2))
+            .sum::<f32>()
+            / total_elements as f32)
+            .sqrt();
 
         println!("\nEncoder call {}:", encoder_call);
-        println!("  Audio samples: {} ({:.1}ms)", chunk.len(), chunk.len() as f32 / sr as f32 * 1000.0);
+        println!(
+            "  Audio samples: {} ({:.1}ms)",
+            chunk.len(),
+            chunk.len() as f32 / sr as f32 * 1000.0
+        );
         println!("  MEL frames: {}", num_mel_frames);
         println!("  MEL input shape: {:?}", mel_batch.shape());
-        println!("  Subsampling output shape: {:?} (total: {})", subsampled.shape(), total_elements);
+        println!(
+            "  Subsampling output shape: {:?} (total: {})",
+            subsampled.shape(),
+            total_elements
+        );
         println!("  first 5: [{}]", first_samples.join(", "));
         println!("  mid 5 (@{}): [{}]", mid_start, mid_samples.join(", "));
         println!("  last 5 (@{}): [{}]", last_start, last_samples.join(", "));
-        println!("  stats: min={:.6}, max={:.6}, mean={:.6}, std={:.6}", out_min, out_max, out_mean, out_std);
+        println!(
+            "  stats: min={:.6}, max={:.6}, mean={:.6}, std={:.6}",
+            out_min, out_max, out_mean, out_std
+        );
 
         // For encoder call 0, print detailed comparison values
         if encoder_call == 0 {
@@ -169,9 +204,16 @@ fn main() -> mlx_voice::Result<()> {
 
             // Time step 0
             println!("  Time step 0:");
-            let t0_samples: Vec<String> = out_slice[..5].iter().map(|x| format!("{:.6}", x)).collect();
-            let t0_mid: Vec<String> = out_slice[512..517].iter().map(|x| format!("{:.6}", x)).collect();
-            let t0_end: Vec<String> = out_slice[1019..1024].iter().map(|x| format!("{:.6}", x)).collect();
+            let t0_samples: Vec<String> =
+                out_slice[..5].iter().map(|x| format!("{:.6}", x)).collect();
+            let t0_mid: Vec<String> = out_slice[512..517]
+                .iter()
+                .map(|x| format!("{:.6}", x))
+                .collect();
+            let t0_end: Vec<String> = out_slice[1019..1024]
+                .iter()
+                .map(|x| format!("{:.6}", x))
+                .collect();
             println!("    features 0-4: [{}]", t0_samples.join(", "));
             println!("    features 512-516: [{}]", t0_mid.join(", "));
             println!("    features 1019-1023: [{}]", t0_end.join(", "));
@@ -180,9 +222,18 @@ fn main() -> mlx_voice::Result<()> {
             let mid_t = t_dim / 2;
             let mid_offset = mid_t * d_dim;
             println!("  Time step {}:", mid_t);
-            let tm_samples: Vec<String> = out_slice[mid_offset..mid_offset+5].iter().map(|x| format!("{:.6}", x)).collect();
-            let tm_mid: Vec<String> = out_slice[mid_offset+512..mid_offset+517].iter().map(|x| format!("{:.6}", x)).collect();
-            let tm_end: Vec<String> = out_slice[mid_offset+1019..mid_offset+1024].iter().map(|x| format!("{:.6}", x)).collect();
+            let tm_samples: Vec<String> = out_slice[mid_offset..mid_offset + 5]
+                .iter()
+                .map(|x| format!("{:.6}", x))
+                .collect();
+            let tm_mid: Vec<String> = out_slice[mid_offset + 512..mid_offset + 517]
+                .iter()
+                .map(|x| format!("{:.6}", x))
+                .collect();
+            let tm_end: Vec<String> = out_slice[mid_offset + 1019..mid_offset + 1024]
+                .iter()
+                .map(|x| format!("{:.6}", x))
+                .collect();
             println!("    features 0-4: [{}]", tm_samples.join(", "));
             println!("    features 512-516: [{}]", tm_mid.join(", "));
             println!("    features 1019-1023: [{}]", tm_end.join(", "));
@@ -191,9 +242,18 @@ fn main() -> mlx_voice::Result<()> {
             let last_t = t_dim - 1;
             let last_offset = last_t * d_dim;
             println!("  Time step {}:", last_t);
-            let tl_samples: Vec<String> = out_slice[last_offset..last_offset+5].iter().map(|x| format!("{:.6}", x)).collect();
-            let tl_mid: Vec<String> = out_slice[last_offset+512..last_offset+517].iter().map(|x| format!("{:.6}", x)).collect();
-            let tl_end: Vec<String> = out_slice[last_offset+1019..last_offset+1024].iter().map(|x| format!("{:.6}", x)).collect();
+            let tl_samples: Vec<String> = out_slice[last_offset..last_offset + 5]
+                .iter()
+                .map(|x| format!("{:.6}", x))
+                .collect();
+            let tl_mid: Vec<String> = out_slice[last_offset + 512..last_offset + 517]
+                .iter()
+                .map(|x| format!("{:.6}", x))
+                .collect();
+            let tl_end: Vec<String> = out_slice[last_offset + 1019..last_offset + 1024]
+                .iter()
+                .map(|x| format!("{:.6}", x))
+                .collect();
             println!("    features 0-4: [{}]", tl_samples.join(", "));
             println!("    features 512-516: [{}]", tl_mid.join(", "));
             println!("    features 1019-1023: [{}]", tl_end.join(", "));
@@ -206,11 +266,14 @@ fn main() -> mlx_voice::Result<()> {
 
             // Print values at each time step (matching Python format)
             // Valid time steps are 0 to t_dim-2 (last one is padding in NeMo)
-            let valid_t = t_dim - 1;  // NeMo considers last step as padding
+            let valid_t = t_dim - 1; // NeMo considers last step as padding
             println!("\n  === Valid output (time steps 0 to {}) ===", valid_t - 1);
             for t in 0..valid_t {
                 let offset = t * d_dim;
-                let vals: Vec<String> = out_slice[offset..offset+5].iter().map(|x| format!("{:.6}", x)).collect();
+                let vals: Vec<String> = out_slice[offset..offset + 5]
+                    .iter()
+                    .map(|x| format!("{:.6}", x))
+                    .collect();
                 println!("  T{:02} [0:5]: [{}]", t, vals.join(", "));
             }
         }

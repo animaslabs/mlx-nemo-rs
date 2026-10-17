@@ -31,8 +31,8 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use mlx_voice::asr::{CacheAwareRNNTPipeline, EncDecRNNTModel};
-use serde_json::{json, Value};
-use tracing_subscriber::{fmt, EnvFilter};
+use serde_json::{Value, json};
+use tracing_subscriber::{EnvFilter, fmt};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     fmt()

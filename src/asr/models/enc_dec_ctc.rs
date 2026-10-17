@@ -46,12 +46,12 @@ use crate::asr::config::AsrModelConfig;
 use crate::asr::decoding::{greedy_ctc_merge, greedy_decode, lcs_merge_buffer};
 use crate::asr::modules::{CTCDecoder, ConformerEncoder, MelSpectrogram};
 use crate::asr::streaming::{
-    compute_streaming_config, get_streaming_modes, EncoderCache, StreamingConfig,
-    StreamingModeInfo, StreamingOutput,
+    EncoderCache, StreamingConfig, StreamingModeInfo, StreamingOutput, compute_streaming_config,
+    get_streaming_modes,
 };
+use crate::audio::resample;
 use crate::core::checkpoint::NemoCheckpoint;
 use crate::core::config::from_yaml_str;
-use crate::audio::resample;
 use crate::core::error::{Error, Result};
 use crate::core::quantization::QuantizationConfig;
 
@@ -666,10 +666,7 @@ impl EncDecCTCModel {
     /// Finalize streaming and get final transcription.
     ///
     /// Returns the complete transcription from accumulated tokens.
-    pub fn finalize_streaming(
-        &mut self,
-        session: CtcStreamingSession,
-    ) -> Result<StreamingOutput> {
+    pub fn finalize_streaming(&mut self, session: CtcStreamingSession) -> Result<StreamingOutput> {
         // Note: preprocessor is stateless, no flush needed
         // All audio has been processed through process_chunk()
 
@@ -782,4 +779,3 @@ fn load_wav(_path: &Path) -> Result<(Vec<f32>, u32)> {
         "Audio loading requires the 'asr' feature",
     ))
 }
-

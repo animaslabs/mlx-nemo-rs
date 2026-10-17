@@ -8,7 +8,8 @@
 use mlx_voice::asr::CacheAwareRNNTPipeline;
 
 fn main() -> mlx_voice::Result<()> {
-    let model_path = "models/nvidia/nemotron-speech-streaming-en-0.6b/nemotron-speech-streaming-en-0.6b.nemo";
+    let model_path =
+        "models/nvidia/nemotron-speech-streaming-en-0.6b/nemotron-speech-streaming-en-0.6b.nemo";
     let audio_path = "samples/2086-149220-0033.wav";
 
     println!("Loading pipeline from: {}", model_path);

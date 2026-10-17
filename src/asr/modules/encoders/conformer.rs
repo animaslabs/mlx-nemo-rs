@@ -7,11 +7,11 @@ use std::collections::HashMap;
 use std::sync::LazyLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use mlx_rs::Array;
 use mlx_rs::builder::Builder;
 use mlx_rs::module::{Module, ModuleParameters};
 use mlx_rs::nn;
 use mlx_rs::ops::indexing::IndexOp;
-use mlx_rs::Array;
 
 use super::attention::{AttentionContext, RelPositionMultiHeadAttention, RelPositionalEncoding};
 use crate::asr::config::EncoderConfig;
@@ -21,8 +21,10 @@ use crate::core::error::Result;
 use crate::core::quantization::{LinearLayer, QuantizationConfig, load_linear_layer};
 
 /// Debug switches, read from the environment once rather than on every call
-static DEBUG_MEL_MASK: LazyLock<bool> = LazyLock::new(|| std::env::var_os("DEBUG_MEL_MASK").is_some());
-static MLX_VOICE_DEBUG: LazyLock<bool> = LazyLock::new(|| std::env::var_os("MLX_VOICE_DEBUG").is_some());
+static DEBUG_MEL_MASK: LazyLock<bool> =
+    LazyLock::new(|| std::env::var_os("DEBUG_MEL_MASK").is_some());
+static MLX_VOICE_DEBUG: LazyLock<bool> =
+    LazyLock::new(|| std::env::var_os("MLX_VOICE_DEBUG").is_some());
 static DEBUG_LAYER0: LazyLock<bool> = LazyLock::new(|| std::env::var_os("DEBUG_LAYER0").is_some());
 static DEBUG_CONV: LazyLock<bool> = LazyLock::new(|| std::env::var_os("DEBUG_CONV").is_some());
 
@@ -537,7 +539,12 @@ impl ConformerEncoder {
     /// This should be called after loading the model and before streaming inference
     /// to select the appropriate context size for the desired latency mode.
     pub fn set_streaming_mode(&mut self, mode_idx: usize) {
-        if let Some(ctx_size) = self.config.att_context_size.as_ref().and_then(|cs| cs.get_mode(mode_idx)) {
+        if let Some(ctx_size) = self
+            .config
+            .att_context_size
+            .as_ref()
+            .and_then(|cs| cs.get_mode(mode_idx))
+        {
             tracing::debug!(
                 mode_idx,
                 left = ctx_size.0,
@@ -588,7 +595,7 @@ impl ConformerEncoder {
             let x_slice: Vec<f32> = x_flat.to_vec_row_major()?;
             let n_features = x.dim(2) as usize;
             let last_frame_offset = (mel_time as usize - 1) * n_features;
-            let before_mask: Vec<f32> = x_slice[last_frame_offset..last_frame_offset+5].to_vec();
+            let before_mask: Vec<f32> = x_slice[last_frame_offset..last_frame_offset + 5].to_vec();
             tracing::debug!(
                 x_shape = ?x.shape(),
                 mel_time,
@@ -608,7 +615,7 @@ impl ConformerEncoder {
             let x_slice: Vec<f32> = x_flat.to_vec_row_major()?;
             let n_features = x.dim(2) as usize;
             let last_frame_offset = (mel_time as usize - 1) * n_features;
-            let after_mask: Vec<f32> = x_slice[last_frame_offset..last_frame_offset+5].to_vec();
+            let after_mask: Vec<f32> = x_slice[last_frame_offset..last_frame_offset + 5].to_vec();
             tracing::debug!(?after_mask, "MEL masking after");
         }
 
@@ -758,7 +765,11 @@ impl ConformerEncoder {
     /// # Returns
     /// * Subsampled features [batch, time', d_model]
     /// * Output lengths [batch]
-    pub fn forward_subsampling_only(&mut self, features: &Array, lengths: &Array) -> Result<(Array, Array)> {
+    pub fn forward_subsampling_only(
+        &mut self,
+        features: &Array,
+        lengths: &Array,
+    ) -> Result<(Array, Array)> {
         self.subsampling.forward(features, lengths)
     }
 
@@ -775,7 +786,11 @@ impl ConformerEncoder {
     /// # Returns
     /// * Encoded features [batch, d_model, time]
     /// * Output lengths [batch]
-    pub fn forward_from_embeddings(&mut self, embeddings: &Array, lengths: &Array) -> Result<(Array, Array)> {
+    pub fn forward_from_embeddings(
+        &mut self,
+        embeddings: &Array,
+        lengths: &Array,
+    ) -> Result<(Array, Array)> {
         let mut x = embeddings.clone();
 
         // Scale input by sqrt(d_model) if xscaling is enabled
@@ -813,7 +828,11 @@ impl ConformerEncoder {
     /// Forward pass with debug output.
     ///
     /// Returns intermediate values for comparison with Python.
-    pub fn forward_debug(&mut self, features: &Array, lengths: &Array) -> Result<DebugEncoderOutput> {
+    pub fn forward_debug(
+        &mut self,
+        features: &Array,
+        lengths: &Array,
+    ) -> Result<DebugEncoderOutput> {
         // Transpose from [B, F, T] to [B, T, F] for processing
         let mut x = mlx_rs::ops::transpose_axes(features, &[0, 2, 1])?;
 
@@ -850,7 +869,8 @@ impl ConformerEncoder {
         for (i, layer) in self.layers.iter_mut().enumerate() {
             x = layer.forward(&x, &pos_emb, context)?;
             x.eval()?;
-            if i < 3 {  // Only save first few layers
+            if i < 3 {
+                // Only save first few layers
                 layer_outputs.push(x.clone());
             }
         }
@@ -927,10 +947,14 @@ impl ConformerEncoder {
         // Lengths and the cache fill level are host arrays (this function
         // returns them that way too), so reading them doesn't wait on the GPU.
         let input_lengths: Vec<i32> = lengths.as_dtype(mlx_rs::Dtype::Int32)?.to_vec_row_major()?;
-        let filled_cache_lens: Vec<i64> = cache_last_channel_len.as_dtype(mlx_rs::Dtype::Int64)?.to_vec_row_major()?;
+        let filled_cache_lens: Vec<i64> = cache_last_channel_len
+            .as_dtype(mlx_rs::Dtype::Int64)?
+            .to_vec_row_major()?;
 
         // Subsampling
-        let mut x = self.subsampling.forward_frames_chunked(&x, SUBSAMPLING_CHUNK_FRAMES)?;
+        let mut x = self
+            .subsampling
+            .forward_frames_chunked(&x, SUBSAMPLING_CHUNK_FRAMES)?;
 
         // Drop the frames the pre-encode cache produced (NeMo also shortens
         // `length` by the same amount)
@@ -1095,7 +1119,12 @@ impl ConformerEncoder {
 
         // NeMo: clamp(cache_last_channel_len + cache_keep_size, max=cache_len),
         // with cache_keep_size = frames - cache_drop_size
-        let keep = (tensor_seq_len as i64 - self.layers.first().map_or(0, |l| l.self_attn.cache_drop_size) as i64).max(0);
+        let keep = (tensor_seq_len as i64
+            - self
+                .layers
+                .first()
+                .map_or(0, |l| l.self_attn.cache_drop_size) as i64)
+            .max(0);
         let next_lens: Vec<i64> = filled_cache_lens
             .iter()
             .map(|&len| (len + keep).min(cache_size as i64))
@@ -1178,7 +1207,11 @@ struct Subsampling {
 impl Subsampling {
     fn set_dtype(&mut self, dtype: mlx_rs::Dtype) -> Result<()> {
         cast_module(&mut self.first_conv, dtype)?;
-        for conv in self.depthwise_convs.iter_mut().chain(self.pointwise_convs.iter_mut()) {
+        for conv in self
+            .depthwise_convs
+            .iter_mut()
+            .chain(self.pointwise_convs.iter_mut())
+        {
             cast_module(conv, dtype)?;
         }
         self.out_proj.cast(dtype)
@@ -1207,7 +1240,11 @@ impl Subsampling {
         // First conv: 1 input channel (mono spectrogram) -> conv_channels
         // For causal: padding=0 (manual causal padding applied before each conv)
         // For non-causal: padding=1 (symmetric padding to preserve frequency dimension)
-        let conv_padding = if is_causal { 0 } else { (kernel_size / 2) as i32 };
+        let conv_padding = if is_causal {
+            0
+        } else {
+            (kernel_size / 2) as i32
+        };
         let first_conv = nn::Conv2dBuilder::new(1, conv_channels as i32, kernel_size as i32)
             .stride(stride as i32)
             .padding(conv_padding)
@@ -1345,16 +1382,28 @@ impl Subsampling {
         let variance: f32 = data.iter().map(|x| (x - mean).powi(2)).sum::<f32>() / n as f32;
         let std = variance.sqrt();
 
-        tracing::info!("  min={:.6} max={:.6} mean={:.6} std={:.6}", min, max, mean, std);
+        tracing::info!(
+            "  min={:.6} max={:.6} mean={:.6} std={:.6}",
+            min,
+            max,
+            mean,
+            std
+        );
 
         // First few samples
         let samples: usize = show_samples.min(n);
-        let first: Vec<String> = data[..samples].iter().map(|x| format!("{:.6}", x)).collect();
+        let first: Vec<String> = data[..samples]
+            .iter()
+            .map(|x| format!("{:.6}", x))
+            .collect();
         tracing::info!("  first {}: [{}]", samples, first.join(", "));
 
         // Last few samples
         if n > samples {
-            let last: Vec<String> = data[n - samples..].iter().map(|x| format!("{:.6}", x)).collect();
+            let last: Vec<String> = data[n - samples..]
+                .iter()
+                .map(|x| format!("{:.6}", x))
+                .collect();
             tracing::info!("  last {}: [{}]", samples, last.join(", "));
         }
     }
@@ -1497,9 +1546,11 @@ impl Subsampling {
         let mut x = x.reshape(&[-1, x.dim(1) as i32, x.dim(2) as i32, 1])?;
 
         if debug_enabled {
-            tracing::info!("DEBUG subsampling: after reshape to [B,T,F,1]: {:?}", x.shape());
+            tracing::info!(
+                "DEBUG subsampling: after reshape to [B,T,F,1]: {:?}",
+                x.shape()
+            );
         }
-
 
         // Apply causal padding if needed before first conv
         if self.is_causal {
@@ -1519,7 +1570,10 @@ impl Subsampling {
         x = mlx_rs::nn::relu(&x)?;
 
         if debug_enabled {
-            tracing::info!("DEBUG subsampling: after first_conv + ReLU: {:?}", x.shape());
+            tracing::info!(
+                "DEBUG subsampling: after first_conv + ReLU: {:?}",
+                x.shape()
+            );
             Self::debug_print_array("after_first_conv", &x, 5);
         }
 
@@ -1535,7 +1589,6 @@ impl Subsampling {
             .zip(self.pointwise_convs.iter_mut())
             .enumerate()
         {
-
             // Apply causal padding before each depthwise conv
             if is_causal {
                 x = causal_pad_2d(&x, kernel_size, stride)?;
@@ -1552,11 +1605,14 @@ impl Subsampling {
             x = mlx_rs::nn::relu(&x)?;
 
             if debug_enabled {
-                tracing::info!("DEBUG subsampling: after dw_conv_{} + pw_conv + ReLU: {:?}", i, x.shape());
+                tracing::info!(
+                    "DEBUG subsampling: after dw_conv_{} + pw_conv + ReLU: {:?}",
+                    i,
+                    x.shape()
+                );
                 Self::debug_print_array(&format!("after_conv_pair_{}", i), &x, 5);
             }
         }
-
 
         // x is now [B, T', F', C] where T' = T/subsampling_factor, F' = F/subsampling_factor
         // In MLX (N, H, W, C), H=T', W=F', C=conv_channels
@@ -1578,14 +1634,20 @@ impl Subsampling {
         let x = mlx_rs::ops::transpose_axes(&x, &[0, 1, 3, 2])?;
 
         if debug_enabled {
-            tracing::info!("DEBUG subsampling: after transpose to [B,T,C,F]: {:?}", x.shape());
+            tracing::info!(
+                "DEBUG subsampling: after transpose to [B,T,C,F]: {:?}",
+                x.shape()
+            );
         }
 
         // Flatten to [B, T', C*F']
         let x = x.reshape(&[batch as i32, time as i32, -1])?;
 
         if debug_enabled {
-            tracing::info!("DEBUG subsampling: after flatten to [B,T,C*F]: {:?}", x.shape());
+            tracing::info!(
+                "DEBUG subsampling: after flatten to [B,T,C*F]: {:?}",
+                x.shape()
+            );
             Self::debug_print_array("before_out_proj", &x, 5);
         }
 
@@ -1756,7 +1818,7 @@ impl ConformerBlock {
             let t00: Vec<f32> = slice[..5].to_vec();
             let t16_offset = 16 * d;
             let t16: Option<Vec<f32>> = if slice.len() > t16_offset + 4 {
-                Some(slice[t16_offset..t16_offset+5].to_vec())
+                Some(slice[t16_offset..t16_offset + 5].to_vec())
             } else {
                 None
             };
@@ -1776,7 +1838,7 @@ impl ConformerBlock {
             let t00: Vec<f32> = slice[..5].to_vec();
             let t16_offset = 16 * d;
             let t16: Option<Vec<f32>> = if slice.len() > t16_offset + 4 {
-                Some(slice[t16_offset..t16_offset+5].to_vec())
+                Some(slice[t16_offset..t16_offset + 5].to_vec())
             } else {
                 None
             };
@@ -1959,7 +2021,8 @@ impl ConformerBlock {
         let residual = x.clone();
         let conv_norm_out = self.conv_norm.forward(&x)?;
         let (conv_out, new_cache_time) =
-            self.conv.forward_with_cache(&conv_norm_out, cache_last_time, pad_mask)?;
+            self.conv
+                .forward_with_cache(&conv_norm_out, cache_last_time, pad_mask)?;
         let x = &residual + &conv_out;
 
         tracing::trace!(
@@ -2059,15 +2122,16 @@ impl FeedForward {
 
     fn new(d_model: usize, ff_dim: usize, dropout: f32, use_bias: bool) -> Result<Self> {
         // Create zero-initialized linear layers (will be loaded from weights)
-        let create_linear = |in_dim: usize, out_dim: usize, with_bias: bool| -> Result<LinearLayer> {
-            let weight = mlx_rs::ops::zeros::<f32>(&[out_dim as i32, in_dim as i32])?;
-            let bias = if with_bias {
-                Some(mlx_rs::ops::zeros::<f32>(&[out_dim as i32])?)
-            } else {
-                None
+        let create_linear =
+            |in_dim: usize, out_dim: usize, with_bias: bool| -> Result<LinearLayer> {
+                let weight = mlx_rs::ops::zeros::<f32>(&[out_dim as i32, in_dim as i32])?;
+                let bias = if with_bias {
+                    Some(mlx_rs::ops::zeros::<f32>(&[out_dim as i32])?)
+                } else {
+                    None
+                };
+                Ok(LinearLayer::standard(weight, bias))
             };
-            Ok(LinearLayer::standard(weight, bias))
-        };
 
         Ok(Self {
             linear1: create_linear(d_model, ff_dim, use_bias)?,
@@ -2079,7 +2143,7 @@ impl FeedForward {
     fn forward(&self, x: &Array) -> Result<Array> {
         let x = self.linear1.forward(x)?;
         let x = mlx_rs::nn::silu(&x)?; // silu is the same as swish
-                                       // Skip dropout during inference
+        // Skip dropout during inference
         let x = self.linear2.forward(&x)?;
         Ok(x)
     }
@@ -2411,11 +2475,9 @@ impl ConvolutionModule {
         quant: Option<&QuantizationConfig>,
     ) -> Result<()> {
         // Load pointwise conv1 as LinearLayer (may be quantized)
-        if let Some(layer) = load_pointwise_conv_as_linear(
-            weights,
-            &format!("{}.pointwise_conv1", prefix),
-            quant,
-        ) {
+        if let Some(layer) =
+            load_pointwise_conv_as_linear(weights, &format!("{}.pointwise_conv1", prefix), quant)
+        {
             self.pointwise_conv1 = layer;
         }
 
@@ -2427,11 +2489,9 @@ impl ConvolutionModule {
         );
 
         // Load pointwise conv2 as LinearLayer (may be quantized)
-        if let Some(layer) = load_pointwise_conv_as_linear(
-            weights,
-            &format!("{}.pointwise_conv2", prefix),
-            quant,
-        ) {
+        if let Some(layer) =
+            load_pointwise_conv_as_linear(weights, &format!("{}.pointwise_conv2", prefix), quant)
+        {
             self.pointwise_conv2 = layer;
         }
 
@@ -2486,8 +2546,15 @@ mod tests {
 
             let a: Vec<f32> = single.to_vec_row_major().unwrap();
             let b: Vec<f32> = chunked.to_vec_row_major().unwrap();
-            assert!(a.iter().any(|v| v.abs() > 1e-3), "degenerate output (causal={causal})");
-            let max_diff = a.iter().zip(&b).map(|(x, y)| (x - y).abs()).fold(0.0, f32::max);
+            assert!(
+                a.iter().any(|v| v.abs() > 1e-3),
+                "degenerate output (causal={causal})"
+            );
+            let max_diff = a
+                .iter()
+                .zip(&b)
+                .map(|(x, y)| (x - y).abs())
+                .fold(0.0, f32::max);
             assert!(max_diff < 1e-5, "causal={causal}: max diff {max_diff}");
         }
     }

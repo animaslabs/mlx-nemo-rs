@@ -8,14 +8,14 @@
 
 use std::collections::HashMap;
 
+use mlx_rs::Array;
 use mlx_rs::module::Module;
 use mlx_rs::nn;
 use mlx_rs::ops;
-use mlx_rs::Array;
 
 use crate::asr::config::TransformerEncoderConfig;
 use crate::core::error::Result;
-use crate::core::quantization::{load_linear_layer, LinearLayer, QuantizationConfig};
+use crate::core::quantization::{LinearLayer, QuantizationConfig, load_linear_layer};
 
 /// Multi-head attention (standard, no relative positional encoding).
 ///
@@ -60,7 +60,13 @@ impl MultiHeadAttention {
         })
     }
 
-    fn forward(&self, query: &Array, key: &Array, value: &Array, mask: Option<&Array>) -> Result<Array> {
+    fn forward(
+        &self,
+        query: &Array,
+        key: &Array,
+        value: &Array,
+        mask: Option<&Array>,
+    ) -> Result<Array> {
         let batch = query.dim(0);
         let seq_len_q = query.dim(1);
         let seq_len_k = key.dim(1);
@@ -127,7 +133,9 @@ impl MultiHeadAttention {
         if let Some(layer) = load_linear_layer(weights, &format!("{}.value_net", prefix), quant) {
             self.value_proj = layer;
         }
-        if let Some(layer) = load_linear_layer(weights, &format!("{}.out_projection", prefix), quant) {
+        if let Some(layer) =
+            load_linear_layer(weights, &format!("{}.out_projection", prefix), quant)
+        {
             self.out_proj = layer;
         }
     }
@@ -255,10 +263,20 @@ impl TransformerEncoderBlock {
         quant: Option<&QuantizationConfig>,
     ) {
         // NeMo weight prefix: {prefix}.first_sub_layer (MHA), {prefix}.second_sub_layer (FFN)
-        self.self_attn.load_weights(weights, &format!("{}.first_sub_layer", prefix), quant);
-        self.ffn.load_weights(weights, &format!("{}.second_sub_layer", prefix), quant);
-        load_layer_norm(&mut self.layer_norm_1, weights, &format!("{}.layer_norm_1", prefix));
-        load_layer_norm(&mut self.layer_norm_2, weights, &format!("{}.layer_norm_2", prefix));
+        self.self_attn
+            .load_weights(weights, &format!("{}.first_sub_layer", prefix), quant);
+        self.ffn
+            .load_weights(weights, &format!("{}.second_sub_layer", prefix), quant);
+        load_layer_norm(
+            &mut self.layer_norm_1,
+            weights,
+            &format!("{}.layer_norm_1", prefix),
+        );
+        load_layer_norm(
+            &mut self.layer_norm_2,
+            weights,
+            &format!("{}.layer_norm_2", prefix),
+        );
     }
 }
 

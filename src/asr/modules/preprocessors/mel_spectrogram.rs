@@ -49,7 +49,7 @@
 use std::sync::Arc;
 
 use mlx_rs::ops::indexing::IndexOp;
-use mlx_rs::{ops, Array};
+use mlx_rs::{Array, ops};
 
 use crate::asr::config::PreprocessorConfig;
 use crate::asr::dsp;
@@ -394,15 +394,28 @@ impl MelProcessor {
 
     /// Per-feature normalization over each stream's valid frames, like NeMo's
     /// normalize_batch: unbiased std, plus 1e-5.
-    fn normalize_per_feature(&self, features: &Array, valid: &Array, lengths: &Array) -> Result<Array> {
-        let count = lengths.as_dtype(mlx_rs::Dtype::Float32)?.reshape(&[-1, 1, 1])?;
+    fn normalize_per_feature(
+        &self,
+        features: &Array,
+        valid: &Array,
+        lengths: &Array,
+    ) -> Result<Array> {
+        let count = lengths
+            .as_dtype(mlx_rs::Dtype::Float32)?
+            .reshape(&[-1, 1, 1])?;
         let zero = Array::from_f32(0.0);
         let masked = ops::select(valid, features, &zero)?;
-        let mean = ops::divide(&ops::sum_axis(&masked, 2, Some(true))?, &ops::maximum(&count, &Array::from_f32(1.0))?)?;
+        let mean = ops::divide(
+            &ops::sum_axis(&masked, 2, Some(true))?,
+            &ops::maximum(&count, &Array::from_f32(1.0))?,
+        )?;
         let centered = ops::select(valid, &ops::subtract(features, &mean)?, &zero)?;
         let variance = ops::divide(
             &ops::sum_axis(&ops::square(&centered)?, 2, Some(true))?,
-            &ops::maximum(&ops::subtract(&count, &Array::from_f32(1.0))?, &Array::from_f32(1.0))?,
+            &ops::maximum(
+                &ops::subtract(&count, &Array::from_f32(1.0))?,
+                &Array::from_f32(1.0),
+            )?,
         )?;
         let std = ops::add(&ops::sqrt(&variance)?, &Array::from_f32(1e-5))?;
         ops::divide(&ops::subtract(features, &mean)?, &std).map_err(|e| Error::model(e.to_string()))
@@ -447,7 +460,9 @@ impl MelStreamState {
     ///
     /// Initializes the overlap buffer with zeros and last_sample to 0.
     pub fn new(processor: &MelProcessor) -> Self {
-        let overlap_size = processor.win_samples().saturating_sub(processor.hop_samples());
+        let overlap_size = processor
+            .win_samples()
+            .saturating_sub(processor.hop_samples());
         Self {
             overlap: vec![0.0f32; overlap_size],
             last_sample: 0.0,
@@ -684,7 +699,12 @@ impl MelProcessor {
     ///
     /// # Returns
     /// Mel features with shape [n_mels, n_frames]
-    pub fn process_frames(&self, audio: &[f32], n_frames: usize, last_sample: f32) -> Result<Array> {
+    pub fn process_frames(
+        &self,
+        audio: &[f32],
+        n_frames: usize,
+        last_sample: f32,
+    ) -> Result<Array> {
         if n_frames == 0 {
             return Ok(Array::zeros::<f32>(&[self.config.features as i32, 0])?);
         }
@@ -882,11 +902,7 @@ impl StreamingMelConfig {
 
     /// Minimum new frames a final, shorter chunk needs (NeMo's sampling frames).
     pub fn min_frames_for_chunk(&self, is_first: bool) -> usize {
-        if is_first {
-            1
-        } else {
-            self.subsampling_factor
-        }
+        if is_first { 1 } else { self.subsampling_factor }
     }
 }
 
@@ -1011,7 +1027,9 @@ impl StreamingMel {
         }
 
         // Process frames
-        let mel = self.processor.process_frames(&combined, n_frames, self.last_sample)?;
+        let mel = self
+            .processor
+            .process_frames(&combined, n_frames, self.last_sample)?;
         mel.eval()?;
 
         // Extract mel data and append to buffer
@@ -1109,7 +1127,10 @@ impl StreamingMel {
             }
         }
 
-        Ok(Array::from_slice(&output, &[self.n_mels as i32, count as i32]))
+        Ok(Array::from_slice(
+            &output,
+            &[self.n_mels as i32, count as i32],
+        ))
     }
 
     /// Get mel frames for a range, with lookahead from the audio lookback buffer.
@@ -1141,7 +1162,9 @@ impl StreamingMel {
             None
         };
 
-        let peek_count = peek_frames.as_ref().map_or(0, |data| data.len() / self.n_mels);
+        let peek_count = peek_frames
+            .as_ref()
+            .map_or(0, |data| data.len() / self.n_mels);
         let const_pad_after = pad_after.saturating_sub(peek_count);
 
         if peek_count > 0 {
@@ -1183,7 +1206,10 @@ impl StreamingMel {
             }
         }
 
-        Ok(Array::from_slice(&output, &[self.n_mels as i32, count as i32]))
+        Ok(Array::from_slice(
+            &output,
+            &[self.n_mels as i32, count as i32],
+        ))
     }
 
     /// Compute speculative mel frames from the lookback buffer without consuming it.
@@ -1222,14 +1248,16 @@ impl StreamingMel {
         padded.extend_from_slice(&self.audio_lookback);
         padded.resize(lookback_len + pad_len, 0.0);
 
-        let n_frames = dsp::num_frames(padded.len(), self.win_samples, self.hop_samples)
-            .min(n_target);
+        let n_frames =
+            dsp::num_frames(padded.len(), self.win_samples, self.hop_samples).min(n_target);
 
         if n_frames == 0 {
             return Ok(None);
         }
 
-        let mel = self.processor.process_frames(&padded, n_frames, self.last_sample)?;
+        let mel = self
+            .processor
+            .process_frames(&padded, n_frames, self.last_sample)?;
         mel.eval()?;
 
         // mel is [n_mels, n_frames] row-major
@@ -1813,7 +1841,11 @@ mod tests {
         let total_frames = mel1.shape()[1] + mel2.shape()[1];
         // With 240 initial overlap and 3200 new samples = 3440 total
         // (3440 - 400) / 160 + 1 = 20 frames approximately
-        assert!(total_frames >= 15, "Expected ~20 frames, got {}", total_frames);
+        assert!(
+            total_frames >= 15,
+            "Expected ~20 frames, got {}",
+            total_frames
+        );
     }
 
     // ==================== StreamingMel Tests ====================
@@ -1940,7 +1972,9 @@ mod tests {
 
         // Process in multiple chunks
         let audio1: Vec<f32> = (0..1600).map(|i| (i as f32 * 0.001).sin()).collect();
-        let audio2: Vec<f32> = (0..1600).map(|i| ((i + 1600) as f32 * 0.001).sin()).collect();
+        let audio2: Vec<f32> = (0..1600)
+            .map(|i| ((i + 1600) as f32 * 0.001).sin())
+            .collect();
 
         let frames1 = mel.add_audio(&audio1).unwrap();
         let frames2 = mel.add_audio(&audio2).unwrap();
@@ -2017,7 +2051,11 @@ mod tests {
         let n_frames = audio.len() / 160 + 1;
         assert_eq!(mel.total_frames(), n_frames);
 
-        let streamed: Vec<f32> = mel.get_frames(0, n_frames).unwrap().to_vec_row_major().unwrap();
+        let streamed: Vec<f32> = mel
+            .get_frames(0, n_frames)
+            .unwrap()
+            .to_vec_row_major()
+            .unwrap();
         // The batch output zeroes its last frame (past NeMo's valid length)
         // (a frame off by one sample's alignment would differ by far more than
         // float noise)

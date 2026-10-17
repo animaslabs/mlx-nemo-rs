@@ -16,7 +16,7 @@ pub use decoders::CTCDecoder;
 pub use decoders::{LstmState, RNNTDecoder, RNNTJoint, StatelessTransducerDecoder};
 pub use encoders::ConformerEncoder;
 pub use encoders::TransformerEncoder;
-pub use language_prompt::{LanguagePrompt, AUTO_LANGUAGE};
+pub use language_prompt::{AUTO_LANGUAGE, LanguagePrompt};
 pub use sortformer::SortformerModules;
 pub use speaker_kernel::{SpeakerKernels, SpeakerTargets};
 
@@ -25,7 +25,7 @@ pub use preprocessors::{MelConfig, MelProcessor, SpectrumTransform, StreamingMel
 
 // Stateless streaming exports
 pub use preprocessors::{
-    frames_available, process_audio_streaming, MelStreamState, StreamingMelConfig,
+    MelStreamState, StreamingMelConfig, frames_available, process_audio_streaming,
 };
 
 // Backwards-compatible aliases

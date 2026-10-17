@@ -6,7 +6,7 @@
 use std::f32::consts::PI;
 
 use mlx_rs::ops::indexing::IndexOp;
-use mlx_rs::{ops, Array};
+use mlx_rs::{Array, ops};
 
 use crate::core::error::{Error, Result};
 
@@ -90,7 +90,10 @@ pub fn create_window(window_type: &str, length: usize) -> Result<Array> {
     match window_type {
         "hann" => hann_window(length),
         "hamming" => hamming_window(length),
-        _ => Err(Error::config(format!("Unknown window type: {}", window_type))),
+        _ => Err(Error::config(format!(
+            "Unknown window type: {}",
+            window_type
+        ))),
     }
 }
 
@@ -397,8 +400,13 @@ pub fn frame_audio_batch(
         let left_pad = ((n_fft - window_len) / 2) as i32;
         let right_pad = (n_fft - window_len) as i32 - left_pad;
         // Pad along axis 2 (the frame dimension)
-        ops::pad(&frames, &[(0, 0), (0, 0), (left_pad, right_pad)], None, None)
-            .map_err(|e| Error::model(e.to_string()))
+        ops::pad(
+            &frames,
+            &[(0, 0), (0, 0), (left_pad, right_pad)],
+            None,
+            None,
+        )
+        .map_err(|e| Error::model(e.to_string()))
     } else {
         Ok(frames)
     }
