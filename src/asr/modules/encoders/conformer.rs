@@ -13,7 +13,7 @@ use mlx_rs::nn;
 use mlx_rs::ops::indexing::IndexOp;
 use mlx_rs::Array;
 
-use super::attention::{RelPositionMultiHeadAttention, RelPositionalEncoding};
+use super::attention::{AttentionContext, RelPositionMultiHeadAttention, RelPositionalEncoding};
 use crate::asr::config::EncoderConfig;
 use crate::asr::modules::speaker_kernel::{SpeakerKernels, SpeakerTargets};
 use crate::core::ArrayExt;
@@ -627,6 +627,7 @@ impl ConformerEncoder {
         let pos_emb = self.pos_enc.get_encoding(seq_len)?;
 
         // Process through conformer blocks with positional info
+        let context = self.offline_attention_context();
         for (layer_idx, layer) in self.layers.iter_mut().enumerate() {
             x = apply_speaker_kernels(
                 self.speaker_kernels.as_ref(),
@@ -634,7 +635,7 @@ impl ConformerEncoder {
                 layer_idx,
                 x,
             )?;
-            x = layer.forward(&x, &pos_emb)?;
+            x = layer.forward(&x, &pos_emb, context)?;
         }
 
         // NOTE: NeMo's ConformerEncoder does NOT have a final_norm at the encoder level.
@@ -645,6 +646,15 @@ impl ConformerEncoder {
         let x = mlx_rs::ops::transpose_axes(&x, &[0, 2, 1])?.as_dtype(mlx_rs::Dtype::Float32)?;
 
         Ok((x, lengths))
+    }
+
+    /// The attention context offline passes use: NeMo masks whole-file attention
+    /// to the current `att_context_size` (the first configured mode by
+    /// default), so cache-aware models see the same context offline as when
+    /// streaming. `None` (full attention) for [-1, -1] models such as parakeet.
+    fn offline_attention_context(&self) -> Option<AttentionContext> {
+        self.att_context_size
+            .and_then(|size| AttentionContext::new(size, &self.att_context_style))
     }
 
     /// Get output dimension.
@@ -779,8 +789,9 @@ impl ConformerEncoder {
         let pos_emb = self.pos_enc.get_encoding(seq_len)?;
 
         // Process through conformer blocks
+        let context = self.offline_attention_context();
         for layer in &mut self.layers {
-            x = layer.forward(&x, &pos_emb)?;
+            x = layer.forward(&x, &pos_emb, context)?;
         }
 
         // Transpose to [B, D, T]
@@ -834,9 +845,10 @@ impl ConformerEncoder {
         pos_emb.eval()?;
 
         // Process through conformer blocks
+        let context = self.offline_attention_context();
         let mut layer_outputs = Vec::new();
         for (i, layer) in self.layers.iter_mut().enumerate() {
-            x = layer.forward(&x, &pos_emb)?;
+            x = layer.forward(&x, &pos_emb, context)?;
             x.eval()?;
             if i < 3 {  // Only save first few layers
                 layer_outputs.push(x.clone());
@@ -1698,7 +1710,12 @@ impl ConformerBlock {
         })
     }
 
-    fn forward(&mut self, x: &Array, pos_emb: &Array) -> Result<Array> {
+    fn forward(
+        &mut self,
+        x: &Array,
+        pos_emb: &Array,
+        context: Option<AttentionContext>,
+    ) -> Result<Array> {
         // x: [B, T, D]
         let debug_layer = *DEBUG_LAYER0;
 
@@ -1766,7 +1783,7 @@ impl ConformerBlock {
             tracing::debug!(?t00, ?t16, "after self_attn_norm");
         }
 
-        let attn_out = self.self_attn.forward(&attn_normed, pos_emb)?;
+        let attn_out = self.self_attn.forward(&attn_normed, pos_emb, context)?;
 
         if debug_layer {
             attn_out.eval()?;
